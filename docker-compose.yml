@@ -1,0 +1,57 @@
+# Deploy template. Pull the prebuilt image from ghcr.io — do NOT build on prod.
+# Values below are PLACEHOLDERS (XXX), not real secrets.
+#
+# This is the WEB-SERVICE variant (published via Traefik). For a polling bot with
+# no inbound port, drop `networks`, the Traefik labels and the healthcheck.
+
+volumes:
+  new_project:
+
+networks:
+  docker_main_net:
+    external: true
+
+services:
+  new_project:
+    image: ghcr.io/vvzvlad/new-project:latest
+    container_name: new-project
+    restart: always
+    # The app runs as non-root user `app` (uid 1000): the entrypoint starts as
+    # root, chowns /app/data and drops privileges via gosu. Setting a
+    # `user: "UID:GID"` override here makes the entrypoint skip the chown —
+    # the volume must then already be owned by that uid.
+    security_opt:
+      - no-new-privileges:true   # forbids privilege escalation via setuid binaries; compatible with gosu (it only drops privileges)
+    # Optional hardening. The cap_add list is the minimum the root entrypoint
+    # needs (chown -R the volume + gosu setuid/setgid drop):
+    # cap_drop: [ALL]
+    # cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID]
+    volumes:
+      - new_project:/app/data          # all mutable state survives restart/update
+    environment:
+      TELEGRAM_BOT_TOKEN: XXX
+      TZ: Europe/Moscow
+    networks:
+      - docker_main_net
+    logging:
+      driver: "json-file"
+      options:
+        max-file: 5
+        max-size: 10m
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.newproject.rule: Host(`new.example.com`)
+      traefik.http.services.newproject.loadBalancer.server.port: 8000
+      traefik.http.routers.newproject.entrypoints: websecure
+      traefik.http.routers.newproject.tls: "true"
+      traefik.http.routers.newproject.tls.certresolver: letsEncrypt
+      com.centurylinklabs.watchtower.enable: "true"   # auto-update the image
+    healthcheck:
+      # Short interval + start_period are REQUIRED behind Traefik: Traefik does not
+      # route to a container while its health is starting/unhealthy, so interval:30m
+      # with no start_period leaves it unrouted for ~30 min (default cert + 404).
+      test: ["CMD", "curl", "-s", "-f", "-o", "/dev/null", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

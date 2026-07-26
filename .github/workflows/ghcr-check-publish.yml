@@ -1,0 +1,62 @@
+name: Docker Image CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "develop" ]
+
+permissions:
+  contents: read   # checkout
+  packages: write  # push image to ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: pip install -r requirements-dev.txt
+
+    - name: Run tests
+      env:
+        TELEGRAM_BOT_TOKEN: test-token   # required ENV so importing settings works
+      run: pytest --tb=short -q
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test                          # no green tests → no image is built
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Compute image tags
+      id: tags
+      # main -> :latest + :<sha> (watchtower deploys :latest); develop -> :develop only
+      run: |
+        if [ "${{ github.ref_name }}" = "main" ]; then
+          echo "tags=ghcr.io/${{ github.repository }}:latest ghcr.io/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "tags=ghcr.io/${{ github.repository }}:develop" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build the Docker image
+      run: |
+        tag_args=""
+        for tag in ${{ steps.tags.outputs.tags }}; do tag_args="$tag_args --tag $tag"; done
+        docker build . --file Dockerfile $tag_args
+
+    - name: Push Docker images
+      run: |
+        for tag in ${{ steps.tags.outputs.tags }}; do docker push "$tag"; done
