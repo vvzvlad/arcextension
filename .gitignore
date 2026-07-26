@@ -15,3 +15,6 @@ data/*
 !data/.gitkeep
 # Claude Code agent worktrees — never commit
 .claude/worktrees/
+
+# Donor repo sits nested here — never pull it into this git
+brave-window-mcp/
