@@ -26,7 +26,18 @@ async function poll() {
   if (!wins.length) return;
   const target = wins[0];
 
-  if (cmd === 'minimize') {
+  if (cmd === 'fullscreen') {
+    // Setup, not treatment: native fullscreen puts the window on its own Space.
+    // Re-read the state afterwards: the request is not always honoured, and a
+    // silent no-op would make the arm test a different scenario than intended.
+    let err = null;
+    try {
+      await chrome.windows.update(target.id, { state: 'fullscreen' });
+    } catch (e) { err = String(e); }
+    const after = await chrome.windows.get(target.id);
+    await report({ event: 'fullscreen_setup', windowId: target.id,
+                   requested: 'fullscreen', actual: after.state, err });
+  } else if (cmd === 'minimize') {
     // Setup, not treatment: puts the window into the state under test.
     await chrome.windows.update(target.id, { state: 'minimized' });
     await report({ event: 'minimized', windowId: target.id });

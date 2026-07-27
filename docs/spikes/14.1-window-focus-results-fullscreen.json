@@ -1,0 +1,256 @@
+[
+  {
+    "arm": "fs-treat",
+    "treatment": true,
+    "minimized": false,
+    "fullscreen": true,
+    "ext_alive": true,
+    "browser_pid": 64514,
+    "baseline": [
+      "Terminal",
+      11506
+    ],
+    "samples": [
+      [
+        2,
+        [
+          "Brave Browser",
+          64514
+        ]
+      ],
+      [
+        5,
+        [
+          "Brave Browser",
+          64514
+        ]
+      ],
+      [
+        15,
+        [
+          "Brave Browser",
+          64514
+        ]
+      ],
+      [
+        30,
+        [
+          "Brave Browser",
+          64514
+        ]
+      ],
+      [
+        60,
+        [
+          "Brave Browser",
+          64514
+        ]
+      ]
+    ],
+    "probe_events": [
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1931664465,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "focus_called",
+        "windowId": 1931664465,
+        "state": "fullscreen",
+        "err": null
+      },
+      {
+        "noop_count": 0
+      }
+    ]
+  },
+  {
+    "arm": "fs-control",
+    "treatment": false,
+    "minimized": false,
+    "fullscreen": true,
+    "ext_alive": true,
+    "browser_pid": 64834,
+    "baseline": [
+      "Terminal",
+      11506
+    ],
+    "samples": [
+      [
+        2,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        5,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        15,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        30,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        60,
+        [
+          "Terminal",
+          11506
+        ]
+      ]
+    ],
+    "probe_events": [
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "event": "fullscreen_setup",
+        "windowId": 1334326311,
+        "requested": "fullscreen",
+        "actual": "fullscreen",
+        "err": null
+      },
+      {
+        "noop_count": 61
+      }
+    ]
+  }
+]

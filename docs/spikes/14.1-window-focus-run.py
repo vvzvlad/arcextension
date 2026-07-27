@@ -67,7 +67,7 @@ def front_terminal():
     time.sleep(2)
 
 
-def arm(name, treatment, minimize):
+def arm(name, treatment, minimize, fullscreen=False):
     global focus_served
     focus_served = False
     STATE["cmd"] = "wait"
@@ -82,6 +82,9 @@ def arm(name, treatment, minimize):
     STATE["cmd"] = "hello"; time.sleep(3)
     alive = any(e.get("event") == "alive" for _, e in LOG)
 
+    if fullscreen:
+        STATE["cmd"] = "fullscreen"; time.sleep(10)
+        STATE["cmd"] = "wait"; time.sleep(2)
     if minimize:
         STATE["cmd"] = "minimize"; time.sleep(3)
     STATE["cmd"] = "wait"; time.sleep(1)
@@ -98,8 +101,11 @@ def arm(name, treatment, minimize):
         samples.append((wait, frontmost()))
     STATE["cmd"] = "wait"
 
-    called = [e for _, e in LOG if e.get("event") in ("focus_called", "noop_arm")]
+    called = [e for _, e in LOG
+              if e.get("event") in ("focus_called", "fullscreen_setup", "minimized")]
+    called.append({"noop_count": sum(1 for _, e in LOG if e.get("event") == "noop_arm")})
     res = {"arm": name, "treatment": treatment, "minimized": minimize,
+           "fullscreen": fullscreen,
            "ext_alive": alive, "browser_pid": p.pid, "baseline": base,
            "samples": samples, "probe_events": called}
     p.send_signal(signal.SIGTERM)
@@ -114,13 +120,11 @@ srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 results = []
-for nm, tr, mi in [("behind-treat", True, False),
-                   ("behind-control", False, False),
-                   ("min-treat", True, True),
-                   ("min-control", False, True)]:
-    results.append(arm(nm, tr, mi))
+for nm, tr, mi, fs in [("fs-treat", True, False, True),
+                       ("fs-control", False, False, True)]:
+    results.append(arm(nm, tr, mi, fs))
     print(json.dumps(results[-1], ensure_ascii=False), flush=True)
 
-with open("/tmp/focus-spike/results.json", "w") as f:
+with open("/tmp/focus-spike/results-fs2.json", "w") as f:
     json.dump(results, f, ensure_ascii=False, indent=2)
 print("DONE", flush=True)
