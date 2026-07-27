@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "focus-spike-probe",
+  "version": "1.0",
+  "permissions": ["tabs", "alarms", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "bg.js" }
+}

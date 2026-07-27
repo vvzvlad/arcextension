@@ -1,0 +1,580 @@
+[
+  {
+    "arm": "behind-treat",
+    "treatment": true,
+    "minimized": false,
+    "ext_alive": true,
+    "browser_pid": 62303,
+    "baseline": [
+      "Terminal",
+      11506
+    ],
+    "samples": [
+      [
+        2,
+        [
+          "Brave Browser",
+          62303
+        ]
+      ],
+      [
+        5,
+        [
+          "Brave Browser",
+          62303
+        ]
+      ],
+      [
+        15,
+        [
+          "Brave Browser",
+          62303
+        ]
+      ],
+      [
+        30,
+        [
+          "Brave Browser",
+          62303
+        ]
+      ],
+      [
+        60,
+        [
+          "Brave Browser",
+          62303
+        ]
+      ]
+    ],
+    "probe_events": [
+      {
+        "event": "focus_called",
+        "windowId": 2067428893,
+        "state": "normal",
+        "err": null
+      }
+    ]
+  },
+  {
+    "arm": "behind-control",
+    "treatment": false,
+    "minimized": false,
+    "ext_alive": true,
+    "browser_pid": 62548,
+    "baseline": [
+      "Terminal",
+      11506
+    ],
+    "samples": [
+      [
+        2,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        5,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        15,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        30,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        60,
+        [
+          "Terminal",
+          11506
+        ]
+      ]
+    ],
+    "probe_events": [
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      }
+    ]
+  },
+  {
+    "arm": "min-treat",
+    "treatment": true,
+    "minimized": true,
+    "ext_alive": true,
+    "browser_pid": 62805,
+    "baseline": [
+      "Terminal",
+      11506
+    ],
+    "samples": [
+      [
+        2,
+        [
+          "Brave Browser",
+          62805
+        ]
+      ],
+      [
+        5,
+        [
+          "Brave Browser",
+          62805
+        ]
+      ],
+      [
+        15,
+        [
+          "Brave Browser",
+          62805
+        ]
+      ],
+      [
+        30,
+        [
+          "Brave Browser",
+          62805
+        ]
+      ],
+      [
+        60,
+        [
+          "Brave Browser",
+          62805
+        ]
+      ]
+    ],
+    "probe_events": [
+      {
+        "event": "focus_called",
+        "windowId": 1111407861,
+        "state": "minimized",
+        "err": null
+      }
+    ]
+  },
+  {
+    "arm": "min-control",
+    "treatment": false,
+    "minimized": true,
+    "ext_alive": true,
+    "browser_pid": 63066,
+    "baseline": [
+      "Terminal",
+      11506
+    ],
+    "samples": [
+      [
+        2,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        5,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        15,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        30,
+        [
+          "Terminal",
+          11506
+        ]
+      ],
+      [
+        60,
+        [
+          "Terminal",
+          11506
+        ]
+      ]
+    ],
+    "probe_events": [
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      },
+      {
+        "event": "noop_arm"
+      }
+    ]
+  }
+]
