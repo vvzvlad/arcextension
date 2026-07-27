@@ -1622,9 +1622,10 @@ MCP не работала бы ни одна: превью живёт в UI и �
   `curator_deferred_total{to_instance}`, `curator_quarantined_total`,
   `curator_paused_until`, `curator_resume_pending`, `curator_rules_total`,
   `curator_rules_invalid`,
-  `curator_relocations_incomplete`, `curator_nonconvergent_relocations`,
+  `curator_relocations_incomplete`, `curator_main_instance_never_seen`,
   `curator_instance_snapshot_age_seconds`,
-  `curator_clock_step_seconds`, `curator_backup_last_ok_ts`,
+  `curator_clock_step_seconds`, `curator_pass_overdue_seconds`,
+  `curator_backup_age_seconds`, `curator_backup_last_ok_ts`,
   `curator_backup_bytes`, `curator_migration_failed`.
 
   **Всё, что относится к проходу, читается из таблицы `passes`, а не из памяти
@@ -1652,8 +1653,8 @@ MCP не работала бы ни одна: превью живёт в UI и �
   Поэтому сервис экспортирует **готовые гейджи**, а правила только сравнивают их с
   порогом: `curator_pass_overdue_seconds` (0, если проход не просрочен **или** идёт
   пауза — подавление живёт здесь, а не в выражении), `curator_backup_age_seconds`,
-  `curator_last_pass_ok`, `curator_main_instance_ready`, `curator_rules_total`,
-  `curator_rules_invalid`. Гейджи регистрируются со значением при старте процесса —
+  `curator_last_pass_ok`, `curator_main_instance_never_seen`, `curator_rules_total`,
+  `curator_rules_invalid`, `curator_migration_failed`. Гейджи регистрируются со значением при старте процесса —
   иначе «не отработало ни разу» даёт NoData, и пер-метричное правило промолчит именно
   тогда, когда всё сломано.
 
@@ -1663,8 +1664,7 @@ MCP не работала бы ни одна: превью живёт в UI и �
   `curator_main_instance_never_seen`, `curator_rules_total == 0` и
   `curator_instance_absent_seconds`.
 
-  ⚠️ **Алертить по живой готовности нельзя, и `curator_main_instance_ready` для этого
-  не годится.** По §6 `ready` означает «подключён, ответил на снимок этого прохода, та
+  ⚠️ **Алертить по живой готовности нельзя.** По §6 `ready` означает «подключён, ответил на снимок этого прохода, та
   же сессия» — условие, ложное каждую ночь, пока ноутбук спит, и вообще не
   определённое между проходами. Правило на нём горит еженощно по несколько часов и
   будет отключено за неделю — ровно тот отказ, от которого предостерегает абзац выше.
