@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     # approve pending enroll requests; compared against "now" AT READ TIME (no timer),
     # so a restart neither silently closes nor leaves-open-forever an armed window.
     enroll_window_min: int = 10
+    # Ceiling on the number of PENDING enroll_requests (§2). A not-yet-approved client's
+    # enroll_request is refused with enroll_rejected{reason:capacity} once the pending
+    # list is at this size, so a flood of anonymous enroll_requests cannot grow the
+    # operator-facing list without bound. 64 is generous for a human-scale fleet while
+    # still bounding the pre-auth list.
+    enroll_max_pending: int = 64
+    # Ceiling on simultaneously-open /ext sockets that have been accepted but have not
+    # yet completed a hello/enroll (§2). Refused BEFORE accept() (a handshake rejection,
+    # no TLS session), so a flood of opened-but-silent sockets cannot exhaust memory or
+    # TLS sessions. A live authenticated connection releases its slot on a successful
+    # hello, so this bounds only the pre-auth window, not the connected fleet.
+    enroll_preauth_max: int = 128
     # Comma-separated allow-list for the extension's `hello.origin`. DEFAULT
     # EMPTY = accept any origin and log a one-time warning (the concrete
     # chrome-extension:// id is unknown until the extension/generator phases;

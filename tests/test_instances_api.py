@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import _recv, approve_instance, make_settings, secret_hash_for
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -47,9 +47,12 @@ def _q_one(db_path, sql, params=()):
 
 
 def _connect(client, instance_id="prox", session="sess-1", db_path=None):
+    # Secret-based hello (issue #35): approve the instance (Task E) before it can hello.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json({
-        "type": "hello", "protocolVersion": 1, "token": EXT_TOKEN,
+        "type": "hello", "protocolVersion": 1,
+        "secretHash": secret_hash_for(instance_id),
         "instanceId": instance_id, "installUuid": f"u-{instance_id}",
         "origin": "chrome-extension://abc", "title": "T",
         "sessionId": session, "allowExecuteJs": False,

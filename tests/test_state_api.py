@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
-from conftest import _recv, make_settings
+from conftest import _recv, approve_instance, make_settings, secret_hash_for
 from starlette.testclient import TestClient
 
 from src.api.state import kick_state_refresh
@@ -39,7 +39,7 @@ def _hello(instance_id="i1", session="sess-1", **over):
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "token": EXT_TOKEN,
+        "secretHash": secret_hash_for(instance_id),
         "instanceId": instance_id,
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",
@@ -82,6 +82,8 @@ def _wait_until(fn, timeout=5.0, interval=0.01):
 
 
 def _connect_fresh(client, db_path, instance_id="i1", session="sess-1", tabs=None):
+    # Secret-based hello (issue #35): approve the instance (Task E) before it can hello.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
     _recv(ws)                 # hello_ack
@@ -518,6 +520,7 @@ def test_an_unlanded_handshake_leaves_the_slot_occupied_and_is_caught(tmp_path):
     app = create_app(_settings(tmp_path, state_fresh_ms=3000, snapshot_timeout_ms=200))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        approve_instance(db_path, "i1")  # secret-hello needs an approved active row (#35)
         ws = client.websocket_connect("/ext").__enter__()
         try:
             ws.send_json(_hello())

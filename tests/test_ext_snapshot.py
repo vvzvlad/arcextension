@@ -19,6 +19,18 @@ async def _make_db(tmp_path):
 
 
 async def _register(db, instance_id, session_id, now):
+    # Enrollment (issue #35): hello_upsert is UPDATE-only and only bumps an ALREADY
+    # active row (a hello never creates one). Create the approved row first — the thing
+    # Task E's operator approval does — so the first hello returns conn_epoch=1 and a
+    # reconnect bumps it to 2. ON CONFLICT DO NOTHING so a repeat _register (reconnect)
+    # reuses the same row and its bumped epoch.
+    await db.write(
+        lambda c: c.execute(
+            "INSERT INTO instances (id, status, secret_hash, connected, conn_epoch) "
+            "VALUES (?, 'active', ?, 0, 0) ON CONFLICT(id) DO NOTHING",
+            (instance_id, f"hash-{instance_id}"),
+        )
+    )
     return await db.write(
         lambda c: queries.hello_upsert(c, instance_id, session_id, "t", False, now)
     )
@@ -271,3 +283,146 @@ def test_heartbeat_two_consecutive_misses_disconnects():
     assert heartbeat_step(alive=False, misses=0) == (1, False)
     # Second consecutive miss: disconnect.
     assert heartbeat_step(alive=False, misses=1) == (2, True)
+
+
+# --- UPDATE-only upsert / rejection invariants (§3, issue #35) ---------------
+async def test_hello_upsert_is_update_only_and_returns_none_for_missing_row(tmp_path):
+    # A hello for an id with NO instances row creates nothing and returns None (never
+    # int(None)). Reverting _HELLO_UPSERT to its INSERT branch reddens the COUNT check.
+    db = await _make_db(tmp_path)
+    try:
+        epoch = await db.write(
+            lambda c: queries.hello_upsert(c, "ghost", "s", "t", False, 1)
+        )
+        assert epoch is None
+        count = await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+        )
+        assert count == 0
+    finally:
+        await db.close()
+
+
+async def test_hello_upsert_ignores_a_revoked_row(tmp_path):
+    # status='active' guard: a hello must not bump a revoked row (returns None, row
+    # untouched). Dropping the guard would silently re-activate a revoked instance.
+    db = await _make_db(tmp_path)
+    try:
+        await db.write(
+            lambda c: c.execute(
+                "INSERT INTO instances (id, status, connected, conn_epoch) "
+                "VALUES ('r', 'revoked', 0, 5)"
+            )
+        )
+        epoch = await db.write(
+            lambda c: queries.hello_upsert(c, "r", "s", "t", False, 1)
+        )
+        assert epoch is None
+        row = await db.read(
+            lambda c: c.execute(
+                "SELECT connected, conn_epoch, status FROM instances WHERE id='r'"
+            ).fetchone()
+        )
+        assert row == (0, 5, "revoked")
+    finally:
+        await db.close()
+
+
+async def test_record_rejection_is_update_only_no_row_created(tmp_path):
+    # A rejection for an unknown id is a silent no-op — the anti-flood point of §3.
+    db = await _make_db(tmp_path)
+    try:
+        await db.write(
+            lambda c: queries.record_rejection(c, "ghost", "protocol", 1)
+        )
+        count = await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+        )
+        assert count == 0
+    finally:
+        await db.close()
+
+
+async def test_resolve_secret_maps_hash_to_id_and_status(tmp_path):
+    db = await _make_db(tmp_path)
+    try:
+        await db.write(
+            lambda c: c.execute(
+                "INSERT INTO instances (id, status, secret_hash) "
+                "VALUES ('a', 'active', 'H1')"
+            )
+        )
+        assert await db.read(lambda c: queries.resolve_secret(c, "H1")) == ("a", "active")
+        assert await db.read(lambda c: queries.resolve_secret(c, "nope")) is None
+    finally:
+        await db.close()
+
+
+async def test_upsert_enroll_request_does_not_bump_first_seen_at(tmp_path):
+    # first_seen_at is frozen across repeats (so the TTL is reachable); last_seen_at /
+    # title / secret_hash refresh to the latest.
+    db = await _make_db(tmp_path)
+    try:
+        await db.write(
+            lambda c: queries.upsert_enroll_request(
+                c, "u1", "o1", "T1", 1, "h1", now=100
+            )
+        )
+        await db.write(
+            lambda c: queries.upsert_enroll_request(
+                c, "u1", "o2", "T2", 1, "h2", now=200
+            )
+        )
+        row = await db.read(
+            lambda c: c.execute(
+                "SELECT first_seen_at, last_seen_at, suggested_title, secret_hash, origin "
+                "FROM enroll_requests WHERE install_uuid='u1'"
+            ).fetchone()
+        )
+        assert row == (100, 200, "T2", "h2", "o2")
+        count = await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
+        )
+        assert count == 1
+    finally:
+        await db.close()
+
+
+async def test_upsert_enroll_request_capped_enforces_capacity_atomically(tmp_path):
+    # The capacity gate must be authoritative under one transaction: a NEW install_uuid is
+    # rejected once the list is at max_pending, but an EXISTING one is always accepted (an
+    # update, not a new row — so a full list can still refresh last_seen_at under TTL).
+    db = await _make_db(tmp_path)
+    try:
+        # Fill to a max_pending of 2.
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, None, 1, "h1", 100, 2)
+        )
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(c, "u2", None, None, 1, "h2", 100, 2)
+        )
+        # A third, NEW uuid at capacity is refused and writes nothing.
+        assert not await db.write(
+            lambda c: queries.upsert_enroll_request_capped(c, "u3", None, None, 1, "h3", 100, 2)
+        )
+        assert await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
+        ) == 2
+        assert await db.read(
+            lambda c: c.execute("SELECT 1 FROM enroll_requests WHERE install_uuid='u3'").fetchone()
+        ) is None
+        # An EXISTING uuid at capacity is still accepted (refresh), count unchanged.
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, "T1b", 1, "h1b", 300, 2)
+        )
+        row = await db.read(
+            lambda c: c.execute(
+                "SELECT last_seen_at, secret_hash FROM enroll_requests WHERE install_uuid='u1'"
+            ).fetchone()
+        )
+        assert row == (300, "h1b")
+        assert await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
+        ) == 2
+    finally:
+        await db.close()

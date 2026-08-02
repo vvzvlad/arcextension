@@ -12,24 +12,25 @@ from __future__ import annotations
 
 import sqlite3
 
-# hello success: create-or-bump the instance row and return the NEW conn_epoch.
-# A brand-new instance starts at conn_epoch=1 (0 means "never connected"); a
-# reconnect does conn_epoch+1. connected=1 and the reject fields are cleared. The
-# new epoch is read back in the SAME transaction so the caller can hand it to the
-# connection's finalizer (§6).
+# hello success: bump an ALREADY-APPROVED instance row and return the NEW conn_epoch.
+# UPDATE-only (§3, issue #35): under enrollment a hello NEVER creates a row — the row
+# is created by an operator approval (Task E) with status='active' and a secret_hash;
+# an anon who only knows the public PROTOCOL_VERSION must not be able to conjure an
+# `instances` row. A reconnect does conn_epoch+1, sets connected=1 and clears the reject
+# fields. The ``AND status='active'`` guard means a hello for a revoked/pending/absent id
+# matches nothing (the channel resolves the secret first, but the row can vanish or be
+# revoked between resolve and this write — the None-guard below handles that race).
 _HELLO_UPSERT = """
-INSERT INTO instances (id, title, conn_epoch, connected, session_id,
-                       allow_execute_js, last_seen_at, reject_reason, reject_at)
-VALUES (?, ?, 1, 1, ?, ?, ?, NULL, NULL)
-ON CONFLICT(id) DO UPDATE SET
+UPDATE instances SET
     conn_epoch = conn_epoch + 1,
     connected = 1,
-    session_id = excluded.session_id,
-    title = excluded.title,
-    allow_execute_js = excluded.allow_execute_js,
-    last_seen_at = excluded.last_seen_at,
+    session_id = ?,
+    title = ?,
+    allow_execute_js = ?,
+    last_seen_at = ?,
     reject_reason = NULL,
     reject_at = NULL
+WHERE id = ? AND status = 'active'
 """
 
 
@@ -40,36 +41,149 @@ def hello_upsert(
     title: str | None,
     allow_execute_js: bool,
     now: int,
-) -> int:
-    """Register a successful hello; return the instance's new ``conn_epoch``."""
+) -> int | None:
+    """Register a successful hello on an already-active row; return its new
+    ``conn_epoch``, or ``None`` if no active row exists.
+
+    No longer creates rows (§3): a hello for a non-active id (deleted / revoked /
+    never-approved) updates nothing. The subsequent ``SELECT`` then reads back ``None``,
+    which is returned as a sentinel so the caller rejects cleanly instead of doing
+    ``int(None)`` — the row may have been revoked/deleted between the channel's
+    ``resolve_secret`` and this write.
+    """
     conn.execute(
         _HELLO_UPSERT,
-        (instance_id, title, session_id, 1 if allow_execute_js else 0, now),
+        (session_id, title, 1 if allow_execute_js else 0, now, instance_id),
     )
     row = conn.execute(
-        "SELECT conn_epoch FROM instances WHERE id = ?", (instance_id,)
+        "SELECT conn_epoch FROM instances WHERE id = ? AND status = 'active'",
+        (instance_id,),
     ).fetchone()
+    if row is None:
+        return None
     return int(row[0])
 
 
-# Record the reason of the most recent rejection. UPSERT because the instanceId
-# may never have connected (a brand-new row is created with connected=0); for an
-# existing row ONLY the reject fields are touched — connected / conn_epoch /
-# focused_window_id are left exactly as they are, so recording a duplicate-instance
-# rejection never disturbs the live socket that already owns the id (§6).
+# Record the reason of the most recent rejection. UPDATE-only (§3): a rejection for an
+# id with no existing row is a SILENT no-op. This is the point of dropping the INSERT
+# branch — an anon knowing only the public ``PROTOCOL_VERSION`` (no valid secret) can no
+# longer flood the `instances` table with junk rows via rejected hellos. For an existing
+# row ONLY the reject fields are touched — connected / conn_epoch / focused_window_id /
+# status are left exactly as they are, so recording a duplicate/revoked rejection never
+# disturbs the live socket that already owns the id (§6).
 _RECORD_REJECTION = """
-INSERT INTO instances (id, connected, reject_reason, reject_at)
-VALUES (?, 0, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    reject_reason = excluded.reject_reason,
-    reject_at = excluded.reject_at
+UPDATE instances SET reject_reason = ?, reject_at = ? WHERE id = ?
 """
 
 
 def record_rejection(
     conn: sqlite3.Connection, instance_id: str, reason: str, now: int
 ) -> None:
-    conn.execute(_RECORD_REJECTION, (instance_id, reason, now))
+    conn.execute(_RECORD_REJECTION, (reason, now, instance_id))
+
+
+def resolve_secret(
+    conn: sqlite3.Connection, secret_hash: str
+) -> tuple[str, str] | None:
+    """Resolve a hello's ``secretHash`` to ``(instance_id, status)`` or ``None``.
+
+    Uses the UNIQUE ``instances_secret_hash`` index (§1). ``None`` means no instance
+    carries this secret at all (the client is unknown / not yet approved). The status is
+    returned raw ('active' / 'revoked' / 'pending') so the channel can map it to the
+    right client-facing verdict (unknown vs revoked, §7).
+    """
+    row = conn.execute(
+        "SELECT id, status FROM instances WHERE secret_hash = ?", (secret_hash,)
+    ).fetchone()
+    if row is None:
+        return None
+    return (row[0], row[1])
+
+
+# Record (or refresh) a pending enrollment request. Keyed by install_uuid so a repeat
+# hello UPSERTs the same row instead of piling up. ``first_seen_at`` is DELIBERATELY NOT
+# updated on conflict (issue §1): a request that keeps re-arriving must still age out
+# against its ORIGINAL first_seen_at, otherwise the TTL is never reached and a stale
+# request lives forever. Everything else (last_seen_at, the client-proposed title,
+# secret_hash, protocol_version, origin) is refreshed to the latest hello.
+_UPSERT_ENROLL_REQUEST = """
+INSERT INTO enroll_requests
+    (install_uuid, origin, suggested_title, protocol_version, secret_hash,
+     first_seen_at, last_seen_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(install_uuid) DO UPDATE SET
+    last_seen_at = excluded.last_seen_at,
+    suggested_title = excluded.suggested_title,
+    secret_hash = excluded.secret_hash,
+    protocol_version = excluded.protocol_version,
+    origin = excluded.origin
+"""
+
+
+def upsert_enroll_request(
+    conn: sqlite3.Connection,
+    install_uuid: str,
+    origin: str | None,
+    suggested_title: str | None,
+    protocol_version: int,
+    secret_hash: str,
+    now: int,
+) -> None:
+    """Insert-or-refresh the pending enroll request for ``install_uuid`` (see SQL)."""
+    conn.execute(
+        _UPSERT_ENROLL_REQUEST,
+        (install_uuid, origin, suggested_title, protocol_version, secret_hash, now, now),
+    )
+
+
+def upsert_enroll_request_capped(
+    conn: sqlite3.Connection,
+    install_uuid: str,
+    origin: str | None,
+    suggested_title: str | None,
+    protocol_version: int,
+    secret_hash: str,
+    now: int,
+    max_pending: int,
+) -> bool:
+    """Capacity-check + upsert atomically in ONE write transaction; return acceptance.
+
+    The channel's pre-read capacity gate (:func:`count_enroll_requests`) is only
+    advisory: it runs in a separate read transaction, so N racing enroll_requests could
+    each observe ``pending < max`` and all write, overshooting ``max_pending``. This does
+    the count and the write under the SAME ``Database.write`` BEGIN, so the ceiling is
+    authoritative. An install_uuid that ALREADY has a row is an UPDATE (refresh), never a
+    new row, so it is always accepted regardless of capacity — else a full list could not
+    even refresh ``last_seen_at`` and a pending request would age out under TTL. A genuinely
+    NEW install_uuid is written only when ``count < max_pending``; otherwise nothing is
+    written and ``False`` is returned so the caller replies ``enroll_rejected{capacity}``.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
+    ).fetchone()
+    if exists is None:
+        n = conn.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
+        if n >= max_pending:
+            return False
+    conn.execute(
+        _UPSERT_ENROLL_REQUEST,
+        (install_uuid, origin, suggested_title, protocol_version, secret_hash, now, now),
+    )
+    return True
+
+
+def count_enroll_requests(conn: sqlite3.Connection) -> int:
+    """Number of pending enroll requests — the capacity gate's numerator (§2)."""
+    row = conn.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()
+    return int(row[0])
+
+
+def count_active_instances(conn: sqlite3.Connection) -> int:
+    """Number of approved (active) instances. Exposed for completeness / later use."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM instances WHERE status = 'active'"
+    ).fetchone()
+    return int(row[0])
 
 
 def mark_disconnected(

@@ -15,7 +15,7 @@ and grows once the pause has expired (the click-wait fires the alert).
 
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import _recv, approve_instance, make_settings, secret_hash_for
 from starlette.testclient import TestClient
 
 from src.api.metrics import Snapshot, _pass_overdue_seconds
@@ -312,10 +312,12 @@ def test_forced_restore_is_journaled_as_user_and_marked_in_detail(tmp_path):
     app = create_app(_settings(tmp_path, state_fresh_ms=3_000_000))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        approve_instance(db_path, "i1")  # secret-hello needs an approved active row (#35)
         ws = client.websocket_connect("/ext").__enter__()
         try:
             ws.send_json({
-                "type": "hello", "protocolVersion": 1, "token": EXT_TOKEN,
+                "type": "hello", "protocolVersion": 1,
+                "secretHash": secret_hash_for("i1"),
                 "instanceId": "i1", "installUuid": "u", "origin": "chrome-extension://a",
                 "title": "T", "sessionId": "sess-1", "allowExecuteJs": False,
             })

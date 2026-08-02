@@ -10,12 +10,19 @@ tested without a socket or a wall clock.
 
 from __future__ import annotations
 
-import hmac
 from typing import Any
 
 # --- Message types (the `type` field of every frame) ------------------------
 TYPE_HELLO = "hello"
 TYPE_HELLO_ACK = "hello_ack"
+# Enrollment handshake (§2, issue #35). A not-yet-approved instance opens with an
+# `enroll_request` (carrying the window `code`); the service records the request and
+# answers `enroll_pending` (approval is async — no response is sent on approval, the
+# client learns via a successful `hello` on its next alarm). A gated request is refused
+# with `enroll_rejected{reason}`.
+TYPE_ENROLL_REQUEST = "enroll_request"
+TYPE_ENROLL_PENDING = "enroll_pending"
+TYPE_ENROLL_REJECTED = "enroll_rejected"
 TYPE_SNAPSHOT_REQUEST = "snapshot_request"
 TYPE_SNAPSHOT = "snapshot"
 TYPE_PING = "ping"
@@ -58,6 +65,19 @@ REJECT_AUTH = "auth"
 REJECT_INSTANCE = "instance"
 REJECT_DUPLICATE = "duplicate_instance"
 REJECT_ORIGIN = "origin"
+# hello verdicts the client acts on (§7): the secret matched a REVOKED row, or matched
+# no active/pending row at all (unknown — e.g. never approved, or deleted). The client
+# distinguishes these to decide whether to re-enroll (unknown) or stop (revoked).
+REJECT_REVOKED = "revoked"
+REJECT_UNKNOWN = "unknown_instance"
+
+# --- Enroll reject reasons (`reason` of an `enroll_rejected` frame) ----------
+# The enrollment window is closed, the supplied window `code` was wrong/blank, or the
+# pending-request list is at its ceiling. A protocolVersion mismatch reuses
+# ``REJECT_PROTOCOL`` (same string as the hello path).
+ENROLL_CLOSED = "closed"
+ENROLL_BAD_CODE = "bad_code"
+ENROLL_CAPACITY = "capacity"
 
 # Two consecutive heartbeat misses close the socket (§6).
 MAX_HEARTBEAT_MISSES = 2
@@ -110,29 +130,33 @@ def parse_origins(raw: str) -> set[str]:
 
 
 def hello_reject_reason(
-    msg: dict[str, Any], protocol_version: int, ext_token: str, allowed_origins: set[str]
+    msg: dict[str, Any],
+    protocol_version: int,
+    resolved_instance_id: str | None,
+    allowed_origins: set[str],
 ) -> str | None:
     """Validate a ``hello`` frame against config; return a reject reason or None.
 
-    Order mirrors §6: protocol version (exact int equality, never a silent
-    downgrade), then token, then a non-blank instanceId (two instances sharing an
-    id collide on ``PRIMARY KEY(instance_id, tab_id)`` and erase each other's
-    tabs), then origin when an allow-list is configured. Duplicate-instance is
-    NOT decided here — it needs the live registry — so it lives in the channel.
+    Secret-based (§2, issue #35): authentication is by the per-install SECRET, which
+    the channel resolves to an active ``instances`` row (``secret_hash -> id``) BEFORE
+    calling this. There is no shared token and no self-reported instanceId anymore — the
+    id is server-assigned. So this pure helper only does the config-shaped checks that
+    do not need the DB or the registry:
+
+    Order mirrors §6: protocol version (exact int equality, never a silent downgrade)
+    first; then ``resolved_instance_id`` — ``None`` means the secret matched no active
+    instance, a last-line ``REJECT_AUTH`` guard (the channel normally rejects a
+    revoked/unknown secret with a more specific reason BEFORE reaching here); then origin
+    when an allow-list is configured. Duplicate-instance is NOT decided here — it needs
+    the live registry — so it lives in the channel.
     """
     if msg.get("protocolVersion") != protocol_version:
         return REJECT_PROTOCOL
-    # Constant-time compare — a short-circuiting `!=` leaks the token byte-by-byte
-    # via timing. Compare as BYTES: compare_digest raises TypeError on a non-ASCII
-    # str (Starlette/JSON can carry any codepoint), and this runs outside any
-    # try/except, so a non-ASCII token would escape as an unhandled 500/crash.
-    token = msg.get("token")
-    token_bytes = token.encode("utf-8") if isinstance(token, str) else b""
-    if not hmac.compare_digest(token_bytes, str(ext_token).encode("utf-8")):
+    # The secret already matched (or did not) in the channel via a hashed lookup — the
+    # comparison is NOT done here (keeping this module pure and DB-free). A None id is
+    # the belt-and-suspenders guard for "no active instance behind this secret".
+    if resolved_instance_id is None:
         return REJECT_AUTH
-    instance_id = msg.get("instanceId")
-    if not isinstance(instance_id, str) or not instance_id.strip():
-        return REJECT_INSTANCE
     # Empty allow-list => accept ANY origin here, while /api/* CORS treats the same
     # empty list as CLOSED. Deliberate asymmetry — see parse_origins' docstring for the
     # full reasoning and for how the empty case is made audible (§12).
@@ -140,6 +164,40 @@ def hello_reject_reason(
         origin = msg.get("origin")
         if origin not in allowed_origins:
             return REJECT_ORIGIN
+    return None
+
+
+def enroll_reject_reason(
+    msg: dict[str, Any],
+    protocol_version: int,
+    window_open: bool,
+    code_ok: bool,
+    has_capacity: bool,
+) -> str | None:
+    """Decide whether an ``enroll_request`` is refused; return a reason or None.
+
+    Pure so the enroll gate is unit-testable without a socket or the DB. **Order is
+    load-bearing** (issue acceptance 2/3): protocol version first, then the WINDOW must
+    be open, then the CODE must be correct, then there must be pending capacity — every
+    one of these gates BEFORE the channel writes any ``enroll_requests`` row. In
+    particular a request with a missing/blank code at an OPEN window must be refused
+    (``bad_code``) and write NO row, so the channel passes ``code_ok=False`` for a
+    missing/blank/mismatched code (acceptance 2).
+
+    * protocolVersion mismatch -> ``REJECT_PROTOCOL`` (same string as the hello path)
+    * not ``window_open``      -> ``ENROLL_CLOSED``
+    * not ``code_ok``          -> ``ENROLL_BAD_CODE``
+    * not ``has_capacity``     -> ``ENROLL_CAPACITY``
+    * otherwise                -> ``None`` (accept, record the request)
+    """
+    if msg.get("protocolVersion") != protocol_version:
+        return REJECT_PROTOCOL
+    if not window_open:
+        return ENROLL_CLOSED
+    if not code_ok:
+        return ENROLL_BAD_CODE
+    if not has_capacity:
+        return ENROLL_CAPACITY
     return None
 
 

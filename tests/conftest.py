@@ -8,6 +8,8 @@ os.environ.setdefault("EXT_TOKEN", "test-ext-token")
 os.environ.setdefault("METRICS_TOKEN", "test-metrics-token")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
+import hashlib  # noqa: E402
+import sqlite3  # noqa: E402
 import threading  # noqa: E402
 from types import SimpleNamespace  # noqa: E402 - must follow the env defaults above
 
@@ -59,6 +61,8 @@ _DEFAULTS: dict = {
     "restore_marker_path": "",
     "log_level": "INFO",
     "enroll_window_min": 10,
+    "enroll_max_pending": 64,
+    "enroll_preauth_max": 128,
 }
 
 # Parked far beyond any test's lifetime. ``src.app._curator_driver`` sleeps this long
@@ -97,6 +101,49 @@ def make_settings(tmp_path=None, **over) -> SimpleNamespace:
 def settings_factory():
     """``settings_factory(tmp_path, **over)`` -> the shared settings object."""
     return make_settings
+
+
+# --- secret-based /ext hello helpers (enrollment, issue #35) -----------------
+# Under enrollment a hello authenticates by a per-install SECRET: the client sends
+# ``secretHash`` = sha256(secret), the server resolves it to an ACTIVE instances row and
+# takes the server-assigned id from that row. A test that wants to drive the hello path
+# must therefore first have an approved (active) row with a known secret_hash — the thing
+# Task E's operator approval creates. These helpers make that a one-liner so every /ext
+# test converges on the same shape instead of hand-rolling INSERTs.
+
+
+def secret_for(instance_id: str) -> str:
+    """A deterministic per-instance secret for tests (never a real credential)."""
+    return f"secret-{instance_id}"
+
+
+def secret_hash_for(instance_id: str) -> str:
+    """sha256 hex of :func:`secret_for` — the value stored in ``instances.secret_hash``
+    and sent by a hello as ``secretHash``."""
+    return hashlib.sha256(secret_for(instance_id).encode("utf-8")).hexdigest()
+
+
+def approve_instance(db_path, instance_id, *, status="active", secret_hash=None):
+    """Insert (or update) an ``instances`` row so a secret-hello authenticates.
+
+    Mimics the operator approval of Task E: a row with a human-assigned ``id``, a
+    ``secret_hash`` and ``status`` (default 'active'). ``conn_epoch`` starts at 0 and the
+    first hello bumps it to 1 via the UPDATE-only upsert.
+    """
+    sh = secret_hash if secret_hash is not None else secret_hash_for(instance_id)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(
+            "INSERT INTO instances (id, status, secret_hash, connected, conn_epoch) "
+            "VALUES (?, ?, ?, 0, 0) "
+            "ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
+            "secret_hash=excluded.secret_hash",
+            (instance_id, status, sh),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # --- bounded socket waits ----------------------------------------------------

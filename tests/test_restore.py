@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import _recv, approve_instance, make_settings, secret_hash_for
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -36,7 +36,7 @@ def _hello(instance_id="i1", session="sess-1", **over):
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "token": EXT_TOKEN,
+        "secretHash": secret_hash_for(instance_id),
         "instanceId": instance_id,
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",
@@ -108,6 +108,9 @@ def _seed_tab(db_path, instance_id, tab_id, url):
 
 def _connect_fresh(client, db_path, instance_id="i1", session="sess-1", tabs=None):
     """hello + answer the initial snapshot_request so the instance is FRESH."""
+    # Secret-based hello (issue #35): the instance must be an APPROVED active row first
+    # (what Task E does), else the hello resolves to no instance and is rejected.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
     _recv(ws)                # hello_ack

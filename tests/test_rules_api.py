@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import _recv, approve_instance, make_settings, secret_hash_for
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -113,7 +113,7 @@ def _hello(instance_id, session="sess-1", **over):
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "token": EXT_TOKEN,
+        "secretHash": secret_hash_for(instance_id),
         "instanceId": instance_id,
         "installUuid": f"uuid-{instance_id}",
         "origin": "chrome-extension://abc",
@@ -171,6 +171,8 @@ def _connect_fresh(client, db_path, instance_id, session="sess-1", tabs=None):
     After this the mirror holds ``tabs`` and preview finds the instance already
     fresh (no re-request), so the HTTP call can run inline.
     """
+    # Secret-based hello (issue #35): approve the instance (Task E) before it can hello.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
     _recv(ws)                # hello_ack
@@ -191,12 +193,14 @@ def _connect_fresh(client, db_path, instance_id, session="sess-1", tabs=None):
     return ws
 
 
-def _connect_unanswered(client, instance_id, session="sess-1"):
+def _connect_unanswered(client, db_path, instance_id, session="sess-1"):
     """hello + DISCARD the initial snapshot_request (leave snapshot_at NULL).
 
     The instance is connected but has never delivered a snapshot, so preview MUST
     actively request one — the hook the `preview-requests-snapshot` guard tests.
     """
+    # Secret-based hello (issue #35): approve the instance (Task E) before it can hello.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
     _recv(ws)                # hello_ack
@@ -417,8 +421,9 @@ def test_preview_marks_unanswering_instance_not_counted(tmp_path):
     # refresh (never a silent stale zero). Runs inline: preview only POLLS the DB
     # while it waits, so nothing on the socket has to be driven — it just times out.
     app = create_app(_settings(tmp_path, snapshot_timeout_ms=300))
+    db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
-        ws = _connect_unanswered(client, "prox")   # connected, snapshot_at NULL
+        ws = _connect_unanswered(client, db_path, "prox")  # connected, snapshot_at NULL
         try:
             resp = client.post(
                 "/api/rules/preview", headers=AUTH,
