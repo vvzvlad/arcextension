@@ -6,6 +6,7 @@ import os
 # injected via the workflow's `env:` block.
 os.environ.setdefault("EXT_TOKEN", "test-ext-token")
 os.environ.setdefault("METRICS_TOKEN", "test-metrics-token")
+os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 import threading  # noqa: E402
 from types import SimpleNamespace  # noqa: E402 - must follow the env defaults above
@@ -14,6 +15,7 @@ import pytest  # noqa: E402
 
 EXT_TOKEN = "test-ext-token"
 METRICS_TOKEN = "test-metrics-token"
+ADMIN_TOKEN = "test-admin-token"
 
 # --- THE settings surface for tests ------------------------------------------
 # Every test that builds an app used to hand-roll its own ``SimpleNamespace``. Nine of
@@ -29,6 +31,7 @@ _DEFAULTS: dict = {
     # tokens / transport
     "ext_token": EXT_TOKEN,
     "metrics_token": METRICS_TOKEN,
+    "admin_token": ADMIN_TOKEN,
     "protocol_version": 1,
     "ext_allowed_origins": "",
     "host": "0.0.0.0",
@@ -55,6 +58,7 @@ _DEFAULTS: dict = {
     "main_instance_id": "main",
     "restore_marker_path": "",
     "log_level": "INFO",
+    "enroll_window_min": 10,
 }
 
 # Parked far beyond any test's lifetime. ``src.app._curator_driver`` sleeps this long

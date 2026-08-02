@@ -1,7 +1,9 @@
 """Ordered migration steps. The schema here is the canon copied verbatim from
-docs/architecture.md §4 (lines 129-270) — column names, types, defaults and
-primary keys must match §4 exactly. The migration runner (migrations.py) applies
-these steps under an explicit BEGIN IMMEDIATE transaction each.
+docs/architecture.md §4 — column names, types, defaults and primary keys must
+match §4 exactly (the version-1 schema mirrors the §4 base tables; the version-2
+enrollment delta mirrors §4's "Миграция 2 — enrollment" block). The migration
+runner (migrations.py) applies these steps under an explicit BEGIN IMMEDIATE
+transaction each.
 
 A step is ``(target_version: int, statements: list[str])``. Each statement is a
 single DDL/DML operation; the runner executes them in order inside one
@@ -177,10 +179,67 @@ _V1_STATEMENTS: list[str] = [
     "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)",
 ]
 
+# --- Version 2: enrollment (§1 of issue #35) --------------------------------
+# Enrollment replaces the shared EXT_TOKEN: an instance says hello with an
+# install_uuid + a per-install secret, lands in enroll_requests, and an operator
+# approves it into instances during a short enrollment window. This step only adds
+# the STORAGE (tables + columns + the guarding index) and migrates existing rows —
+# the /ext handshake, /admin endpoints and revocation are later tasks.
+#
+# Each ALTER TABLE / CREATE / UPDATE is ONE statement and its OWN list entry: the
+# runner executes them individually inside a single BEGIN IMMEDIATE transaction, so
+# a SQLite build that rejects multiple ADD COLUMN per statement is never a factor.
+_V2_STATEMENTS: list[str] = [
+    # Pending enrollment requests. Keyed by install_uuid so a repeat hello UPSERTs
+    # the same row rather than piling up.
+    """
+    CREATE TABLE enroll_requests (
+        install_uuid TEXT PRIMARY KEY,
+        origin TEXT,                          -- chrome-extension:// origin of the hello
+        suggested_title TEXT,                 -- human-readable name proposed by the client
+        protocol_version INTEGER NOT NULL,
+        secret_hash TEXT NOT NULL,            -- hash of the per-install secret, never the secret
+        first_seen_at INTEGER NOT NULL,       -- NOT bumped by a repeat: else the TTL is never
+                                              -- reached and a stale request lives forever
+        last_seen_at INTEGER NOT NULL
+    )
+    """,
+    # Audit trail of operator/admin actions (approve, revoke, open-window, ...).
+    # Deliberately OUTSIDE retention (src/db/retention.py): a security trail is kept.
+    """
+    CREATE TABLE admin_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        install_uuid TEXT,
+        instance_id TEXT,
+        initiator TEXT NOT NULL,              -- who acted: admin | system
+        detail TEXT
+    )
+    """,
+    "CREATE INDEX admin_audit_ts ON admin_audit(ts)",
+    # New instances columns. Default 'pending' (NOT 'active'): a post-migration hello
+    # must not silently re-activate a row — approval is an explicit later step.
+    "ALTER TABLE instances ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE instances ADD COLUMN secret_hash TEXT",
+    "ALTER TABLE instances ADD COLUMN install_uuid TEXT",
+    "ALTER TABLE instances ADD COLUMN enrolled_at INTEGER",
+    "ALTER TABLE instances ADD COLUMN revoked_at INTEGER",
+    # One enrolled secret per instance. NULL values do NOT collide under a UNIQUE
+    # index in SQLite, so every not-yet-enrolled row (secret_hash IS NULL) coexists.
+    "CREATE UNIQUE INDEX instances_secret_hash ON instances(secret_hash)",
+    # Migrate EVERY pre-existing instance (including MAIN) to 'revoked': before
+    # enrollment there were no secrets, so none of these rows is enrolled. After the
+    # upgrade MAIN therefore requires explicit re-approval — a documented consequence
+    # (a later task raises the operator alert).
+    "UPDATE instances SET status='revoked' WHERE secret_hash IS NULL",
+]
+
 # Ordered list of steps. Append new steps with the next target_version and bump
 # MAX_VERSION; never edit a shipped step (a migrated DB has already run it).
 STEPS: list[tuple[int, list[str]]] = [
     (1, _V1_STATEMENTS),
+    (2, _V2_STATEMENTS),
 ]
 
 MAX_VERSION: int = max(target for target, _ in STEPS)

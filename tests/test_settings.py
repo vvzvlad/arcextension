@@ -5,9 +5,10 @@ from src.settings import Settings
 
 
 def _base_env(monkeypatch):
-    """Set the two required tokens so only the field under test is unset."""
+    """Set the three required tokens so only the field under test is unset."""
     monkeypatch.setenv("EXT_TOKEN", "ext-secret")
     monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
+    monkeypatch.setenv("ADMIN_TOKEN", "admin-secret")
 
 
 def test_loads_defaults_from_section4(monkeypatch):
@@ -107,6 +108,66 @@ def test_identical_tokens_fail_at_startup(monkeypatch):
 def test_distinct_tokens_still_load(monkeypatch):
     _base_env(monkeypatch)
     assert Settings(_env_file=None).metrics_token == "metrics-secret"
+
+
+# --- ADMIN_TOKEN (§13): required, blank-rejected, must differ from METRICS_TOKEN ---
+def test_admin_token_loads(monkeypatch):
+    _base_env(monkeypatch)
+    assert Settings(_env_file=None).admin_token == "admin-secret"
+
+
+def test_missing_admin_token_fails(monkeypatch):
+    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
+    monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_empty_admin_token_fails(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_TOKEN", "")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_blank_admin_token_fails(monkeypatch):
+    # A whitespace-only token is just as unusable as an empty one.
+    _base_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_TOKEN", "   ")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_admin_token_equal_to_metrics_fails_at_startup(monkeypatch):
+    # §13/§12: ADMIN_TOKEN opens /admin (enrollment approvals, revocation). METRICS_TOKEN
+    # lives in a plaintext scrape config in git; making ADMIN_TOKEN equal to it would let
+    # that read-only scrape credential open /admin. A misconfigured credential must fail
+    # at startup, and the error must attach to admin_token so the env var is named.
+    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
+    monkeypatch.setenv("METRICS_TOKEN", "shared-secret")
+    monkeypatch.setenv("ADMIN_TOKEN", "shared-secret")
+    with pytest.raises(ValidationError) as ei:
+        Settings(_env_file=None)
+    msg = str(ei.value)
+    assert "METRICS_TOKEN" in msg
+    assert any(err["loc"] == ("admin_token",) for err in ei.value.errors())
+
+
+def test_admin_token_may_equal_ext_token(monkeypatch):
+    # Only the metrics/admin pair is constrained here (the EXT_TOKEN purge is #37); a
+    # distinct-from-metrics admin token that happens to equal ext_token still loads.
+    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
+    monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
+    monkeypatch.setenv("ADMIN_TOKEN", "ext-secret")
+    assert Settings(_env_file=None).admin_token == "ext-secret"
+
+
+def test_enroll_window_min_default_and_override(monkeypatch):
+    _base_env(monkeypatch)
+    assert Settings(_env_file=None).enroll_window_min == 10
+    monkeypatch.setenv("ENROLL_WINDOW_MIN", "25")
+    assert Settings(_env_file=None).enroll_window_min == 25
 
 
 def test_restore_marker_path_defaults_to_unset(monkeypatch):
