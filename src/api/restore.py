@@ -31,7 +31,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_ext_token, require_not_paused, require_operational
 from src.db.actions import (
     insert_action,
     mark_action_abandoned,
@@ -317,6 +317,7 @@ async def restore_row(app, orig, *, initiator: str = "user", write_on_present: b
 async def restore_action(request: Request) -> JSONResponse:
     require_ext_token(request)      # 401 before anything else
     require_operational(request)    # 503 in degraded mode
+    await require_not_paused(request)  # 423 while paused (§7 gate)
 
     action_id = request.path_params["action_id"]
     orig = await request.app.state.db.read(lambda c: _read_action(c, action_id))

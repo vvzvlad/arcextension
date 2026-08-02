@@ -26,7 +26,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_ext_token, require_not_paused, require_operational
 from src.api.restore import _is_fresh, _request_snapshot
 from src.rules import access
 from src.rules.matcher import InvalidPattern, compile_pattern
@@ -226,6 +226,7 @@ async def list_rules(request: Request) -> JSONResponse:
 async def create_rule(request: Request) -> JSONResponse:
     require_ext_token(request)
     require_operational(request)
+    await require_not_paused(request)  # 423 while paused — a rule edit mutates (§7)
     body = await _body(request)
     fields = _extract_rule_fields(body)
     _validate_pattern_or_422(fields["pattern"])
@@ -256,6 +257,7 @@ async def create_rule(request: Request) -> JSONResponse:
 async def update_rule(request: Request) -> JSONResponse:
     require_ext_token(request)
     require_operational(request)
+    await require_not_paused(request)  # 423 while paused (§7)
     rule_id = request.path_params["rule_id"]
     body = await _body(request)
     fields = _extract_rule_fields(body)
@@ -288,6 +290,7 @@ async def update_rule(request: Request) -> JSONResponse:
 async def delete_rule(request: Request) -> JSONResponse:
     require_ext_token(request)
     require_operational(request)
+    await require_not_paused(request)  # 423 while paused (§7)
     rule_id = request.path_params["rule_id"]
     body = {}
     if await request.body():
@@ -343,6 +346,7 @@ async def reset_rule(request: Request) -> JSONResponse:
     confirm the rule exists and return the reset target, keeping it minimal."""
     require_ext_token(request)
     require_operational(request)
+    await require_not_paused(request)  # 423 while paused (§7)
     rule_id = request.path_params["rule_id"]
     row = await request.app.state.db.read(lambda c: access.get_rule(c, rule_id))
     if row is None:

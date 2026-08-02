@@ -11,6 +11,7 @@ import { computed, ref } from "vue";
 
 import {
   STATE_CACHE_KEY,
+  deletePause,
   enqueueQuickLinkOp,
   fetchRules,
   fetchState,
@@ -18,6 +19,7 @@ import {
   httpBaseFromServiceUrl,
   loadInstanceConfig,
   postFocus,
+  postPause,
   previewRule,
   queryOwnTabs,
   readCache,
@@ -45,6 +47,14 @@ export function createStore(deps = {}) {
   const search = ref("");
   const fallbackMessage = ref("");
 
+  // --- pause state (§7) — server-wide; rides in the StateResponse ------------
+  // `pausedUntil` is the RAW server deadline (ms) — the status bar counts down from it
+  // against the LOCAL clock. It renders from the cache too (offline-first): applyState
+  // is the single writer, and it runs from both the cache and a live refresh.
+  const pausedUntil = ref(null);
+  const resumePending = ref(false);
+  const pauseError = ref("");
+
   // --- rules editor state (§8/§10) — needs the network; degrades gracefully -----
   const rules = ref([]);
   const rulesLoaded = ref(false);
@@ -64,6 +74,10 @@ export function createStore(deps = {}) {
       (t) => t.instance_id !== ownInstanceId.value,
     );
     quickLinks.value = sortQuickLinks(state.quick_links || []);
+    // Pause (§7): surface the deadline + the after-expiry click-wait. `undefined`
+    // (a pre-pause cache) reads as "not paused" rather than clobbering a live value.
+    pausedUntil.value = state.paused_until ?? null;
+    resumePending.value = !!state.resume_pending;
   }
 
   // --- computed views (search is a LOCAL substring filter, §10) -------------
@@ -209,6 +223,44 @@ export function createStore(deps = {}) {
     search.value = q;
   }
 
+  // --- pause / resume (§7) --------------------------------------------------
+  // The buttons need the network (a live mutating verb). Offline they no-op with a
+  // note; the countdown ROW still renders from the cache regardless.
+  async function pauseCurator(minutes = null) {
+    pauseError.value = "";
+    if (!base || !token) {
+      offline.value = true;
+      pauseError.value = "offline";
+      return { ok: false, offline: true };
+    }
+    const { status, body } = await postPause(fetchFn, base, token, minutes);
+    if (status >= 200 && status < 300 && body) {
+      pausedUntil.value = body.paused_until ?? pausedUntil.value;
+      return { ok: true };
+    }
+    pauseError.value = "pause failed: HTTP " + status;
+    return { ok: false };
+  }
+
+  async function resumeCurator() {
+    pauseError.value = "";
+    if (!base || !token) {
+      offline.value = true;
+      pauseError.value = "offline";
+      return { ok: false, offline: true };
+    }
+    const { status } = await deletePause(fetchFn, base, token);
+    if (status >= 200 && status < 300) {
+      // The server cleared the pause and ran a pass; reflect it + pull fresh state.
+      pausedUntil.value = null;
+      resumePending.value = false;
+      await refresh();
+      return { ok: true };
+    }
+    pauseError.value = "resume failed: HTTP " + status;
+    return { ok: false };
+  }
+
   // --- rules editor (§8/§10) ------------------------------------------------
   // The editor is the ONE network-only surface of the offline-first page: it lists
   // rules, previews a rule's whole-pass impact on the CURRENT mirror, and CRUDs
@@ -307,6 +359,10 @@ export function createStore(deps = {}) {
     offline,
     search,
     fallbackMessage,
+    // pause state (§7)
+    pausedUntil,
+    resumePending,
+    pauseError,
     // rules editor state
     rules,
     rulesLoaded,
@@ -328,6 +384,9 @@ export function createStore(deps = {}) {
     jumpOwn,
     jumpForeign,
     setSearch,
+    // pause methods (§7)
+    pauseCurator,
+    resumeCurator,
     // rules editor methods
     loadRules,
     previewRuleDraft,

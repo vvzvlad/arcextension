@@ -38,7 +38,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_ext_token, require_not_paused, require_operational
 from src.api.restore import _now_ms, _read_action, restore_row
 from src.ext import protocol
 from src.ext.commands import CommandError, send_command
@@ -266,6 +266,7 @@ async def _body(request: Request) -> dict:
 async def undo_pass(request: Request) -> JSONResponse:
     require_ext_token(request)      # 401 before anything else
     require_operational(request)    # 503 in degraded mode
+    await require_not_paused(request)  # 423 while paused (the biggest op — §7 gate)
 
     pass_id = request.path_params["pass_id"]
     app = request.app

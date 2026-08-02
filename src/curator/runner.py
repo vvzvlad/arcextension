@@ -24,7 +24,7 @@ from loguru import logger
 
 from src.curator import clock as clockmod
 from src.curator import decide as decidemod
-from src.curator import lease, phases
+from src.curator import lease, pause, phases
 from src.curator.mirror import load_mirror
 from src.db.settings_store import get_setting, set_setting
 from src.ext import protocol
@@ -36,6 +36,7 @@ def _now_ms() -> int:
 
 _RESUME_PENDING_KEY = "resume_pending"
 _PAUSE_UNTIL_KEY = "pause_until"
+_PAUSE_STARTED_AT_KEY = "pause_started_at"
 # The last observed server-clock step (seconds) is persisted here so /metrics can
 # export curator_clock_step_seconds (§12): the clock-step abort happens BEFORE any
 # `passes` row is written, so settings is the only durable place to record it.
@@ -183,29 +184,45 @@ async def run_pass(
     # --- step 1: pause / resume_pending / continuity gate (§7) ---------------
     effective_dry_run = dry_run
     armed_after_break = False
-    # TODO(Фаза 16): SUGGESTION 7 — ``confirm_pending`` (a resume click) currently
-    # skips this whole gate, so it also bypasses an ACTIVE ``pause_until``. That is
-    # harmless today (no endpoint arms a pause), but once the Фаза 16 pause endpoints
-    # land, a confirm must still honour a live pause. Re-check ``pause_until`` on the
-    # confirm_pending path then.
+    # SUGGESTION 7 (Фаза 16): a ``confirm_pending`` click confirms a DEFERRED plan, so
+    # it skips the resume_pending/continuity gate below — but it must STILL lose to a
+    # LIVE pause. If a pause was re-armed AFTER the plan was computed (the owner saw
+    # the plan and hit "stop" again), the confirm cannot run a full pass through an
+    # active emergency stop. dry_run is never muted (looking at the plan is why a
+    # pause is taken, §7), so this check is only for the confirm path.
+    if confirm_pending and not dry_run:
+        pause_until = get_setting_int(await _read_setting(db, _PAUSE_UNTIL_KEY))
+        if pause_until is not None and pause_until > now:
+            return {"status": "paused", "until": pause_until}
     if not dry_run and not confirm_pending:
         pause_until = get_setting_int(await _read_setting(db, _PAUSE_UNTIL_KEY))
         if pause_until is not None and pause_until > now:
             return {"status": "paused", "until": pause_until}
         if await _read_setting(db, _RESUME_PENDING_KEY):
             return {"status": "resume_pending"}
-        current_fp = await db.read(
-            lambda c: clockmod.current_fingerprint(
-                c, idle_minutes=settings.idle_minutes,
-                main_instance_id=settings.main_instance_id,
-            )
-        )
-        stored_fp = await db.read(clockmod.read_stored_fingerprint)
-        if clockmod.is_continuity_break(stored_fp, current_fp):
-            # First pass after a continuity break: compute a dry-run plan and arm
-            # resume_pending; the owner confirms with run_pass{confirm_pending} (§7).
+        # A pause that EXPIRED but was never resumed by hand still has its start armed
+        # (``pause_started_at`` set — a manual resume/confirm clears it via the TTL
+        # shift). The FIRST pass after a timeout expiry must NOT auto-run and drain the
+        # night's backlog (§7 "истечение по таймауту — нет"): it computes a dry-run plan,
+        # arms ``resume_pending`` and waits for a click. The click
+        # (run_pass{confirm_pending}) applies the full TTL shift and runs the real pass.
+        pause_started = get_setting_int(await _read_setting(db, _PAUSE_STARTED_AT_KEY))
+        if pause_until is not None and pause_started is not None:
             effective_dry_run = True
             armed_after_break = True
+        else:
+            current_fp = await db.read(
+                lambda c: clockmod.current_fingerprint(
+                    c, idle_minutes=settings.idle_minutes,
+                    main_instance_id=settings.main_instance_id,
+                )
+            )
+            stored_fp = await db.read(clockmod.read_stored_fingerprint)
+            if clockmod.is_continuity_break(stored_fp, current_fp):
+                # First pass after a continuity break: compute a dry-run plan and arm
+                # resume_pending; the owner confirms with run_pass{confirm_pending} (§7).
+                effective_dry_run = True
+                armed_after_break = True
 
     # --- step 2: acquire the lease with a fencing epoch (§7) ------------------
     owner = f"pass-{uuid.uuid4()}"
@@ -227,6 +244,19 @@ async def run_pass(
     try:
         if not effective_dry_run:
             await db.write(lease.guarded(epoch, lambda c: _insert_pass_started(c, pass_id, pass_start)))
+
+        # Timeout-expiry TTL shift (§7): when a pause ends by expiry, its protections
+        # are shifted by the FULL pause duration the moment the deferred plan is
+        # CONFIRMED (confirm_pending) — BEFORE any decision, so the first post-resume
+        # pass respects the shifted quarantine/exemptions instead of evicting exactly
+        # what the pause protected. Guarded ONCE by pause_started_at (apply_resume_shift
+        # is a no-op after it clears the start), so a normal pass shifts nothing and the
+        # manual-resume path — which already shifted in DELETE /api/pause — is not
+        # double-shifted here.
+        if confirm_pending and not effective_dry_run:
+            await db.write(
+                lease.guarded(epoch, lambda c: pause.apply_resume_shift(c, now=now))
+            )
 
         # --- step 3: freshness — snapshot_request keyed on our OWN ids -------
         sent = await _request_all_snapshots(registry)
