@@ -105,17 +105,25 @@ def test_source_instance_example_is_not_copied_as_instance_json(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# <host> stamping
+# Universal (hostless) manifest — issue #35 removed the per-host patterns
 # --------------------------------------------------------------------------- #
-def test_host_stamped_into_manifest_all_urls_kept(tmp_path):
-    res = _gen(tmp_path, "eps", service_url="wss://curator.example.com")
+def test_generate_manifest_is_universal_hostless_all_urls_only(tmp_path):
+    # Universal build (§7, issue #35): the repo manifest carries ONLY <all_urls> — the two
+    # per-host patterns (https://<host>/* + wss://<host>/*) were removed with enrollment,
+    # so generate no longer stamps a concrete <host>. The manifest stays hostless and the
+    # key is still pinned. (serviceUrl is irrelevant to host_permissions now.)
+    res = _gen(tmp_path, "eps", service_url="wss://curator.example.com",
+               key_b64="REALKEYBASE64==")
     manifest = json.loads((res.paths.extension_dir / "manifest.json").read_text())
     perms = manifest["host_permissions"]
-    assert "https://curator.example.com/*" in perms
-    assert "wss://curator.example.com/*" in perms
-    assert "<all_urls>" in perms  # SECURITY-sensitive grant kept (§6)
-    # Redden: skip the <host> replacement -> a placeholder leaks and this fails.
+    # NEW invariant: exactly <all_urls>, no per-host patterns, no leaked <host> placeholder.
+    # Redden: if generate re-introduced host stamping, perms would gain https/wss entries.
+    assert perms == ["<all_urls>"]  # SECURITY-sensitive grant kept (§6); nothing else
     assert not any("<host>" in p for p in perms)
+    assert not any(p.startswith(("https://", "wss://")) for p in perms)
+    # Redden: drop key pinning -> the placeholder leaks and this fails.
+    assert manifest["key"] == "REALKEYBASE64=="
+    assert manifest["key"] != core.KEY_PLACEHOLDER
 
 
 def test_host_derived_from_various_urls():
@@ -247,17 +255,25 @@ def test_restamp_has_no_way_to_change_instance_id(tmp_path):
     assert data["instanceId"] == "fixed-id"
 
 
-def test_restamp_can_also_change_service_url_and_manifest_host(tmp_path):
-    _gen(tmp_path, "alpha", service_url="wss://old.example.com", token="old")
+def test_restamp_change_service_url_keeps_manifest_universal_hostless(tmp_path):
+    # Universal build (issue #35): restamp can still change serviceUrl in instance.json,
+    # but the manifest has no <host> to re-stamp — host_permissions stays EXACTLY
+    # ["<all_urls>"] (no per-host patterns are minted), and the pinned key is untouched.
+    _gen(tmp_path, "alpha", service_url="wss://old.example.com", token="old",
+         key_b64="PINNEDKEY==")
     core.restamp_all(tmp_path, token="new", service_url="wss://new.example.com")
     data = json.loads((tmp_path / "alpha" / "extension" / "instance.json").read_text())
+    # serviceUrl still rotates in the config. Redden: drop the serviceUrl write -> fails.
     assert data["serviceUrl"] == "wss://new.example.com"
     manifest = json.loads(
         (tmp_path / "alpha" / "extension" / "manifest.json").read_text()
     )
-    assert "wss://new.example.com/*" in manifest["host_permissions"]
-    assert "https://new.example.com/*" in manifest["host_permissions"]
-    assert "<all_urls>" in manifest["host_permissions"]
+    perms = manifest["host_permissions"]
+    # NEW invariant: hostless — no https://new.* / wss://new.* patterns are ever stamped.
+    # Redden: if restamp re-minted per-host patterns, perms would gain new.example.com.
+    assert perms == ["<all_urls>"]
+    assert not any("new.example.com" in p for p in perms)
+    assert manifest["key"] == "PINNEDKEY=="  # pinned key preserved across the restamp
 
 
 def test_restamp_empty_root_raises(tmp_path):

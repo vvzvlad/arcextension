@@ -22,9 +22,11 @@ from collections import Counter
 class AuthRejections:
     """A thread-safe monotonic counter of auth rejections, keyed by a coarse reason.
 
-    Only the unlabelled total is exported (§12 lists ``curator_auth_rejections_total``
-    without a label); the per-reason breakdown is kept internally so a future phase
-    can expose it cheaply without touching the increment sites.
+    The per-reason breakdown is exported as the LABELED family
+    ``curator_auth_rejections_total{reason=...}`` (:mod:`src.api.metrics` reads
+    :meth:`by_reason`) — one series per coarse reason, so an alert can key on a specific
+    one (e.g. ``reason="enroll_bad_code"``). :meth:`total` remains for internal callers
+    that want the unlabelled sum; it is no longer what ``/metrics`` exports.
     """
 
     def __init__(self) -> None:
