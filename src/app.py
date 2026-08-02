@@ -13,11 +13,13 @@ from types import SimpleNamespace
 
 from loguru import logger
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 
 from src.api.actions import list_actions
+from src.api.cors import CountingCORSMiddleware, cors_kwargs
 from src.api.guards import require_operational
 from src.api.metrics import metrics
 from src.api.quick_links import quick_links_ops
@@ -176,7 +178,16 @@ def create_app(settings) -> Starlette:
         mcp_route(mcp),
         WebSocketRoute("/ext", ext_channel),
     ]
-    app = Starlette(routes=routes, lifespan=lifespan)
+    # CORS for /api/* (§12): explicit chrome-extension:// origins only, NEVER '*'.
+    # The middleware ignores non-http scopes (so /ext WebSocket is untouched) and
+    # only echoes an origin present in the allow-list, so /metrics/healthz scrapes
+    # (no Origin header) pass through unaffected. Same allow-list as the hello check.
+    middleware = [
+        Middleware(
+            CountingCORSMiddleware, **cors_kwargs(settings.ext_allowed_origins)
+        )
+    ]
+    app = Starlette(routes=routes, lifespan=lifespan, middleware=middleware)
     # Let the MCP tools reach app.state (db / ext_registry / settings) at call time.
     app_ref.app = app
     app.state.mcp = mcp

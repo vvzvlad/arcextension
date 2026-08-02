@@ -6,6 +6,10 @@
 
 volumes:
   curator:
+  # Backup copies mount on a SEPARATE volume from the DB (§12): a full DB volume
+  # must not also swallow the nightly VACUUM INTO copies, and a copy volume can be
+  # snapshotted / off-boxed independently.
+  curator_backups:
 
 networks:
   docker_main_net:
@@ -28,11 +32,20 @@ services:
     # cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID]
     volumes:
       - curator:/app/data              # all mutable state survives restart/update
+      - curator_backups:/app/backups   # backup copies on a SEPARATE volume (§12)
     environment:
       # EXT_TOKEN opens /ext, /api/* and /mcp; METRICS_TOKEN is read-only for
       # /metrics. Both are REQUIRED — an empty value fails startup (§4).
       EXT_TOKEN: XXX
       METRICS_TOKEN: XXX
+      # Backups live on the separate curator_backups volume above, NOT under
+      # /app/data. The entrypoint mkdir+chowns this path before dropping to `app`.
+      BACKUP_DIR: /app/backups
+      # Real chrome-extension://<id> origins, comma-separated. MUST match the
+      # installed extension id(s): a mismatch silently breaks the startpage's
+      # /api/* fetch (CORS preflight) while /ext still connects (§12). Empty here
+      # closes cross-origin /api/* entirely (secure default, not '*').
+      EXT_ALLOWED_ORIGINS: chrome-extension://XXX
       TZ: Europe/Moscow
     networks:
       - docker_main_net
