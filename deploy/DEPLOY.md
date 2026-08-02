@@ -105,7 +105,10 @@ Signals that expose the mismatch:
 Rules for the value:
 
 - Set it to the exact installed extension id(s), e.g.
-  `EXT_ALLOWED_ORIGINS=chrome-extension://<id1>,chrome-extension://<id2>`.
+  `EXT_ALLOWED_ORIGINS=chrome-extension://<id1>,chrome-extension://<id2>`. The
+  **instance generator** (§13, `tools/README.md`) pins the id via a manifest `key`
+  and prints the exact `chrome-extension://<id>` origin — **all** instances share
+  **one** id/origin, so a single entry covers every instance.
 - **Empty in prod is wrong.** Empty leaves `/ext` open (accept-any + warning) and
   leaves `/api/*` CORS **CLOSED** (no `Access-Control-Allow-Origin` emitted — the
   secure default, never `*`). The startpage will not be able to call `/api/*` until
@@ -142,3 +145,21 @@ Everything else — CORS allow-list echo (never `*`), `/metrics` needs
 `METRICS_TOKEN`, `/api/*` needs `EXT_TOKEN`, the `reject_reason='origin'` path — is
 covered by the automated tests (`tests/test_cors.py`, `tests/test_metrics_api.py`,
 `tests/test_state_api.py`, `tests/test_ext_channel.py`).
+
+## 7. Instances & token rotation (§13)
+
+Themed browser instances are built with the **instance generator** — see
+`tools/README.md` for the full guide. In short:
+
+- `make instance INSTANCE_ID=… SERVICE_URL=wss://host OUT=… EXT_TOKEN=…` creates an
+  instance (own profile, extension copy, `instance.json`, `.app`). No manual
+  options-page edit is needed — `instance.json` carries all four config fields.
+- `make restamp OUT=… EXT_TOKEN=<new>` rotates the token across **all** instances
+  at once (then restart the browsers). Rotating by hand across N options pages
+  would leave every instance silently dead in between.
+- **Cloning a `.app` does not add an instance** — the clone is rejected as
+  `duplicate_instance` (the `install_uuid` guarantee, §6). Run the generator again
+  with a new `instanceId`.
+
+Its three operational acceptance checks (new instance connects; re-stamp
+reconnects; clone rejected) are a manual list in `tools/README.md`.

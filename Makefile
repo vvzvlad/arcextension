@@ -62,6 +62,25 @@ startpage: ## Build the startpage, run the §10 build gates, then the vitest sui
 	cd startpage && npm run gates
 	cd startpage && npm test
 
+# --- Instance generator (§13) ------------------------------------------------
+# Generate a themed Brave instance (own --user-data-dir, extension copy,
+# instance.json, .app). The token is a SECRET — pass it via the EXT_TOKEN env,
+# never on the command line. See tools/README.md for the manual acceptance list.
+#   make instance INSTANCE_ID=main SERVICE_URL=wss://host OUT=~/instances \
+#                 TITLE="Curator Main" EXT_TOKEN=…
+.PHONY: instance
+instance: install ## Generate an instance (vars: INSTANCE_ID SERVICE_URL OUT [TITLE]; env EXT_TOKEN)
+	$(PY) -m tools.generate_instance generate \
+		--instance-id "$(INSTANCE_ID)" --service-url "$(SERVICE_URL)" --out "$(OUT)" \
+		$(if $(TITLE),--title "$(TITLE)",)
+
+# Rotate EXT_TOKEN across EVERY instance under OUT (the §13 rotation path);
+# restart the browsers afterwards so the SW re-reads instance.json.
+#   make restamp OUT=~/instances EXT_TOKEN=…
+.PHONY: restamp
+restamp: install ## Rotate EXT_TOKEN across ALL instances under OUT (env EXT_TOKEN)
+	$(PY) -m tools.generate_instance restamp --out "$(OUT)"
+
 # --- Housekeeping ------------------------------------------------------------
 .PHONY: clean
 clean: ## Remove the venv and Python caches
