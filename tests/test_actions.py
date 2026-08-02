@@ -95,17 +95,19 @@ async def test_insert_action_validates_enums(tmp_path):
     try:
         for bad in (
             dict(kind="teleport", status="done", initiator="curator"),
-            dict(kind="restore", status="pending", initiator="curator"),
+            dict(kind="restore", status="teleporting", initiator="curator"),
             dict(kind="restore", status="done", initiator="root"),
         ):
             with pytest.raises(ValueError):
                 await db.write(lambda c, b=bad: insert_action(c, ts=1, **b))
-        # 'abandoned' is a legit terminal status introduced in Фаза 4.
-        aid = await db.write(
-            lambda c: insert_action(
-                c, ts=1, kind="relocate", status="abandoned", initiator="curator"
+        # 'abandoned' is a legit terminal status introduced in Фаза 4; 'pending' is
+        # the in-flight close status introduced in Фаза 16 (WARNING-1).
+        for good in ("abandoned", "pending"):
+            aid = await db.write(
+                lambda c, s=good: insert_action(
+                    c, ts=1, kind="relocate_close", status=s, initiator="curator"
+                )
             )
-        )
-        assert isinstance(aid, int)
+            assert isinstance(aid, int)
     finally:
         await db.close()

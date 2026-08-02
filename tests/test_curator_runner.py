@@ -12,6 +12,7 @@ non-convergence latch, and passes-row-on-empty.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from types import SimpleNamespace
 
@@ -503,6 +504,279 @@ async def test_close_survivor_vanished_source_not_closed(tmp_path):
         # The source tab is still present; no dedupe_close row was written.
         assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='main' AND tab_id=20") == [(1,)]
         assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='dedupe_close'") == [(0,)]
+    finally:
+        await db.close()
+
+
+# --- WARNING-1: lease lost between a good close_tab and the completion write --
+def _bump_lease_epoch_raw(db_path):
+    """Increment the fencing epoch from OUTSIDE the pass (as a pause would), so the
+    pass's next guarded write is fenced with LeaseLost — simulating the WARNING-1
+    window between a successful browser close and its completion write."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(
+            "UPDATE settings SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+            "WHERE key = 'pass_lease_epoch'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _expire_lease_raw(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("UPDATE settings SET value = '0' WHERE key = 'pass_lease_until'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def test_phase_b_lease_lost_before_completion_pending_survives_then_reconciled(tmp_path):
+    """THE race (§7 WARNING-1). Phase B: the browser closes the source successfully,
+    then a pause bumps the lease epoch BEFORE the completion write. The `relocate_close`
+    was recorded `pending` UNDER the guard first, so it SURVIVES the fenced completion
+    (neuter the pending write => there is no row and this reddens). The NEXT pass, whose
+    mirror no longer holds the source, reconciles the pending → `done` — at-least-once
+    journal, undoable-state consistent.
+    """
+    db = await _mkdb(tmp_path)
+    try:
+        await _seed_rule(db, "grafana.lc", "prox")
+        ext = Ext(db)
+        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/abc")])
+        await ext.add_instance("prox", tabs=[_tabinfo(99, "https://grafana.lc/d/abc")])
+        reloc_id = await _seed_relocate(
+            db, instance_from="main", instance_to="prox", tab_id=20,
+            session_id_from="s", tab_id_to=99, session_id_to="s",
+            url="https://grafana.lc/d/abc", url_norm="https://grafana.lc/d/abc",
+        )
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_GET_TAB:
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": "https://grafana.lc/d/abc"}}}
+            if cmd == protocol.CMD_CLOSE_TAB:
+                # Browser closed the source successfully; a pause bumps the epoch NOW,
+                # so the completion write below is fenced (LeaseLost).
+                _bump_lease_epoch_raw(db.db_path)
+                return {"ok": True, "result": {"ok": True}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res1 = await ext.run_pass()
+        assert res1["error"] == "lease_lost"  # pass stopped at the fenced completion
+        # The pending relocate_close SURVIVES (no journal hole). Neuter the pending
+        # write and this row is absent => the close is unrecorded => reddens.
+        rc1 = await _rows(db, "SELECT status, tab_id, origin_action_id "
+                              "FROM actions WHERE kind='relocate_close'")
+        assert rc1 == [("pending", 20, reloc_id)]
+
+        # --- second pass: the source really closed, so it is gone from the mirror ----
+        ext.tabs["main"] = []
+        _expire_lease_raw(db.db_path)  # let the next pass acquire (pass 1 left it held)
+
+        res2 = await ext.run_pass()
+        assert res2["status"] == "ok"
+        # Reconcile flipped the pending → done: the journal hole is closed at-least-once.
+        rc2 = await _rows(db, "SELECT status, tab_id FROM actions WHERE kind='relocate_close'")
+        assert rc2 == [("done", 20)]
+        # No SECOND close_tab was sent (phase B did not re-run — the relocation is retired).
+        assert res2["actions_count"] == 1  # exactly the reconcile completion
+    finally:
+        await db.close()
+
+
+async def test_reconcile_reverts_pending_when_source_still_present_no_double_close(tmp_path):
+    """Reconcile-revert (§7 WARNING-1). A prior-pass `pending` close whose source is
+    STILL present (the close never took effect — a connection-class failure) must be
+    ABANDONED, and `decide` re-issues the close THIS pass. The source is closed exactly
+    once. Reddens if reconcile marks it done (a phantom close) or does not abandon it.
+    """
+    db = await _mkdb(tmp_path)
+    try:
+        await _seed_rule(db, "grafana.lc", "prox")
+        ext = Ext(db)
+        # main's tab is ruled to prox; prox already holds the identical url => decide
+        # schedules a dedupe_close of the main tab (survivor in prox).
+        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
+        await ext.add_instance("prox", tabs=[_tabinfo(99, "https://grafana.lc/d/x")])
+        # A leftover pending dedupe_close from a PRIOR pass, source still present.
+        pending_id = await _seed_relocate(
+            db, kind="dedupe_close", status="pending", decision="dedupe",
+            instance_from="main", tab_id=20, session_id_from="s",
+            url="https://grafana.lc/d/x", url_norm="https://grafana.lc/d/x",
+        )
+        closes = []
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_GET_TAB:
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": "https://grafana.lc/d/x"}}}
+            if cmd == protocol.CMD_CLOSE_TAB:
+                closes.append(params["tabId"])
+                return {"ok": True, "result": {"ok": True}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+        # The stale pending row was ABANDONED, not completed.
+        assert await _rows(db, "SELECT status FROM actions WHERE id=?", (pending_id,)) == [("abandoned",)]
+        # decide re-issued the close => exactly ONE done dedupe_close and ONE close_tab.
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='dedupe_close' AND status='done'") == [(1,)]
+        assert closes == [20]
+        # Source closed exactly once (tab removed from the mirror).
+        assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='main' AND tab_id=20") == [(0,)]
+    finally:
+        await db.close()
+
+
+async def test_reconcile_after_reconnect_url_present_abandons_not_phantom_done(tmp_path):
+    """Finding #1: a pending close whose browser close NEVER happened (connection-class)
+    then the source instance RECONNECTS with a new session — the tab persisted, same
+    url. `_source_present` must key on URL (not session): the source is still open, so
+    the pending is ABANDONED (and re-closed), NOT phantom-marked `done`. Reddens under
+    the old session short-circuit (session mismatch => absent => done)."""
+    db = await _mkdb(tmp_path)
+    try:
+        await _seed_rule(db, "grafana.lc", "prox")
+        ext = Ext(db)
+        # Instance reconnected: NEW session "s2", but the same url is still open (a WS
+        # reconnect does not close browser tabs). prox holds the survivor for the dedupe.
+        await ext.add_instance("main", session="s2",
+                               tabs=[_tabinfo(31, "https://grafana.lc/d/y")])
+        await ext.add_instance("prox", session="s2",
+                               tabs=[_tabinfo(99, "https://grafana.lc/d/y")])
+        # A leftover pending dedupe_close from a PRIOR pass under the OLD session "s1".
+        pending_id = await _seed_relocate(
+            db, kind="dedupe_close", status="pending", decision="dedupe",
+            instance_from="main", tab_id=20, session_id_from="s1",
+            url="https://grafana.lc/d/y", url_norm="https://grafana.lc/d/y",
+        )
+        closes = []
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_GET_TAB:
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": "https://grafana.lc/d/y"}}}
+            if cmd == protocol.CMD_CLOSE_TAB:
+                closes.append(params["tabId"])
+                return {"ok": True, "result": {"ok": True}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+        # ABANDONED, not a phantom `done` (the source was still open across the reconnect).
+        assert await _rows(db, "SELECT status FROM actions WHERE id=?", (pending_id,)) == [("abandoned",)]
+        # And decide re-issued the close against the live (new-session) source tab 31.
+        assert closes == [31]
+    finally:
+        await db.close()
+
+
+async def test_reconcile_completes_pending_when_source_gone(tmp_path):
+    """Reconcile-complete: a prior-pass `pending` dedupe_close whose source is GONE from
+    the mirror (the close happened, just wasn't journaled) is flipped to `done`
+    (at-least-once) and the pair's strikes are reset. No new close is issued."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await ext.add_instance("main", tabs=[])  # source already gone
+        pending_id = await _seed_relocate(
+            db, kind="dedupe_close", status="pending", decision="dedupe",
+            instance_from="main", tab_id=20, session_id_from="s",
+            url="https://grafana.lc/d/x", url_norm="https://grafana.lc/d/x",
+        )
+        # A leftover strike on the pair; a success (the completed close) resets it.
+        await db.write(lambda c: c.execute(
+            "INSERT INTO quarantine (instance_id, url, strikes, until, reason) "
+            "VALUES ('main', 'https://grafana.lc/d/x', 2, 0, 'x')"))
+        closes = []
+        ext.responder = lambda i, c, p: (
+            closes.append(p.get("tabId")) or {"ok": True, "result": {}}
+        )
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+        assert await _rows(db, "SELECT status FROM actions WHERE id=?", (pending_id,)) == [("done",)]
+        assert closes == []  # nothing to close — the source was already gone
+        # Strikes reset by the completion (success on the pair, §7).
+        assert await _rows(db, "SELECT strikes FROM quarantine "
+                               "WHERE instance_id='main' AND url='https://grafana.lc/d/x'") == [(0,)]
+    finally:
+        await db.close()
+
+
+async def test_close_precondition_failed_updates_pending_to_failed_and_strikes(tmp_path):
+    """precondition_failed still strikes (unchanged behaviour, now via the pending row).
+    The source turned active/pinned between snapshot and close: the pending close row is
+    updated → `failed` and one quarantine strike lands. Reddens if the strike is dropped.
+    """
+    db = await _mkdb(tmp_path)
+    try:
+        await _seed_rule(db, "grafana.lc", "prox")
+        ext = Ext(db)
+        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
+        await ext.add_instance("prox", tabs=[_tabinfo(99, "https://grafana.lc/d/x")])
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_GET_TAB:
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": "https://grafana.lc/d/x"}}}
+            if cmd == protocol.CMD_CLOSE_TAB:
+                return {"ok": False, "error": {"code": protocol.ERR_PRECONDITION_FAILED}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+        # Exactly one dedupe_close row, and it is FAILED (not left pending, not done).
+        assert await _rows(db, "SELECT status, reason FROM actions WHERE kind='dedupe_close'") == \
+            [("failed", protocol.ERR_PRECONDITION_FAILED)]
+        # A strike landed on the (source, url_norm) pair (drop _strike_once => reddens).
+        assert await _rows(db, "SELECT strikes FROM quarantine "
+                               "WHERE instance_id='main' AND url='https://grafana.lc/d/x'") == [(1,)]
+        # Source NOT closed (precondition failed).
+        assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='main' AND tab_id=20") == [(1,)]
+    finally:
+        await db.close()
+
+
+async def test_dedupe_close_happy_path_one_done_row_tab_deleted(tmp_path):
+    """Happy path unchanged: a normal inter-instance dedupe_close ends with exactly one
+    `done` row (never a lingering `pending`), the source tab deleted, strikes reset."""
+    db = await _mkdb(tmp_path)
+    try:
+        await _seed_rule(db, "grafana.lc", "prox")
+        ext = Ext(db)
+        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
+        await ext.add_instance("prox", tabs=[_tabinfo(99, "https://grafana.lc/d/x")])
+        # Pre-existing strikes on the pair — a successful close resets them (§7).
+        await db.write(lambda c: c.execute(
+            "INSERT INTO quarantine (instance_id, url, strikes, until, reason) "
+            "VALUES ('main', 'https://grafana.lc/d/x', 2, 0, 'x')"))
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_GET_TAB:
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": "https://grafana.lc/d/x"}}}
+            if cmd == protocol.CMD_CLOSE_TAB:
+                return {"ok": True, "result": {"ok": True}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+        # Exactly one dedupe_close and it is done — no pending left behind.
+        assert await _rows(db, "SELECT status FROM actions WHERE kind='dedupe_close'") == [("done",)]
+        assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='main' AND tab_id=20") == [(0,)]
+        assert await _rows(db, "SELECT strikes FROM quarantine "
+                               "WHERE instance_id='main' AND url='https://grafana.lc/d/x'") == [(0,)]
     finally:
         await db.close()
 

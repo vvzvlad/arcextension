@@ -149,14 +149,27 @@ def load_mirror(conn: sqlite3.Connection) -> Mirror:
     # corrupting the §10 journal/metrics and letting the stale row capture a new
     # same-URL tab.
     #
-    # ⚠️ ONLY a `status='done'` relocate_close retires the row. Phase B writes a
-    # `relocate_close status='failed'` on a `precondition_failed` (the source turned
-    # active/pinned/audible between snapshot and close); that is a TRANSIENT retry,
-    # not a completion. Retiring on a failed close would drop the relocation identity
-    # and re-route the source through normal `decide` — and if the copy's url drifted
-    # (Grafana slug / OAuth nonce, §7:1000-1004) the full-url dedup misses and phase A
-    # opens a SECOND copy. Leaving a failed row live lets phase B retry by `tab_id_to`
-    # (drift-resistant: get_tab by id, not url). Indexed by actions_origin (§4).
+    # ⚠️ A `status='done'` relocate_close retires the row — AND so does a
+    # `status='pending'` one (Фаза 16, WARNING-1). A pending relocate_close is phase B
+    # IN-FLIGHT (its intent recorded before the browser close, completion not yet
+    # journaled): it must NOT re-enter as a fresh phase-B candidate, or the same source
+    # would be phase-B'd twice within a pass. The pass's reconcile step runs FIRST and
+    # resolves every PRIOR-pass pending (→ done when the source is gone, → abandoned
+    # when it is still present) BEFORE phase B; but `decide` reads THIS frozen mirror,
+    # not a re-read, so excluding pending here is what actually prevents the double
+    # phase B — a reconcile that flips a pending → done AFTER load would otherwise leave
+    # the still-frozen live row to be phase-B'd and wrongly marked `abandoned`. A
+    # pending that reconcile flips to `abandoned` (close never happened) re-enters
+    # live_relocations on the NEXT pass, one pass later — equivalent to today's
+    # connection-class retry-next-pass, no regression.
+    #
+    # ⚠️ A `relocate_close status='failed'` (a `precondition_failed`: the source turned
+    # active/pinned/audible between snapshot and close) is a TRANSIENT retry, NOT a
+    # completion, so it does NOT retire the row: dropping the relocation identity would
+    # re-route the source through normal `decide` and, on url drift (Grafana slug /
+    # OAuth nonce, §7:1000-1004), the full-url dedup misses and phase A opens a SECOND
+    # copy. Leaving a failed row live lets phase B retry by `tab_id_to` (drift-resistant:
+    # get_tab by id, not url). Indexed by actions_origin (§4).
     live_relocations = []
     for r in conn.execute(
         "SELECT id, instance_from, session_id_from, tab_id, instance_to, "
@@ -165,7 +178,7 @@ def load_mirror(conn: sqlite3.Connection) -> Mirror:
         "FROM actions a WHERE a.kind = 'relocate' AND a.status = 'done' "
         "AND a.restored_at IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM actions rc "
-        "WHERE rc.kind = 'relocate_close' AND rc.status = 'done' "
+        "WHERE rc.kind = 'relocate_close' AND rc.status IN ('done', 'pending') "
         "AND rc.origin_action_id = a.id)"
     ).fetchall():
         src = instances.get(r["instance_from"])

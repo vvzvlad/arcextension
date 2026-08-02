@@ -26,6 +26,7 @@ from src.curator import clock as clockmod
 from src.curator import decide as decidemod
 from src.curator import lease, pause, phases
 from src.curator.mirror import load_mirror
+from src.db.actions import read_pending_closes
 from src.db.settings_store import get_setting, set_setting
 from src.ext import protocol
 
@@ -265,6 +266,25 @@ async def run_pass(
 
         # --- capture the frozen mirror; all decisions run against it ---------
         mirror = await db.read(load_mirror)
+        ctx = phases.PassCtx(
+            db=db, registry=registry, settings=settings, pass_id=pass_id,
+            epoch=epoch, now=now, idle_ms=idle_ms, mirror=mirror, struck=set(),
+            ready=ready,
+        )
+
+        # --- reconcile: resolve prior-pass PENDING closes EARLY, before decide
+        # (§7, WARNING-1). Each pending *_close (a close whose completion write was
+        # fenced by a lost lease) is resolved against this fresh mirror: → done when
+        # the source is gone (at-least-once journal), → abandoned when it is still
+        # present (decide re-issues it). Per row isolated; every write lease-guarded.
+        # Skipped on dry_run (a dry_run writes no actions). Reconcile does not mutate
+        # the frozen mirror, so decide below still decides against the same picture;
+        # a pending relocate_close is already excluded from live_relocations, so a
+        # relocation is never both reconciled AND phase-B'd in the same pass.
+        if not effective_dry_run:
+            for pending_row in await db.read(read_pending_closes):
+                await _isolated(phases.run_reconcile(ctx, pending_row))
+
         decisions = decidemod.decide(
             mirror, ready_ids,
             now=now, idle_ms=idle_ms, main_instance_id=settings.main_instance_id,
@@ -287,11 +307,6 @@ async def run_pass(
             return {"status": "dry_run", "plan": plan}
 
         # --- steps 4-8: execute (each decision isolated) ---------------------
-        ctx = phases.PassCtx(
-            db=db, registry=registry, settings=settings, pass_id=pass_id,
-            epoch=epoch, now=now, idle_ms=idle_ms, mirror=mirror, struck=set(),
-            ready=ready,
-        )
         # Abandon stale relocate rows (source moved/gone); their source tabs, if any,
         # were already re-routed in the SAME decide() call (they are not "owned").
         for ab in decisions.abandon:

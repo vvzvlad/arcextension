@@ -235,6 +235,32 @@ def test_undo_skips_restored_at_rows(tmp_path):
                    for s in body["skipped"])
 
 
+# --- a PENDING close is in-flight => undo skips it (Фаза 16, WARNING-1) ------
+def test_undo_skips_pending_close(tmp_path):
+    """A `pending` relocate_close/dedupe_close is a close IN-FLIGHT (its completion not
+    yet journaled), not a completed action. Undo must NOT reverse it: it counts 0 impact
+    (so no confirm gate) and is reported as skipped. Reddens if pending were treated as
+    a done close (impact>0 => a 409, and it would try to reopen the source)."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_pass(db_path, "p1")
+        aid = _seed_action(
+            db_path, pass_id="p1", kind="dedupe_close", status="pending", initiator="curator",
+            instance_from="ghost", url="https://x/y", url_norm="https://x/y",
+            session_id_from="s",
+        )
+        # impact 0 (pending ignored by _classify) => 200, no confirm required.
+        resp = client.post("/api/passes/p1/undo", headers=AUTH)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["results"] == []  # NOT reversed
+        assert any(s["action_id"] == aid and s["reason"] == "status_pending"
+                   for s in body["skipped"])
+        # The pending row is untouched (no restored_at stamped).
+        assert _db_row(db_path, "SELECT restored_at FROM actions WHERE id=?", (aid,))[0] is None
+
+
 # --- dedupe_close undo: reopen source + write exemption (no re-eviction) ----
 def test_undo_pure_close_reopens_and_writes_exemption(tmp_path):
     app = create_app(_settings(tmp_path))

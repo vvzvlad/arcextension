@@ -38,7 +38,18 @@ ALLOWED_KINDS = frozenset(
 # unfinished relocation marks the live ``relocate`` row ``abandoned`` (§10) — a
 # legitimate terminal state, distinct from ``failed`` (which means the operation
 # was attempted and refused) and ``done``.
-ALLOWED_STATUSES = frozenset({"done", "failed", "deferred", "abandoned"})
+#
+# ``pending`` is the ONE non-terminal status (Фаза 16, WARNING-1): a ``*_close``
+# row written UNDER the lease guard BEFORE the browser ``close_tab``, so that a lease
+# lost between a successful close and its completion write does not lose the close's
+# record (an audit-journal hole / an un-undoable relocation). The pass's reconcile
+# step (runner, EARLY, before decide) resolves every prior-pass ``pending`` against
+# the fresh mirror — to ``done`` when the source is gone (the close happened,
+# at-least-once journal), or ``abandoned`` when the source is still present (the close
+# never took effect, so ``decide`` re-issues it). Readers stay pending-aware:
+# ``mirror.live_relocations`` excludes a relocate with a pending relocate_close (phase
+# B is in-flight), and ``undo`` skips a pending row (in-flight, nothing to reverse).
+ALLOWED_STATUSES = frozenset({"done", "failed", "deferred", "abandoned", "pending"})
 
 # Who initiated the action; orthogonal to ``kind`` (§4).
 ALLOWED_INITIATORS = frozenset({"curator", "mcp", "user"})
@@ -180,3 +191,41 @@ def mark_action_abandoned(conn: sqlite3.Connection, action_id: int) -> None:
     conn.execute(
         "UPDATE actions SET status = 'abandoned' WHERE id = ?", (action_id,)
     )
+
+
+def set_action_status(
+    conn: sqlite3.Connection, action_id: int, status: str, *, reason: str | None = None
+) -> None:
+    """Update a row's ``status`` in place (Фаза 16, WARNING-1). Used to complete or
+    fail a ``pending`` ``*_close`` row once the browser close is known: ``pending`` →
+    ``done`` on a successful close, ``pending`` → ``failed`` (with ``reason``) on a
+    ``precondition_failed``. Parameterized; never interpolate the id."""
+    if status not in ALLOWED_STATUSES:
+        raise ValueError(f"invalid actions.status: {status!r}")
+    if reason is not None:
+        conn.execute(
+            "UPDATE actions SET status = ?, reason = ? WHERE id = ?",
+            (status, reason, action_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE actions SET status = ? WHERE id = ?", (status, action_id)
+        )
+
+
+def read_pending_closes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Read every ``pending`` close row for the pass's reconcile step (Фаза 16).
+
+    Returns the ``*_close`` rows (relocate_close / dedupe_close / singleton_close)
+    left ``pending`` by a prior pass — a close whose browser ``close_tab`` succeeded
+    (or is uncertain) but whose completion write was fenced by a lost lease. The
+    reconcile step (runner, before decide) resolves each against the fresh mirror.
+    Runs before any of THIS pass's own pending writes, so every row it returns is
+    necessarily prior-pass and safe to reconcile."""
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        "SELECT id, kind, pass_id, instance_from, instance_to, tab_id, "
+        "session_id_from, url, url_norm FROM actions "
+        "WHERE status = 'pending' "
+        "AND kind IN ('relocate_close', 'dedupe_close', 'singleton_close')"
+    ).fetchall()
