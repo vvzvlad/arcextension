@@ -17,6 +17,7 @@ import {
 } from "./activity-map.js";
 import { buildSnapshot } from "./snapshot.js";
 import { chromeEnv, Connection } from "./connection.js";
+import { enqueueOp, flushQueue } from "./quicklinks.js";
 import { TICK_MS, RECONNECT_ALARM, TICK_ALARM } from "./constants.js";
 
 const now = () => Date.now();
@@ -35,6 +36,23 @@ const logFail = (p) => {
 // (src/commands.js): a `command` frame is executed against chrome.tabs/windows/
 // scripting + the activity map and answered with a `response` frame.
 const connection = new Connection(chromeEnv(), { buildSnapshot });
+
+// Quick-links queue env (§6/§10): the SW owns the durable offline op queue and its
+// flush. Injected deps mirror connection.js's chromeEnv so both sides read
+// instance.json + storage.local the same way.
+function quickLinksEnv() {
+  return {
+    getInstanceConfig: async () => {
+      const resp = await fetch(chrome.runtime.getURL("instance.json"));
+      return await resp.json();
+    },
+    storageLocalGet: (key) => chrome.storage.local.get(key),
+    storageLocalSet: (obj) => chrome.storage.local.set(obj),
+    fetchFn: (...a) => fetch(...a),
+    randomUUID: () => crypto.randomUUID(),
+    now: () => Date.now(),
+  };
+}
 
 // --- tab / window activity events (§5 table) -------------------------------
 
@@ -71,6 +89,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     connection.ensureSocket();
   } else if (alarm.name === TICK_ALARM) {
     logFail(onTick(now()));
+    // Opportunistically drain the quick-links queue: an op enqueued offline flushes
+    // once connectivity returns, without waiting for the next enqueue (§10).
+    flushQueue(quickLinksEnv()).catch((e) =>
+      console.error("[ext] quick-links flush failed:", e),
+    );
   }
 });
 
@@ -110,6 +133,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       rejectReason: null,
     });
     return false;
+  }
+  if (message.type === "enqueue_quicklink_op") {
+    // The startpage has already updated its own view optimistically; here the SW
+    // makes the op durable (queue + optimistic CACHE edit) and best-effort flushes
+    // it (§6/§10). {op, url?, title?, id?, order?}.
+    const { type: _t, ...op } = message;
+    const env = quickLinksEnv();
+    enqueueOp(env, op)
+      .then(() => flushQueue(env))
+      .then((res) => sendResponse({ ok: true, flush: res }))
+      .catch((e) => {
+        console.error("[ext] enqueue_quicklink_op failed:", e);
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      });
+    return true; // async response
   }
   return false;
 });

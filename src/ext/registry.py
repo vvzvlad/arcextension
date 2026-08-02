@@ -37,6 +37,11 @@ class ConnState:
     # a human Cmd+T lands a foreign snapshot mid-pass and moves the column, which —
     # if readiness were column-keyed — would eject the whole fleet from the pass.
     last_applied_snapshot_id: str | None = None
+    # Single-flight guard for GET /api/state's background refresh (§10): set while a
+    # refresh snapshot_request is outstanding so a burst of newtab opens (every
+    # Cmd+T hits /api/state) fires ONE request per instance, never a fan-out. The
+    # single-threaded writer (§4) must not be hammered by duplicate snapshots.
+    state_refresh_inflight: bool = False
     heartbeat_task: asyncio.Task | None = None
     # Outstanding service->extension commands keyed by request id (§6). Each
     # `send_command` stores a Future here and awaits it; the receive loop

@@ -17,7 +17,9 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 
 from src.api.guards import require_operational
+from src.api.quick_links import quick_links_ops
 from src.api.restore import restore_action
+from src.api.state import focus, get_state
 from src.api.rules import (
     create_rule,
     delete_rule,
@@ -122,6 +124,12 @@ def create_app(settings) -> Starlette:
 
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
+        # Startpage state + jump (§10). /api/state returns the mirror immediately and
+        # kicks a background single-flight refresh; /api/focus raises a foreign tab.
+        Route("/api/state", get_state, methods=["GET"]),
+        Route("/api/focus", focus, methods=["POST"]),
+        # Quick links offline op queue flush (§10): array of ops + Idempotency-Key.
+        Route("/api/quick_links/ops", quick_links_ops, methods=["POST"]),
         Route(
             "/api/actions/{action_id:int}/restore",
             restore_action,

@@ -9,6 +9,7 @@ action is deleted — swap/share the horizons and this reddens.
 from src.db.access import Database
 from src.db.actions import insert_action
 from src.db.audit import insert_js_audit
+from src.db.quick_links import idempotency_key_seen, record_idempotency_key
 from src.db.retention import cutoff_ms, run_retention
 
 _MS_PER_DAY = 86_400_000
@@ -66,5 +67,44 @@ async def test_retention_horizons_spare_js_audit(tmp_path):
         # The 100d js_audit row is SPARED although a 100d ACTION was dropped —
         # this is the separate-horizon guarantee (§12).
         assert js_left == ["x"]
+    finally:
+        await db.close()
+
+
+async def test_retention_prunes_old_idempotency_keys(tmp_path):
+    """``qlkey:*`` markers grow ``settings`` unbounded; retention must sweep the OLD
+    ones while a RECENT one still de-dupes a retry. Seed one old (beyond the 7d
+    idempotency window) and one recent marker; run retention with the default
+    idempotency horizon; assert only the old one is pruned and the recent one still
+    reports ``idempotency_key_seen`` True. Widen the sweep to keep the old key (remove
+    the prune) and this reddens."""
+    db = await _make_db(tmp_path)
+    try:
+        now = 2_000 * _MS_PER_DAY
+
+        def seed(c):
+            # Recorded 30d ago (older than the 7d idempotency window) -> pruned.
+            record_idempotency_key(c, "old-batch", now - 30 * _MS_PER_DAY)
+            # Recorded 1d ago (inside the window) -> kept and still de-dupes.
+            record_idempotency_key(c, "recent-batch", now - 1 * _MS_PER_DAY)
+
+        await db.write(seed)
+        result = await db.write(
+            lambda c: run_retention(c, now, ACTIONS_DAYS, JS_AUDIT_DAYS)
+        )
+        assert result.idempotency_keys_deleted == 1
+
+        # The recent key is still recorded, so a retry of THAT batch is a no-op.
+        assert await db.read(lambda c: idempotency_key_seen(c, "recent-batch")) is True
+        # The old key is gone (would re-apply, but the batch is long finished).
+        assert await db.read(lambda c: idempotency_key_seen(c, "old-batch")) is False
+
+        # Non-idempotency settings rows are never touched by the sweep.
+        remaining = await db.read(
+            lambda c: [
+                r[0] for r in c.execute("SELECT key FROM settings WHERE key LIKE 'qlkey:%'")
+            ]
+        )
+        assert remaining == ["qlkey:recent-batch"]
     finally:
         await db.close()
