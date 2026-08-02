@@ -12,13 +12,16 @@ import { computed, ref } from "vue";
 import {
   STATE_CACHE_KEY,
   enqueueQuickLinkOp,
+  fetchRules,
   fetchState,
   getIdentity,
   httpBaseFromServiceUrl,
   loadInstanceConfig,
   postFocus,
+  previewRule,
   queryOwnTabs,
   readCache,
+  saveRule,
   writeCache,
 } from "./adapters.js";
 import { instanceStatus } from "./status.js";
@@ -41,6 +44,13 @@ export function createStore(deps = {}) {
   const offline = ref(false);
   const search = ref("");
   const fallbackMessage = ref("");
+
+  // --- rules editor state (§8/§10) — needs the network; degrades gracefully -----
+  const rules = ref([]);
+  const rulesLoaded = ref(false);
+  const rulesOffline = ref(false);
+  const rulesError = ref("");
+  const rulesPreview = ref(null); // last server-side preview (impact before save)
 
   let base = null;
   let token = null;
@@ -199,6 +209,93 @@ export function createStore(deps = {}) {
     search.value = q;
   }
 
+  // --- rules editor (§8/§10) ------------------------------------------------
+  // The editor is the ONE network-only surface of the offline-first page: it lists
+  // rules, previews a rule's whole-pass impact on the CURRENT mirror, and CRUDs
+  // through the confirm gate. With no base/token it degrades to a plain "offline"
+  // note rather than a broken editor.
+  const invalidRules = computed(() => rules.value.filter((r) => r.invalid));
+
+  function _hasNet() {
+    if (base && token) return true;
+    rulesOffline.value = true;
+    return false;
+  }
+
+  function _rulePayload(op, draft) {
+    if (op === "delete") return { op: "delete", id: draft.id };
+    return {
+      op,
+      id: draft.id,
+      pattern: draft.pattern,
+      instance_id: draft.instance_id,
+      singleton: !!draft.singleton,
+      canonical_url: draft.canonical_url || null,
+      note: draft.note || null,
+    };
+  }
+
+  async function loadRules() {
+    if (!_hasNet()) {
+      rulesError.value = "offline";
+      return;
+    }
+    try {
+      rules.value = await fetchRules(fetchFn, base, token);
+      rulesLoaded.value = true;
+      rulesOffline.value = false;
+      rulesError.value = "";
+    } catch {
+      rulesOffline.value = true;
+      rulesError.value = "offline";
+    }
+  }
+
+  // Preview BEFORE save (§8): the same whole-pass model the confirm gate uses.
+  async function previewRuleDraft(op, draft) {
+    rulesPreview.value = null;
+    rulesError.value = "";
+    if (!_hasNet()) {
+      rulesError.value = "offline";
+      return null;
+    }
+    const { status, body } = await previewRule(fetchFn, base, token, _rulePayload(op, draft));
+    if (status !== 200) {
+      rulesError.value = (body && body.detail) || "preview failed";
+      return null;
+    }
+    rulesPreview.value = body;
+    return body;
+  }
+
+  // Save through the confirm gate (§8): a 409 carries the preview and asks for
+  // confirmation; the caller re-invokes with { confirmImpact: true }.
+  async function saveRuleDraft(op, draft, { confirmImpact = false } = {}) {
+    rulesError.value = "";
+    if (!_hasNet()) {
+      rulesError.value = "offline";
+      return { ok: false, offline: true };
+    }
+    const rule = _rulePayload(op, draft);
+    const { status, body } = await saveRule(fetchFn, base, token, {
+      op,
+      id: draft.id,
+      rule,
+      confirmImpact,
+    });
+    if (status === 409) {
+      rulesPreview.value = body; // surface the impact; caller confirms to proceed
+      return { ok: false, needsConfirm: true, preview: body };
+    }
+    if (status >= 200 && status < 300) {
+      rulesPreview.value = null;
+      await loadRules();
+      return { ok: true };
+    }
+    rulesError.value = (body && body.detail) || "save failed: HTTP " + status;
+    return { ok: false, error: rulesError.value };
+  }
+
   return {
     // state
     ownInstanceId,
@@ -210,11 +307,18 @@ export function createStore(deps = {}) {
     offline,
     search,
     fallbackMessage,
+    // rules editor state
+    rules,
+    rulesLoaded,
+    rulesOffline,
+    rulesError,
+    rulesPreview,
     // views
     filteredOwnTabs,
     filteredQuickLinks,
     foreignGroups,
     statusRows,
+    invalidRules,
     // methods
     init,
     refresh,
@@ -224,6 +328,10 @@ export function createStore(deps = {}) {
     jumpOwn,
     jumpForeign,
     setSearch,
+    // rules editor methods
+    loadRules,
+    previewRuleDraft,
+    saveRuleDraft,
     // for tests / consumers
     STATE_CACHE_KEY,
   };
