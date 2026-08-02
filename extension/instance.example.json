@@ -1,8 +1,5 @@
 {
-  "//": "Template for the per-instance config the generator (§13) writes next to the bundle as instance.json, read by the SW via chrome.runtime.getURL on EVERY start and treated as authoritative over storage (§6). All four fields are required; a missing/default instanceId is rejected by the service. Copy to instance.json and stamp real values per instance. Do NOT commit a real instance.json (token is a secret).",
-  "instanceId": "REPLACE_PER_INSTANCE",
-  "title": "Example instance",
+  "//": "With enrollment (§7, issue #35) the build is UNIVERSAL — there is NO generator and NO per-instance instance.json to stamp. The credential is a per-profile SECRET the extension generates itself into chrome.storage.local (never in the bundle); only its sha256 (secretHash) goes on the wire. The service address and browser name are operator SETTINGS entered on the options page (also storage.local). This file is now only an OPTIONAL bootstrap: ship a serviceUrl to pre-fill the address so a fresh profile does not have to type it. The old shared `token` and self-reported `instanceId` are GONE — do NOT add them back.",
   "serviceUrl": "wss://<host>",
-  "token": "REPLACE_WITH_EXT_TOKEN",
-  "allowExecuteJs": false
+  "title": "Example instance"
 }

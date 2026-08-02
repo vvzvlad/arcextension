@@ -44,6 +44,45 @@ export const WINDOW_ID_NONE = -1;
 export const MAP_KEY = "activityMap"; // chrome.storage.session — the activity map
 export const SESSION_ID_KEY = "sessionId"; // chrome.storage.session — the epoch
 export const INSTALL_UUID_KEY = "installUuid"; // chrome.storage.local — survives sessions
+
+// --- Enrollment (§7, issue #35) --------------------------------------------
+// The per-install SECRET (32 random bytes, stored as hex) lives ONLY in this
+// profile's chrome.storage.local — never in the bundle. Only its sha256 hash
+// (`secretHash`) ever goes on the wire (enroll_request + every hello). Absence of
+// this key is the "needs-enroll" fact. When a quarantined instance re-enrolls, the
+// FRESH secret is generated under INSTANCE_SECRET_PENDING_KEY and promoted over the
+// old one ONLY after the server approves it (unknown_instance never wipes — see
+// connection.js), which is why the two keys are distinct.
+export const INSTANCE_SECRET_KEY = "instanceSecret"; // storage.local — the active secret (hex)
+export const INSTANCE_SECRET_PENDING_KEY = "instanceSecretPending"; // storage.local — re-enroll secret
+// The server-ASSIGNED instance id, learned from a successful hello_ack (the client no
+// longer self-reports a trusted id, §2). Durable so the popup/startpage can name the
+// rule target + filter own tabs even while the MV3 worker is cold.
+export const INSTANCE_ID_KEY = "instanceId"; // storage.local — server-assigned id
+// Operator-entered settings that USED to live in instance.json. The address and the
+// browser name are per-profile now (a universal build has no generator to stamp them),
+// and the shared token is gone entirely (§7). The enroll CODE is the ~10-min window
+// code the operator reads off /admin and types once to submit an enrollment.
+export const SERVICE_ADDRESS_KEY = "serviceAddress"; // storage.local — wss/ws service URL
+export const BROWSER_NAME_KEY = "browserName"; // storage.local — suggested_title source
+export const ENROLL_CODE_KEY = "enrollCode"; // storage.local — the window code (transient input)
+// Durable enrollment facts, the SINGLE source getEnrollState reads (the in-memory
+// helloAcked is useless at page open — the worker is cold). Shape:
+//   { requestPending: bool, approved: bool, quarantined: bool, lastVerdict: str|null }
+export const ENROLL_STATE_KEY = "enrollState"; // storage.local — durable enroll facts
+
+// The five enroll states getEnrollState resolves to (§7). Only these are authoritative
+// from the SW branch; actual connectivity stays with /api/state on the startpage.
+export const ENROLL_NEEDS = "needs-enroll"; // no secret yet
+export const ENROLL_PENDING = "pending"; // request submitted, awaiting approval
+export const ENROLL_APPROVED = "approved"; // a hello has succeeded at least once
+export const ENROLL_REVOKED = "revoked"; // server said `revoked` — secret wiped
+export const ENROLL_QUARANTINED = "quarantined"; // server said `unknown_instance` post-approval
+
+// hello_ack{ok:false}.error.code verdicts the client ACTS on (§7). Mirror the
+// service-side strings in src/ext/protocol.py (REJECT_REVOKED / REJECT_UNKNOWN).
+export const VERDICT_REVOKED = "revoked";
+export const VERDICT_UNKNOWN = "unknown_instance";
 // The execute_js opt-in checkbox (§12): per-copy, default OFF, lives in
 // chrome.storage.local (survives a session, is set from the options page). It is
 // the AUTHORITATIVE runtime state — read fresh on every execute_js and reported

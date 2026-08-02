@@ -15,10 +15,8 @@
     "idle"
   ],
 
-  "//host_permissions": "TWO patterns, not one: in Chromium match-patterns ws/wss are distinct schemes and the https pattern does NOT cover a wss request (§6). <host> is a deploy-time placeholder stamped by the instance generator (§13). <all_urls> IS requested — SECURITY-SENSITIVE, deliberate (§6: '<all_urls> — только ради execute_js'): execute_js runs curator-supplied JS in the arbitrary http/https tabs this instance manages, which needs host access to those origins. It is gated by the per-copy options checkbox (default OFF) + the server kill-switch, AND commands.js edge-guards the target tab to http/https only (no file://view-source:), so the grant cannot be abused past those gates.",
+  "//host_permissions": "ONLY <all_urls> now. The two per-host patterns (https://<host>/* and wss://<host>/*) are REMOVED: with enrollment (§7, issue #35) the build is UNIVERSAL — there is no generator to stamp a concrete <host> at package time, and the service address is an operator setting entered per profile. <all_urls> IS requested — SECURITY-SENSITIVE, deliberate — and now carries TWO paths, not one: (1) execute_js runs curator-supplied JS in the arbitrary http/https tabs this instance manages (§6), and (2) the startpage's fetch to the service /api/* is a cross-origin request whose CORS host-permission is <all_urls> (slice C / §12). Both are gated (execute_js by the per-copy options checkbox default OFF + the server kill-switch + commands.js's http/https-only edge guard; /api by the instance secretHash Bearer). A future tightening of <all_urls> to a fixed host list must therefore account for BOTH the execute_js origins AND the /api fetch host, or the startpage goes offline fleet-wide.",
   "host_permissions": [
-    "https://<host>/*",
-    "wss://<host>/*",
     "<all_urls>"
   ],
 

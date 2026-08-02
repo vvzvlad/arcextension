@@ -137,6 +137,28 @@ export async function getIdentity(chromeApi) {
   }
 }
 
+// The /api base + Bearer come from the SW now (§7): the address setting + the instance
+// secretHash (slice C — the /api credential IS the secretHash). The raw secret never
+// leaves the SW. Returns { serviceUrl, secretHash } or null when the channel is down.
+export async function getCredential(chromeApi) {
+  try {
+    return await chromeApi.runtime.sendMessage({ type: "get_credential" });
+  } catch {
+    return null;
+  }
+}
+
+// The SW's durable-fact enroll state + whether an address is configured (§7). The
+// status bar shows "ожидает одобрения" / "отозван" / "адрес не настроен" from this;
+// connectivity itself stays with /api/state.
+export async function getConnectionState(chromeApi) {
+  try {
+    return await chromeApi.runtime.sendMessage({ type: "get_connection_state" });
+  } catch {
+    return null;
+  }
+}
+
 // --- pause (§7) ---------------------------------------------------------------
 // Arm/extend a finite pause (POST) or resume early (DELETE). Bearer-authed like the
 // other verbs. Both return {status, body} so the store can react without throwing on a

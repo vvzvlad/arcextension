@@ -379,8 +379,21 @@ export default {
       </p>
     </section>
 
-    <!-- Status bar: pause countdown ROW (§7) + four instance states (§10) -->
+    <!-- Status bar: enroll banner (§7) + pause countdown ROW (§7) + four instance states (§10) -->
     <footer class="sp-status" data-role="status-bar">
+      <!-- Enroll banner (§7): shows "адрес не настроен" / "ожидает одобрения" /
+           "отозён" from getConnectionState (durable facts) — states /api/state cannot
+           express. Absent when approved (the normal status rows speak). acc 13. -->
+      <div
+        v-if="store.enrollStatus.value"
+        class="sp-status-row sp-enroll-row"
+        data-role="enroll-banner"
+        :data-state="store.enrollStatus.value.state"
+      >
+        <span class="sp-dot" :class="store.enrollStatus.value.state"></span>
+        <span class="sp-status-name">Регистрация</span>
+        <span class="sp-sub">— {{ store.enrollStatus.value.label }}</span>
+      </div>
       <!-- Pause row (§7 "видимость обязательна"): a persistent ROW with a live
            countdown, NOT a badge/toast. Renders from cache too (offline-first). -->
       <div class="sp-status-row sp-pause-row" data-role="pause-row">

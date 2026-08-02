@@ -3,24 +3,44 @@ import { createChromeMock, FakeWebSocket } from "./chrome-mock.js";
 import { chromeEnv, Connection } from "../src/connection.js";
 import { PROTOCOL_VERSION } from "../src/constants.js";
 
+// instance.json is now only an OPTIONAL address bootstrap (§7): the shared token +
+// self-reported instanceId are GONE. The credential is a per-profile secret.
 const CONFIG = {
-  instanceId: "inst-1",
   title: "Test instance",
   serviceUrl: "wss://host.example",
-  token: "the-token",
-  allowExecuteJs: false,
 };
 
-const flush = () => new Promise((r) => setTimeout(r, 5));
+// A known 32-byte secret (all 0x01) and its sha256 — the wire `secretHash` (§7). The
+// vector is asserted directly in the secret/hash test below.
+const SECRET_HEX = "01".repeat(32);
+const SECRET_HASH = "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793";
+const APPROVED_FACTS = { requestPending: false, approved: true, quarantined: false, lastVerdict: null };
+
+// sha256(hexBytes) -> hex, to derive the secretHash the wire carries for a RANDOM
+// pending secret the code generated (so a quarantine test can assert on it).
+import { createHash } from "node:crypto";
+function sha256hex(hex) {
+  return createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex");
+}
+
+// hello/enroll now read the secret from storage (several async ticks) and hash it, so
+// the opening frame lands a few macrotasks later than the old token-only path.
+const flush = () => new Promise((r) => setTimeout(r, 25));
+
+// Seed an ENROLLED profile (secret + approved) so the socket opens and hello is sent.
+async function seedEnrolled() {
+  await chrome.storage.local.set({ instanceSecret: SECRET_HEX, enrollState: { ...APPROVED_FACTS } });
+}
 
 let savedFetch, savedWS;
 
-beforeEach(() => {
+beforeEach(async () => {
   globalThis.chrome = createChromeMock();
   savedFetch = globalThis.fetch;
   savedWS = globalThis.WebSocket;
   globalThis.fetch = async () => ({ json: async () => ({ ...CONFIG }) });
   globalThis.WebSocket = FakeWebSocket;
+  await seedEnrolled();
 });
 
 afterEach(() => {
@@ -44,7 +64,8 @@ describe("ids & config (§6)", () => {
   it("generates installUuid in local, sessionId in session, reads instance.json", async () => {
     const conn = makeConnection();
     await conn.init();
-    expect(conn.config).toMatchObject({ instanceId: "inst-1", serviceUrl: "wss://host.example" });
+    expect(conn.config).toMatchObject({ serviceUrl: "wss://host.example" });
+    expect(conn.serviceAddress).toBe("wss://host.example");
     expect(conn.installUuid).toBeTruthy();
     expect(conn.sessionId).toBeTruthy();
     const local = await chrome.storage.local.get("installUuid");
@@ -61,25 +82,28 @@ describe("ids & config (§6)", () => {
   });
 });
 
-describe("hello (§6)", () => {
-  it("sends a well-formed hello on socket open", async () => {
+describe("hello (§6/§7)", () => {
+  it("sends a secret-authenticated hello on socket open — NO token, NO self-reported id", async () => {
     const conn = makeConnection();
     await conn.ensureSocket();
     const ws = conn.ws;
     ws._open();
-    // hello now reads the execute_js checkbox from storage.local first, so it is
+    // hello reads the secret + execute_js checkbox from storage.local first, so it is
     // sent on a macrotask — flush before asserting.
     await flush();
     expect(ws.sent).toHaveLength(1);
     expect(ws.sent[0]).toMatchObject({
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
-      token: "the-token",
-      instanceId: "inst-1",
+      secretHash: SECRET_HASH,
       installUuid: conn.installUuid,
       sessionId: conn.sessionId,
       allowExecuteJs: false,
     });
+    // The shared token and the self-reported instanceId are GONE from the wire (§7):
+    // the server resolves the id from the secret. Their absence is the whole point.
+    expect(ws.sent[0].token).toBeUndefined();
+    expect(ws.sent[0].instanceId).toBeUndefined();
   });
 
   it("reports the checkbox state, NOT instance.json (gate default OFF, §12)", async () => {
@@ -216,5 +240,374 @@ describe("ensureSocket idempotence (§6)", () => {
     first._open();
     await conn.ensureSocket();
     expect(conn.ws).toBe(first);
+  });
+});
+
+// ============================================================================
+// Enrollment (§7, issue #35)
+// ============================================================================
+
+// A bare env (stubbable crypto) around the current chrome mock.
+function bareConn(overrides = {}) {
+  const env = { ...chromeEnv(), ...overrides };
+  return new Connection(env, { buildSnapshot: async () => ({}) });
+}
+
+describe("secret + secretHash (§7)", () => {
+  it("generates a 32-byte secret ONCE, persists it, and derives sha256(secret) — known vector", async () => {
+    // Fresh profile: drop the beforeEach seed. Stub ONLY randomBytes (via the env seam);
+    // sha256Hex stays REAL so the assertion is a genuine known vector.
+    await chrome.storage.local.remove("instanceSecret");
+    await chrome.storage.local.remove("enrollState");
+    let rand = 0;
+    const conn = bareConn({
+      randomBytes: (n) => {
+        rand += 1;
+        return new Uint8Array(n).fill(1);
+      },
+    });
+    await conn.submitEnrollment("WIN-CODE");
+    const got = await chrome.storage.local.get("instanceSecret");
+    expect(got.instanceSecret).toBe(SECRET_HEX); // stored as hex, from the env seam
+    expect(await conn._secretHash()).toBe(SECRET_HASH); // = sha256(0x01*32), the vector
+    // Generated ONCE: a second submit reuses the same secret.
+    await conn.submitEnrollment("WIN-CODE-2");
+    expect(rand).toBe(1);
+  });
+
+  it("hashes through the env.sha256Hex seam over the RAW secret bytes (stubbable)", async () => {
+    // If the code hashed via a hardcoded global crypto instead of the seam, the stub
+    // would never be called and _secretHash would not be STUBHASH.
+    await chrome.storage.local.remove("instanceSecret");
+    await chrome.storage.local.remove("enrollState");
+    const seen = [];
+    const conn = bareConn({
+      randomBytes: (n) => new Uint8Array(n).fill(2),
+      sha256Hex: async (bytes) => {
+        seen.push([...bytes]);
+        return "STUBHASH";
+      },
+    });
+    await conn.submitEnrollment("C");
+    expect(await conn._secretHash()).toBe("STUBHASH");
+    expect(seen[seen.length - 1]).toEqual(new Array(32).fill(2)); // the raw 32 secret bytes
+  });
+});
+
+describe("enroll_request frame (§2/§7)", () => {
+  it("sends enroll_request{code, secretHash, installUuid, suggestedTitle} — NOT a hello", async () => {
+    // Keep the seeded secret but make the state not-approved, and stage a browser name.
+    await chrome.storage.local.set({
+      enrollState: { requestPending: false, approved: false, quarantined: false, lastVerdict: null },
+      browserName: "Bob's Chrome",
+    });
+    const conn = makeConnection();
+    await conn.submitEnrollment("WIN-CODE");
+    const ws = conn.ws;
+    ws._open();
+    await flush();
+    const req = ws.sent.find((m) => m.type === "enroll_request");
+    expect(req).toBeDefined();
+    expect(req).toMatchObject({
+      type: "enroll_request",
+      protocolVersion: PROTOCOL_VERSION,
+      code: "WIN-CODE",
+      secretHash: SECRET_HASH,
+      installUuid: conn.installUuid,
+      suggestedTitle: "Bob's Chrome", // documented frame field
+      title: "Bob's Chrome", // what the server actually reads (wire contract)
+    });
+    expect(ws.sent.find((m) => m.type === "hello")).toBeUndefined();
+  });
+
+  it("after a pending submit a FRESH worker sends HELLO (not enroll_request) to learn approval (acc 5)", async () => {
+    // Durable: secret + requestPending, but a fresh worker has NO in-memory code.
+    await chrome.storage.local.set({
+      enrollState: { requestPending: true, approved: false, quarantined: false, lastVerdict: null },
+    });
+    const conn = makeConnection(); // _pendingEnrollCode is null (cold)
+    await conn.ensureSocket();
+    const ws = conn.ws;
+    ws._open();
+    await flush();
+    expect(ws.sent.find((m) => m.type === "hello")).toBeDefined();
+    expect(ws.sent.find((m) => m.type === "enroll_request")).toBeUndefined();
+  });
+});
+
+describe("hello_ack{ok:false} verdicts (§7)", () => {
+  it("`revoked` WIPES the secret and drops to needs-enroll (records lastVerdict)", async () => {
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    const ws = conn.ws;
+    ws._open();
+    await flush();
+    expect((await chrome.storage.local.get("instanceSecret")).instanceSecret).toBe(SECRET_HEX);
+    ws._serverSend({ type: "hello_ack", ok: false, error: { code: "revoked" } });
+    await flush();
+    expect((await chrome.storage.local.get("instanceSecret")).instanceSecret).toBeUndefined();
+    expect(await conn.getEnrollState()).toBe("revoked"); // secret gone + lastVerdict='revoked'
+  });
+
+  it("a REVOKED instance opens NO idle socket on the next alarm (nothing to send)", async () => {
+    // Durable revoked state: the secret is already wiped, so a hello would carry no
+    // secretHash. Connecting anyway would hold/reopen an idle pre-auth socket every alarm
+    // across the whole revoked fleet. The gate must treat revoked like needs-enroll.
+    await chrome.storage.local.remove("instanceSecret");
+    await chrome.storage.local.remove("instanceSecretPending");
+    await chrome.storage.local.set({
+      serviceAddress: "wss://host.example",
+      enrollState: { requestPending: false, approved: false, quarantined: false, lastVerdict: "revoked" },
+    });
+    const conn = makeConnection();
+    expect(await conn.getEnrollState()).toBe("revoked");
+    await conn.ensureSocket();
+    expect(conn.ws).toBe(null); // no idle socket
+  });
+
+  it("`unknown_instance` KEEPS the secret and stages a fresh pending re-enroll (staged code)", async () => {
+    await chrome.storage.local.set({ enrollCode: "NEW-CODE" });
+    const oldSecret = (await chrome.storage.local.get("instanceSecret")).instanceSecret;
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    const ws = conn.ws;
+    ws._open();
+    await flush();
+
+    // A previously-approved instance suddenly unknown => quarantine WITHOUT wiping.
+    ws._serverSend({ type: "hello_ack", ok: false, error: { code: "unknown_instance" } });
+    await flush();
+    const active = (await chrome.storage.local.get("instanceSecret")).instanceSecret;
+    const pending = (await chrome.storage.local.get("instanceSecretPending")).instanceSecretPending;
+    expect(active).toBe(oldSecret); // OLD secret KEPT (no fleet-timer walk)
+    expect(pending).toBeTruthy(); // a fresh secret staged for the parallel re-enroll
+    expect(pending).not.toBe(oldSecret);
+    expect(await conn.getEnrollState()).toBe("quarantined");
+  });
+
+  it("survives worker death: a COLD worker sends enroll_request for the PENDING secret (invariant C)", async () => {
+    // Quarantine first (staged code), then throw away the live worker and prove a COLD
+    // Connection over the same storage reconstitutes the code from ENROLL_CODE_KEY and
+    // sends an enroll_request for the PENDING secret — NOT a doomed hello. Reverting the
+    // cold-worker code reconstitution reddens this (it would send a hello instead).
+    await chrome.storage.local.set({ enrollCode: "NEW-CODE" });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    conn.ws._serverSend({ type: "hello_ack", ok: false, error: { code: "unknown_instance" } });
+    await flush();
+    const pendingHex = (await chrome.storage.local.get("instanceSecretPending")).instanceSecretPending;
+
+    // COLD worker (probe cursor is DURABLE at 0): open a fresh socket.
+    const cold = makeConnection();
+    await cold.ensureSocket();
+    cold.ws._open();
+    await flush();
+    const req = cold.ws.sent.find((m) => m.type === "enroll_request");
+    expect(req).toBeDefined();
+    expect(req.code).toBe("NEW-CODE");
+    expect(req.secretHash).toBe(sha256hex(pendingHex)); // enrolls the PENDING secret
+    expect(cold.ws.sent.find((m) => m.type === "hello")).toBeUndefined();
+  });
+
+  it("keeps attempting HELLO with the OLD secret while quarantined (invariant A — no shadowing)", async () => {
+    // Seed a quarantine mid-cycle at the OLD-hello probe phase (1). A cold worker must
+    // hello with the OLD secret so a transient `unknown` that healed server-side recovers
+    // — never permanently shadowed by the unenrolled pending secret. Reverting the
+    // old-vs-pending fix (always helloing pending) reddens this.
+    const pendingHex = "ab".repeat(32);
+    await chrome.storage.local.set({
+      instanceSecret: SECRET_HEX, // OLD (approved) secret
+      instanceSecretPending: pendingHex, // staged re-enroll secret
+      enrollCode: "NEW-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: true,
+        lastVerdict: "unknown_instance",
+        quarantineProbe: 1, // the hello(old) phase
+      },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    const hello = conn.ws.sent.find((m) => m.type === "hello");
+    expect(hello).toBeDefined();
+    expect(hello.secretHash).toBe(SECRET_HASH); // the OLD secret, not the pending one
+  });
+
+  it("OLD-secret hello succeeding while quarantined = transient recovery: discard pending, keep old (invariant A)", async () => {
+    const pendingHex = "ab".repeat(32);
+    await chrome.storage.local.set({
+      instanceSecret: SECRET_HEX,
+      instanceSecretPending: pendingHex,
+      enrollCode: "NEW-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: true,
+        lastVerdict: "unknown_instance",
+        quarantineProbe: 1, // hello(old)
+      },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    // The server RE-KNOWS the old secret (restore completed) => ok:true on the old hello.
+    conn.ws._serverSend({ type: "hello_ack", ok: true, instanceId: "srv-old" });
+    await flush();
+    expect((await chrome.storage.local.get("instanceSecret")).instanceSecret).toBe(SECRET_HEX); // OLD kept
+    expect((await chrome.storage.local.get("instanceSecretPending")).instanceSecretPending).toBeUndefined(); // moot re-enroll dropped
+    expect(await conn.getEnrollState()).toBe("approved");
+  });
+
+  it("PENDING-secret hello succeeding = re-enroll approved: promote pending, wipe old (invariant B)", async () => {
+    const pendingHex = "ab".repeat(32);
+    await chrome.storage.local.set({
+      instanceSecret: SECRET_HEX,
+      instanceSecretPending: pendingHex,
+      enrollCode: "NEW-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: true,
+        lastVerdict: "unknown_instance",
+        quarantineProbe: 2, // the hello(pending) phase
+      },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    const hello = conn.ws.sent.find((m) => m.type === "hello");
+    expect(hello.secretHash).toBe(sha256hex(pendingHex)); // helloed with the PENDING secret
+    // The operator approved the re-enrollment => ok:true on the pending hello.
+    conn.ws._serverSend({ type: "hello_ack", ok: true, instanceId: "srv-new" });
+    await flush();
+    expect((await chrome.storage.local.get("instanceSecret")).instanceSecret).toBe(pendingHex); // promoted (old wiped)
+    expect((await chrome.storage.local.get("instanceSecretPending")).instanceSecretPending).toBeUndefined();
+    expect((await chrome.storage.local.get("instanceId")).instanceId).toBe("srv-new");
+    expect((await chrome.storage.local.get("enrollCode")).enrollCode).toBeUndefined(); // staged code cleared
+    expect(await conn.getEnrollState()).toBe("approved");
+  });
+
+  it("surfaces an enroll_rejected reason through get_connection_state (durable, cold-worker readable)", async () => {
+    await chrome.storage.local.set({
+      enrollState: { requestPending: true, approved: false, quarantined: false, lastVerdict: null },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    conn.ws._serverSend({ type: "enroll_rejected", reason: "bad_code" });
+    await flush();
+    // A brand-new COLD worker over the same storage must still report the reason.
+    const cold = makeConnection();
+    const st = await cold.getConnectionState();
+    expect(st.enrollReject).toBe("bad_code");
+  });
+
+  it("a terminal enroll_rejected(bad_code) clears the staged code so the probe stops re-sending enroll_request", async () => {
+    const pendingHex = "ab".repeat(32);
+    const quarantined = {
+      requestPending: true,
+      approved: false,
+      quarantined: true,
+      lastVerdict: "unknown_instance",
+      quarantineProbe: 0, // the enroll_request(pending) phase
+    };
+    await chrome.storage.local.set({
+      instanceSecret: SECRET_HEX,
+      instanceSecretPending: pendingHex,
+      enrollCode: "STALE-CODE",
+      enrollState: { ...quarantined },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    // Phase 0 sent the enroll_request with the (now stale) code.
+    const req = conn.ws.sent.find((m) => m.type === "enroll_request");
+    expect(req).toBeDefined();
+    expect(req.code).toBe("STALE-CODE");
+
+    // The server rejects it terminally: the code is dead.
+    conn.ws._serverSend({ type: "enroll_rejected", reason: "bad_code" });
+    await flush();
+    expect((await chrome.storage.local.get("enrollCode")).enrollCode).toBeUndefined(); // cleared
+
+    // A fresh COLD worker back at phase 0 must NOT re-send enroll_request (no code) — it
+    // falls back to a hello instead. Reverting the terminal-clear reddens this (a stale
+    // code would re-arm enroll_request forever).
+    await chrome.storage.local.set({ enrollState: { ...quarantined } }); // probe back to 0
+    const cold = makeConnection();
+    await cold.ensureSocket();
+    cold.ws._open();
+    await flush();
+    expect(cold.ws.sent.find((m) => m.type === "enroll_request")).toBeUndefined(); // no more spam
+    expect(cold.ws.sent.find((m) => m.type === "hello")).toBeDefined(); // falls back to hello
+  });
+
+  it("a not-yet-approved `unknown_instance` just keeps waiting — no quarantine, no re-enroll", async () => {
+    // Pending (submitted, not approved). unknown is the NORMAL not-approved-yet answer.
+    await chrome.storage.local.set({
+      enrollState: { requestPending: true, approved: false, quarantined: false, lastVerdict: null },
+      enrollCode: "SOME-CODE",
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    const ws = conn.ws;
+    ws._open();
+    await flush();
+    ws._serverSend({ type: "hello_ack", ok: false, error: { code: "unknown_instance" } });
+    await flush();
+    // Still pending; NOT quarantined, and no pending secret was staged.
+    expect(await conn.getEnrollState()).toBe("pending");
+    expect((await chrome.storage.local.get("instanceSecretPending")).instanceSecretPending).toBeUndefined();
+  });
+});
+
+describe("socket identity guard (§6/§7)", () => {
+  it("ignores a late frame from a PREEMPTED socket (structural no-wrong-promotion)", async () => {
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    const oldWs = conn.ws;
+    oldWs._open();
+    await flush();
+    expect(conn.helloAcked).toBe(false);
+    // Preempt the socket, as a quarantine forced-reconnect does: this.ws is swapped.
+    conn.connect();
+    expect(conn.ws).not.toBe(oldWs);
+    // A late hello_ack lands on the OLD socket — the identity guard must drop it so it
+    // cannot flip helloAcked or drive a promotion against the CURRENT connection's state.
+    oldWs._serverSend({ type: "hello_ack", ok: true, instanceId: "srv-stale" });
+    await flush();
+    expect(conn.helloAcked).toBe(false); // not marked connected by the preempted socket
+    expect((await chrome.storage.local.get("instanceId")).instanceId).toBeUndefined();
+  });
+});
+
+describe("enrollState from durable storage with a COLD worker (§7)", () => {
+  it("an enrolled instance reads as approved even though helloAcked is false", async () => {
+    // The operator's address is a durable setting; the worker is cold (never connected).
+    await chrome.storage.local.set({ serviceAddress: "wss://host.example" });
+    const conn = makeConnection();
+    expect(conn.helloAcked).toBe(false); // cold — in-memory says "not connected"
+    const st = await conn.getConnectionState();
+    expect(st.connected).toBe(false); // honestly not connected right now
+    expect(st.enrollState).toBe("approved"); // but DURABLY enrolled (from storage facts)
+    expect(st.hasAddress).toBe(true);
+  });
+
+  it("a fresh profile (no secret) reads as needs-enroll and does NOT open a socket", async () => {
+    await chrome.storage.local.remove("instanceSecret");
+    await chrome.storage.local.remove("enrollState");
+    const conn = makeConnection();
+    expect(await conn.getEnrollState()).toBe("needs-enroll");
+    await conn.ensureSocket();
+    expect(conn.ws).toBe(null); // nothing to say => no churn before enrollment
   });
 });

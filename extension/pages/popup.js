@@ -67,10 +67,40 @@ export async function saveRule(fetchFn, base, token, rule, { confirmImpact = fal
   return { status: resp.status, body };
 }
 
-// Read instance.json (authoritative config, §6) via the extension URL.
+// Read instance.json via the extension URL. With enrollment (§7) this is only a
+// FALLBACK bootstrap: the credential source moved to the SW (address + secretHash +
+// server-assigned id). Kept for a bundle that still ships a serviceUrl.
 export async function loadConfig(fetchFn, getURL) {
   const resp = await fetchFn(getURL("instance.json"));
   return await resp.json();
+}
+
+// Resolve the /api base + Bearer + target instanceId (§7). PREFER the SW credential
+// (the instance secretHash is the /api Bearer — slice C — and the id is server-assigned,
+// learned from a successful hello); fall back to instance.json when the SW channel is
+// unavailable or has nothing yet (e.g. before enrollment).
+export async function loadPopupContext(chromeApi, fetchFn) {
+  try {
+    if (chromeApi.runtime && chromeApi.runtime.sendMessage) {
+      const cred = await chromeApi.runtime.sendMessage({ type: "get_credential" });
+      const ident = await chromeApi.runtime.sendMessage({ type: "get_identity" });
+      if (cred && cred.serviceUrl && cred.secretHash && ident && ident.instanceId) {
+        return {
+          base: httpBaseFromServiceUrl(cred.serviceUrl),
+          token: cred.secretHash,
+          instanceId: ident.instanceId,
+        };
+      }
+    }
+  } catch {
+    // fall through to the instance.json bootstrap
+  }
+  const config = await loadConfig(fetchFn, chromeApi.runtime.getURL);
+  return {
+    base: httpBaseFromServiceUrl(config.serviceUrl),
+    token: config.token,
+    instanceId: config.instanceId,
+  };
 }
 
 export async function getActiveTab(chromeApi) {
@@ -110,12 +140,12 @@ export async function init(doc, chromeApi, fetchFn) {
 
   let base, token, rule;
   try {
-    const config = await loadConfig(fetchFn, chromeApi.runtime.getURL);
-    base = httpBaseFromServiceUrl(config.serviceUrl);
-    token = config.token;
+    const ctx = await loadPopupContext(chromeApi, fetchFn);
+    base = ctx.base;
+    token = ctx.token;
     const tab = await getActiveTab(chromeApi);
     if (!tab || !tab.url) throw new Error("no active tab URL");
-    rule = buildRule(tab.url, config.instanceId);
+    rule = buildRule(tab.url, ctx.instanceId);
   } catch (e) {
     setStatus("Cannot build a rule for this tab: " + (e && e.message));
     if (els.save) els.save.disabled = true;
