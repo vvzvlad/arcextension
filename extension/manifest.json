@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "arcextension",
+  "version": "0.1.0",
+  "description": "Curator client: reports tab activity snapshots and executes curator commands (§5, §6).",
+
+  "//key": "Fixes the extension id independent of the load path (§6). Replace this PLACEHOLDER with the real public key of the signing keypair at packaging time; the value below is not a real key and must be regenerated per deployment.",
+  "key": "REPLACE_WITH_BASE64_PUBLIC_KEY_TO_PIN_EXTENSION_ID",
+
+  "permissions": [
+    "tabs",
+    "scripting",
+    "alarms",
+    "storage",
+    "idle"
+  ],
+
+  "//host_permissions": "TWO patterns, not one: in Chromium match-patterns ws/wss are distinct schemes and the https pattern does NOT cover a wss request (§6). <host> is a deploy-time placeholder stamped by the instance generator (§13). <all_urls> is deliberately NOT requested here — it is only for execute_js and is added in that phase (least privilege).",
+  "host_permissions": [
+    "https://<host>/*",
+    "wss://<host>/*"
+  ],
+
+  "background": {
+    "service_worker": "src/service-worker.js",
+    "type": "module"
+  },
+
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+
+  "chrome_url_overrides": {
+    "newtab": "pages/newtab.html"
+  },
+
+  "options_page": "pages/options.html",
+
+  "action": {
+    "default_title": "arcextension"
+  },
+
+  "incognito": "not_allowed"
+}

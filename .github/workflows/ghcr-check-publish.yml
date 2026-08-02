@@ -29,6 +29,28 @@ jobs:
         METRICS_TOKEN: test-metrics-token
       run: pytest --tb=short -q
 
+  # Extension (MV3) tests: independent Node/vitest toolchain under extension/.
+  # Kept separate from the Python `test` job and NOT a dependency of `build`
+  # (the image ships the Python service only). Runs on the same triggers as the
+  # rest of this workflow (push to main/develop + workflow_dispatch); it does NOT
+  # block the image build. Add a `pull_request:` trigger if PR-level gating is
+  # wanted (that would apply to the whole workflow, matching the repo's convention).
+  extension-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install and test the extension
+      working-directory: extension
+      run: |
+        npm ci || npm install
+        npm test
+
   build:
     runs-on: ubuntu-latest
     needs: test                          # no green tests → no image is built
