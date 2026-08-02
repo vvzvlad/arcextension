@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>arcextension — Options</title>
+  </head>
+  <body>
+    <!--
+      Options page. The execute_js opt-in checkbox (§12) is the "stop" button for
+      the most dangerous operation in the system: per-copy, default OFF, stored in
+      chrome.storage.local (the authoritative runtime state reported in `hello`).
+      The script is external (options.js) because the extension_pages CSP is
+      `script-src 'self'` — an inline handler would be blocked.
+    -->
+    <main>
+      <h1>arcextension options</h1>
+      <label>
+        <input type="checkbox" id="allow-execute-js" />
+        Allow <code>execute_js</code> on this copy
+      </label>
+      <p>
+        When off, the service cannot run arbitrary JavaScript through this
+        extension: every <code>execute_js</code> command is refused with
+        <code>js_disabled</code> and nothing is executed. Default: off.
+      </p>
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+    <script src="options.js" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "arcextension",
+  "version": "0.1.0",
+  "description": "Curator client: reports tab activity snapshots and executes curator commands (§5, §6).",
+
+  "//key": "Fixes the extension id independent of the load path (§6). Replace this PLACEHOLDER with the real public key of the signing keypair at packaging time; the value below is not a real key and must be regenerated per deployment.",
+  "key": "REPLACE_WITH_BASE64_PUBLIC_KEY_TO_PIN_EXTENSION_ID",
+
+  "permissions": [
+    "tabs",
+    "scripting",
+    "alarms",
+    "storage",
+    "idle"
+  ],
+
+  "//host_permissions": "TWO patterns, not one: in Chromium match-patterns ws/wss are distinct schemes and the https pattern does NOT cover a wss request (§6). <host> is a deploy-time placeholder stamped by the instance generator (§13). <all_urls> IS requested — SECURITY-SENSITIVE, deliberate (§6: '<all_urls> — только ради execute_js'): execute_js runs curator-supplied JS in the arbitrary http/https tabs this instance manages, which needs host access to those origins. It is gated by the per-copy options checkbox (default OFF) + the server kill-switch, AND commands.js edge-guards the target tab to http/https only (no file://view-source:), so the grant cannot be abused past those gates.",
+  "host_permissions": [
+    "https://<host>/*",
+    "wss://<host>/*",
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "src/service-worker.js",
+    "type": "module"
+  },
+
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+
+  "//chrome_url_overrides": "The newtab is the Vue 3 startpage built into startpage/ (offline-first quick links / search / jump / status bar, §10). All assets are local and the page runs under the extension_pages CSP `script-src 'self'` — the build uses base './' and precompiled SFCs (no runtime compiler), verified by the three §10 build gates.",
+  "chrome_url_overrides": {
+    "newtab": "startpage/index.html"
+  },
+
+  "options_page": "pages/options.html",
+
+  "//action": "The toolbar popup is 'Rule from this tab' (§8, §10): one click to add a rule <origin>/* -> this instance with a server-side impact preview.",
+  "action": {
+    "default_title": "arcextension",
+    "default_popup": "pages/popup.html"
+  },
+
+  "incognito": "not_allowed"
+}

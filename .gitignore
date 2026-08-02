@@ -18,3 +18,13 @@ data/*
 
 # Donor repo sits nested here — never pull it into this git
 brave-window-mcp/
+
+# Node / extension toolchain
+extension/node_modules/
+# Startpage (Vue 3 + Vite) toolchain — the BUILT output ships in extension/startpage
+startpage/node_modules/
+startpage/dist/
+# Per-instance config carries EXT_TOKEN — never commit a real one (only the .example)
+extension/instance.json
+# Instance-generator signing key (§13) — a per-deployment secret, never commit it
+.instancegen/

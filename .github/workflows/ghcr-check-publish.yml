@@ -25,8 +25,65 @@ jobs:
 
     - name: Run tests
       env:
-        TELEGRAM_BOT_TOKEN: test-token   # required ENV so importing settings works
+        EXT_TOKEN: test-ext-token        # required ENV so importing settings works
+        METRICS_TOKEN: test-metrics-token
       run: pytest --tb=short -q
+
+  # Extension (MV3) tests: independent Node/vitest toolchain under extension/.
+  # Kept separate from the Python `test` job and NOT a dependency of `build`
+  # (the image ships the Python service only). Runs on the same triggers as the
+  # rest of this workflow (push to main/develop + workflow_dispatch); it does NOT
+  # block the image build. Add a `pull_request:` trigger if PR-level gating is
+  # wanted (that would apply to the whole workflow, matching the repo's convention).
+  extension-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install and test the extension
+      working-directory: extension
+      run: |
+        npm ci || npm install
+        npm test
+
+  # Startpage (Vue 3 + Vite) tests: build INTO extension/startpage, then the three
+  # §10 build gates and the vitest suite (the render smoke test loads the built
+  # bundle, so the build must run first). Independent of the Python image build.
+  startpage-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Build, gate and test the startpage
+      working-directory: startpage
+      run: |
+        npm ci || npm install
+        npm run build
+        npm run gates
+        npm test
+
+    # The build writes into the TRACKED extension/startpage. A fresh build must match
+    # what is committed — otherwise editing startpage/src/* without rebuilding ships a
+    # stale newtab and no gate above catches it (the gates run over whatever was built,
+    # not over the committed artifact). The Vite build is byte-reproducible on the
+    # pinned toolchain (verified), so a plain diff is the gate; a drift means "run
+    # `npm --prefix startpage run build` and commit the result".
+    - name: Fail if the committed startpage bundle is stale (drift from a fresh build)
+      run: |
+        if ! git diff --exit-code -- extension/startpage; then
+          echo "::error::extension/startpage is out of date vs a fresh build — run 'npm --prefix startpage run build' and commit extension/startpage."
+          exit 1
+        fi
 
   build:
     runs-on: ubuntu-latest

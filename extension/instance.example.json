@@ -1,0 +1,8 @@
+{
+  "//": "Template for the per-instance config the generator (§13) writes next to the bundle as instance.json, read by the SW via chrome.runtime.getURL on EVERY start and treated as authoritative over storage (§6). All four fields are required; a missing/default instanceId is rejected by the service. Copy to instance.json and stamp real values per instance. Do NOT commit a real instance.json (token is a secret).",
+  "instanceId": "REPLACE_PER_INSTANCE",
+  "title": "Example instance",
+  "serviceUrl": "wss://<host>",
+  "token": "REPLACE_WITH_EXT_TOKEN",
+  "allowExecuteJs": false
+}

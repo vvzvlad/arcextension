@@ -1,0 +1,21 @@
+{
+  "name": "arcextension-startpage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Newtab startpage (offline-first, quick links, search, jump, status bar) — Vue 3 + Vite, built into ../extension/startpage (§10).",
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "gates": "node scripts/gates.mjs"
+  },
+  "//pin": "The Vite MAJOR is pinned (§10: gate measurements do not transfer across majors — 6.4.3 emitted `new Function(`, 8.x's rolldown/oxc emits bare `Function(`). Vite/Vue/plugin-vue are pinned EXACT so the three empty-page gates are re-measured against the exact bundler that ships. Re-measure the gates if any of these three change.",
+  "devDependencies": {
+    "vite": "8.2.0",
+    "vue": "3.5.40",
+    "@vitejs/plugin-vue": "6.0.8",
+    "@vue/test-utils": "2.4.11",
+    "happy-dom": "20.11.1",
+    "vitest": "4.1.10"
+  }
+}

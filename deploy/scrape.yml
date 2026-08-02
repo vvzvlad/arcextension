@@ -1,0 +1,26 @@
+# Curator /metrics scrape config — docs/architecture.md §12 «Наблюдаемость».
+#
+# Drop this job into a Prometheus / vmagent scrape configuration. The alert rules
+# that consume these series live in deploy/alerts.yml (the `job="curator"` label
+# below is what `up{job="curator"}` / `curator-down` there match — DO NOT rename it
+# without updating alerts.yml).
+#
+# ⚠️ THIS FILE LIVES IN GIT IN PLAINTEXT. That is exactly WHY the scrape credential
+# is METRICS_TOKEN and NOT EXT_TOKEN (§12): METRICS_TOKEN is read-only and opens
+# ONLY /metrics, so leaking it here grants nothing but read access to metrics. Never
+# put EXT_TOKEN (which opens /ext, /api/* and /mcp) in a scrape config.
+#
+# Placeholders below are XXX — replace at deploy time (inject the token from a
+# secret store; do NOT commit the real value):
+#   * bearer_token  -> the value of METRICS_TOKEN (must equal the service's env).
+#   * target host   -> the public Traefik host that serves the curator over TLS.
+
+scrape_configs:
+  - job_name: curator          # matches deploy/alerts.yml (`up{job="curator"}`)
+    scheme: https              # WSS/HTTPS only — the cert must be browser/CA-trusted
+    metrics_path: /metrics
+    # METRICS_TOKEN (read-only, §12). Placeholder — inject the real value at deploy.
+    bearer_token: XXX
+    static_configs:
+      - targets:
+          - curator.example.com   # the Traefik Host() that routes to the container

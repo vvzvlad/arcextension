@@ -1,0 +1,893 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { createChromeMock } from "./chrome-mock.js";
+import { dispatchCommand } from "../src/commands.js";
+import * as activityMap from "../src/activity-map.js";
+import {
+  CMD_OPEN_TAB,
+  CMD_CLOSE_TAB,
+  CMD_GET_TAB,
+  CMD_FOCUS_TAB,
+  CMD_NAVIGATE_TAB,
+  CMD_MERGE_WINDOWS,
+  CMD_EXECUTE_JS,
+} from "../src/constants.js";
+
+const NOW = 1_000_000_000;
+const SID = "session-1";
+
+// A fully-spied activity map so ordering / "not called" / "no leak" assertions
+// are exact. readMap is configurable per test (default: an empty map).
+function spyMap(readValue = { tabs: {} }) {
+  return {
+    seedCuratorTab: vi.fn(async () => {}),
+    markCuratorCause: vi.fn(async () => {}),
+    clearCuratorCause: vi.fn(async () => {}),
+    readMap: vi.fn(async () => readValue),
+  };
+}
+
+function ctx(overrides = {}) {
+  return { sessionId: SID, now: () => NOW, map: spyMap(), ...overrides };
+}
+
+function frame(command, params = {}, sessionId = SID) {
+  return { type: "command", id: "c1", sessionId, command, params };
+}
+
+beforeEach(() => {
+  globalThis.chrome = createChromeMock();
+  activityMap.__resetQueue();
+});
+
+// --- session check (§5): FIRST, before any verb executes --------------------
+describe("stale_session rejects every verb without executing", () => {
+  const verbs = [
+    [CMD_OPEN_TAB, { url: "https://x/" }],
+    [CMD_CLOSE_TAB, { tabId: 1, expect: {} }],
+    [CMD_GET_TAB, { tabId: 1 }],
+    [CMD_FOCUS_TAB, { tabId: 1 }],
+    [CMD_NAVIGATE_TAB, { tabId: 1, url: "https://x/" }],
+    [CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }],
+    [CMD_EXECUTE_JS, { code: "1", tabId: 1 }],
+  ];
+
+  it.each(verbs)("%s from a foreign session => stale_session, no side effects", async (cmd, params) => {
+    const create = vi.spyOn(chrome.tabs, "create");
+    const remove = vi.spyOn(chrome.tabs, "remove");
+    const update = vi.spyOn(chrome.tabs, "update");
+    const move = vi.spyOn(chrome.tabs, "move");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = ctx();
+
+    // frame.sessionId ("dead") != ctx.sessionId (SID) => must be rejected.
+    const res = await dispatchCommand(frame(cmd, params, "dead-session"), c);
+
+    expect(res).toEqual({ ok: false, error: { code: "stale_session", message: expect.any(String) } });
+    // Nothing touched the browser or the map.
+    for (const spy of [create, remove, update, move, exec]) expect(spy).not.toHaveBeenCalled();
+    expect(c.map.seedCuratorTab).not.toHaveBeenCalled();
+    expect(c.map.markCuratorCause).not.toHaveBeenCalled();
+  });
+});
+
+// --- open_tab ---------------------------------------------------------------
+describe("open_tab", () => {
+  it("rejects javascript: and data: urls at the edge, tabs.create NOT called", async () => {
+    for (const url of ["javascript:alert(1)", "data:text/html,<b>x", "chrome://settings", "file:///etc/passwd"]) {
+      const create = vi.spyOn(chrome.tabs, "create");
+      const c = ctx();
+      const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url }), c);
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("precondition_failed");
+      expect(create).not.toHaveBeenCalled(); // never reached tabs.create
+      expect(c.map.seedCuratorTab).not.toHaveBeenCalled();
+      create.mockRestore();
+    }
+  });
+
+  it("accepts http/https, creates the tab and seeds the activity map (real map)", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 1, url: "https://a/" }],
+      windows: [{ id: 1, type: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    // Real map here: assert the record was actually seeded with the source ages.
+    const res = await dispatchCommand(
+      frame(CMD_OPEN_TAB, {
+        url: "https://example.com/a",
+        pinned: true,
+        seed_age_ms: 5000,
+        seed_opened_ago_ms: 9000,
+      }),
+      { sessionId: SID, now: () => NOW }, // no map override => real activityMap
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ tabId: 1000, windowId: expect.anything() });
+
+    const map = await activityMap.readMap();
+    const rec = map.tabs[1000];
+    expect(rec).toBeDefined();
+    expect(rec.lastActive).toBe(NOW - 5000); // inherited the source's idle age
+    expect(rec.openedAt).toBe(NOW - 9000);
+  });
+
+  // --- §9: the window choice is DETERMINISTIC, never "wherever create lands" ----
+  it("targets the NORMAL window with the most tabs, ignoring a focused POPUP (§9)", async () => {
+    // The popup is the last-focused window and has the most tabs of all; a bare
+    // tabs.create would land there and the copy would be invisible to the pass
+    // (phase B never completes). Drop the explicit windowId and this reddens.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 1, windowId: 1, url: "https://a/" },
+        { id: 2, windowId: 2, url: "https://b/" },
+        { id: 3, windowId: 2, url: "https://c/" },
+        { id: 4, windowId: 3, url: "https://p1/" },
+        { id: 5, windowId: 3, url: "https://p2/" },
+        { id: 6, windowId: 3, url: "https://p3/" },
+      ],
+      windows: [
+        { id: 1, type: "normal" },
+        { id: 2, type: "normal" }, // 2 tabs — the biggest NORMAL window
+        { id: 3, type: "popup" }, // 3 tabs, and focused — must be ignored
+      ],
+      lastFocused: { id: 3, type: "popup", focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+    expect(res.ok).toBe(true);
+    expect(create.mock.calls[0][0].windowId).toBe(2);
+    expect(res.result.windowId).toBe(2);
+  });
+
+  it("breaks a tie on tab count by the SMALLEST windowId (§9, deterministic)", async () => {
+    // Equal-sized windows listed biggest-id-first: getAll() promises no order, so the
+    // tie-break must be explicit or the choice flips between calls.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 1, windowId: 9, url: "https://a/" },
+        { id: 2, windowId: 4, url: "https://b/" },
+      ],
+      windows: [
+        { id: 9, type: "normal" },
+        { id: 4, type: "normal" },
+      ],
+      lastFocused: { id: 9, focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+    expect(res.ok).toBe(true);
+    expect(create.mock.calls[0][0].windowId).toBe(4); // smaller id wins the tie
+  });
+
+  it("never targets a FULLSCREEN window even when it has the most tabs (§9)", async () => {
+    // The macOS wall dashboard: a fullscreen Grafana showcase on its own Space (§1,
+    // ledger 43). §9's predicate — the service's own `_window_mergeable` — bars it from
+    // BOTH roles, so a curator copy must not land in it however many tabs it holds.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 1, windowId: 1, url: "https://a/" },
+        { id: 2, windowId: 7, url: "https://dash1/" },
+        { id: 3, windowId: 7, url: "https://dash2/" },
+        { id: 4, windowId: 7, url: "https://dash3/" },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 7, type: "normal", state: "fullscreen" }, // the showcase, and the biggest
+      ],
+      lastFocused: { id: 7, type: "normal", state: "fullscreen", focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+    expect(res.ok).toBe(true);
+    expect(create.mock.calls[0][0].windowId).toBe(1); // never 7
+  });
+
+  it("with ONLY a fullscreen normal window, creates a background window instead", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 2, windowId: 7, url: "https://dash/" }],
+      windows: [{ id: 7, type: "normal", state: "fullscreen" }],
+      lastFocused: { id: 7, type: "normal", state: "fullscreen", focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    const winCreate = vi.spyOn(chrome.windows, "create");
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+    expect(res.ok).toBe(true);
+    expect(create).not.toHaveBeenCalled();
+    expect(winCreate).toHaveBeenCalledOnce();
+  });
+
+  it("retries in a NEW window when the chosen window vanished mid-command (§9)", async () => {
+    // The explicit windowId introduced a race a bare tabs.create did not have: the human
+    // closes the window between getAll() and create(). Answering `internal` would send
+    // the relocation to `deferred` and on to quarantine — exactly what §9 chose this
+    // path to avoid. Remove the retry and this reddens with ok:false.
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 1, url: "https://a/" }],
+      windows: [{ id: 1, type: "normal", state: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    create.mockRejectedValueOnce(new Error("No window with id: 1"));
+    const winCreate = vi.spyOn(chrome.windows, "create");
+
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+
+    expect(res.ok).toBe(true);
+    expect(create).toHaveBeenCalledOnce(); // the failed attempt
+    expect(winCreate).toHaveBeenCalledOnce(); // then a window of our own
+    expect(res.result.tabId).toBeDefined();
+  });
+
+  it("a mid-DRAG refusal is busy_dragging, NOT a new window (§9)", async () => {
+    // The retry must not treat every rejection as "the window vanished": a human
+    // dragging a tab makes Chromium refuse tab edits, and a pass with three relocations
+    // would leave three stray background windows with no self-healing (a one-tab window
+    // is never picked again). Phase A defers an open failure without a strike
+    // (src/curator/phases.py), so refusing honestly is the cheaper answer.
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 1, url: "https://a/" }],
+      windows: [{ id: 1, type: "normal", state: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    create.mockRejectedValueOnce(
+      new Error("Tabs cannot be edited right now (user may be dragging a tab)."),
+    );
+    const winCreate = vi.spyOn(chrome.windows, "create");
+
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("busy_dragging");
+    expect(winCreate).not.toHaveBeenCalled(); // no stray window
+  });
+
+  it("an unrelated tabs.create fault stays `internal`, it does not spawn a window", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 1, url: "https://a/" }],
+      windows: [{ id: 1, type: "normal", state: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    vi.spyOn(chrome.tabs, "create").mockRejectedValueOnce(new Error("quota exceeded"));
+    const winCreate = vi.spyOn(chrome.windows, "create");
+
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("internal");
+    expect(winCreate).not.toHaveBeenCalled();
+  });
+
+  it("with ZERO normal windows creates a BACKGROUND normal window (§9), never fails", async () => {
+    // macOS: the browser lives with no windows daily. Failing here would push the
+    // relocation to `deferred` and on to quarantine. Only a popup exists.
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 4, windowId: 3, url: "https://p/" }],
+      windows: [{ id: 3, type: "popup" }],
+      lastFocused: { id: 3, type: "popup", focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    const winCreate = vi.spyOn(chrome.windows, "create");
+    const res = await dispatchCommand(
+      frame(CMD_OPEN_TAB, { url: "https://x/", pinned: true }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(create).not.toHaveBeenCalled(); // no tabs.create into the popup
+    expect(winCreate).toHaveBeenCalledOnce();
+    const props = winCreate.mock.calls[0][0];
+    expect(props).toMatchObject({ url: "https://x/", focused: false, state: "normal" });
+    // The tab really exists in the new window, and `pinned` survived (windows.create
+    // takes no pinned flag, so it is applied to the created tab afterwards).
+    const tabs = await chrome.tabs.query({});
+    const opened = tabs.find((t) => t.url === "https://x/");
+    expect(opened.windowId).toBe(res.result.windowId);
+    expect(opened.pinned).toBe(true);
+  });
+});
+
+// --- close_tab: the edge re-check is the whole point ------------------------
+describe("close_tab edge re-check (§6)", () => {
+  function chromeWithTab(over = {}) {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 7, windowId: 1, url: "https://x/", audible: false, pinned: false, active: false, ...over }],
+      windows: [{ id: 1, type: "normal", state: "normal" }],
+      lastFocused: { id: 2, focused: true }, // a DIFFERENT window is focused by default
+    });
+  }
+
+  it("precondition_failed when the tab became AUDIBLE after the snapshot; remove NOT called, no curatorCause leak", async () => {
+    chromeWithTab({ audible: true }); // audible now, though the snapshot saw it silent
+    const remove = vi.spyOn(chrome.tabs, "remove");
+    const c = ctx();
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/", notAudible: true } }),
+      c,
+    );
+    expect(res).toEqual({ ok: false, error: { code: "precondition_failed", message: expect.any(String) } });
+    expect(remove).not.toHaveBeenCalled(); // the tab was NOT closed
+    expect(c.map.markCuratorCause).not.toHaveBeenCalled(); // no cause mark leaked
+    expect(c.map.clearCuratorCause).not.toHaveBeenCalled();
+  });
+
+  it("happy path: markCuratorCause is AWAITED BEFORE tabs.remove (assert order)", async () => {
+    chromeWithTab();
+    const order = [];
+    const map = spyMap();
+    map.markCuratorCause = vi.fn(async () => {
+      order.push("mark");
+    });
+    vi.spyOn(chrome.tabs, "remove").mockImplementation(async () => {
+      order.push("remove");
+    });
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/", notAudible: true, notPinned: true } }),
+      ctx({ map }),
+    );
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(map.markCuratorCause).toHaveBeenCalledWith(1, NOW); // the tab's window
+    expect(order).toEqual(["mark", "remove"]); // cause written BEFORE the close
+  });
+
+  it("precondition_failed when pinned after the snapshot", async () => {
+    chromeWithTab({ pinned: true });
+    const remove = vi.spyOn(chrome.tabs, "remove");
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/", notPinned: true } }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("precondition_failed when active in the focused window", async () => {
+    chromeWithTab({ active: true });
+    globalThis.chrome.__state.lastFocused = { id: 1, focused: true }; // the tab's window IS focused
+    const remove = vi.spyOn(chrome.tabs, "remove");
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/" } }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("precondition_failed when idle age fell below minIdleMs", async () => {
+    chromeWithTab();
+    const remove = vi.spyOn(chrome.tabs, "remove");
+    // The tab was re-viewed 1s ago per the OWN map, but the command wants >=60s idle.
+    const map = spyMap({ tabs: { 7: { lastActive: NOW - 1000 } } });
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/", minIdleMs: 60000 } }),
+      ctx({ map }),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(remove).not.toHaveBeenCalled();
+    expect(map.markCuratorCause).not.toHaveBeenCalled();
+  });
+
+  it("passes minIdleMs when the map shows the tab idle long enough", async () => {
+    chromeWithTab();
+    const map = spyMap({ tabs: { 7: { lastActive: NOW - 5 * 60000 } } });
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/", minIdleMs: 60000 } }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("precondition_failed when the url diverged from expect.url", async () => {
+    chromeWithTab({ url: "https://x/moved" });
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/" } }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+  });
+
+  it("no_such_tab when the tab is gone", async () => {
+    chromeWithTab();
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 999, expect: {} }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("clears the curatorCause mark when the remove fails", async () => {
+    chromeWithTab();
+    vi.spyOn(chrome.tabs, "remove").mockRejectedValue(new Error("gone mid-flight"));
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { tabId: 7, expect: { url: "https://x/" } }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(false);
+    expect(map.markCuratorCause).toHaveBeenCalledWith(1, NOW);
+    expect(map.clearCuratorCause).toHaveBeenCalledWith(1); // undone
+  });
+});
+
+// --- get_tab / focus_tab / navigate_tab -------------------------------------
+describe("get / focus / navigate", () => {
+  function chromeWithTab() {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 5, windowId: 3, url: "https://y/", active: false }],
+      windows: [{ id: 3, type: "normal", state: "normal" }],
+    });
+  }
+
+  it("get_tab happy => {tab}", async () => {
+    chromeWithTab();
+    const res = await dispatchCommand(frame(CMD_GET_TAB, { tabId: 5 }), ctx());
+    expect(res.ok).toBe(true);
+    expect(res.result.tab).toMatchObject({ id: 5, windowId: 3 });
+  });
+
+  it("get_tab no_such_tab", async () => {
+    chromeWithTab();
+    const res = await dispatchCommand(frame(CMD_GET_TAB, { tabId: 42 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("focus_tab activates the tab and focuses its window", async () => {
+    chromeWithTab();
+    const update = vi.spyOn(chrome.tabs, "update");
+    const winUpdate = vi.spyOn(chrome.windows, "update");
+    const res = await dispatchCommand(frame(CMD_FOCUS_TAB, { tabId: 5 }), ctx());
+    expect(res.ok).toBe(true);
+    expect(update).toHaveBeenCalledWith(5, { active: true });
+    expect(winUpdate).toHaveBeenCalledWith(3, { focused: true });
+  });
+
+  it("focus_tab no_such_tab", async () => {
+    chromeWithTab();
+    const res = await dispatchCommand(frame(CMD_FOCUS_TAB, { tabId: 42 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("navigate_tab happy (http/https validated) updates the url", async () => {
+    chromeWithTab();
+    const update = vi.spyOn(chrome.tabs, "update");
+    const res = await dispatchCommand(frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://z/" }), ctx());
+    expect(res.ok).toBe(true);
+    expect(update).toHaveBeenCalledWith(5, { url: "https://z/" });
+  });
+
+  it("navigate_tab rejects a non-http(s) url at the edge, tabs.update NOT called", async () => {
+    chromeWithTab();
+    const update = vi.spyOn(chrome.tabs, "update");
+    const res = await dispatchCommand(frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "javascript:1" }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("navigate_tab no_such_tab for a missing tab", async () => {
+    chromeWithTab();
+    const res = await dispatchCommand(frame(CMD_NAVIGATE_TAB, { tabId: 42, url: "https://z/" }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
+// --- merge_windows ----------------------------------------------------------
+describe("merge_windows", () => {
+  function chromeTwoWindows() {
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://b/" },
+        { id: 201, windowId: 2, url: "https://c/" },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+  }
+
+  it("marks BOTH source and target windows before moving; returns merged count", async () => {
+    chromeTwoWindows();
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 2 }); // both window-2 tabs moved
+    // Marked the union {source 2, target 1} before the move.
+    const marked = map.markCuratorCause.mock.calls[0][0];
+    expect([...marked].sort()).toEqual([1, 2]);
+    expect(move).toHaveBeenCalled();
+  });
+
+  it("empty params fold only NORMAL windows into the FOCUSED normal one (§9)", async () => {
+    // Criterion 1 of the manual "{}" button: the focused normal window is the TARGET
+    // even though window 2 has more tabs. That is deliberate — the edge re-check
+    // refuses to move a window whose active tab is on screen, so a focused window used
+    // as a SOURCE would just be dropped and the button would leave unmerged exactly the
+    // window the human is looking at. Popups are excluded from both roles.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://b/" },
+        { id: 201, windowId: 2, url: "https://b2/" }, // window 2 is the LARGER one
+        { id: 300, windowId: 3, url: "https://p/" }, // lives in a POPUP window
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }, { id: 3, type: "popup" }],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(frame(CMD_MERGE_WINDOWS, {}), ctx({ map }));
+    expect(res.ok).toBe(true);
+    // The normal window 2 folds into the focused window 1; the popup (3) is untouched.
+    expect(res.result).toEqual({ merged: 2 });
+    expect(move.mock.calls[0][0]).toEqual([200, 201]); // not 300 (popup)
+    expect(move.mock.calls[0][1].windowId).toBe(1); // the FOCUSED window is the target
+  });
+
+  it("empty params with NO focused normal window target the LARGEST normal window (§9)", async () => {
+    // Criterion 2: §9 names the target "обычное окно с наибольшим числом вкладок". The
+    // old fallback was `normalWindows[0]` — getAll() promises no order, so the target
+    // flipped between calls AND could be the smallest window, making the merge move far
+    // more tabs than necessary. Windows are listed with the largest LAST on purpose:
+    // with the old fallback the target would be 5 and this reddens.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 5, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://b/" },
+        { id: 300, windowId: 9, url: "https://c1/" },
+        { id: 301, windowId: 9, url: "https://c2/" },
+        { id: 302, windowId: 9, url: "https://c3/" },
+      ],
+      windows: [{ id: 5, type: "normal" }, { id: 2, type: "normal" }, { id: 9, type: "normal" }],
+      lastFocused: { id: -1, focused: false }, // macOS: no window focused at all
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(frame(CMD_MERGE_WINDOWS, {}), ctx());
+    expect(res.ok).toBe(true);
+    expect(move.mock.calls[0][1].windowId).toBe(9); // most tabs => fewest moves
+    expect(move.mock.calls[0][0].sort()).toEqual([100, 200]); // the two small windows fold in
+    expect(res.result).toEqual({ merged: 2 });
+  });
+
+  it("empty params break a target tie by the SMALLEST windowId (§9, deterministic)", async () => {
+    // Equal-sized normal windows listed largest-id-first: the choice must not depend on
+    // getAll() order. The same rule (and the same helper) open_tab uses.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 9, url: "https://a1/" },
+        { id: 101, windowId: 9, url: "https://a2/" },
+        { id: 200, windowId: 4, url: "https://b1/" },
+        { id: 201, windowId: 4, url: "https://b2/" },
+      ],
+      windows: [{ id: 9, type: "normal" }, { id: 4, type: "normal" }],
+      lastFocused: { id: -1, focused: false },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(frame(CMD_MERGE_WINDOWS, {}), ctx());
+    expect(res.ok).toBe(true);
+    expect(move.mock.calls[0][1].windowId).toBe(4); // smaller id wins the tie
+    expect(move.mock.calls[0][0]).toEqual([100, 101]);
+    expect(res.result).toEqual({ merged: 2 });
+  });
+
+  it("empty params with a POPUP focused fall back to the deterministic rule, not the popup (§9)", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 5, url: "https://a/" },
+        { id: 300, windowId: 9, url: "https://c1/" },
+        { id: 301, windowId: 9, url: "https://c2/" },
+        { id: 400, windowId: 3, url: "https://p/" },
+      ],
+      windows: [{ id: 5, type: "normal" }, { id: 9, type: "normal" }, { id: 3, type: "popup" }],
+      lastFocused: { id: 3, type: "popup", focused: true }, // a popup is on top
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(frame(CMD_MERGE_WINDOWS, {}), ctx());
+    expect(res.ok).toBe(true);
+    expect(move.mock.calls[0][1].windowId).toBe(9); // never the popup
+    expect(move.mock.calls[0][0]).toEqual([100]); // popup tab 400 stays put
+  });
+
+  it("moves ONLY unpinned tabs; pinned tabs stay, the window is not emptied (§9)", async () => {
+    // A cross-window tabs.move resets `pinned` (§9 trap) — pinned tabs must never
+    // migrate. Window 2 holds one pinned + one unpinned tab: only the unpinned one
+    // moves, so window 2 keeps its pinned tab and does not vanish. Drop `!t.pinned`
+    // from the toMove filter and this reddens (the pinned tab 200 would move too).
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", pinned: false },
+        { id: 200, windowId: 2, url: "https://pin/", pinned: true },
+        { id: 201, windowId: 2, url: "https://b/", pinned: false },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 1 }); // only the unpinned tab 201 moved
+    expect(move.mock.calls[0][0]).toEqual([201]); // NOT 200 (pinned)
+    // BOTH windows were marked BEFORE the move (§6: no rejuvenation of either side).
+    const marked = map.markCuratorCause.mock.calls[0][0];
+    expect([...marked].sort()).toEqual([1, 2]);
+    // The pinned tab is still in window 2 (never moved) => the window survives.
+    const stillThere = (await chrome.tabs.query({})).find((t) => t.id === 200);
+    expect(stillThere.windowId).toBe(2);
+  });
+
+  it("a source window of ONLY pinned tabs yields an empty move (§9)", async () => {
+    // Window 2 is all-pinned: nothing may migrate, so the move set is empty and the
+    // window stays. (chrome.tabs.move must not be called with an empty list.)
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", pinned: false },
+        { id: 200, windowId: 2, url: "https://pin1/", pinned: true },
+        { id: 201, windowId: 2, url: "https://pin2/", pinned: true },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 0 });
+    expect(move).not.toHaveBeenCalled(); // no empty tabs.move
+  });
+
+  it("EDGE re-check: a source the owner returned to (active tab in the focused window) is NOT moved (§9)", async () => {
+    // The merge was decided on the step-3 snapshot; if the owner focused window 2 and
+    // its active tab is on screen in the sub-second gap before step 9, that window must
+    // NOT collapse (parity with close_tab's expect). Drop the edge re-check and this
+    // reddens (tab 200 would move into window 1).
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://b/", active: true },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 2, type: "normal", focused: true }, // owner is IN window 2 now
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 0 }); // window 2 dropped by the edge re-check
+    expect(move).not.toHaveBeenCalled();
+  });
+
+  it("EDGE re-check: a source with an audible tab is NOT moved; an unfocused active source still moves (§9)", async () => {
+    // Audible => dropped even if unfocused (background media). Control: window 3's
+    // active tab is NOT in the focused window (1), so it is NOT on screen and DOES move
+    // — proving the re-check is specific, not a blanket refusal.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://sound/", audible: true },
+        { id: 300, windowId: 3, url: "https://c/", active: true }, // active but window 3 not focused
+      ],
+      windows: [
+        { id: 1, type: "normal" }, { id: 2, type: "normal" }, { id: 3, type: "normal" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2, 3], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 1 }); // only window 3 (not the audible window 2)
+    expect(move.mock.calls[0][0]).toEqual([300]);
+  });
+
+  it("a FULLSCREEN focused window is NEVER the merge target (§9)", async () => {
+    // THE blocker: `{}` (the manual button) with a fullscreen showcase focused. §9 and
+    // the service's `_window_mergeable` say a fullscreen window is "neither folded nor
+    // merged into", and a window merge is NOT undoable — dumping every other window's
+    // tabs into the wall dashboard is unrecoverable. The target must fall back to the
+    // deterministic rule among the MERGEABLE windows.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://b1/" },
+        { id: 201, windowId: 2, url: "https://b2/" },
+        { id: 300, windowId: 7, url: "https://dash/" },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 2, type: "normal", state: "normal" },
+        { id: 7, type: "normal", state: "fullscreen" },
+      ],
+      lastFocused: { id: 7, type: "normal", state: "fullscreen", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(frame(CMD_MERGE_WINDOWS, {}), ctx());
+    expect(res.ok).toBe(true);
+    // Target = window 2 (most tabs among mergeable), NOT the focused fullscreen 7.
+    expect(move.mock.calls[0][1].windowId).toBe(2);
+    expect(move.mock.calls[0][0]).toEqual([100]); // only window 1 folds
+    // The showcase keeps its tab and gains nothing.
+    const dash = (await chrome.tabs.query({})).find((t) => t.id === 300);
+    expect(dash.windowId).toBe(7);
+  });
+
+  it("an EXPLICIT fullscreen targetWindowId is refused with no_window (§9)", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 300, windowId: 7, url: "https://dash/" },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 7, type: "normal", state: "fullscreen" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [1], targetWindowId: 7 }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: false, error: { code: "no_window", message: expect.any(String) } });
+    expect(move).not.toHaveBeenCalled();
+  });
+
+  it("a target window that CLOSED since the snapshot answers no_window, not internal", async () => {
+    // The service decided on the step-3 snapshot; a pass runs for minutes. `no_window`
+    // is in the service's _CLIENT_ERRORS (src/api/instances.py) => 409 + refetch, so the
+    // page re-reads state. `internal` would become a 502 and nothing would re-read.
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 100, windowId: 1, url: "https://a/" }],
+      windows: [{ id: 1, type: "normal", state: "normal" }],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [1], targetWindowId: 42 }), // 42 is gone
+      ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("no_window");
+    expect(move).not.toHaveBeenCalled();
+  });
+
+  it("an EXPLICIT popup targetWindowId is refused too (§9)", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 300, windowId: 3, url: "https://p/" },
+      ],
+      windows: [
+        { id: 1, type: "normal" },
+        { id: 3, type: "popup" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [1], targetWindowId: 3 }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("no_window");
+  });
+
+  it("EDGE re-check: a FULLSCREEN source window is NOT merged (§9)", async () => {
+    // §9's guard is literally "обычное окно в состоянии не fullscreen". A window the
+    // owner just put fullscreen (a video, a presentation) is in use even with a silent,
+    // inactive tab — the audible/on-screen pair does not catch it. Control: window 3 is
+    // the same shape but `normal`, and it DOES move.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://full/" },
+        { id: 300, windowId: 3, url: "https://c/" },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 2, type: "normal", state: "fullscreen" },
+        { id: 3, type: "normal", state: "normal" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2, 3], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 1 }); // only window 3
+    expect(move.mock.calls[0][0]).toEqual([300]); // NOT 200 (fullscreen)
+  });
+
+  it("filters EXPLICIT windowIds by type === normal too, not just the {} branch (§9)", async () => {
+    // The service names its sources from the step-3 snapshot; by command time one may
+    // be a popup (or the mirror is simply stale). Folding a popup's tabs is the exact
+    // failure the manual branch already guards. Drop the filter and 300 moves too.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://b/" },
+        { id: 300, windowId: 3, url: "https://p/" }, // lives in a POPUP window
+      ],
+      windows: [
+        { id: 1, type: "normal" },
+        { id: 2, type: "normal" },
+        { id: 3, type: "popup" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2, 3], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 1 });
+    expect(move.mock.calls[0][0]).toEqual([200]); // NOT 300 (popup)
+  });
+
+  it("busy_dragging when a drag is in progress; curatorCause cleared", async () => {
+    chromeTwoWindows();
+    chrome.__state.moveError = "Tabs cannot be edited right now (user may be dragging a tab).";
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx({ map }),
+    );
+    expect(res.error.code).toBe("busy_dragging");
+    expect(map.markCuratorCause).toHaveBeenCalled();
+    expect(map.clearCuratorCause).toHaveBeenCalled(); // rolled back
+  });
+});
+
+// --- execute_js: the checkbox gate ------------------------------------------
+describe("execute_js checkbox gate (§12)", () => {
+  it("checkbox OFF (default) => js_disabled and executeScript NOT called", async () => {
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(frame(CMD_EXECUTE_JS, { code: "1+1", tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: false, error: { code: "js_disabled", message: expect.any(String) } });
+    expect(exec).not.toHaveBeenCalled(); // never executed
+  });
+
+  it("checkbox ON => runs executeScript in the requested world and returns {results}", async () => {
+    globalThis.chrome = createChromeMock({ tabs: [{ id: 5, windowId: 1, url: "https://x/" }] });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.scriptResults = [{ result: 4 }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_EXECUTE_JS, { code: "2+2", tabId: 5, world: "MAIN" }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ results: [{ result: 4 }] });
+    expect(exec).toHaveBeenCalledOnce();
+    const injection = exec.mock.calls[0][0];
+    expect(injection.target).toEqual({ tabId: 5 });
+    expect(injection.world).toBe("MAIN");
+    expect(injection.args).toEqual(["2+2"]); // the curator code is passed as an arg
+  });
+
+  it("checkbox ON but target is a non-http tab => precondition_failed, NOT executed (§12)", async () => {
+    // Even with <all_urls> granted, execute_js must edge-guard the target's scheme
+    // so it can never inject into file:///view-source: (a MAIN-world eval on file://
+    // reads local files same-origin). Drop the target guard and this reddens.
+    globalThis.chrome = createChromeMock({ tabs: [{ id: 7, windowId: 1, url: "file:///etc/passwd" }] });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(frame(CMD_EXECUTE_JS, { code: "1", tabId: 7 }), ctx());
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "precondition_failed", message: expect.any(String) },
+    });
+    expect(exec).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,188 @@
+# Curator alert rules — docs/architecture.md §12 «Наблюдаемость».
+#
+# FORMAT: a plain PROMETHEUS rule file (`groups → rules → alert/expr/for/labels/
+# annotations`), loadable by Prometheus (`rule_files:`) and by vmalert. Nothing else
+# is permitted here: both unmarshal this schema STRICTLY, so a single unknown field
+# rejects the WHOLE file and leaves the curator with no alerts at all — including
+# `curator-down`. In particular there is no `noDataState` key: that belongs to
+# Grafana-MANAGED alerts, whose provisioning format is a different schema entirely
+# (`data`/`refId`/`condition`), so a file carrying it loads in neither system.
+#
+# CONVENTION (the "шапка" of this rules.yml — read before adding a rule):
+#
+#   * Compare a READY-MADE gauge against a threshold. NEVER write
+#     `time() - <metric> > X`. A comparison in PromQL/MetricsQL is a SERIES FILTER:
+#     on a healthy curator `time() - curator_last_pass_ts > …` matches nothing, and an
+#     empty result is indistinguishable from a dead exporter. So the service exports
+#     the ready-made gauges (overdue/age in seconds, suppression already applied) and
+#     every rule below is a plain gauge-vs-threshold compare.
+#
+#   * "No data" is expressed in PromQL, not in a rule field. An expression that
+#     returns an empty vector simply does not fire — which is EXACTLY what every
+#     per-metric rule below wants: a `{id}`/`{kind}`/`{to_instance}` family may be
+#     legitimately empty (no instances connected, empty rules/quarantine tables) and
+#     must stay SILENT. That silence is the Prometheus default, so those rules need
+#     nothing extra.
+#
+#   * The one case where absence MUST fire is TARGET LOSS, and absence there has two
+#     shapes: the target is scraped and failing (`up == 0`) or the target is gone from
+#     service discovery entirely (no `up` series at all). `absent()` covers the second
+#     — it returns 1 exactly when its argument has no series — so `curator-down` ORs
+#     the two. It is the only rule in this file that fires on missing data.
+#
+#   * Live readiness is NOT alertable (`ready` is false every night the laptop
+#     sleeps). The sticky, sleep-independent facts are alertable instead:
+#     `curator_main_instance_never_seen`, `curator_rules_total == 0`,
+#     `curator_last_pass_ok == 0`, and the half-open-socket combo.
+#
+# PASS_INTERVAL_MIN = 5 -> PASS_INTERVAL = 300s, 3× = 900s, 6× = 1800s. §7 fixes
+# "прохода не было" at 3×PASS_INTERVAL; 6× is reserved for snapshot-stale (§12).
+#
+#   ⚠️ MIND WHAT EACH GAUGE MEASURES, AND COUNT `for:` IN. §7 fixes the moment the
+#   alert FIRES, and firing time = (time the gauge crosses the threshold) + `for:`.
+#   `curator_pass_overdue_seconds` is overdue BEYOND the interval
+#   (`elapsed − PASS_INTERVAL`, see `_pass_overdue_seconds` in src/api/metrics.py), so
+#   for "fires at 3×PASS_INTERVAL":
+#       gauge > 300  is crossed at  elapsed = 300 + 300 = 600s
+#       + for: 5m (300s)          ->  fires at  900s = 3×PASS_INTERVAL  ✔
+#   Using 600 here would fire at 4×, the same overshoot that made 900 wrong. Every
+#   other age gauge (`snapshot_age`, `absent_seconds`, `backup_age`) is a RAW age, so
+#   its threshold is the plain multiple and only `for:` is added on top.
+
+groups:
+  - name: curator
+    rules:
+      # The ONLY rule that fires on missing data — target loss / scrape down.
+      # `up == 0`: scraped and failing. `absent(up{...})`: no such target at all
+      # (dropped from service discovery, job renamed, config lost) — which a bare
+      # `up == 0` would silently miss, since a vanished target has no `up` series.
+      - alert: curator-down
+        # [A]: up{job="curator"}   [C]: A == 0 OR A does not exist
+        expr: up{job="curator"} == 0 or absent(up{job="curator"})
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Curator target is down or missing from discovery (no /metrics scrape)."
+
+      # A pass is overdue past 3×PASS_INTERVAL (§7). The gauge is already 0 while
+      # paused, so a routine hour-long pause never lights this; once the pause
+      # EXPIRES the gauge counts from the expiry, which is what gives the owner the
+      # promised 3×PASS_INTERVAL to click confirm before this fires (§7).
+      - alert: curator-pass-overdue
+        # [A]: curator_pass_overdue_seconds   [C]: A > 300
+        # The gauge is overdue-BEYOND-the-interval (elapsed − PASS_INTERVAL), so it
+        # crosses 300 at elapsed 600s; `for: 5m` then fires it at elapsed 900s =
+        # 3×PASS_INTERVAL exactly, which is the moment §7 promises.
+        expr: curator_pass_overdue_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No curator pass finished within 3×PASS_INTERVAL."
+
+      # Passes run but find nobody ready (expired cert / closed port / drifted
+      # PROTOCOL_VERSION / rotated token): green-and-dead. last_pass_ok is forced to
+      # 0 when a finished pass had zero ready instances.
+      - alert: curator-last-pass-not-ok
+        # [A]: curator_last_pass_ok   [C]: A == 0
+        expr: curator_last_pass_ok == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Last finished curator pass was not OK (0 ready instances or error)."
+
+      # Backups have stopped (nightly at ~03:00; alert past ~26h of staleness).
+      - alert: curator-backup-stale
+        # [A]: curator_backup_age_seconds   [C]: A > 93600  (~26h)
+        expr: curator_backup_age_seconds > 93600
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Newest DB backup is older than ~26h (or missing)."
+
+      # Orphaned rules (instance_id no longer exists) — the stock branch silently
+      # mis-routes / defers forever.
+      - alert: curator-rules-invalid
+        # [A]: curator_rules_invalid   [C]: A > 0
+        expr: curator_rules_invalid > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "One or more curation rules are invalid (orphaned instance_id)."
+
+      # The continuity marker is configured but UNREADABLE, so restore-from-backup
+      # detection is blind (§7). Silent and expensive: every other fingerprint component
+      # travels inside the backup and therefore matches, so a restore looks like
+      # ordinary operation and the very first pass applies yesterday's policy with no
+      # confirmation. The summary names the fix because the metric name does not: the
+      # usual cause is a marker written by root under umask 077 (600 root:root) that the
+      # uid-1000 container can never read.
+      - alert: curator-restore-marker-unreadable
+        # [A]: curator_restore_marker_unreadable   [C]: A == 1
+        expr: curator_restore_marker_unreadable == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Restore-from-backup detection is BLIND: marker unreadable — check it is readable by uid 1000 (chmod 644; see deploy/DEPLOY.md §8)."
+
+      # A migration failed: the service runs degraded, refusing authoritative writes.
+      - alert: curator-migration-failed
+        # [A]: curator_migration_failed   [C]: A == 1
+        expr: curator_migration_failed == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service is in degraded mode (a DB migration failed)."
+
+      # MAIN_INSTANCE_ID has never been seen — the stock branch is off (§12), and this
+      # fact is sticky and sleep-independent (unlike live `ready`).
+      - alert: curator-main-instance-never-seen
+        # [A]: curator_main_instance_never_seen   [C]: A == 1
+        expr: curator_main_instance_never_seen == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MAIN_INSTANCE_ID has never connected — stock branch disabled."
+
+      # An empty rules table (post-restore / mass edit) disables the whole stock
+      # branch by §8.
+      - alert: curator-rules-empty
+        # [A]: curator_rules_total   [C]: A == 0
+        expr: curator_rules_total == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The rules table is empty — the stock branch is disabled."
+
+      # An instance has not said hello for ~12h (threshold high enough that a nightly
+      # sleep does not shout). Per-instance family: an empty family stays silent.
+      - alert: curator-instance-absent
+        # [A]: curator_instance_absent_seconds   [C]: A > 43200  (~12h)
+        expr: curator_instance_absent_seconds > 43200
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Instance {{ $labels.id }} absent for over ~12h."
+
+      # Half-open socket: connected but the mirror snapshot stopped advancing for
+      # >6×PASS_INTERVAL (§12 reserves 6× for exactly this). snapshot_age is already 0
+      # while paused, so the routine hour-long pause never lights this on every
+      # instance.
+      - alert: curator-instance-snapshot-stale
+        # [A]: curator_instance_connected / curator_instance_snapshot_age_seconds
+        # [C]: connected == 1 AND snapshot_age > 1800  (6×PASS_INTERVAL)
+        expr: curator_instance_connected == 1 and curator_instance_snapshot_age_seconds > 1800
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Instance {{ $labels.id }} connected but its snapshot is stale (half-open socket)."
