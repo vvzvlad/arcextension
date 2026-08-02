@@ -24,8 +24,13 @@ def require_ext_token(request: Request) -> None:
     expected = request.app.state.settings.ext_token
     header = request.headers.get("authorization", "")
     scheme, _, token = header.partition(" ")
-    # Constant-time compare so a wrong token cannot be probed byte-by-byte.
-    if scheme.lower() != "bearer" or not secrets.compare_digest(token, expected):
+    # Constant-time compare so a wrong token cannot be probed byte-by-byte. Compare
+    # as BYTES: compare_digest raises TypeError on a non-ASCII str (Starlette decodes
+    # the header latin-1), which would turn a malformed header into a 500 instead of
+    # a flat 401 — cheap DoS/log-noise, and it breaks a legit non-ASCII EXT_TOKEN.
+    if scheme.lower() != "bearer" or not secrets.compare_digest(
+        token.encode("utf-8", "ignore"), expected.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
 

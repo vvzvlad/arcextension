@@ -179,6 +179,22 @@ async def test_send_failure_raises_command_error_and_records_audit(tmp_path):
         await db.close()
 
 
+# --- execute_js fail-closed without an audit sink ---------------------------
+async def test_execute_js_without_db_refuses_and_sends_no_frame():
+    # execute_js MUST NOT be sent when there is no db to write the js_audit row
+    # (§12): fail-closed with `internal`, and NOTHING reaches the socket — the
+    # "JS ran without an audit row" path must not exist.
+    reg, cs, ws = _registry_with()
+    with pytest.raises(CommandError) as ei:
+        await send_command(
+            reg, None, "i1", protocol.CMD_EXECUTE_JS,
+            {"code": "danger()", "world": "MAIN"}, cmd_timeout_ms=5000,
+        )
+    assert ei.value.code == "internal"
+    assert ws.sent == []            # no command frame was sent
+    assert cs.pending_commands == {}
+
+
 # --- execute_js writes js_audit BEFORE the send ----------------------------
 async def _read_audit(db):
     return await db.read(

@@ -22,8 +22,24 @@ import asyncio
 import uuid
 from typing import Any
 
+from loguru import logger
+
 from src.db.audit import insert_js_audit, update_js_audit_outcome
 from src.ext import protocol
+
+
+async def _safe_update_outcome(db, audit_id: int, outcome: str, detail: str | None) -> None:
+    """Best-effort js_audit outcome update.
+
+    A failure here (degraded DB, disk full mid-flight) must NOT mask the command's
+    real result or the intended CommandError — the audit ROW itself was already
+    durably committed before the send (§12), so the evidence is not lost even if
+    the outcome column stays stale. Log and swallow.
+    """
+    try:
+        await db.write(lambda c: update_js_audit_outcome(c, audit_id, outcome, detail))
+    except Exception:  # noqa: BLE001 - never let an outcome-update fault mask the result
+        logger.exception("failed to update js_audit outcome for audit {}", audit_id)
 
 
 class CommandError(Exception):
@@ -109,6 +125,14 @@ async def send_command(
         "params": params,
     }
 
+    # execute_js MUST NOT run without a durable audit sink (§12): with no db to
+    # write the js_audit row, refuse fail-closed rather than send arbitrary code
+    # un-audited. The "JS ran without an audit row" code path must not exist.
+    if command == protocol.CMD_EXECUTE_JS and db is None:
+        raise CommandError(
+            protocol.ERR_INTERNAL, "execute_js requires an audit sink (db is None)"
+        )
+
     # execute_js: audit BEFORE sending, so a disabled/rejected/timed-out call is
     # still the only durable trace of arbitrary code execution (§12).
     audit_id: int | None = None
@@ -140,9 +164,7 @@ async def send_command(
             # Honour the contract (only CommandError leaves this function) AND record
             # the audit outcome — a failed send of execute_js is still an attempt (§12).
             if audit_id is not None:
-                await db.write(
-                    lambda c: update_js_audit_outcome(c, audit_id, "error", "send_failed")
-                )
+                await _safe_update_outcome(db, audit_id, "error", "send_failed")
             raise CommandError(
                 protocol.ERR_NO_CONNECTION,
                 f"send to instance {instance_id} failed: {exc}",
@@ -151,9 +173,7 @@ async def send_command(
             resp = await asyncio.wait_for(fut, cmd_timeout_ms / 1000.0)
         except asyncio.TimeoutError:
             if audit_id is not None:
-                await db.write(
-                    lambda c: update_js_audit_outcome(c, audit_id, "error", "timeout")
-                )
+                await _safe_update_outcome(db, audit_id, "error", "timeout")
             raise CommandError(protocol.ERR_TIMEOUT, "command timed out")
     finally:
         # Always drop the pending entry — on success, timeout, or a broken socket.
@@ -164,12 +184,10 @@ async def send_command(
         code = error.get("code") or protocol.ERR_INTERNAL
         if audit_id is not None:
             outcome = "disabled" if code == protocol.ERR_JS_DISABLED else "error"
-            await db.write(
-                lambda c: update_js_audit_outcome(c, audit_id, outcome, code)
-            )
+            await _safe_update_outcome(db, audit_id, outcome, code)
         raise CommandError(code, error.get("message"))
 
     result = resp.get("result") or {}
     if audit_id is not None:
-        await db.write(lambda c: update_js_audit_outcome(c, audit_id, "ok", None))
+        await _safe_update_outcome(db, audit_id, "ok", None)
     return result

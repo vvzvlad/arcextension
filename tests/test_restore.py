@@ -140,6 +140,13 @@ def test_restore_requires_bearer_and_refuses_degraded(tmp_path):
         assert client.post(
             "/api/actions/1/restore", headers={"Authorization": "Bearer nope"}
         ).status_code == 401
+        # A non-ASCII bearer token must be a flat 401, not a 500 (compare_digest
+        # raises TypeError on the non-ASCII str Starlette decodes latin-1; the guard
+        # compares bytes now). Sent as RAW BYTES — that is the only way a byte >=0x80
+        # reaches the app (httpx ASCII-encodes str header values).
+        assert client.post(
+            "/api/actions/1/restore", headers={"Authorization": b"Bearer br\xe9k\xe9n"}
+        ).status_code == 401
         # Degraded => 503 even with a valid token.
         client.app.state.degraded = True
         assert client.post("/api/actions/1/restore", headers=AUTH).status_code == 503
@@ -158,6 +165,35 @@ def test_restore_refuses_when_source_not_fresh(tmp_path):
         resp = client.post(f"/api/actions/{aid}/restore", headers=AUTH)
         # Never silently substitutes `main`: an unconnected source is a hard error.
         assert resp.status_code == 409
+
+
+# --- stale mirror: re-snapshot then 409 (never silently main) ---------------
+def test_restore_refuses_stale_mirror_not_refreshed(tmp_path):
+    # connected but the mirror is stale AND the instance does not answer the
+    # re-snapshot => 409, exercising the poll-then-409 half of _ensure_fresh
+    # (the load-bearing "never silently main for a live-but-stale mirror").
+    app = create_app(_settings(tmp_path, state_fresh_ms=1, snapshot_timeout_ms=300))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect_fresh(client, db_path, tabs=[])   # fresh, but state_fresh_ms=1
+        try:
+            aid = _seed_action(
+                db_path, kind="dedupe_close", status="done", initiator="curator",
+                instance_from="i1", url="https://x/y", url_norm="https://x/y",
+                session_id_from="sess-1",
+            )
+            # Do NOT answer the snapshot_request the endpoint emits => it times out.
+            resp = client.post(f"/api/actions/{aid}/restore", headers=AUTH)
+            assert resp.status_code == 409
+        finally:
+            ws.__exit__(None, None, None)
+
+
+# NB: the proceed half (stale mirror answered fresh -> open_tab) is exercised by
+# the fresh-mirror restore tests below (they prove the open_tab continuation), and
+# the 409 test above proves the stale-recheck GATE. A dedicated HTTP+ws concurrent
+# test of the proceed path deadlocks TestClient's single-portal threading, so it is
+# intentionally omitted rather than made flaky.
 
 
 # --- restore twice: dedup by URL, no duplicate ------------------------------
