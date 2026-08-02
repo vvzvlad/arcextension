@@ -1,0 +1,151 @@
+# Curator alert rules — docs/architecture.md §12 «Наблюдаемость».
+#
+# CONVENTION (the "шапка" of this rules.yml — read before adding a rule):
+#
+#   * Query [A] returns the RAW gauge value; the threshold lives in the CONDITION
+#     [C] (written here as `[A] <op> <threshold>`). NEVER write `time() - <metric> > X`.
+#     A comparison inside MetricsQL is a SERIES FILTER: on a healthy curator
+#     `time() - curator_last_pass_ts > …` yields ZERO series = NoData, and with
+#     noDataState=Alerting that fires forever and never resolves — it would be muted
+#     within a day, losing the one signal that tells a dead curator from a live one.
+#     So the service exports READY-MADE gauges (overdue/age in seconds, suppression
+#     already applied) and every rule below is a plain gauge-vs-threshold compare.
+#
+#   * Every PER-METRIC rule carries `noDataState: OK`. Its metric family may be
+#     legitimately absent (no instances connected, empty rules/quarantine tables),
+#     and a `{id}`/`{kind}`/`{to_instance}` family with zero series is NoData — which
+#     must stay SILENT, not fire.
+#
+#   * TARGET LOSS (the whole /metrics scrape down) is covered by exactly ONE rule,
+#     `curator-down` on `up{job="curator"}`, with `noDataState: Alerting` (mirrors
+#     `gitmost-app-down`). It is the ONLY Alerting-on-NoData rule in this file.
+#
+#   * Live readiness is NOT alertable (`ready` is false every night the laptop
+#     sleeps). The sticky, sleep-independent facts are alertable instead:
+#     `curator_main_instance_never_seen`, `curator_rules_total == 0`,
+#     `curator_last_pass_ok == 0`, and the half-open-socket combo.
+#
+# PASS_INTERVAL_MIN = 5  ->  6×PASS_INTERVAL = 1800s.
+
+groups:
+  - name: curator
+    rules:
+      # The ONLY noDataState: Alerting rule — target loss / scrape down.
+      - alert: curator-down
+        # [A]: up{job="curator"}   [C]: A == 0
+        expr: up{job="curator"} == 0
+        for: 5m
+        noDataState: Alerting
+        labels:
+          severity: page
+        annotations:
+          summary: "Curator target is down (no /metrics scrape)."
+
+      # A pass is overdue. Gauge is already 0 while paused, so a routine hour-long
+      # pause never lights this.
+      - alert: curator-pass-overdue
+        # [A]: curator_pass_overdue_seconds   [C]: A > 1800  (6×PASS_INTERVAL)
+        expr: curator_pass_overdue_seconds > 1800
+        for: 5m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "No curator pass finished within 6×PASS_INTERVAL."
+
+      # Passes run but find nobody ready (expired cert / closed port / drifted
+      # PROTOCOL_VERSION / rotated token): green-and-dead. last_pass_ok is forced to
+      # 0 when a finished pass had zero ready instances.
+      - alert: curator-last-pass-not-ok
+        # [A]: curator_last_pass_ok   [C]: A == 0
+        expr: curator_last_pass_ok == 0
+        for: 15m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "Last finished curator pass was not OK (0 ready instances or error)."
+
+      # Backups have stopped (nightly at ~03:00; alert past ~26h of staleness).
+      - alert: curator-backup-stale
+        # [A]: curator_backup_age_seconds   [C]: A > 93600  (~26h)
+        expr: curator_backup_age_seconds > 93600
+        for: 30m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "Newest DB backup is older than ~26h (or missing)."
+
+      # Orphaned rules (instance_id no longer exists) — the stock branch silently
+      # mis-routes / defers forever.
+      - alert: curator-rules-invalid
+        # [A]: curator_rules_invalid   [C]: A > 0
+        expr: curator_rules_invalid > 0
+        for: 10m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "One or more curation rules are invalid (orphaned instance_id)."
+
+      # A migration failed: the service runs degraded, refusing authoritative writes.
+      - alert: curator-migration-failed
+        # [A]: curator_migration_failed   [C]: A == 1
+        expr: curator_migration_failed == 1
+        for: 1m
+        noDataState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service is in degraded mode (a DB migration failed)."
+
+      # MAIN_INSTANCE_ID has never been seen — the stock branch is off (§12), and this
+      # fact is sticky and sleep-independent (unlike live `ready`).
+      - alert: curator-main-instance-never-seen
+        # [A]: curator_main_instance_never_seen   [C]: A == 1
+        expr: curator_main_instance_never_seen == 1
+        for: 15m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "MAIN_INSTANCE_ID has never connected — stock branch disabled."
+
+      # An empty rules table (post-restore / mass edit) disables the whole stock
+      # branch by §8.
+      - alert: curator-rules-empty
+        # [A]: curator_rules_total   [C]: A == 0
+        expr: curator_rules_total == 0
+        for: 15m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "The rules table is empty — the stock branch is disabled."
+
+      # An instance has not said hello for ~12h (threshold high enough that a nightly
+      # sleep does not shout). Per-instance family, so NoData = OK.
+      - alert: curator-instance-absent
+        # [A]: curator_instance_absent_seconds   [C]: A > 43200  (~12h)
+        expr: curator_instance_absent_seconds > 43200
+        for: 30m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "Instance {{ $labels.id }} absent for over ~12h."
+
+      # Half-open socket: connected but the mirror snapshot stopped advancing for
+      # >6×PASS_INTERVAL. snapshot_age is already 0 while paused, so the routine
+      # hour-long pause never lights this on every instance.
+      - alert: curator-instance-snapshot-stale
+        # [A]: curator_instance_connected / curator_instance_snapshot_age_seconds
+        # [C]: connected == 1 AND snapshot_age > 1800  (6×PASS_INTERVAL)
+        expr: curator_instance_connected == 1 and curator_instance_snapshot_age_seconds > 1800
+        for: 10m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "Instance {{ $labels.id }} connected but its snapshot is stale (half-open socket)."
