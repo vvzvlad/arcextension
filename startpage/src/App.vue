@@ -6,9 +6,11 @@
 // tests can inject a fake chrome + fetch; in the real page the store falls back to
 // the browser globals. The first paint is local-only (offline-first): the store's
 // init() populates own tabs + cache, then refresh() hits GET /api/state.
-import { onMounted } from "vue";
+import { onMounted, reactive, ref } from "vue";
 import { createStore } from "./lib/store.js";
 import { formatTime } from "./lib/status.js";
+
+const EMPTY_DRAFT = { id: null, pattern: "", instance_id: "", singleton: false };
 
 export default {
   name: "Startpage",
@@ -29,13 +31,87 @@ export default {
       form.reset();
     }
 
+    // --- rules editor local state (§8/§10) ---------------------------------
+    const draft = reactive({ ...EMPTY_DRAFT });
+    const draftOp = ref("create"); // "create" | "update"
+    const confirmPending = ref(false); // a save came back 409 (confirm gate)
+    const pendingDeleteId = ref(null); // a delete came back 409; armed for a 2nd click
+
+    function resetDraft() {
+      Object.assign(draft, EMPTY_DRAFT);
+      draftOp.value = "create";
+      confirmPending.value = false;
+      store.rulesPreview.value = null;
+    }
+
+    function editRule(rule) {
+      Object.assign(draft, {
+        id: rule.id,
+        pattern: rule.pattern,
+        instance_id: rule.instance_id,
+        singleton: !!rule.singleton,
+      });
+      draftOp.value = "update";
+      confirmPending.value = false;
+      store.rulesPreview.value = null;
+    }
+
+    // Preview BEFORE save (§8) — always available so the human sees the impact first.
+    async function onPreview() {
+      confirmPending.value = false;
+      await store.previewRuleDraft(draftOp.value, draft);
+    }
+
+    async function onSave() {
+      const res = await store.saveRuleDraft(draftOp.value, draft, {
+        confirmImpact: confirmPending.value,
+      });
+      if (res.needsConfirm) {
+        confirmPending.value = true; // show the impact + a confirm button
+        return;
+      }
+      if (res.ok) resetDraft();
+    }
+
+    async function onDelete(rule) {
+      // DELETE is gated (§8): the FIRST click surfaces the impact (a 409 preview)
+      // and arms this rule; only a SECOND click on the same rule confirms. Never
+      // auto-confirm in one click — the human must see the impact and act again
+      // (same contract as onSave; the server gate must not be echo-confirmed).
+      if (pendingDeleteId.value === rule.id) {
+        const done = await store.saveRuleDraft("delete", { id: rule.id }, { confirmImpact: true });
+        if (done.ok) pendingDeleteId.value = null;
+        return;
+      }
+      const res = await store.saveRuleDraft("delete", { id: rule.id }, { confirmImpact: false });
+      if (res.needsConfirm) {
+        pendingDeleteId.value = rule.id; // impact now shown; a second click confirms
+      } else if (res.ok) {
+        pendingDeleteId.value = null; // no impact => deleted outright
+      }
+    }
+
     onMounted(async () => {
       if (!props.autostart) return;
       await store.init(); // local-only first paint
       await store.refresh(); // background live refresh
+      await store.loadRules(); // rules editor needs the network (§10)
     });
 
-    return { store, formatTime, onAddQuickLink };
+    return {
+      store,
+      formatTime,
+      onAddQuickLink,
+      draft,
+      draftOp,
+      confirmPending,
+      resetDraft,
+      editRule,
+      onPreview,
+      onSave,
+      onDelete,
+      pendingDeleteId,
+    };
   },
 };
 </script>
@@ -121,6 +197,75 @@ export default {
     </section>
 
     <p v-if="store.fallbackMessage.value" class="sp-fallback">{{ store.fallbackMessage.value }}</p>
+
+    <!-- Rules editor (§8/§10): list + invalid highlight + preview-before-save -->
+    <section class="sp-group" data-role="rules-editor">
+      <div class="sp-group-head">
+        <span class="sp-group-name">Правила</span>
+        <span v-if="store.rulesOffline.value" class="sp-cache-note">офлайн — редактор недоступен</span>
+      </div>
+
+      <ul class="sp-list" data-role="rules-list">
+        <li
+          v-for="r in store.rules.value"
+          :key="r.id"
+          class="sp-item sp-rule"
+          :class="{ 'is-invalid': r.invalid }"
+          :data-invalid="r.invalid ? '1' : '0'"
+        >
+          <span class="sp-item-title">{{ r.pattern }} → {{ r.instance_id }}</span>
+          <span v-if="r.singleton" class="sp-rule-flag">singleton</span>
+          <span v-if="r.invalid" class="sp-rule-flag sp-rule-invalid" title="Правило невалидно">невалидно</span>
+          <button class="sp-btn" type="button" @click="editRule(r)">Изменить</button>
+          <button
+            class="sp-remove"
+            :class="{ 'is-confirm': pendingDeleteId === r.id }"
+            :title="pendingDeleteId === r.id ? 'Подтвердите удаление (см. влияние ниже)' : 'Удалить'"
+            @click.prevent="onDelete(r)"
+          >{{ pendingDeleteId === r.id ? 'подтвердить ×' : '×' }}</button>
+        </li>
+        <li v-if="store.rules.value.length === 0 && !store.rulesOffline.value" class="sp-empty">
+          Нет правил
+        </li>
+      </ul>
+
+      <form
+        v-if="!store.rulesOffline.value"
+        class="sp-rule-form"
+        data-role="rule-form"
+        @submit.prevent="onSave"
+      >
+        <input v-model="draft.pattern" name="pattern" placeholder="example.com[:port]" />
+        <input v-model="draft.instance_id" name="instance_id" placeholder="инстанс" />
+        <label class="sp-rule-singleton">
+          <input v-model="draft.singleton" type="checkbox" /> singleton
+        </label>
+        <button class="sp-btn" type="button" data-role="rule-preview" @click="onPreview">
+          Показать влияние
+        </button>
+        <button class="sp-btn" type="submit" data-role="rule-save">
+          {{ confirmPending ? "Подтвердить и сохранить" : "Сохранить" }}
+        </button>
+        <button v-if="draftOp === 'update'" class="sp-btn" type="button" @click="resetDraft">
+          Отмена
+        </button>
+      </form>
+
+      <!-- Impact preview (§8): shown BEFORE the change is committed. -->
+      <p
+        v-if="store.rulesPreview.value"
+        class="sp-rule-preview"
+        data-role="rule-preview-out"
+        :class="{ 'is-confirm': confirmPending }"
+      >
+        Переселений: {{ store.rulesPreview.value.relocations }},
+        закрытий: {{ store.rulesPreview.value.closures }}
+        <template v-if="confirmPending"> — требуется подтверждение</template>
+      </p>
+      <p v-if="store.rulesError.value && !store.rulesOffline.value" class="sp-fallback">
+        {{ store.rulesError.value }}
+      </p>
+    </section>
 
     <!-- Status bar: four instance states (§10) -->
     <footer class="sp-status" data-role="status-bar">

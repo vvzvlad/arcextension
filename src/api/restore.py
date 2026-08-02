@@ -240,25 +240,33 @@ def _open_tab_params(orig: sqlite3.Row, url: str) -> dict:
     }
 
 
-# --- the endpoint -----------------------------------------------------------
-async def restore_action(request: Request) -> JSONResponse:
-    require_ext_token(request)      # 401 before anything else
-    require_operational(request)    # 503 in degraded mode
+# --- the reusable core (restore ONE archived row) ---------------------------
+async def restore_row(app, orig, *, initiator: str = "user", write_on_present: bool = False) -> dict:
+    """Reopen the source tab recorded by one archived ``actions`` row (§10).
 
-    action_id = request.path_params["action_id"]
-    app = request.app
+    THE restore mechanism, factored out of the endpoint so pass-undo reuses it per
+    row instead of reimplementing it. Freshens the source (§6, never a silent
+    ``main``), dedups by URL, opens the tab OUTSIDE any transaction, then records the
+    exemption + restore row + (for an unfinished relocation) the ``relocate``
+    cancellation in ONE atomic ``db.write`` (all via :func:`_record_restore`).
+
+    ``write_on_present`` — when the URL is ALREADY live in the source (dedup hit):
+    the endpoint returns without writing (idempotent restore), but pass-undo passes
+    ``True`` so the exemptions + ``restored_at`` markers are STILL written — otherwise
+    undoing a relocation whose source was never closed would leave no exemption and
+    the next pass would re-evict it ("undo looks broken", §10).
+
+    Returns ``{restored, reason, action_id, tab_id}``. Raises ``HTTPException`` 422
+    (no source/url) or 409 (source not freshenable) — the caller decides whether to
+    propagate (endpoint) or isolate per row (undo).
+    """
     db = app.state.db
     registry = app.state.ext_registry
     settings = app.state.settings
 
-    orig = await db.read(lambda c: _read_action(c, action_id))
-    if orig is None:
-        raise HTTPException(status_code=404, detail=f"action {action_id} not found")
-
-    # NOTE: restore does NOT short-circuit on restored_at. Idempotency is provided
-    # by the dedup-by-URL check below against the FRESH mirror (§10 "Перед
-    # открытием — дедуп по URL"): if the tab is already live in the source, we do
-    # not open a second one. (restored_at remains the marker UNDO uses to skip.)
+    # NOTE: restore does NOT short-circuit on restored_at. Idempotency is provided by
+    # the dedup-by-URL check below against the FRESH mirror (§10 "Перед открытием —
+    # дедуп по URL"). (restored_at remains the marker UNDO uses to skip rows.)
     instance_from = orig["instance_from"]
     url = orig["url"]
     if not instance_from or not url:
@@ -272,27 +280,23 @@ async def restore_action(request: Request) -> JSONResponse:
     session_now = conn_state.session_id
 
     # Dedup by URL from the FRESH mirror, BEFORE opening — restore is idempotent.
-    # ASSUMPTION (§10): restore targets an ALREADY-CLOSED source — after phase B the
-    # source tab is gone, so the mirror does not contain the URL and we proceed to
-    # `_record_restore`. If the source tab were still LIVE (an unfinished relocation
-    # whose phase-B close has not run), this returns already_present WITHOUT
-    # cancelling the relocate — acceptable only because phase 7's pass writer (which
-    # defines when that live-source window can occur) does not exist yet. Revisit
-    # when phase 7 lands: on a dedup hit, still cancel a pending relocate for url_norm.
-    if await db.read(lambda c: _mirror_has_url(c, instance_from, url_norm)):
-        return JSONResponse({"ok": True, "restored": False, "reason": "already_present"})
-
-    # Open the tab (async command, OUTSIDE any transaction).
-    result = await send_command(
-        registry,
-        db,
-        instance_from,
-        protocol.CMD_OPEN_TAB,
-        _open_tab_params(orig, url),
-        cmd_timeout_ms=settings.cmd_timeout_ms,
-        initiator="user",
-    )
-    new_tab_id = result.get("tabId")
+    present = await db.read(lambda c: _mirror_has_url(c, instance_from, url_norm))
+    new_tab_id = None
+    if not present:
+        # Open the tab (async command, OUTSIDE any transaction).
+        result = await send_command(
+            registry,
+            db,
+            instance_from,
+            protocol.CMD_OPEN_TAB,
+            _open_tab_params(orig, url),
+            cmd_timeout_ms=settings.cmd_timeout_ms,
+            initiator=initiator,
+        )
+        new_tab_id = result.get("tabId")
+    elif not write_on_present:
+        # Endpoint path: already present => nothing to open and nothing to record.
+        return {"restored": False, "reason": "already_present", "action_id": None, "tab_id": None}
 
     now = _now_ms()
     until = now + settings.restore_exemption_min * 60_000
@@ -301,6 +305,27 @@ async def restore_action(request: Request) -> JSONResponse:
             c, orig, instance_from, url, url_norm, new_tab_id, session_now, now, until
         )
     )
-    return JSONResponse(
-        {"ok": True, "restored": True, "action_id": restore_id, "tab_id": new_tab_id}
-    )
+    return {
+        "restored": not present,
+        "reason": "already_present" if present else None,
+        "action_id": restore_id,
+        "tab_id": new_tab_id,
+    }
+
+
+# --- the endpoint -----------------------------------------------------------
+async def restore_action(request: Request) -> JSONResponse:
+    require_ext_token(request)      # 401 before anything else
+    require_operational(request)    # 503 in degraded mode
+
+    action_id = request.path_params["action_id"]
+    orig = await request.app.state.db.read(lambda c: _read_action(c, action_id))
+    if orig is None:
+        raise HTTPException(status_code=404, detail=f"action {action_id} not found")
+
+    res = await restore_row(request.app, orig)
+    if res["restored"]:
+        return JSONResponse(
+            {"ok": True, "restored": True, "action_id": res["action_id"], "tab_id": res["tab_id"]}
+        )
+    return JSONResponse({"ok": True, "restored": False, "reason": res["reason"]})

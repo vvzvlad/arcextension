@@ -92,3 +92,51 @@ export async function getIdentity(chromeApi) {
     return null;
   }
 }
+
+// --- rules editor (§8/§10) ----------------------------------------------------
+// The editor needs the network (a live server-side preview + CRUD). Every call is
+// Bearer-authed with the instance token, exactly like fetchState/postFocus above.
+function authHeaders(token) {
+  return { "Content-Type": "application/json", Authorization: "Bearer " + token };
+}
+
+export async function fetchRules(fetchFn, base, token) {
+  const resp = await fetchFn(base + "/api/rules", {
+    headers: { Authorization: "Bearer " + token },
+  });
+  if (!resp.ok) throw new Error("GET /api/rules failed: HTTP " + resp.status);
+  const body = await resp.json();
+  return body.rules || [];
+}
+
+// Server-side preview (§8): the SAME whole-pass model the confirm gate uses, so the
+// human sees the impact BEFORE saving. Returns the preview payload as-is.
+export async function previewRule(fetchFn, base, token, payload) {
+  const resp = await fetchFn(base + "/api/rules/preview", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(payload),
+  });
+  const body = await resp.json().catch(() => null);
+  return { status: resp.status, body };
+}
+
+// CRUD (§7 endpoints). A mutating call may come back 409 carrying the preview when it
+// needs confirmation (§8); the caller re-submits with confirm_impact:true. Returns
+// {status, body} so the store drives the confirm gate without throwing on a 409.
+export async function saveRule(fetchFn, base, token, { op, id, rule, confirmImpact }) {
+  const body = { ...rule };
+  if (confirmImpact) body.confirm_impact = true;
+  let url = base + "/api/rules";
+  let method = "POST";
+  if (op === "update") {
+    url = base + "/api/rules/" + id;
+    method = "PUT";
+  } else if (op === "delete") {
+    url = base + "/api/rules/" + id;
+    method = "DELETE";
+  }
+  const resp = await fetchFn(url, { method, headers: authHeaders(token), body: JSON.stringify(body) });
+  const parsed = await resp.json().catch(() => null);
+  return { status: resp.status, body: parsed };
+}

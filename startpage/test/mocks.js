@@ -76,6 +76,28 @@ export function makeFetch(routes = {}) {
       const v = typeof r === "function" ? r(opts, counts.focus) : r;
       return jsonResponse(v.status ?? 200, v.body ?? { ok: true });
     }
+    // --- rules editor (§8/§10). /preview is more specific — check it first. -----
+    if (u.includes("/api/rules/preview")) {
+      counts.rulesPreview = (counts.rulesPreview || 0) + 1;
+      const r = routes.rulesPreview;
+      const v = typeof r === "function" ? r(opts, counts.rulesPreview) : r;
+      return jsonResponse((v && v.status) ?? 200, (v && v.body) ?? { relocations: 0, closures: 0, impact: 0 });
+    }
+    if (u.includes("/api/rules")) {
+      const method = (opts && opts.method ? opts.method : "GET").toUpperCase();
+      if (method === "GET") {
+        counts.rules = (counts.rules || 0) + 1;
+        const r = routes.rules;
+        if (r === undefined) return jsonResponse(200, { rules: [] });
+        const v = typeof r === "function" ? r(counts.rules) : r;
+        if (v instanceof Error) throw v;
+        return jsonResponse((v && v.status) ?? 200, (v && v.body) ?? { rules: v.rules ?? [] });
+      }
+      counts.rulesSave = (counts.rulesSave || 0) + 1;
+      const r = routes.rulesSave;
+      const v = typeof r === "function" ? r(opts, counts.rulesSave) : r;
+      return jsonResponse((v && v.status) ?? 200, (v && v.body) ?? { ok: true });
+    }
     throw new Error("unrouted fetch: " + u);
   };
   return { fetchFn, counts };

@@ -16,6 +16,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 
+from src.api.actions import list_actions
 from src.api.guards import require_operational
 from src.api.quick_links import quick_links_ops
 from src.api.restore import restore_action
@@ -29,6 +30,7 @@ from src.api.rules import (
     update_rule,
 )
 from src.api.run_pass import run_pass_endpoint
+from src.api.undo import undo_pass
 from src.curator import runner
 from src.curator.clock import ClockGuard
 from src.db.access import Database
@@ -130,11 +132,15 @@ def create_app(settings) -> Starlette:
         Route("/api/focus", focus, methods=["POST"]),
         # Quick links offline op queue flush (§10): array of ops + Idempotency-Key.
         Route("/api/quick_links/ops", quick_links_ops, methods=["POST"]),
+        # Archive list (§10): filtered, deferred hidden by default, newest-first.
+        Route("/api/actions", list_actions, methods=["GET"]),
         Route(
             "/api/actions/{action_id:int}/restore",
             restore_action,
             methods=["POST"],
         ),
+        # Pass undo (§10): restore per reversible row + close copies; per-row summary.
+        Route("/api/passes/{pass_id}/undo", undo_pass, methods=["POST"]),
         # Rules engine (§8, §10). `/preview` and `/:id/reset` are declared before the
         # bare `/api/rules` so their distinct paths route unambiguously.
         Route("/api/rules", list_rules, methods=["GET"]),
