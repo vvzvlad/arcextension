@@ -9,6 +9,7 @@ caller-supplied output root.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import struct
@@ -45,6 +46,25 @@ _COPY_IGNORE = shutil.ignore_patterns(
 # --------------------------------------------------------------------------- #
 # Layout
 # --------------------------------------------------------------------------- #
+def _write_private_text(path, text: str) -> None:
+    """Write *text* to *path* owner-only (0600).
+
+    ``instance.json`` carries the ``EXT_TOKEN`` in cleartext — a credential as
+    sensitive as the signing key (which is already 0600), so it must never be
+    group/world-readable at rest. Atomic create at 0600; the explicit ``chmod``
+    also covers an OVERWRITE (restamp rewrites the token in place) where an existing
+    file's mode would otherwise persist. The browser runs as the same user, so
+    owner-only loses no functionality.
+    """
+    data = text.encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+
+
 def slugify(text: str) -> str:
     """A filesystem-safe slug for a dir name / bundle id segment."""
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", text.strip()).strip("-._")
@@ -360,9 +380,7 @@ def generate_instance(
     instance = build_instance_json(
         instance_id, title, service_url, token, allow_execute_js
     )
-    paths.instance_json.write_text(
-        json.dumps(instance, indent=2) + "\n", encoding="utf-8"
-    )
+    _write_private_text(paths.instance_json, json.dumps(instance, indent=2) + "\n")
 
     # 3. Stamp <host> + key into the copied manifest.
     host = host_from_service_url(service_url)
@@ -472,7 +490,7 @@ def restamp_all(
             data["serviceUrl"] = service_url
             _restamp_manifest_host(ij.parent / "manifest.json", service_url)
 
-        ij.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        _write_private_text(ij, json.dumps(data, indent=2) + "\n")
         changes.append(
             RestampChange(
                 instance_json=ij,

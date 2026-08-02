@@ -370,3 +370,21 @@ def test_title_with_traversal_stays_under_out_root(tmp_path):
     # The human-readable title still survives verbatim in Info.plist.
     plist = res.paths.info_plist.read_text()
     assert "../../escape" in plist  # CFBundleName keeps the raw (xml-escaped) title
+
+
+# --- instance.json (carries EXT_TOKEN) is owner-only 0600, like the signing key ---
+def test_instance_json_written_0600(tmp_path):
+    # A group/world-readable token-at-rest is a secret leak; the signing key is 0600,
+    # so the token file must match. Reddens if the 0600 write is reverted to write_text.
+    res = _gen(tmp_path, "sec", token="super-secret-token")
+    mode = res.paths.instance_json.stat().st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+
+
+def test_restamp_keeps_instance_json_0600(tmp_path):
+    # Restamp rewrites the token in place — the overwrite must preserve 0600 (an
+    # existing file's mode would otherwise persist).
+    _gen(tmp_path, "sec", token="old-secret")
+    core.restamp_all(tmp_path, token="new-secret")
+    ij = next(iter(core.iter_instance_json_paths(tmp_path)))
+    assert (ij.stat().st_mode & 0o777) == 0o600, oct(ij.stat().st_mode & 0o777)
