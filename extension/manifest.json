@@ -37,8 +37,10 @@
 
   "options_page": "pages/options.html",
 
+  "//action": "The toolbar popup is 'Rule from this tab' (§8, §10): one click to add a rule <origin>/* -> this instance with a server-side impact preview.",
   "action": {
-    "default_title": "arcextension"
+    "default_title": "arcextension",
+    "default_popup": "pages/popup.html"
   },
 
   "incognito": "not_allowed"

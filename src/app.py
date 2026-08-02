@@ -18,6 +18,14 @@ from starlette.routing import Route, WebSocketRoute
 
 from src.api.guards import require_operational
 from src.api.restore import restore_action
+from src.api.rules import (
+    create_rule,
+    delete_rule,
+    list_rules,
+    preview_rule,
+    reset_rule,
+    update_rule,
+)
 from src.db.access import Database
 from src.db.backup import nightly_backup_loop
 from src.db.retention import retention_loop
@@ -86,6 +94,14 @@ def create_app(settings) -> Starlette:
             restore_action,
             methods=["POST"],
         ),
+        # Rules engine (§8, §10). `/preview` and `/:id/reset` are declared before the
+        # bare `/api/rules` so their distinct paths route unambiguously.
+        Route("/api/rules", list_rules, methods=["GET"]),
+        Route("/api/rules", create_rule, methods=["POST"]),
+        Route("/api/rules/preview", preview_rule, methods=["POST"]),
+        Route("/api/rules/{rule_id:int}", update_rule, methods=["PUT"]),
+        Route("/api/rules/{rule_id:int}", delete_rule, methods=["DELETE"]),
+        Route("/api/rules/{rule_id:int}/reset", reset_rule, methods=["POST"]),
         WebSocketRoute("/ext", ext_channel),
     ]
     return Starlette(routes=routes, lifespan=lifespan)
