@@ -1,8 +1,9 @@
 """Service -> extension commands: send, correlate by id, time out, surface codes.
 
 This is the SERVICE half of §6 "Команды (сервис → расширение)". The extension
-executes the verbs in a later phase; here we own the send + correlate + timeout +
-error-code path, plus the ``execute_js`` audit-before-send rule (§12).
+executes the verbs (§6 dispatcher); here we own the send + correlate + timeout +
+error-code path, plus the ``execute_js`` audit-before-send rule and the runtime
+kill-switch that can refuse an ``execute_js`` before it is ever sent (§12).
 
 Correlation: :func:`send_command` builds a ``command {id, sessionId, command,
 params}`` frame, stores an :class:`asyncio.Future` under ``id`` on the live
@@ -25,6 +26,7 @@ from typing import Any
 from loguru import logger
 
 from src.db.audit import insert_js_audit, update_js_audit_outcome
+from src.db.settings_store import is_execute_js_enabled
 from src.ext import protocol
 
 
@@ -153,6 +155,19 @@ async def send_command(
                 now=_now_ms(),
             )
         )
+
+        # Runtime kill-switch (§12 "запретить execute_js везде сейчас"): the
+        # audit row is written FIRST (a refused call is still the only trace of an
+        # execute_js attempt), THEN the switch is checked. When off we record
+        # outcome='disabled' and REFUSE — no frame is ever put on the socket.
+        if not await db.read(is_execute_js_enabled):
+            # best-effort like every other outcome-update: a failure here must not
+            # mask the intended CommandError (the audit row is already committed).
+            await _safe_update_outcome(db, audit_id, "disabled", "kill_switch")
+            raise CommandError(
+                protocol.ERR_JS_DISABLED,
+                "execute_js is disabled by the runtime kill-switch",
+            )
 
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
