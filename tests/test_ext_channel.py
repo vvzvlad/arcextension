@@ -252,6 +252,57 @@ def test_duplicate_instance_rejected_first_socket_survives(tmp_path):
             assert got == (7,), "the surviving first socket still applies snapshots"
 
 
+# --- degraded /ext is refused (§12) -----------------------------------------
+def test_degraded_ext_rejected_no_row_no_registry(tmp_path):
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        client.app.state.degraded = True
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_hello())
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()   # accept then close 1011, no hello handling
+        # No instance row was written and nothing registered.
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
+        assert client.app.state.ext_registry.get("i1") is None
+
+
+# --- a non-str token must not crash compare_digest (str-coercion) ------------
+def test_non_str_token_rejected_cleanly(tmp_path):
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_hello(token=12345))     # int, not str
+            ack = ws.receive_json()
+            assert ack["ok"] is False and ack["error"]["code"] == "auth"
+
+
+# --- a snapshot with NO id must be ignored, never wipe tabs ------------------
+def test_snapshot_without_id_is_ignored(tmp_path):
+    import time as _time
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    tab = {"tabId": 1, "windowId": 1, "url": "https://a", "title": "a",
+           "favIconUrl": None, "pinned": False, "active": True, "audible": False,
+           "ageMs": 0, "openedAgoMs": 0, "ageUnknown": False, "selfNavigating": False}
+    with TestClient(app) as client:
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_hello())
+            ws.receive_json()                     # hello_ack
+            req = ws.receive_json()               # snapshot_request
+            ws.send_json({"type": "snapshot", "id": req["id"], "sessionId": "sess-1",
+                          "focusedWindowId": 1, "tabs": [tab],
+                          "windows": [{"id": 1, "type": "normal", "state": "normal"}]})
+            _wait_until(lambda: _db_row(
+                db_path, "SELECT COUNT(*) FROM tabs WHERE instance_id='i1'") == (1,))
+            # Unsolicited snapshot with NO id and NO sessionId: the old None==None
+            # bypass would treat it as a session change and WIPE the tab. It must be
+            # ignored — the tab survives.
+            ws.send_json({"type": "snapshot", "focusedWindowId": 9, "tabs": [], "windows": []})
+            _time.sleep(0.15)
+            assert _db_row(db_path, "SELECT COUNT(*) FROM tabs WHERE instance_id='i1'") == (1,)
+
+
 # --- heartbeat wiring (integration, not just the pure step) ------------------
 def test_heartbeat_closes_after_two_missed_pongs(tmp_path):
     # With a small interval and NO pong ever sent, the server must ping then close

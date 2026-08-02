@@ -96,12 +96,25 @@ def apply_snapshot(
         tab_ids.append(tab_id)
 
     # --- replace the window list --------------------------------------------
+    # window_id/type are NOT NULL; a malformed (non-int id, missing type) or
+    # DUPLICATE window must not hit the constraint / PK and abort the whole
+    # snapshot transaction (which would drop the instance out of curation) — skip it.
     conn.execute("DELETE FROM windows WHERE instance_id = ?", (instance_id,))
+    seen_windows: set[int] = set()
     for win in snapshot.get("windows") or []:
+        win_id = win.get("id")
+        win_type = win.get("type")
+        if not isinstance(win_id, int) or isinstance(win_id, bool):
+            continue
+        if not isinstance(win_type, str):
+            continue
+        if win_id in seen_windows:
+            continue
+        seen_windows.add(win_id)
         conn.execute(
             "INSERT INTO windows (instance_id, window_id, type, state) "
             "VALUES (?, ?, ?, ?)",
-            (instance_id, win.get("id"), win.get("type"), win.get("state")),
+            (instance_id, win_id, win_type, win.get("state")),
         )
 
     # --- instance-level update ----------------------------------------------

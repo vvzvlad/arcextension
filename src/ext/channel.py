@@ -71,11 +71,25 @@ async def ext_channel(websocket: WebSocket) -> None:
     registry: Registry = app.state.ext_registry
     db = app.state.db
 
-    conn_state.heartbeat_task = asyncio.create_task(
-        _heartbeat(websocket, conn_state, settings.heartbeat_ms)
-    )
-
     try:
+        # hello_ack + the first snapshot_request are sent INSIDE this try/finally:
+        # they run AFTER _handle_hello committed connected=1 and registered the
+        # socket, so a peer drop here MUST still reach _finalize (epoch-guarded
+        # mark_disconnected + de-register). Otherwise a phantom connected=1 row and
+        # an orphan ConnState would linger with no live socket (§6 — the invariant
+        # the whole epoch guard exists to protect).
+        await websocket.send_json(
+            {
+                "type": protocol.TYPE_HELLO_ACK,
+                "ok": True,
+                "instanceId": instance_id,
+                "connEpoch": conn_state.conn_epoch,
+            }
+        )
+        await _send_snapshot_request(websocket, conn_state)
+        conn_state.heartbeat_task = asyncio.create_task(
+            _heartbeat(websocket, conn_state, settings.heartbeat_ms)
+        )
         await _receive_loop(websocket, app, conn_state, instance_id)
     except WebSocketDisconnect:
         pass
@@ -169,16 +183,9 @@ async def _handle_hello(
         )
         registry.put(instance_id, conn_state)
 
-    await websocket.send_json(
-        {
-            "type": protocol.TYPE_HELLO_ACK,
-            "ok": True,
-            "instanceId": instance_id,
-            "connEpoch": new_epoch,
-        }
-    )
-    # Immediately request the first snapshot; record its server send-time.
-    await _send_snapshot_request(websocket, conn_state)
+    # NOTE: the hello_ack and first snapshot_request are sent by the CALLER, inside
+    # its try/finally — so a drop between the commit above and those sends still
+    # runs _finalize (no phantom connected=1 / orphan ConnState).
     return conn_state
 
 
@@ -239,7 +246,12 @@ async def _handle_snapshot(
     # Ignore a reply whose id is unknown/stale, or that arrived on a socket whose
     # epoch is no longer current (§6). Reading back the registry entry proves this
     # socket still owns the instance.
-    if msg.get("id") != conn_state.pending_snapshot_id:
+    # A frame with NO id must NOT pass: `msg.get("id")` (None) != pending (also None
+    # once consumed) is False, which would apply an UNSOLICITED snapshot with
+    # sent_at=None — the sent_at-bounded delete becomes `<= NULL` (never) and a
+    # missing sessionId reads as a session change → wipe. Guard `pending is None`.
+    pending = conn_state.pending_snapshot_id
+    if pending is None or msg.get("id") != pending:
         return
     if registry.get(instance_id) is not conn_state:
         return

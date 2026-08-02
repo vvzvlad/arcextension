@@ -10,6 +10,7 @@ tested without a socket or a wall clock.
 
 from __future__ import annotations
 
+import hmac
 from typing import Any
 
 # --- Message types (the `type` field of every frame) ------------------------
@@ -70,7 +71,10 @@ def hello_reject_reason(
     """
     if msg.get("protocolVersion") != protocol_version:
         return REJECT_PROTOCOL
-    if msg.get("token") != ext_token:
+    # Constant-time compare — a short-circuiting `!=` leaks the token byte-by-byte
+    # via timing. str-coerce both sides: compare_digest raises TypeError on a
+    # non-str / str-vs-bytes mismatch, and this runs outside any try/except.
+    if not hmac.compare_digest(str(msg.get("token") or ""), str(ext_token)):
         return REJECT_AUTH
     instance_id = msg.get("instanceId")
     if not isinstance(instance_id, str) or not instance_id.strip():
@@ -84,6 +88,19 @@ def hello_reject_reason(
     return None
 
 
+def _safe_int(value: Any) -> int:
+    """Coerce a client-supplied age to int; a malformed value becomes 0 (fresh).
+
+    A non-numeric ``ageMs``/``openedAgoMs`` must NOT raise and abort the whole
+    snapshot transaction — that would drop an authenticated instance out of
+    curation until it reconnects (same reasoning as the non-int tabId skip).
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def tab_info_to_row(instance_id: str, tab: dict[str, Any], now: int) -> tuple:
     """Map one client ``TabInfo`` to a positional ``tabs`` row tuple.
 
@@ -95,8 +112,8 @@ def tab_info_to_row(instance_id: str, tab: dict[str, Any], now: int) -> tuple:
 
     Column order matches ``_UPSERT_TAB`` below.
     """
-    age_ms = int(tab.get("ageMs") or 0)
-    opened_ago_ms = int(tab.get("openedAgoMs") or 0)
+    age_ms = _safe_int(tab.get("ageMs"))
+    opened_ago_ms = _safe_int(tab.get("openedAgoMs"))
     last_active_at = min(now, now - age_ms)
     opened_at = min(now, now - opened_ago_ms)
     return (

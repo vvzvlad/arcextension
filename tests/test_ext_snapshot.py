@@ -160,6 +160,39 @@ async def test_snapshot_upserts_over_a_preexisting_row(tmp_path):
         await db.close()
 
 
+# --- malformed fields must not abort the whole transaction ------------------
+async def test_malformed_ages_and_windows_do_not_abort(tmp_path):
+    # Non-numeric ages coerce to 0 (fresh); a bad/duplicate window is skipped.
+    # Without this, int("x") / a NOT-NULL / a PK collision aborts apply_snapshot
+    # and drops the instance out of curation.
+    db = await _make_db(tmp_path)
+    try:
+        base = 7_000_000
+        epoch = await _register(db, "i", "s", base)
+        snap = {
+            "sessionId": "s", "focusedWindowId": 1,
+            "tabs": [_tab(1, ageMs="x"), _tab(2, openedAgoMs=[])],  # malformed ages
+            "windows": [
+                {"id": 1, "type": "normal", "state": "normal"},
+                {"id": None, "type": "normal"},   # bad id -> skipped
+                {"id": 2},                          # missing type -> skipped
+                {"id": 1, "type": "normal"},        # duplicate window_id -> skipped
+            ],
+        }
+        await db.write(
+            lambda c: apply_snapshot(c, "i", snap, sent_at=base, now=base + 5, expected_epoch=epoch)
+        )
+        assert await _tab_ids(db, "i") == [1, 2]   # both tabs applied
+        wins = await db.read(
+            lambda c: c.execute(
+                "SELECT window_id FROM windows WHERE instance_id='i'"
+            ).fetchall()
+        )
+        assert wins == [(1,)]                        # only the one valid window
+    finally:
+        await db.close()
+
+
 # --- epoch-guarded snapshot application (TOCTOU at eviction) ----------------
 async def test_stale_epoch_snapshot_is_discarded(tmp_path):
     # A snapshot from a socket whose epoch was superseded (a newer hello bumped
