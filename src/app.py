@@ -9,6 +9,7 @@ crash startup: the app still serves so that a later /metrics can export
 
 import asyncio
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 from loguru import logger
 from starlette.applications import Starlette
@@ -38,6 +39,7 @@ from src.db.backup import nightly_backup_loop
 from src.db.retention import retention_loop
 from src.ext.channel import ext_channel
 from src.ext.registry import Registry
+from src.mcpiface.server import build_mcp, mcp_route
 
 # Re-exported so callers (and tests) keep importing it from src.app; the
 # implementation lives in src.api.guards to avoid an app<->endpoint import cycle.
@@ -71,6 +73,13 @@ async def _curator_driver(app, db, settings) -> None:
 
 
 def create_app(settings) -> Starlette:
+    # Build the MCP server ONCE, before the lifespan (§11 trap #1: streamable_http_app()
+    # creates the session_manager lazily and must be called before it is accessed).
+    # The tools read `app_ref.app.state` at call time; `app_ref.app` is filled in below
+    # once the Starlette app exists (by then the lifespan has populated app.state).
+    app_ref = SimpleNamespace(app=None)
+    mcp = build_mcp(app_ref)
+
     @asynccontextmanager
     async def lifespan(app: Starlette):
         db = Database(settings.db_path, settings.backup_dir)
@@ -113,7 +122,12 @@ def create_app(settings) -> Starlette:
             )
 
         try:
-            yield
+            # Enter the MCP session manager's task group for the serving window (§11
+            # trap #2: a mounted sub-app's lifespan is NOT run by Starlette, so the
+            # HOST lifespan must initialize it or the first /mcp request raises
+            # "Task group is not initialized").
+            async with mcp.session_manager.run():
+                yield
         finally:
             for task in background_tasks:
                 task.cancel()
@@ -151,6 +165,14 @@ def create_app(settings) -> Starlette:
         Route("/api/rules/{rule_id:int}/reset", reset_rule, methods=["POST"]),
         # Curator pass (§7): trigger one pass (dry_run / confirm_pending optional).
         Route("/api/run_pass", run_pass_endpoint, methods=["POST"]),
+        # MCP over streamable HTTP (§11): an exact Route at /mcp (NOT a Mount under
+        # /mcp, which would double the path to /mcp/mcp and add a 307). Auth is the
+        # same EXT_TOKEN Bearer, enforced inside the ASGI handler.
+        mcp_route(mcp),
         WebSocketRoute("/ext", ext_channel),
     ]
-    return Starlette(routes=routes, lifespan=lifespan)
+    app = Starlette(routes=routes, lifespan=lifespan)
+    # Let the MCP tools reach app.state (db / ext_registry / settings) at call time.
+    app_ref.app = app
+    app.state.mcp = mcp
+    return app
