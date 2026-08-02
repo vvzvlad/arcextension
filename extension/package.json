@@ -1,0 +1,13 @@
+{
+  "name": "arcextension-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser (MV3) side of arcextension: activity map, tick, snapshot build, /ext connection.",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.9"
+  }
+}
