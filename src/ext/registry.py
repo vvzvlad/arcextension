@@ -32,6 +32,11 @@ class ConnState:
     pending_snapshot_id: str | None = None
     pending_sent_at: int | None = None
     heartbeat_task: asyncio.Task | None = None
+    # Outstanding service->extension commands keyed by request id (§6). Each
+    # `send_command` stores a Future here and awaits it; the receive loop
+    # resolves it when the matching `response {id}` frame arrives. A response
+    # whose id is not present is a late/duplicate reply and is ignored.
+    pending_commands: dict[str, asyncio.Future] = field(default_factory=dict)
 
 
 @dataclass

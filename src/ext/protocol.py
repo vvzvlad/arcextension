@@ -20,6 +20,35 @@ TYPE_SNAPSHOT_REQUEST = "snapshot_request"
 TYPE_SNAPSHOT = "snapshot"
 TYPE_PING = "ping"
 TYPE_PONG = "pong"
+# Service -> extension commands and their correlated replies (§6). A `command`
+# carries an `id`; the matching `response` echoes that `id` and is either
+# `{ok:true, result}` or `{ok:false, error:{code, message}}`.
+TYPE_COMMAND = "command"
+TYPE_RESPONSE = "response"
+
+# --- Command verbs (§6 "Команды (сервис → расширение)") ---------------------
+CMD_OPEN_TAB = "open_tab"
+CMD_CLOSE_TAB = "close_tab"
+CMD_GET_TAB = "get_tab"
+CMD_FOCUS_TAB = "focus_tab"
+CMD_NAVIGATE_TAB = "navigate_tab"
+CMD_MERGE_WINDOWS = "merge_windows"
+CMD_EXECUTE_JS = "execute_js"
+
+# --- Command error codes (§6) -----------------------------------------------
+# The `error.code` a failing `response` may carry. These are the extension-side
+# codes; two service-side codes below name failures that never leave the service.
+ERR_STALE_SESSION = "stale_session"
+ERR_PRECONDITION_FAILED = "precondition_failed"
+ERR_NO_SUCH_TAB = "no_such_tab"
+ERR_NO_WINDOW = "no_window"
+ERR_JS_DISABLED = "js_disabled"
+ERR_BUSY_DRAGGING = "busy_dragging"
+ERR_INTERNAL = "internal"
+# Service-side only: no live socket for the instance, and the local send/wait
+# timed out before any `response` arrived.
+ERR_NO_CONNECTION = "no_connection"
+ERR_TIMEOUT = "timeout"
 
 # --- Reject reasons / hello_ack error codes ---------------------------------
 # The `reject_reason` stored in `instances` and the `error.code` returned in a

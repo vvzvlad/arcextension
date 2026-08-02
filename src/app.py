@@ -12,27 +12,21 @@ from contextlib import asynccontextmanager
 
 from loguru import logger
 from starlette.applications import Starlette
-from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 
+from src.api.guards import require_operational
+from src.api.restore import restore_action
 from src.db.access import Database
 from src.db.backup import nightly_backup_loop
+from src.db.retention import retention_loop
 from src.ext.channel import ext_channel
 from src.ext.registry import Registry
 
-
-def require_operational(request: Request) -> None:
-    """Raise 503 when the service is in degraded mode.
-
-    Later phases' mutating endpoints (``/api/*``, ``/ext``) call this so they
-    refuse to act on a database whose migrations failed or that was migrated by
-    newer code. ``/healthz`` deliberately does NOT call it — liveness must stay
-    green so an orchestrator keeps routing to the container (§12).
-    """
-    if getattr(request.app.state, "degraded", False):
-        raise HTTPException(status_code=503, detail="service degraded")
+# Re-exported so callers (and tests) keep importing it from src.app; the
+# implementation lives in src.api.guards to avoid an app<->endpoint import cycle.
+__all__ = ["create_app", "healthz", "require_operational"]
 
 
 async def healthz(request: Request) -> JSONResponse:
@@ -54,25 +48,44 @@ def create_app(settings) -> Starlette:
         app.state.ext_registry = Registry()
         app.state.ext_rejections = 0
 
-        backup_task: asyncio.Task | None = None
+        background_tasks: list[asyncio.Task] = []
         if not result.degraded:
-            backup_task = asyncio.create_task(nightly_backup_loop(db))
+            background_tasks.append(asyncio.create_task(nightly_backup_loop(db)))
+            # Sibling periodic task: prune old actions / js_audit (§12). Separate,
+            # longer horizon for js_audit is enforced inside run_retention.
+            background_tasks.append(
+                asyncio.create_task(
+                    retention_loop(
+                        db,
+                        settings.actions_retention_days,
+                        settings.js_audit_retention_days,
+                    )
+                )
+            )
         else:
-            logger.warning("degraded mode: nightly backup loop not started")
+            logger.warning(
+                "degraded mode: nightly backup and retention loops not started"
+            )
 
         try:
             yield
         finally:
-            if backup_task is not None:
-                backup_task.cancel()
+            for task in background_tasks:
+                task.cancel()
+            for task in background_tasks:
                 try:
-                    await backup_task
+                    await task
                 except asyncio.CancelledError:
                     pass
             await db.close()
 
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
+        Route(
+            "/api/actions/{action_id:int}/restore",
+            restore_action,
+            methods=["POST"],
+        ),
         WebSocketRoute("/ext", ext_channel),
     ]
     return Starlette(routes=routes, lifespan=lifespan)

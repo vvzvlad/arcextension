@@ -25,6 +25,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from src.db import queries
 from src.ext import protocol
+from src.ext.commands import resolve_response
 from src.ext.registry import ConnState, Registry
 from src.ext.snapshot import apply_snapshot
 
@@ -236,6 +237,10 @@ async def _receive_loop(
             conn_state.alive = True
         elif mtype == protocol.TYPE_SNAPSHOT:
             await _handle_snapshot(db, registry, conn_state, instance_id, msg)
+        elif mtype == protocol.TYPE_RESPONSE:
+            # Correlated reply to a service->extension command (§6). Resolve the
+            # pending Future by id; an unknown id (late/duplicate) is ignored.
+            resolve_response(conn_state, msg)
         # Any other frame is unsolicited and ignored (§6: pong is the only
         # unsolicited client message; everything else is a reply keyed by id).
 

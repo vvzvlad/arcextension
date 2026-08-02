@@ -14,6 +14,9 @@ def _settings(tmp_path):
         backup_dir=str(tmp_path / "backups"),
         host="0.0.0.0",
         port=8000,
+        # Consumed by the retention loop started in the app lifespan (Фаза 4).
+        actions_retention_days=90,
+        js_audit_retention_days=730,
     )
 
 
