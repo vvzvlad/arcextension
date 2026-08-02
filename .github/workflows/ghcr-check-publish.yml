@@ -25,7 +25,8 @@ jobs:
 
     - name: Run tests
       env:
-        TELEGRAM_BOT_TOKEN: test-token   # required ENV so importing settings works
+        EXT_TOKEN: test-ext-token        # required ENV so importing settings works
+        METRICS_TOKEN: test-metrics-token
       run: pytest --tb=short -q
 
   build:

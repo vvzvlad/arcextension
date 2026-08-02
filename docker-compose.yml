@@ -5,16 +5,16 @@
 # no inbound port, drop `networks`, the Traefik labels and the healthcheck.
 
 volumes:
-  new_project:
+  curator:
 
 networks:
   docker_main_net:
     external: true
 
 services:
-  new_project:
-    image: ghcr.io/vvzvlad/new-project:latest
-    container_name: new-project
+  curator:
+    image: ghcr.io/vvzvlad/arcextension:latest
+    container_name: curator
     restart: always
     # The app runs as non-root user `app` (uid 1000): the entrypoint starts as
     # root, chowns /app/data and drops privileges via gosu. Setting a
@@ -27,9 +27,12 @@ services:
     # cap_drop: [ALL]
     # cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID]
     volumes:
-      - new_project:/app/data          # all mutable state survives restart/update
+      - curator:/app/data              # all mutable state survives restart/update
     environment:
-      TELEGRAM_BOT_TOKEN: XXX
+      # EXT_TOKEN opens /ext, /api/* and /mcp; METRICS_TOKEN is read-only for
+      # /metrics. Both are REQUIRED — an empty value fails startup (§4).
+      EXT_TOKEN: XXX
+      METRICS_TOKEN: XXX
       TZ: Europe/Moscow
     networks:
       - docker_main_net
@@ -40,17 +43,17 @@ services:
         max-size: 10m
     labels:
       traefik.enable: "true"
-      traefik.http.routers.newproject.rule: Host(`new.example.com`)
-      traefik.http.services.newproject.loadBalancer.server.port: 8000
-      traefik.http.routers.newproject.entrypoints: websecure
-      traefik.http.routers.newproject.tls: "true"
-      traefik.http.routers.newproject.tls.certresolver: letsEncrypt
+      traefik.http.routers.curator.rule: Host(`curator.example.com`)
+      traefik.http.services.curator.loadBalancer.server.port: 8000
+      traefik.http.routers.curator.entrypoints: websecure
+      traefik.http.routers.curator.tls: "true"
+      traefik.http.routers.curator.tls.certresolver: letsEncrypt
       com.centurylinklabs.watchtower.enable: "true"   # auto-update the image
     healthcheck:
       # Short interval + start_period are REQUIRED behind Traefik: Traefik does not
       # route to a container while its health is starting/unhealthy, so interval:30m
       # with no start_period leaves it unrouted for ~30 min (default cert + 404).
-      test: ["CMD", "curl", "-s", "-f", "-o", "/dev/null", "http://127.0.0.1:8000/health"]
+      test: ["CMD", "curl", "-s", "-f", "-o", "/dev/null", "http://127.0.0.1:8000/healthz"]
       interval: 15s
       timeout: 5s
       retries: 3
