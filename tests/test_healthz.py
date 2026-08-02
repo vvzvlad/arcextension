@@ -17,6 +17,8 @@ def _settings(tmp_path):
         # Consumed by the retention loop started in the app lifespan (Фаза 4).
         actions_retention_days=90,
         js_audit_retention_days=730,
+        # Consumed by the curator clock guard + driver started in the lifespan (Фаза 8).
+        pass_interval_min=5,
     )
 
 

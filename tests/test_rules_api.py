@@ -48,6 +48,7 @@ def _settings(tmp_path, **over):
         main_instance_id="main",
         actions_retention_days=90,
         js_audit_retention_days=730,
+        pass_interval_min=5,  # curator clock guard + driver (Фаза 8 lifespan)
     )
     s.update(over)
     return SimpleNamespace(**s)

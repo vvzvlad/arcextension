@@ -261,6 +261,7 @@ async def _handle_snapshot(
     if registry.get(instance_id) is not conn_state:
         return
     sent_at = conn_state.pending_sent_at
+    applied_id = pending
     conn_state.pending_snapshot_id = None
     conn_state.pending_sent_at = None
     now = _now_ms()
@@ -269,6 +270,9 @@ async def _handle_snapshot(
             c, instance_id, msg, sent_at, now, conn_state.conn_epoch
         )
     )
+    # Record WHICH request id was just applied so the curator pass can key its
+    # readiness on the id it sent (§7), never on the shared ``snapshot_at`` column.
+    conn_state.last_applied_snapshot_id = applied_id
     # Keep the connection's notion of the live session in sync with what it just
     # reported (used to reject stale replies / future readiness checks).
     conn_state.session_id = msg.get("sessionId")
