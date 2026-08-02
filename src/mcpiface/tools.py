@@ -426,14 +426,18 @@ async def run_pass(app, *, dry_run: bool = False) -> dict:
 async def pause(app, *, minutes: int | None = None) -> dict:
     """Pause the curator: write ``pause_until`` + bump the fencing epoch (stops an
     in-flight pass). Not itself a "mutating verb" that pause refuses. Defaults to
-    ``PAUSE_DEFAULT_MIN``."""
-    mins = minutes if minutes is not None else app.state.settings.pause_default_min
+    ``PAUSE_DEFAULT_MIN`` and is clamped to a finite window (a pause is never
+    infinite, §7) — the same write-shape as ``POST /api/pause``."""
+    mins = pause_ops.clamp_minutes(minutes, app.state.settings.pause_default_min)
     now = _now_ms()
     until = await app.state.db.write(lambda c: pause_ops.pause(c, now=now, minutes=mins))
     return {"ok": True, "paused_until": until}
 
 
 async def resume(app) -> dict:
-    """Resume the curator: clear ``pause_until`` (§7/§12)."""
-    await app.state.db.write(pause_ops.resume)
+    """Resume the curator (§7/§12): apply the TTL shift on the ACTUAL pause duration,
+    then clear ``pause_until`` / ``pause_started_at`` / ``resume_pending``. Same
+    ``pause.resume`` write-shape as ``DELETE /api/pause``."""
+    now = _now_ms()
+    await app.state.db.write(lambda c: pause_ops.resume(c, now=now))
     return {"ok": True}

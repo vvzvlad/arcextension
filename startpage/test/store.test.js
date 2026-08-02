@@ -164,6 +164,76 @@ describe("local search (§10)", () => {
   });
 });
 
+// --- pause (§7) ---------------------------------------------------------------
+describe("pause status (§7)", () => {
+  it("surfaces paused_until + resume_pending from state (offline-first, via applyState)", () => {
+    const env = makeChrome({ tabs: [], messages: {} });
+    const store = storeWith(env, makeFetch({ state: undefined }).fetchFn);
+    // applyState is the single writer and runs from the CACHE too — a cached pause
+    // renders with no network (§7 "видимость обязательна").
+    store.applyState({
+      instances: [],
+      tabs: [],
+      quick_links: [],
+      paused_until: 5_000_000,
+      resume_pending: true,
+    });
+    expect(store.pausedUntil.value).toBe(5_000_000);
+    expect(store.resumePending.value).toBe(true);
+
+    // A pre-pause state (no key) reads as "not paused", never undefined.
+    store.applyState({ instances: [], tabs: [], quick_links: [] });
+    expect(store.pausedUntil.value).toBe(null);
+    expect(store.resumePending.value).toBe(false);
+  });
+
+  it("pauseCurator POSTs /api/pause and reflects the new deadline", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [] } },
+      pausePost: { status: 200, body: { paused_until: 9_000_000, pause_started_at: 1_000_000 } },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh(); // online: base/token set
+
+    const res = await store.pauseCurator();
+    expect(res.ok).toBe(true);
+    expect(counts.pausePost).toBe(1);
+    expect(store.pausedUntil.value).toBe(9_000_000);
+  });
+
+  it("resumeCurator DELETEs /api/pause, clears the deadline, and re-fetches state", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], paused_until: null } },
+      pauseDelete: { status: 200, body: { resumed: true, pass: { status: "no_ready_instances" } } },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+    store.pausedUntil.value = 9_000_000; // pretend a pause was armed
+
+    const before = counts.state;
+    const res = await store.resumeCurator();
+    expect(res.ok).toBe(true);
+    expect(counts.pauseDelete).toBe(1);
+    expect(store.pausedUntil.value).toBe(null);
+    expect(counts.state).toBe(before + 1); // manual resume re-fetches the truth
+  });
+
+  it("offline: pause/resume no-op with an offline note (never throws)", async () => {
+    const env = makeChrome({ tabs: [], messages: {} });
+    // No init() → base/token stay null → the verbs cannot reach the network.
+    const store = storeWith(env, makeFetch({}).fetchFn);
+    const p = await store.pauseCurator();
+    expect(p.offline).toBe(true);
+    expect(store.pauseError.value).toBe("offline");
+    const r = await store.resumeCurator();
+    expect(r.offline).toBe(true);
+  });
+});
+
 // --- jump (§10) ---------------------------------------------------------------
 describe("jump own (§10)", () => {
   it("activates the tab, focuses its window, and closes the current newtab", async () => {

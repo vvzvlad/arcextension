@@ -20,6 +20,7 @@ the endpoint modules can import them without a cycle.
 from __future__ import annotations
 
 import secrets
+import time
 
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -62,3 +63,25 @@ def require_operational(request: Request) -> None:
     """Raise 503 when the service is in degraded mode (see module docstring)."""
     if getattr(request.app.state, "degraded", False):
         raise HTTPException(status_code=503, detail="service degraded")
+
+
+async def require_not_paused(request: Request) -> None:
+    """Refuse a mutating ``/api/*`` verb while a pause is armed (§7).
+
+    Mirrors :func:`require_operational` but for the pause "kill switch": a paused
+    curator silences ALL automation, not just the pass, so every mutating verb answers
+    ``paused {until}`` (§7 "Пауза глушит всю автоматику"). Applied to every mutating
+    ``/api/*`` route EXCEPT the resume verbs (``POST``/``DELETE /api/pause`` — else an
+    agent that paused by MCP could never lift it) and ``/api/run_pass`` (its own
+    dry_run/confirm/pause logic lives in the runner). Reads ``pause_until`` from the DB
+    — hence ``async`` — and raises **423 Locked** with a structured
+    ``{"error": "paused", "until": <ms>}`` body (rendered by the app's dict-detail
+    exception handler). 423 (the automation is locked) is used consistently for the
+    pause gate; the MCP path returns the parallel ``ToolError("paused", …)``.
+    """
+    # Leaf import (no import cycle): pause.py never imports the api package.
+    from src.curator.pause import read_pause_until
+
+    until = await request.app.state.db.read(read_pause_until)
+    if until is not None and until > int(time.time() * 1000):
+        raise HTTPException(status_code=423, detail={"error": "paused", "until": until})

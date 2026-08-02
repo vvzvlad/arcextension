@@ -6,9 +6,9 @@
 // tests can inject a fake chrome + fetch; in the real page the store falls back to
 // the browser globals. The first paint is local-only (offline-first): the store's
 // init() populates own tabs + cache, then refresh() hits GET /api/state.
-import { onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { createStore } from "./lib/store.js";
-import { formatTime } from "./lib/status.js";
+import { formatCountdown, formatTime } from "./lib/status.js";
 
 const EMPTY_DRAFT = { id: null, pattern: "", instance_id: "", singleton: false };
 
@@ -29,6 +29,27 @@ export default {
       if (!url) return;
       store.addQuickLink(url, title || null);
       form.reset();
+    }
+
+    // --- pause status bar (§7) ---------------------------------------------
+    // A live local clock drives the countdown; the deadline itself comes from the
+    // store (paused_until, offline-first from the cache). isPaused compares against
+    // this ticking `nowTick` so the row flips to "active" the instant it elapses.
+    const nowTick = ref(Date.now());
+    let pauseTimer = null;
+    const isPaused = computed(
+      () => store.pausedUntil.value != null && store.pausedUntil.value > nowTick.value,
+    );
+    const pauseRemaining = computed(() =>
+      isPaused.value ? formatCountdown(store.pausedUntil.value - nowTick.value) : "00:00",
+    );
+    async function onPause() {
+      // Post an explicit 60 so the "Пауза на час" label is always truthful,
+      // independent of the server's PAUSE_DEFAULT_MIN.
+      await store.pauseCurator(60);
+    }
+    async function onResume() {
+      await store.resumeCurator();
     }
 
     // --- rules editor local state (§8/§10) ---------------------------------
@@ -92,10 +113,21 @@ export default {
     }
 
     onMounted(async () => {
+      // The 1s pause countdown ticks regardless of autostart (a cached pause must
+      // still count down on a purely offline first paint, §7).
+      if (typeof setInterval !== "undefined") {
+        pauseTimer = setInterval(() => {
+          nowTick.value = Date.now();
+        }, 1000);
+      }
       if (!props.autostart) return;
       await store.init(); // local-only first paint
       await store.refresh(); // background live refresh
       await store.loadRules(); // rules editor needs the network (§10)
+    });
+
+    onUnmounted(() => {
+      if (pauseTimer != null) clearInterval(pauseTimer);
     });
 
     return {
@@ -111,6 +143,10 @@ export default {
       onSave,
       onDelete,
       pendingDeleteId,
+      isPaused,
+      pauseRemaining,
+      onPause,
+      onResume,
     };
   },
 };
@@ -267,8 +303,53 @@ export default {
       </p>
     </section>
 
-    <!-- Status bar: four instance states (§10) -->
+    <!-- Status bar: pause countdown ROW (§7) + four instance states (§10) -->
     <footer class="sp-status" data-role="status-bar">
+      <!-- Pause row (§7 "видимость обязательна"): a persistent ROW with a live
+           countdown, NOT a badge/toast. Renders from cache too (offline-first). -->
+      <div class="sp-status-row sp-pause-row" data-role="pause-row">
+        <template v-if="isPaused">
+          <span class="sp-dot paused"></span>
+          <span class="sp-status-name">Пауза</span>
+          <span class="sp-sub" data-role="pause-countdown">— осталось {{ pauseRemaining }}</span>
+          <button
+            class="sp-btn"
+            type="button"
+            data-role="pause-resume"
+            :disabled="store.offline.value"
+            @click="onResume"
+          >Возобновить</button>
+        </template>
+        <!-- Click-wait (§7): the hour elapsed but the curator DEFERS until confirmed,
+             so it is neither running nor over — show that explicitly (a forgotten pause
+             in this state must not read "active"). Resume clears the latch and runs a
+             pass now. -->
+        <template v-else-if="store.resumePending.value">
+          <span class="sp-dot paused"></span>
+          <span class="sp-status-name">Пауза истекла</span>
+          <span class="sp-sub" data-role="pause-pending">— ожидание подтверждения</span>
+          <button
+            class="sp-btn"
+            type="button"
+            data-role="pause-confirm"
+            :disabled="store.offline.value"
+            @click="onResume"
+          >Запустить сейчас</button>
+        </template>
+        <template v-else>
+          <span class="sp-dot ok"></span>
+          <span class="sp-status-name">Автоматика активна</span>
+          <button
+            class="sp-btn"
+            type="button"
+            data-role="pause-start"
+            :disabled="store.offline.value"
+            @click="onPause"
+          >Пауза на час</button>
+        </template>
+        <span v-if="store.pauseError.value" class="sp-sub sp-pause-error">{{ store.pauseError.value }}</span>
+      </div>
+
       <div v-for="row in store.statusRows.value" :key="row.id" class="sp-status-row">
         <span class="sp-dot" :class="row.status.state"></span>
         <span class="sp-status-name">{{ row.title }}</span>

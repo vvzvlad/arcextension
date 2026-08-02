@@ -13,15 +13,17 @@ from types import SimpleNamespace
 
 from loguru import logger
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route, WebSocketRoute
 
 from src.api.actions import list_actions
 from src.api.cors import CountingCORSMiddleware, cors_kwargs
 from src.api.guards import require_operational
 from src.api.metrics import metrics
+from src.api.pause import pause_endpoint, resume_endpoint
 from src.api.quick_links import quick_links_ops
 from src.api.restore import restore_action
 from src.api.state import focus, get_state
@@ -52,6 +54,20 @@ __all__ = ["create_app", "healthz", "require_operational"]
 async def healthz(request: Request) -> JSONResponse:
     # Liveness ONLY — never reflect curation/migration health here (§12).
     return JSONResponse({"status": "ok"})
+
+
+async def _http_exception(request: Request, exc: HTTPException) -> Response:
+    """HTTPException renderer: a DICT ``detail`` becomes a JSON body, everything else
+    keeps Starlette's plain-text default. The pause gate (``require_not_paused``)
+    raises 423 with ``{"error":"paused","until":<ms>}`` — a structured body the client
+    reads — while existing string-detail 4xx/5xx responses render unchanged (§7/§12)."""
+    if exc.status_code in {204, 304}:
+        return Response(status_code=exc.status_code, headers=exc.headers)
+    if isinstance(exc.detail, dict):
+        return JSONResponse(exc.detail, status_code=exc.status_code, headers=exc.headers)
+    return PlainTextResponse(
+        exc.detail, status_code=exc.status_code, headers=exc.headers
+    )
 
 
 async def _curator_driver(app, db, settings) -> None:
@@ -172,6 +188,10 @@ def create_app(settings) -> Starlette:
         Route("/api/rules/{rule_id:int}/reset", reset_rule, methods=["POST"]),
         # Curator pass (§7): trigger one pass (dry_run / confirm_pending optional).
         Route("/api/run_pass", run_pass_endpoint, methods=["POST"]),
+        # Pause (§7): POST arms/extends a finite pause; DELETE resumes (TTL shift +
+        # an immediate pass). Both are exceptions to the pause gate (resume verbs).
+        Route("/api/pause", pause_endpoint, methods=["POST"]),
+        Route("/api/pause", resume_endpoint, methods=["DELETE"]),
         # MCP over streamable HTTP (§11): an exact Route at /mcp (NOT a Mount under
         # /mcp, which would double the path to /mcp/mcp and add a 307). Auth is the
         # same EXT_TOKEN Bearer, enforced inside the ASGI handler.
@@ -187,7 +207,12 @@ def create_app(settings) -> Starlette:
             CountingCORSMiddleware, **cors_kwargs(settings.ext_allowed_origins)
         )
     ]
-    app = Starlette(routes=routes, lifespan=lifespan, middleware=middleware)
+    app = Starlette(
+        routes=routes,
+        lifespan=lifespan,
+        middleware=middleware,
+        exception_handlers={HTTPException: _http_exception},
+    )
     # Let the MCP tools reach app.state (db / ext_registry / settings) at call time.
     app_ref.app = app
     app.state.mcp = mcp

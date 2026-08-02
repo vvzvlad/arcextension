@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from src.curator.pause import RESUME_PENDING_KEY, read_pause_until
+
 # Column lists kept next to their SELECTs so the JSON shape and the SQL never drift
 # from §10's StateResponse.
 _INSTANCE_COLUMNS = (
@@ -128,12 +130,22 @@ def build_state(conn: sqlite3.Connection, server_now: int) -> dict:
     connection. ``server_now`` is stamped by the caller (server clock)."""
     last_pass_at, last_pass_ok = _read_last_pass(conn)
     rules_total, rules_invalid = _read_rule_counts(conn)
+    # Pause visibility (§7 "видимость обязательна"): the startpage renders a countdown
+    # row from ``paused_until``, so the server-wide pause deadline (and the after-expiry
+    # ``resume_pending`` latch) ride along in the StateResponse. ``paused_until`` is the
+    # RAW deadline (may already be in the past during resume_pending) — the client
+    # decides "still counting down" against ``server_now``.
+    resume_row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (RESUME_PENDING_KEY,)
+    ).fetchone()
     return {
         "server_now": server_now,
         "last_pass_at": last_pass_at,
         "last_pass_ok": last_pass_ok,
         "rules_total": rules_total,
         "rules_invalid": rules_invalid,
+        "paused_until": read_pause_until(conn),
+        "resume_pending": bool(resume_row is not None and resume_row[0]),
         "instances": _read_instances(conn),
         "tabs": _read_tabs(conn),
         "quick_links": _read_quick_links(conn),

@@ -23,7 +23,12 @@ from loguru import logger
 
 from src.curator import convergence, lease
 from src.curator.decide import step4_passes
-from src.db.actions import insert_action, mark_action_abandoned, normalize_url
+from src.db.actions import (
+    insert_action,
+    mark_action_abandoned,
+    normalize_url,
+    set_action_status,
+)
 from src.ext import protocol
 from src.ext.commands import CommandError, send_command
 
@@ -254,17 +259,25 @@ async def run_phase_b(ctx: PassCtx, dec) -> None:
         logger.info("phase B deferred (source readiness changed) for reloc {}", reloc.id)
         return
 
-    # Copy is alive => close the SOURCE with the full expect (§6/§7).
-    # WARNING 1 (ACTIVE since Фаза 11): ``lease.bump_epoch`` CAN now shift the epoch
-    # mid-pass — the MCP ``pause`` tool (Фаза 11, src/curator/pause.py) is the first
-    # live caller. A pause landing BETWEEN this ``close_tab`` and the guarded write
-    # below leaves the source closed with no ``relocate_close`` row (unrecorded, and —
-    # now that #27 undo is live — un-undoable). Narrow (a sub-race of an active pass's
-    # phase B) and NOT data-loss (tab end-state is correct), but a real audit/undo gap.
-    # The fix — an at-least-once "pending-then-complete" write (record intent BEFORE the
-    # close, reconcile after) — is a core-pass change that lands with the pause surface
-    # in Фаза 16, not bolted onto the MCP PR. The Фаза-8 sub-path is closed by the
-    # hardened renewal loop (runner ``_renew_loop``); this remains for the bump_epoch case.
+    # Copy is alive => complete the relocation at-least-once (§7, WARNING-1).
+    # Record the DISTINCT relocate_close as `pending` UNDER the lease guard BEFORE the
+    # browser close, so that a lease lost between a successful `close_tab` and its
+    # completion write does not leave the source closed with NO record (a journal hole
+    # + an un-undoable relocation). If THIS guarded pending write is fenced, LeaseLost
+    # propagates and the pass stops — no close is attempted.
+    def _pending(conn: sqlite3.Connection) -> int:
+        return insert_action(
+            conn, ts=ctx.now, kind="relocate_close", status="pending",
+            initiator="curator", pass_id=ctx.pass_id, origin_action_id=reloc.id,
+            instance_from=reloc.instance_from, instance_to=reloc.instance_to,
+            tab_id=source_tab.tab_id, session_id_from=reloc.session_id_from,
+            tab_id_to=reloc.tab_id_to, session_id_to=reloc.session_id_to,
+            rule_id=reloc.rule_id, rule_pattern=reloc.rule_pattern,
+            url=reloc.url, url_norm=url_norm,
+        )
+
+    pending_id = await ctx.db.write(lease.guarded(ctx.epoch, _pending))
+
     try:
         await send_command(
             ctx.registry, ctx.db, reloc.instance_from, protocol.CMD_CLOSE_TAB,
@@ -273,33 +286,25 @@ async def run_phase_b(ctx: PassCtx, dec) -> None:
         )
     except CommandError as exc:
         if exc.code == protocol.ERR_PRECONDITION_FAILED:
+            # The source did NOT close (turned active/pinned/audible): fail the pending
+            # row + strike, exactly as before (the row now exists, so UPDATE it).
             def _fail(conn: sqlite3.Connection) -> None:
-                insert_action(
-                    conn, ts=ctx.now, kind="relocate_close", status="failed",
-                    initiator="curator", pass_id=ctx.pass_id,
-                    origin_action_id=reloc.id,
-                    instance_from=reloc.instance_from, instance_to=reloc.instance_to,
-                    tab_id=source_tab.tab_id, session_id_from=reloc.session_id_from,
-                    url=reloc.url, url_norm=url_norm, reason=protocol.ERR_PRECONDITION_FAILED,
-                )
+                set_action_status(conn, pending_id, "failed", reason=protocol.ERR_PRECONDITION_FAILED)
                 _strike_once(conn, ctx, reloc.instance_from, url_norm, protocol.ERR_PRECONDITION_FAILED)
             await ctx.db.write(lease.guarded(ctx.epoch, _fail))
             ctx.actions_count += 1
             return
+        # Connection-class: the close is UNCERTAIN. LEAVE the pending row — next pass's
+        # reconcile resolves it against the fresh mirror (→ done if the source is gone,
+        # → abandoned if it is still present). Do NOT delete it.
         logger.info("phase B close deferred for reloc {}: {}", reloc.id, exc.code)
-        return  # connection-class: leave live, retry.
+        return
 
-    # Source closed => complete the relocation with a DISTINCT relocate_close (§7).
+    # Source closed => complete: pending → done, drop the source, reset strikes (§7).
+    # If THIS guarded write is fenced (the WARNING-1 window), the pending row SURVIVES
+    # and reconcile completes it next pass — that is the whole point.
     def _done(conn: sqlite3.Connection) -> None:
-        insert_action(
-            conn, ts=ctx.now, kind="relocate_close", status="done",
-            initiator="curator", pass_id=ctx.pass_id, origin_action_id=reloc.id,
-            instance_from=reloc.instance_from, instance_to=reloc.instance_to,
-            tab_id=source_tab.tab_id, session_id_from=reloc.session_id_from,
-            tab_id_to=reloc.tab_id_to, session_id_to=reloc.session_id_to,
-            rule_id=reloc.rule_id, rule_pattern=reloc.rule_pattern,
-            url=reloc.url, url_norm=url_norm,
-        )
+        set_action_status(conn, pending_id, "done")
         _delete_tab(conn, reloc.instance_from, source_tab.tab_id)
         # Completed phase B is a success on the pair => reset the strike counter (§7).
         convergence.reset_strikes(conn, reloc.instance_from, url_norm)
@@ -360,10 +365,24 @@ async def run_close(ctx: PassCtx, dec) -> None:
         logger.info("close deferred (source readiness changed) for {}", tab.url)
         return
 
-    # WARNING 1 (ACTIVE since Фаза 11): same at-least-once gap as phase B — ``bump_epoch``
-    # can now shift the epoch mid-pass (MCP ``pause``, Фаза 11), so a lease lost between
-    # this close and the guarded write loses the close's record. The pending-then-complete
-    # fix lands with the pause surface in Фаза 16 (see the phase-B note above).
+    # At-least-once close journaling (§7, WARNING-1): record the close row as `pending`
+    # UNDER the lease guard BEFORE the browser close, with every column the `done` row
+    # carries, so a lease lost between a successful `close_tab` and its completion write
+    # does not lose the close's record. A fenced pending write => LeaseLost, pass stops,
+    # no close attempted.
+    session_from = _session_of(ctx, tab.instance_id)
+
+    def _pending(conn: sqlite3.Connection) -> int:
+        return insert_action(
+            conn, ts=ctx.now, kind=dec.kind, status="pending", initiator="curator",
+            pass_id=ctx.pass_id, instance_from=tab.instance_id, instance_to=instance_to,
+            tab_id=tab.tab_id, session_id_from=session_from,
+            rule_id=rule_id, rule_pattern=rule_pattern, decision=dec.decision,
+            url=tab.url, url_norm=url_norm, title=tab.title, detail=detail,
+        )
+
+    pending_id = await ctx.db.write(lease.guarded(ctx.epoch, _pending))
+
     try:
         await send_command(
             ctx.registry, ctx.db, tab.instance_id, protocol.CMD_CLOSE_TAB,
@@ -372,35 +391,87 @@ async def run_close(ctx: PassCtx, dec) -> None:
         )
     except CommandError as exc:
         if exc.code == protocol.ERR_PRECONDITION_FAILED:
+            # The source did NOT close: fail the pending row + strike (as before).
             def _fail(conn: sqlite3.Connection) -> None:
-                insert_action(
-                    conn, ts=ctx.now, kind=dec.kind, status="failed",
-                    initiator="curator", pass_id=ctx.pass_id,
-                    instance_from=tab.instance_id, instance_to=instance_to,
-                    tab_id=tab.tab_id, session_id_from=_session_of(ctx, tab.instance_id),
-                    rule_id=rule_id, rule_pattern=rule_pattern, decision=dec.decision,
-                    url=tab.url, url_norm=url_norm, title=tab.title,
-                    reason=protocol.ERR_PRECONDITION_FAILED, detail=detail,
-                )
+                set_action_status(conn, pending_id, "failed", reason=protocol.ERR_PRECONDITION_FAILED)
                 _strike_once(conn, ctx, tab.instance_id, url_norm, protocol.ERR_PRECONDITION_FAILED)
             await ctx.db.write(lease.guarded(ctx.epoch, _fail))
             ctx.actions_count += 1
             return
+        # Connection-class: the close is UNCERTAIN. LEAVE the pending row for reconcile.
         logger.info("close deferred for {} ({}): {}", tab.url, dec.kind, exc.code)
         return
 
+    # Source closed => complete: pending → done, drop the tab, reset strikes (§7).
+    # A fenced completion (the WARNING-1 window) leaves the pending row for reconcile.
     def _done(conn: sqlite3.Connection) -> None:
-        insert_action(
-            conn, ts=ctx.now, kind=dec.kind, status="done", initiator="curator",
-            pass_id=ctx.pass_id, instance_from=tab.instance_id, instance_to=instance_to,
-            tab_id=tab.tab_id, session_id_from=_session_of(ctx, tab.instance_id),
-            rule_id=rule_id, rule_pattern=rule_pattern, decision=dec.decision,
-            url=tab.url, url_norm=url_norm, title=tab.title, detail=detail,
-        )
+        set_action_status(conn, pending_id, "done")
         _delete_tab(conn, tab.instance_id, tab.tab_id)
         convergence.reset_strikes(conn, tab.instance_id, url_norm)  # success on the pair (§7)
 
     await ctx.db.write(lease.guarded(ctx.epoch, _done))
+    ctx.actions_count += 1
+
+
+# --- reconcile: resolve prior-pass pending closes (§7, WARNING-1) -----------
+def _source_present(mirror, row) -> bool:
+    """Is the source of a PENDING close still present in this pass's frozen mirror?
+
+    Present iff a tab with the recorded FULL url still sits in the source instance —
+    keyed on URL ONLY, never on session or ``tab_id`` (both are discard-volatile, §5).
+    A websocket reconnect wipes and repopulates the mirror ``tabs`` with new tab_ids
+    and a NEW session, but a source that never actually closed (a connection-class
+    failure whose ``pending`` row we left) still carries the same URL — so keying on
+    URL, not session, avoids journaling a phantom ``done`` for a close that did not
+    happen (the session short-circuit that once lived here did exactly that).
+
+    ABSENT => the close took effect (or the url is gone anyway) → complete → done
+    (at-least-once). PRESENT => the close never happened → abandon so ``decide``
+    re-issues it; the re-issued close is still guarded by ``_expect``'s idle check at
+    the extension edge, so an in-use tab is not force-closed and we never double-close
+    (the original tab, if it truly closed, is gone — a live match is a different tab
+    holding the same url, which the rule wants curated anyway).
+    """
+    return any(t.url == row["url"] for t in mirror.tabs_of(row["instance_from"]))
+
+
+async def run_reconcile(ctx: PassCtx, row) -> None:
+    """Resolve ONE prior-pass ``pending`` close against the fresh frozen mirror (§7).
+
+    Runs EARLY in the pass (before decide), per row isolated, every write lease-guarded.
+    Idempotent and safe to run every pass: a pending row is resolved to exactly one
+    terminal state and never revisited.
+
+    * Source ABSENT (the close happened, just wasn't journaled) → ``pending`` → ``done``
+      and reset the pair's strikes; the source tab is already gone from the mirror, so
+      no ``_delete_tab`` is needed (and doing it by the stale hint would risk a foreign
+      row — see ``_complete``). For a relocate_close this retires the relocation
+      (``live_relocations`` excludes a done/pending relocate_close).
+    * Source PRESENT (the close never took effect — a connection-class failure or a
+      lease lost before ``close_tab``) → ``pending`` → ``abandoned`` so nothing stale
+      lingers. ``decide`` re-issues the close this pass (a plain close: its source tab
+      is still in the mirror) or next pass (a relocate_close: the relocation re-enters
+      ``live_relocations`` once the pending is no longer pending) — closed exactly once.
+    """
+    if _source_present(ctx.mirror, row):
+        await ctx.db.write(
+            lease.guarded(ctx.epoch, lambda c: mark_action_abandoned(c, row["id"]))
+        )
+        ctx.actions_count += 1
+        return
+
+    def _complete(conn: sqlite3.Connection) -> None:
+        set_action_status(conn, row["id"], "done")
+        # No `_delete_tab` here: the source is ABSENT by definition of this branch (no
+        # tab holds the recorded url), and the row's ``tab_id`` is a discard-volatile
+        # hint (§5) a reconnect may have REUSED for a foreign tab — deleting by it could
+        # drop a legitimate mirror row. The DB tabs are refreshed by the next snapshot
+        # regardless, and decide runs off the frozen mirror this pass, so nothing needs
+        # the delete.
+        if row["url_norm"] is not None:
+            convergence.reset_strikes(conn, row["instance_from"], row["url_norm"])
+
+    await ctx.db.write(lease.guarded(ctx.epoch, _complete))
     ctx.actions_count += 1
 
 

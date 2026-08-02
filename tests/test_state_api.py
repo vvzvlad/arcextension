@@ -149,8 +149,11 @@ def test_state_returns_mirror_shape(tmp_path):
             # Exact §10 StateResponse top-level shape.
             assert set(body.keys()) == {
                 "server_now", "last_pass_at", "last_pass_ok", "rules_total",
-                "rules_invalid", "instances", "tabs", "quick_links",
+                "rules_invalid", "paused_until", "resume_pending",
+                "instances", "tabs", "quick_links",
             }
+            # Not paused / not waiting for a click on a fresh mirror (§7).
+            assert body["paused_until"] is None and body["resume_pending"] is False
             assert isinstance(body["server_now"], int)
             assert body["rules_total"] == 0 and body["rules_invalid"] == 0
             # The instance is present with the §10 fields.

@@ -19,7 +19,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_ext_token, require_not_paused, require_operational
 from src.db import quick_links as ql
 
 
@@ -30,6 +30,7 @@ def _now_ms() -> int:
 async def quick_links_ops(request: Request) -> JSONResponse:
     require_ext_token(request)
     require_operational(request)
+    await require_not_paused(request)  # pause silences the offline op flush too (§7)
 
     try:
         ops = await request.json()

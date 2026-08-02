@@ -93,6 +93,29 @@ export async function getIdentity(chromeApi) {
   }
 }
 
+// --- pause (§7) ---------------------------------------------------------------
+// Arm/extend a finite pause (POST) or resume early (DELETE). Bearer-authed like the
+// other verbs. Both return {status, body} so the store can react without throwing on a
+// non-2xx (e.g. an offline blip). `minutes` is optional — the server defaults + caps it.
+export async function postPause(fetchFn, base, token, minutes) {
+  const resp = await fetchFn(base + "/api/pause", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(minutes != null ? { minutes } : {}),
+  });
+  const body = await resp.json().catch(() => null);
+  return { status: resp.status, body };
+}
+
+export async function deletePause(fetchFn, base, token) {
+  const resp = await fetchFn(base + "/api/pause", {
+    method: "DELETE",
+    headers: authHeaders(token),
+  });
+  const body = await resp.json().catch(() => null);
+  return { status: resp.status, body };
+}
+
 // --- rules editor (§8/§10) ----------------------------------------------------
 // The editor needs the network (a live server-side preview + CRUD). Every call is
 // Bearer-authed with the instance token, exactly like fetchState/postFocus above.

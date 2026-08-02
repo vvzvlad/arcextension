@@ -26,7 +26,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_ext_token, require_not_paused, require_operational
 from src.api.restore import _is_fresh, _request_snapshot
 from src.db import state as state_read
 from src.ext import protocol
@@ -139,6 +139,7 @@ async def get_state(request: Request) -> JSONResponse:
 async def focus(request: Request) -> JSONResponse:
     require_ext_token(request)
     require_operational(request)
+    await require_not_paused(request)  # a paused curator silences focus too (§7)
 
     try:
         body = await request.json()
