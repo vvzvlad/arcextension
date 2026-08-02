@@ -59,8 +59,8 @@ def _seed_instance(db_path, iid, connected=1, snapshot_at=None, focused=None):
     c = _conn(db_path)
     try:
         c.execute(
-            "INSERT INTO instances (id, connected, snapshot_at, focused_window_id) "
-            "VALUES (?,?,?,?)",
+            "INSERT INTO instances (id, connected, snapshot_at, focused_window_id, status) "
+            "VALUES (?,?,?,?,'active')",
             (iid, connected, _now_ms() if snapshot_at is None else snapshot_at, focused),
         )
         c.commit()
@@ -249,6 +249,36 @@ def test_create_rejects_unknown_instance_422(tmp_path):
             json={"pattern": "borneo.lc", "instance_id": "ghost"},
         )
         assert resp.status_code == 422
+
+
+def test_rule_to_revoked_rejected_but_x_to_main_stays_valid(tmp_path):
+    """issue #35 §6 cascade at the ``rules`` consumer of ``known_instance_ids``: a rule
+    targeting a REVOKED instance is rejected (the id is no longer active/known), while a
+    rule ``X -> main`` is still accepted even though MAIN has no active row — the consumer
+    exempts MAIN. Reverting the active-only filter makes the revoked target pass (the
+    ``== 422`` reddens); dropping the main exemption makes ``X -> main`` a 422 (the
+    ``!= 422`` reddens)."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "prox")   # active, then revoked below
+        c = _conn(db_path)
+        c.execute("UPDATE instances SET status='revoked' WHERE id='prox'")
+        c.commit()
+        c.close()
+        # Target is revoked => rejected like an unknown instance.
+        r = client.post(
+            "/api/rules", headers=AUTH,
+            json={"pattern": "borneo.lc", "instance_id": "prox"},
+        )
+        assert r.status_code == 422
+        # X -> main (no active main row) is NOT rejected: the target validates (whatever
+        # confirm gating follows is orthogonal — a 422 would mean the target was refused).
+        r2 = client.post(
+            "/api/rules", headers=AUTH,
+            json={"pattern": "borneo.lc", "instance_id": "main"},
+        )
+        assert r2.status_code != 422
 
 
 # --- confirm_impact: only relocations (closures=0) still gated (SUM) ---------

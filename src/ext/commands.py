@@ -26,6 +26,7 @@ from typing import Any
 from loguru import logger
 
 from src.db.audit import insert_js_audit, update_js_audit_outcome
+from src.db.queries import instance_status
 from src.db.settings_store import is_execute_js_enabled
 from src.ext import protocol
 
@@ -116,6 +117,23 @@ async def send_command(
         raise CommandError(
             protocol.ERR_NO_CONNECTION, f"no live connection to instance {instance_id}"
         )
+
+    # §5 revoke safety net (issue #35): a command must not reach a REVOKED instance even
+    # if the best-effort socket close after revoke lost the race to this send. When a DB
+    # is available, a non-active target fails EXACTLY like a dead connection — the hello
+    # ``status='active'`` guard (slice B) blocks re-enrollment, and this blocks in-flight
+    # commands. A target with NO row at all is left to the registry/connection checks (a
+    # live socket implies an approved row in production; the id-only test rigs carry no row
+    # and keep behaving as before). Read-only, OUTSIDE any transaction, before the frame or
+    # the execute_js audit — so a revoked target is refused with no side effect, like
+    # ``no_connection``.
+    if db is not None:
+        status = await db.read(lambda c: instance_status(c, instance_id))
+        if status is not None and status != "active":
+            raise CommandError(
+                protocol.ERR_NO_CONNECTION,
+                f"instance {instance_id} is not active (status={status})",
+            )
 
     request_id = _new_command_id()
     frame = {

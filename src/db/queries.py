@@ -11,6 +11,90 @@ mutation-testable.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
+
+
+class RevokeMainRefused(Exception):
+    """Revoking the configured MAIN requires ``replacement == MAIN_INSTANCE_ID`` (§5).
+
+    ``replacement`` is a PRECONDITION on the CURRENT env MAIN, not a runtime override:
+    there is nowhere to persist a new MAIN, and the id is part of the continuity
+    fingerprint. Task E maps this refusal to HTTP 409 (acceptance 9).
+    """
+
+
+@dataclass
+class RevokeResult:
+    """Outcome of :func:`revoke_instance` — enough for the caller (Task E) to know it
+    succeeded and then close the live socket best-effort AFTER commit (async, outside
+    the txn); ``instance_id`` is how the /admin handler finds the registry entry."""
+
+    instance_id: str
+    revoked: bool   # a row transitioned to 'revoked' this call (rowcount > 0)
+    was_main: bool  # the target was the configured MAIN (a guarded revoke)
+
+
+# Revoke in ONE transaction (§5). session_id=NULL is REQUIRED: today mark_disconnected
+# does NOT clear it, so the mirror keeps treating a relocation as live forever
+# (mirror.load_mirror keeps a relocate live only while both endpoints' sessions still
+# match — a NULL session drops it out of live_relocations at once). connected/
+# focused_window_id are LEFT to the caller's best-effort socket close (mark_disconnected),
+# exactly as §5 prescribes; the status='revoked' itself is the retire INTENT the pass
+# scans for.
+_REVOKE_UPDATE = """
+UPDATE instances SET
+    status = 'revoked',
+    revoked_at = ?,
+    session_id = NULL
+WHERE id = ?
+"""
+
+
+def revoke_instance(
+    conn: sqlite3.Connection,
+    instance_id: str,
+    *,
+    now: int,
+    main_instance_id: str,
+    replacement: str | None = None,
+) -> RevokeResult:
+    """Revoke ``instance_id`` in ONE transaction (issue #35 §5). Sync ``fn(conn)``.
+
+    Sets ``status='revoked'``, ``revoked_at=now`` and — REQUIRED — ``session_id=NULL``
+    (see ``_REVOKE_UPDATE``). Records NO relocation retirement here: the curator PASS's
+    retire step (runner) scans for the ``status='revoked'`` intent and marks the live
+    relocations ``abandoned`` — so this handler does NO async I/O and touches no ``actions``
+    rows (contract: async I/O outside the txn).
+
+    MAIN guard: revoking the configured MAIN is refused unless ``replacement`` equals the
+    current ``main_instance_id``; raises :class:`RevokeMainRefused` (Task E → 409) BEFORE
+    any write. A non-main revoke ignores ``replacement``.
+
+    The live-socket close is left to the caller AFTER commit; :class:`RevokeResult`
+    carries ``instance_id`` so the /admin handler can look up the registry and close it.
+    ``revoked=False`` means no such row existed (the caller maps that to 404).
+    """
+    is_main = instance_id == main_instance_id
+    if is_main and replacement != main_instance_id:
+        raise RevokeMainRefused(
+            f"revoking MAIN ({instance_id!r}) requires replacement == the current "
+            f"MAIN_INSTANCE_ID; got {replacement!r}"
+        )
+    cur = conn.execute(_REVOKE_UPDATE, (now, instance_id))
+    return RevokeResult(
+        instance_id=instance_id, revoked=cur.rowcount > 0, was_main=is_main
+    )
+
+
+def instance_status(conn: sqlite3.Connection, instance_id: str) -> str | None:
+    """Return the instance's ``status`` ('active' | 'revoked' | 'pending') or ``None``
+    when no row exists. Used by :func:`src.ext.commands.send_command` as the §5 revoke
+    safety net: a command to a non-active target fails like a dead connection."""
+    row = conn.execute(
+        "SELECT status FROM instances WHERE id = ?", (instance_id,)
+    ).fetchone()
+    return None if row is None else row[0]
+
 
 # hello success: bump an ALREADY-APPROVED instance row and return the NEW conn_epoch.
 # UPDATE-only (§3, issue #35): under enrollment a hello NEVER creates a row — the row
