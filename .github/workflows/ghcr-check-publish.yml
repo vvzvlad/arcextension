@@ -51,6 +51,27 @@ jobs:
         npm ci || npm install
         npm test
 
+  # Startpage (Vue 3 + Vite) tests: build INTO extension/startpage, then the three
+  # §10 build gates and the vitest suite (the render smoke test loads the built
+  # bundle, so the build must run first). Independent of the Python image build.
+  startpage-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Build, gate and test the startpage
+      working-directory: startpage
+      run: |
+        npm ci || npm install
+        npm run build
+        npm run gates
+        npm test
+
   build:
     runs-on: ubuntu-latest
     needs: test                          # no green tests → no image is built

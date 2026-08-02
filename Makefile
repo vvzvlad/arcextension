@@ -51,6 +51,17 @@ test: install ## Run the test suite (auto-creates .venv if missing)
 run: install ## Run the application (auto-creates .venv if missing)
 	$(PY) main.py
 
+# --- Startpage (Vue 3 + Vite, §10) -------------------------------------------
+# Independent Node toolchain under startpage/, built INTO extension/startpage. The
+# build MUST precede the gates + vitest (the render smoke test loads the built
+# bundle). Kept separate from the Python `test` target.
+.PHONY: startpage
+startpage: ## Build the startpage, run the §10 build gates, then the vitest suite
+	cd startpage && (npm ci || npm install)
+	cd startpage && npm run build
+	cd startpage && npm run gates
+	cd startpage && npm test
+
 # --- Housekeeping ------------------------------------------------------------
 .PHONY: clean
 clean: ## Remove the venv and Python caches
