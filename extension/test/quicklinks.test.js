@@ -1,11 +1,16 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   applyOpToQuickLinks,
   enqueueOp,
   flushQueue,
+  __resetQueueChain,
   QUEUE_KEY,
   STATE_CACHE_KEY,
 } from "../src/quicklinks.js";
+
+// The queue mutation chain is a module-level singleton; reset it between tests so a
+// lingering link from one test cannot serialize behind another's fresh env/store.
+beforeEach(() => __resetQueueChain());
 
 function makeEnv({ cache, fetchImpl, config } = {}) {
   const store = {};
@@ -54,21 +59,20 @@ describe("applyOpToQuickLinks", () => {
 
 // --- enqueue: durable queue + optimistic cache edit (§10) --------------------
 describe("enqueueOp (§10)", () => {
-  it("queues the op with a stable key and edits the cached quick_links optimistically", async () => {
+  it("queues the op and edits the cached quick_links optimistically", async () => {
     const { env, store } = makeEnv({ cache: { state: { quick_links: [] }, cached_at: 1 } });
     await enqueueOp(env, { op: "add", url: "https://q", title: "Q" });
 
-    expect(store[QUEUE_KEY].key).toBe("uuid-fixed");
+    // The durable queue carries ops only; the Idempotency-Key is minted per flush.
     expect(store[QUEUE_KEY].ops).toEqual([{ op: "add", url: "https://q", title: "Q" }]);
     // Optimistic: the cached quick_links show the new link BEFORE any flush (§10).
     expect(store[STATE_CACHE_KEY].state.quick_links.map((l) => l.url)).toContain("https://q");
   });
 
-  it("keeps ONE stable Idempotency-Key across multiple enqueues (retry-safe)", async () => {
+  it("accumulates multiple enqueues into the ops list", async () => {
     const { env, store } = makeEnv({});
     await enqueueOp(env, { op: "add", url: "https://a" });
     await enqueueOp(env, { op: "add", url: "https://b" });
-    expect(store[QUEUE_KEY].key).toBe("uuid-fixed");
     expect(store[QUEUE_KEY].ops).toHaveLength(2);
   });
 });
@@ -112,6 +116,49 @@ describe("flushQueue (§10)", () => {
     const res = await flushQueue(env);
 
     expect(res.flushed).toBe(false);
-    expect(store[QUEUE_KEY].ops).toHaveLength(1); // kept for a later retry
+    expect(store[QUEUE_KEY].ops).toHaveLength(1); // claimed op restored for a later retry
+  });
+
+  // --- the WARNING: a concurrent enqueue during a flush must not lose the op ---
+  it("does not lose an op enqueued concurrently during a flush, and uses a fresh key", async () => {
+    // The flush is parked on the network (fetchGate) so an enqueue interleaves DURING
+    // its POST. With the serialized claim+clear and a fresh per-flush key: op1 is the
+    // ONLY op in the flushed batch, op2 survives in the queue, and the next flush sends
+    // op2 with a DISTINCT key. Revert to a non-atomic clear (clear AFTER the POST) and
+    // op2 is wiped; reuse a stable key and posts[1].key equals posts[0].key — both redden.
+    let releaseFetch;
+    const fetchGate = new Promise((r) => (releaseFetch = r));
+    const posts = [];
+    const { env, store } = makeEnv({
+      cache: { state: { quick_links: [] } },
+      fetchImpl: async (url, opts) => {
+        posts.push({
+          key: opts.headers["Idempotency-Key"],
+          ops: JSON.parse(opts.body),
+        });
+        await fetchGate; // hold the flush open across a concurrent enqueue
+        return { ok: true, json: async () => ({ ok: true, quick_links: [] }) };
+      },
+    });
+    let n = 0;
+    env.randomUUID = () => "key-" + ++n; // distinct key per flush claim
+
+    await enqueueOp(env, { op: "add", url: "https://op1" });
+    const flushP = flushQueue(env);
+    // While the flush is parked on the network, a second op is enqueued.
+    await enqueueOp(env, { op: "add", url: "https://op2" });
+    releaseFetch();
+    const res = await flushP;
+
+    expect(res.flushed).toBe(true);
+    // The first POST carried ONLY op1 — op2 was NOT swept into the claimed batch.
+    expect(posts[0].ops).toEqual([{ op: "add", url: "https://op1" }]);
+    // op2 survived in the queue (not lost, not cleared by the flush it raced).
+    expect(store[QUEUE_KEY].ops).toEqual([{ op: "add", url: "https://op2" }]);
+
+    // Flush op2: it goes with a FRESH, distinct Idempotency-Key (never reuses op1's).
+    await flushQueue(env);
+    expect(posts[1].ops).toEqual([{ op: "add", url: "https://op2" }]);
+    expect(posts[1].key).not.toBe(posts[0].key);
   });
 });

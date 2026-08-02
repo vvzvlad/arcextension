@@ -343,3 +343,39 @@ def test_state_refresh_is_single_flight():
     # EXACTLY one: the single-flight guard collapsed the second kick. Remove the
     # `state_refresh_inflight` guard and this becomes two (the mutation reddens).
     assert len(requests) == 1
+
+
+def test_state_refresh_does_not_clobber_a_pending_pass_snapshot():
+    """A newtab opened during a curator pass's readiness window fires the kick while
+    the pass holds ``pending_snapshot_id`` (a ``pass-<uuid>``). The kick must NOT
+    overwrite it and must send NO competing snapshot_request for that instance —
+    else the instance's answer to the pass id is dropped and it is silently excluded
+    from the pass (restore.py:124-128). Removing the ``pending_snapshot_id`` guard in
+    ``kick_state_refresh`` reddens this (the pass id gets clobbered by a ``req-``)."""
+
+    async def scenario():
+        cs = _FakeConnState("sess-1")
+        # A curator pass already sent its snapshot_request and is awaiting the answer.
+        cs.pending_snapshot_id = "pass-abc"
+        registry = _FakeRegistry({"i1": cs})
+        db = _FakeDb(_FakeConn("i1", "sess-1", snapshot_at=0))  # stale mirror
+        app = SimpleNamespace(
+            state=SimpleNamespace(ext_registry=registry, state_refresh_tasks=set())
+        )
+        settings = SimpleNamespace(state_fresh_ms=1000, snapshot_timeout_ms=100)
+
+        await kick_state_refresh(app, db, settings)
+        # Drain any detached clear-tasks (there should be none, but be defensive).
+        tasks = list(app.state.state_refresh_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+        return cs
+
+    cs = asyncio.run(scenario())
+    # The pass's pending id survived untouched — the instance stays in the pass.
+    assert cs.pending_snapshot_id == "pass-abc"
+    # And no competing snapshot_request was sent for it.
+    requests = [f for f in cs.ws.sent if f.get("type") == "snapshot_request"]
+    assert requests == []
+    # The single-flight flag was never claimed (the kick skipped the instance).
+    assert cs.state_refresh_inflight is False

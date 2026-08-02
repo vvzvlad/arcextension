@@ -8,6 +8,8 @@
 
 export const STATE_CACHE_KEY = "stateCache"; // storage.local: { state: StateResponse, cached_at }
 
+// KEEP IN SYNC with extension/src/quicklinks.js `httpBaseFromServiceUrl`: duplicated
+// across separate build contexts (SW module vs this Vue page bundle); mirror any change.
 // ws://→http://, wss://→https://; trailing slashes trimmed (same mapping as popup).
 export function httpBaseFromServiceUrl(serviceUrl) {
   const base = String(serviceUrl || "").replace(/\/+$/, "");

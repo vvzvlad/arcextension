@@ -72,6 +72,19 @@ jobs:
         npm run gates
         npm test
 
+    # The build writes into the TRACKED extension/startpage. A fresh build must match
+    # what is committed — otherwise editing startpage/src/* without rebuilding ships a
+    # stale newtab and no gate above catches it (the gates run over whatever was built,
+    # not over the committed artifact). The Vite build is byte-reproducible on the
+    # pinned toolchain (verified), so a plain diff is the gate; a drift means "run
+    # `npm --prefix startpage run build` and commit the result".
+    - name: Fail if the committed startpage bundle is stale (drift from a fresh build)
+      run: |
+        if ! git diff --exit-code -- extension/startpage; then
+          echo "::error::extension/startpage is out of date vs a fresh build — run 'npm --prefix startpage run build' and commit extension/startpage."
+          exit 1
+        fi
+
   build:
     runs-on: ubuntu-latest
     needs: test                          # no green tests → no image is built

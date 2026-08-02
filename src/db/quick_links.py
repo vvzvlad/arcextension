@@ -104,12 +104,32 @@ def idempotency_key_seen(conn: sqlite3.Connection, key: str) -> bool:
 
 
 def record_idempotency_key(conn: sqlite3.Connection, key: str, now: int) -> None:
-    """Mark an ``Idempotency-Key`` batch as applied so a retry is a no-op (§10)."""
+    """Mark an ``Idempotency-Key`` batch as applied so a retry is a no-op (§10).
+
+    The value is the ``now`` (ms) the key was recorded, so :func:`prune_idempotency_keys`
+    can sweep old markers by age (they would otherwise grow ``settings`` unbounded)."""
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO NOTHING",
         (_IDEMPOTENCY_PREFIX + key, str(now)),
     )
+
+
+def prune_idempotency_keys(conn: sqlite3.Connection, cutoff: int) -> int:
+    """Delete recorded ``qlkey:*`` idempotency markers older than ``cutoff`` (ms);
+    return the count deleted.
+
+    Every successful flush records one ``qlkey:<uuid>`` row (§10); without a sweep they
+    accumulate forever. The stored value is the ms timestamp the key was recorded, so an
+    age cutoff folds cleanly into the retention loop (§12). Only ``qlkey:*`` rows are
+    touched (the ``LIKE`` prefix), so other ``settings`` rows are untouched and the
+    ``CAST`` only ever sees a numeric marker value. A RECENT marker is kept, so an
+    in-flight retry within the window still de-dupes."""
+    cur = conn.execute(
+        "DELETE FROM settings WHERE key LIKE ? AND CAST(value AS INTEGER) < ?",
+        (_IDEMPOTENCY_PREFIX + "%", cutoff),
+    )
+    return cur.rowcount
 
 
 def apply_ops_with_key(

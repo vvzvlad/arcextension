@@ -18,11 +18,18 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+from src.db.quick_links import prune_idempotency_keys
+
 _MS_PER_DAY = 86_400_000
 
 # How often the retention task wakes. A day is plenty — retention is not
 # time-critical, and a coarse period keeps it off the hot path.
 _RETENTION_INTERVAL_S = 24 * 60 * 60
+
+# Idempotency markers (``qlkey:*``) only guard a client's retry of a still-pending
+# offline flush; a week is generous (and the ops themselves are idempotent), so the
+# recorded keys can be swept well inside the actions horizon to keep ``settings`` small.
+_DEFAULT_IDEMPOTENCY_RETENTION_DAYS = 7
 
 
 def cutoff_ms(now_ms: int, retention_days: int) -> int:
@@ -46,6 +53,7 @@ def delete_old_js_audit(conn: sqlite3.Connection, cutoff: int) -> int:
 class RetentionResult:
     actions_deleted: int
     js_audit_deleted: int
+    idempotency_keys_deleted: int = 0
 
 
 def run_retention(
@@ -53,21 +61,27 @@ def run_retention(
     now_ms: int,
     actions_retention_days: int,
     js_audit_retention_days: int,
+    idempotency_retention_days: int = _DEFAULT_IDEMPOTENCY_RETENTION_DAYS,
 ) -> RetentionResult:
-    """Apply BOTH horizons in one transaction; return the per-table counts.
+    """Apply ALL horizons in one transaction; return the per-table counts.
 
-    The two cutoffs are computed independently — ``js_audit`` uses its own,
-    longer window — so a row old enough to drop from ``actions`` survives in
-    ``js_audit`` (§12). This single ``fn(conn)`` is what the app's periodic task
+    Each cutoff is computed independently — ``js_audit`` uses its own, longer window —
+    so a row old enough to drop from ``actions`` survives in ``js_audit`` (§12). The
+    ``qlkey:*`` idempotency markers get their own short window (they only guard a
+    pending offline retry). This single ``fn(conn)`` is what the app's periodic task
     hands to ``Database.write``.
     """
     a = delete_old_actions(conn, cutoff_ms(now_ms, actions_retention_days))
     j = delete_old_js_audit(conn, cutoff_ms(now_ms, js_audit_retention_days))
-    return RetentionResult(actions_deleted=a, js_audit_deleted=j)
+    k = prune_idempotency_keys(conn, cutoff_ms(now_ms, idempotency_retention_days))
+    return RetentionResult(actions_deleted=a, js_audit_deleted=j, idempotency_keys_deleted=k)
 
 
 async def retention_loop(
-    db, actions_retention_days: int, js_audit_retention_days: int
+    db,
+    actions_retention_days: int,
+    js_audit_retention_days: int,
+    idempotency_retention_days: int = _DEFAULT_IDEMPOTENCY_RETENTION_DAYS,
 ) -> None:
     """Sibling to the nightly backup loop: run retention once, then every day.
 
@@ -80,13 +94,15 @@ async def retention_loop(
             now_ms = int(time.time() * 1000)
             result = await db.write(
                 lambda c: run_retention(
-                    c, now_ms, actions_retention_days, js_audit_retention_days
+                    c, now_ms, actions_retention_days, js_audit_retention_days,
+                    idempotency_retention_days,
                 )
             )
             logger.info(
-                "retention: deleted {} actions, {} js_audit rows",
+                "retention: deleted {} actions, {} js_audit rows, {} idempotency keys",
                 result.actions_deleted,
                 result.js_audit_deleted,
+                result.idempotency_keys_deleted,
             )
         except Exception as exc:  # noqa: BLE001 - never let the schedule die
             logger.error("retention run failed: {}", exc)

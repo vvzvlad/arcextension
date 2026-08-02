@@ -82,7 +82,22 @@ async def kick_state_refresh(app, db, settings) -> None:
         tasks = app.state.state_refresh_tasks = set()
     for instance_id, snapshot_at in ages.items():
         conn_state = registry.get(instance_id)
-        if conn_state is None or conn_state.state_refresh_inflight:
+        # Skip when a request is ALREADY in flight — the single-flight flag (a prior
+        # kick) OR a live ``pending_snapshot_id``. That id may belong to a curator
+        # pass (``pass-<uuid>``, §7) or a restore (``req-<uuid>``, restore.py): the
+        # kick must NOT clobber it. Overwriting a pass's id ejects the instance from
+        # that pass — the instance's answer to the pass id is dropped (the channel
+        # matches ids exactly), ``last_applied_snapshot_id`` never matches, and it is
+        # silently excluded (the exact trap restore.py:124-128 warns about). A
+        # dropped/never-answered pending id self-clears on the next applied snapshot
+        # (the channel sets it None), so kicks resume. Read+decide SYNCHRONOUSLY (no
+        # await before the guard below sets its flag), same discipline as
+        # ``state_refresh_inflight``.
+        if (
+            conn_state is None
+            or conn_state.state_refresh_inflight
+            or conn_state.pending_snapshot_id is not None
+        ):
             continue
         if not _is_stale(snapshot_at, now, settings.state_fresh_ms):
             continue

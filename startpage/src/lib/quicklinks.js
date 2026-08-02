@@ -15,6 +15,9 @@ export function sortQuickLinks(list) {
 }
 
 // Apply ONE op to a quick-links array, returning a NEW array (never mutates input).
+// KEEP IN SYNC with extension/src/quicklinks.js `applyOpToQuickLinks`: it is duplicated
+// (the service worker and this Vue page bundle are separate build contexts, so a shared
+// import is awkward). Any semantic change here MUST be mirrored there, and vice versa.
 export function applyOpToQuickLinks(list, op) {
   const links = list.map((l) => ({ ...l }));
   if (!op || typeof op !== "object") return links;
