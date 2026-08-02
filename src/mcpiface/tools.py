@@ -26,12 +26,15 @@ from types import SimpleNamespace
 from starlette.exceptions import HTTPException
 
 from src.api import actions as actions_api
+from src.api import instances as instances_api
+from src.api import pause as pause_api
 from src.api import rules as rules_api
 from src.api.state import kick_state_refresh
 from src.curator import pause as pause_ops
 from src.curator import runner
 from src.db import state as state_read
 from src.db.actions import insert_action, normalize_url
+from src.db.settings_store import get_setting
 from src.ext import protocol
 from src.ext.commands import CommandError, send_command
 from src.rules import access as rules_access
@@ -68,19 +71,27 @@ async def _ensure_not_paused(app) -> None:
 
 # --- reads -------------------------------------------------------------------
 async def list_instances(app) -> dict:
-    """Instances mirror + per-instance ``snapshot_at`` + ``paused_until`` (§11).
+    """Instances mirror + ``snapshot_at`` + ``paused_until`` + ``resume_pending`` (§11).
 
     Goes through the SAME freshness path as ``/api/state`` (kick a single-flight
     refresh, then return the current mirror) so a stale mirror is at least refreshed
     for the next call, and the agent sees each instance's ``snapshot_at`` age. The
-    ``paused_until`` field lets the agent tell a pause from a broken curator (§11)."""
+    ``paused_until`` field lets the agent tell a pause from a broken curator (§11).
+
+    ``resume_pending`` is required here by §7 verbatim — «`resume_pending` виден в
+    `StateResponse` и в `list_instances`» — and for the same reason: after a pause
+    expires by TIMEOUT the curator is deliberately idle, waiting for a confirming click.
+    Without the flag an agent reads ``paused_until`` in the past, sees no pass
+    happening, and concludes the curator is broken."""
     db, settings = app.state.db, app.state.settings
     await kick_state_refresh(app, db, settings)
     instances = await db.read(state_read._read_instances)
     paused_until = await db.read(pause_ops.read_pause_until)
+    resume_raw = await db.read(lambda c: get_setting(c, pause_ops.RESUME_PENDING_KEY))
     return {
         "server_now": _now_ms(),
         "paused_until": paused_until,
+        "resume_pending": bool(resume_raw),
         "instances": instances,
     }
 
@@ -212,18 +223,38 @@ async def delete_rule(app, *, rule_id: int, confirm_impact: bool = False) -> dic
 
 
 async def reset_singleton(app, *, rule_id: int) -> dict:
-    """Return a rule's reset target (§8/§10): the ``canonical_url`` to apply. Reuses
-    the ``/api/rules/:id/reset`` logic — the tab-content change is a later phase."""
+    """Apply a rule's ``canonical_url`` to its surviving tab (§8/§10).
+
+    The MCP twin of ``POST /api/rules/:id/reset``: it runs the SAME
+    :func:`src.api.rules.perform_reset` core, so it has the same semantics and the same
+    side effects (a ``navigate_tab`` command and an ``actions(kind='reset')`` row) —
+    only ``initiator`` differs, which is precisely what the archive records. A rule
+    holding no tab is not an error, just ``reset: false, reason: "no_tabs"``."""
     await _ensure_not_paused(app)
-    row = await app.state.db.read(lambda c: rules_access.get_rule(c, rule_id))
-    if row is None:
-        raise ToolError("not_found", f"rule {rule_id} not found")
-    return {
-        "ok": True,
-        "id": rule_id,
-        "canonical_url": row["canonical_url"],
-        "note": "reset intent recorded; the tab-content change is a later phase (§10)",
-    }
+    try:
+        return await rules_api.perform_reset(app, rule_id, initiator="mcp")
+    except HTTPException as exc:
+        raise ToolError(*_tool_error_from_http(exc))
+
+
+def _tool_error_from_http(exc: HTTPException) -> tuple[str, str]:
+    """Map a reused endpoint's ``HTTPException`` onto a ToolError (code, message).
+
+    The agent gets the SHORT machine code the HTTP client would read off the body
+    (``not_found``, the §6 command code, …), never a bare status number."""
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return (
+            str(detail.get("error") or f"http_{exc.status_code}"),
+            str(detail.get("message") or detail.get("error") or exc.status_code),
+        )
+    if exc.status_code == 404:
+        return ("not_found", str(detail))
+    if exc.status_code == 409:
+        return ("conflict", str(detail))
+    if exc.status_code == 422:
+        return ("invalid_request", str(detail))
+    return (f"http_{exc.status_code}", str(detail))
 
 
 # --- commands (initiator='mcp' + auth_ctx, §12) ------------------------------
@@ -272,11 +303,25 @@ async def focus_tab(app, *, instance: str, tab_id: int,
 
 async def merge_windows(app, *, instance: str, params: dict | None = None,
                         auth_ctx: str | None = None) -> dict:
+    """Fold an instance's windows into one (§9). Delegates to the SHARED core in
+    :mod:`src.api.instances` — the same one ``POST /api/instances/:id/merge_windows``
+    runs — so the startpage button and the agent cannot drift apart.
+
+    NO ``force``: the HTTP twin honours ``{"force": true}`` because §9 calls it the
+    human's button and §7's exception is for the human's buttons. An agent is not a
+    human at the keyboard, and a paused system exists precisely to stop the MCP caller
+    (§7/§12) — so this verb is gated unconditionally, ``forced`` is never passed (it
+    defaults to False and only affects the archive marker anyway), and a ``force`` key
+    smuggled inside ``params`` reaches the extension as a junk param, never the gate:
+    :func:`_ensure_not_paused` has already refused by then."""
     await _ensure_not_paused(app)
-    result = await _command(
-        app, instance, protocol.CMD_MERGE_WINDOWS, params or {}, auth_ctx=auth_ctx
-    )
-    return {"ok": True, "result": result}
+    try:
+        result = await instances_api.merge_windows(
+            app, instance, params, initiator="mcp", auth_ctx=auth_ctx
+        )
+    except CommandError as exc:
+        raise ToolError(exc.code, exc.message)
+    return {"ok": True, "result": result, "merged": result["merged"]}
 
 
 async def execute_js(app, *, instance: str, tab_id: int, code: str,
@@ -436,8 +481,21 @@ async def pause(app, *, minutes: int | None = None) -> dict:
 
 async def resume(app) -> dict:
     """Resume the curator (§7/§12): apply the TTL shift on the ACTUAL pause duration,
-    then clear ``pause_until`` / ``pause_started_at`` / ``resume_pending``. Same
-    ``pause.resume`` write-shape as ``DELETE /api/pause``."""
-    now = _now_ms()
-    await app.state.db.write(lambda c: pause_ops.resume(c, now=now))
-    return {"ok": True}
+    clear ``pause_until`` / ``pause_started_at`` / ``resume_pending``, THEN run a pass
+    immediately — the SAME :func:`src.api.pause.resume_now` core ``DELETE /api/pause``
+    runs. §7 makes the immediate pass part of what "resume by hand" MEANS (only a
+    timeout expiry defers behind a click); stopping after the settings write left the
+    same verb with two behaviours depending on which door it was called through, and
+    an agent's resume left the curator idle until the next tick.
+
+    KNOWN COST, accepted deliberately: this now BLOCKS for the whole pass — tens of
+    seconds on a large fleet — where it used to be one settings write. Detaching the
+    pass and answering immediately was considered and rejected, because it would restore
+    exactly the divergence just removed: ``DELETE /api/pause`` returns the pass RESULT
+    (the startpage shows what the resume did), so a fire-and-forget MCP twin would again
+    be the same verb with two meanings. If the wait becomes a real problem it must be
+    changed on BOTH doors at once — and the pass is idempotent under the lease, so a
+    client that times out has not lost anything: the pass runs to completion regardless
+    and its outcome is readable from ``passes`` / ``list_actions``."""
+    outcome = await pause_api.resume_now(app)
+    return {"ok": True, **outcome}

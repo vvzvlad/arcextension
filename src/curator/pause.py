@@ -89,6 +89,15 @@ def pause(conn: sqlite3.Connection, *, now: int, minutes: int) -> int:
     the resume TTL shift counts the true elapsed time, not the extended deadline (§7
     "pause_started_at при продлении ... НЕ переписывается"). ``minutes`` is clamped to a
     finite window here as a last line of defence. Returns the absolute ``pause_until``.
+
+    The lease SLOT is deliberately NOT freed here. The fenced pass stops at its next
+    guarded write and then releases the slot itself (:func:`src.curator.lease.release`
+    is keyed on the OWNER, so a moved epoch no longer blocks it) — which is what keeps
+    the §7 promise of an immediate pass after a hand-lifted pause without ever letting
+    two passes overlap. Freeing the slot here would: ``run_phase_a`` and
+    ``run_window_merge`` send their browser command BEFORE their first guarded write, so
+    a pass triggered by a resume seconds later could start while the fenced one is still
+    inside ``send_command``.
     """
     minutes = clamp_minutes(minutes, minutes)
     until = now + minutes * 60_000
@@ -97,7 +106,8 @@ def pause(conn: sqlite3.Connection, *, now: int, minutes: int) -> int:
     if _to_int(get_setting(conn, PAUSE_STARTED_AT_KEY)) is None:
         set_setting(conn, PAUSE_STARTED_AT_KEY, str(now))
     # Bump the epoch so an already-running pass is fenced out immediately, not only
-    # the next one blocked by pause_until.
+    # the next one blocked by pause_until. The slot stays held until that pass actually
+    # finishes and releases it (see the docstring).
     lease.bump_epoch(conn)
     return until
 

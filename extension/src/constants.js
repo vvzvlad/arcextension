@@ -49,6 +49,12 @@ export const INSTALL_UUID_KEY = "installUuid"; // chrome.storage.local — survi
 // the AUTHORITATIVE runtime state — read fresh on every execute_js and reported
 // in `hello` — so a copied instance.json cannot smuggle the gate open.
 export const ALLOW_EXECUTE_JS_KEY = "allowExecuteJs";
+// The last known /ext connection facts (§6 `get_connection_state`), kept in
+// chrome.storage.session: an MV3 worker dies between events, so an in-memory-only
+// `lastSeenAt` would read as "never" on every cold start — the startpage would show
+// a healthy instance as never-connected. Session storage dies with the browser,
+// which is exactly the lifetime of these facts.
+export const CONNECTION_STATE_KEY = "connectionState";
 
 // The reconnect alarm name.
 export const RECONNECT_ALARM = "ext-reconnect";

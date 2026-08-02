@@ -99,17 +99,54 @@ def renew(conn: sqlite3.Connection, owner: str, epoch: int, now: int, ttl_ms: in
     return True
 
 
-def release(conn: sqlite3.Connection, owner: str, epoch: int) -> None:
-    """Release the lease iff this owner still holds this epoch.
+def release(conn: sqlite3.Connection, owner: str) -> None:
+    """Release the lease iff this ``owner`` still holds the SLOT. Keyed on the OWNER.
+
+    Takes NO epoch on purpose. It used to, and the argument is exactly what must not
+    come back: see below.
 
     Expires ``until`` (sets it to 0) so the next pass can acquire immediately; the
-    epoch is left as-is (it only ever moves forward). Releasing someone else's
-    lease is a no-op — an evicted pass must never clear the live one.
+    epoch is left as-is (it only ever moves forward). Releasing someone else's lease
+    is a no-op — an evicted pass must never clear the live one.
+
+    **The owner, NOT the epoch, is the right key.** ``owner`` is a fresh uuid per
+    :func:`acquire`, and ``acquire`` is the only writer of the owner row, so "the owner
+    row still says me" is exactly "nobody else has taken the slot" — the invariant this
+    function needs. Requiring the EPOCH to match too was a bug with real teeth: a PAUSE
+    bumps the epoch without taking the slot (§7 fencing), so a paused-out pass could
+    never release, its renewal stopped, and ``pass_lease_until`` stayed in the future
+    for the rest of ``LEASE_TTL_MS`` (10 minutes by default). Lift the pause two minutes
+    later and §7's promise — "снятие руками (DELETE /api/pause) запускает проход
+    немедленно" — became "every pass answers lease_unavailable until the TTL burns out".
+
+    Freeing the slot from ``pause()`` instead would be worse, not better: the fenced
+    pass stops at its next GUARDED WRITE, and both ``run_phase_a`` and
+    ``run_window_merge`` send their browser command BEFORE that write. A slot freed at
+    pause time lets the pass triggered by the resume start while the fenced one is still
+    inside ``send_command`` — two passes at once, and a phase-A ``open_tab`` whose rows
+    were fenced away leaves a copy the new pass cannot see and duplicates (permanently,
+    for a ``main`` target: a sink without dedup, §15). Keeping the slot until the pass
+    that owns it actually finishes is what makes "one pass at a time" true; the TTL then
+    covers only the case nothing else can — a process that died without its ``finally``.
     """
-    if _epoch(conn) != epoch or _get(conn, _OWNER_KEY) != owner:
+    if _get(conn, _OWNER_KEY) != owner:
         return
     _set(conn, _UNTIL_KEY, "0")
     _set(conn, _OWNER_KEY, "")
+
+
+def holds(conn: sqlite3.Connection, epoch: int) -> bool:
+    """READ-ONLY "do I still hold the fencing epoch?" — :func:`guard` without a write.
+
+    Used to check the lease immediately before a browser command that would otherwise
+    be the pass's first observable effect in that unit (``open_tab``, ``merge_windows``
+    — both send BEFORE their guarded write). It does NOT make the send atomic: a pause
+    landing between this check and the socket write still gets one command through. It
+    shortens the window a fenced pass keeps acting in, which is what §7 asks of the
+    emergency stop ("человек ... ещё несколько минут наблюдал бы, как «выключенная»
+    система необратимо закрывает вкладки"). Mutual exclusion is the SLOT, not this.
+    """
+    return _epoch(conn) == epoch
 
 
 def bump_epoch(conn: sqlite3.Connection) -> int:

@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
+from conftest import make_settings
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -55,29 +56,16 @@ ALL_METRICS = [
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        heartbeat_ms=600_000,
-        protocol_version=1,
-        ext_token=EXT_TOKEN,
-        metrics_token=METRICS_TOKEN,
-        ext_allowed_origins="",
-        cmd_timeout_ms=2000,
-        snapshot_timeout_ms=2000,
-        state_fresh_ms=3_000_000,
-        restore_exemption_min=120,
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        lease_ttl_ms=600_000,
-        pass_interval_min=5,          # 6×PASS_INTERVAL = 1800s
-        idle_minutes=60,
-        main_instance_id="main",
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **{**{
+            "pass_interval_min": 5,
+        }, **over})
 
 
 # --- direct-DB seeding (the mirror the endpoint reads) ----------------------
@@ -109,12 +97,13 @@ def _insert_instance(db_path, iid, connected=0, last_seen_at=None, snapshot_at=N
     )
 
 
-def _insert_action(db_path, pass_id, kind, status="done", instance_to=None, reason=None):
+def _insert_action(db_path, pass_id, kind, status="done", instance_to=None, reason=None,
+                   decision=None):
     _exec(
         db_path,
-        "INSERT INTO actions (pass_id, ts, kind, status, initiator, instance_to, reason) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (pass_id, 1, kind, status, "curator", instance_to, reason),
+        "INSERT INTO actions (pass_id, ts, kind, status, initiator, instance_to, reason, "
+        "decision) VALUES (?,?,?,?,?,?,?,?)",
+        (pass_id, 1, kind, status, "curator", instance_to, reason, decision),
     )
 
 
@@ -334,6 +323,9 @@ def test_deferred_quarantine_relocations(tmp_path):
               ("main", "https://x/z", now - 60_000))        # expired -> not counted
         body = _scrape(client)
         assert _by_label(body, "curator_deferred_total", "to_instance", "prox") == 3.0
+        # A deferred row written before the cause split (decision NULL) keeps its count
+        # and lands under an explicit label, never an empty one.
+        assert _by_label(body, "curator_deferred_total", "cause", "unknown") == 3.0
         assert _scalar(body, "curator_quarantined_total") == 1.0
         assert _scalar(body, "curator_relocations_incomplete") == 0.0
 
@@ -403,14 +395,21 @@ def test_alerts_yml_convention():
     rules = [r for g in doc["groups"] for r in g["rules"]]
     assert rules, "no rules parsed"
 
-    alerting = [r for r in rules if r.get("noDataState") == "Alerting"]
-    ok_rules = [r for r in rules if r.get("noDataState") == "OK"]
-    # Exactly ONE Alerting-on-NoData rule (target loss); every other rule is OK.
-    assert len(alerting) == 1
-    assert alerting[0]["expr"].startswith('up{job="curator"}')
-    assert len(ok_rules) == len(rules) - 1
-    # Every rule declares a noDataState (no rule silently defaults).
-    assert all(r.get("noDataState") in ("OK", "Alerting") for r in rules)
+    # Target loss is the ONE rule that fires on missing data, and it expresses that
+    # in PromQL: `up == 0` (scraped and failing) OR `absent()` (gone from service
+    # discovery, where a bare `up == 0` matches nothing). It used to be spelled
+    # `noDataState: Alerting` — a Grafana-MANAGED-alert field that Prometheus and
+    # vmalert reject on their strict unmarshal, taking the WHOLE file down with it
+    # (verified with promtool; see tests/test_deploy_alerts.py for the full schema
+    # guard). Every other rule wants an empty result to stay silent, which is the
+    # Prometheus default and needs no field at all.
+    down = [r for r in rules if r.get("alert") == "curator-down"]
+    assert len(down) == 1
+    assert down[0]["expr"] == 'up{job="curator"} == 0 or absent(up{job="curator"})'
+    assert not any("noDataState" in r for r in rules)
+    assert not any(
+        "absent(" in r["expr"] for r in rules if r.get("alert") != "curator-down"
+    )
     # No expression uses the time()-metric filter-to-NoData form the spec forbids.
     for r in rules:
         assert "time(" not in r["expr"], f"forbidden time() filter in {r.get('alert')}"
@@ -438,3 +437,136 @@ def test_clock_step_non_finite_setting_renders_valid_sample(tmp_path):
         body = _scrape(client)
         assert "curator_clock_step_seconds +Inf" in body
         assert "curator_clock_step_seconds inf" not in body
+
+
+# --- deferred: the CAUSE is a label, not a summed-away detail ----------------
+def test_deferred_total_splits_by_cause(tmp_path):
+    """`curator_deferred_total` must separate the two reasons a relocation is deferred.
+
+    They are not the same event: ``target_not_ready`` means the home is unreachable (§7
+    connectivity — somebody has to fix something), ``dup_same_pass`` is the curator
+    serialising itself so it does not open a duplicate inside one pass (routine, healthy,
+    gone next pass). Summed into one number neither can be alerted on nor read.
+
+    Reddens if ``decision`` is dropped from the query or the label: the two rows collapse
+    into a single series of 5.
+    """
+    s = _settings(tmp_path)
+    app = create_app(s)
+    now = int(time.time() * 1000)
+    with TestClient(app) as client:
+        _insert_pass(s.db_path, "p1", now - 60_000, now - 50_000, ok=1, instances_ready=1)
+        _insert_action(s.db_path, "p1", "relocate", status="deferred",
+                       instance_to="prox", reason="2", decision="target_not_ready")
+        _insert_action(s.db_path, "p1", "relocate", status="deferred",
+                       instance_to="prox", reason="3", decision="dup_same_pass")
+        body = _scrape(client)
+
+        samples = {
+            labels: val for labels, val in _samples(body, "curator_deferred_total")
+        }
+        assert len(samples) == 2, f"the two causes must be two series, got {samples}"
+        assert samples['to_instance="prox",cause="target_not_ready"'] == 2.0
+        assert samples['to_instance="prox",cause="dup_same_pass"'] == 3.0
+        # The metric NAME is unchanged — deploy/alerts.yml and its series-name guard
+        # key on it, so a rename would be a silent alerting outage.
+        assert "curator_deferred_total{" in body
+
+
+def test_deferred_total_separates_targets_and_causes_together(tmp_path):
+    # Both labels are real dimensions: two targets × two causes => four series, each
+    # carrying its own count (nothing folded into a neighbour).
+    s = _settings(tmp_path)
+    app = create_app(s)
+    now = int(time.time() * 1000)
+    with TestClient(app) as client:
+        _insert_pass(s.db_path, "p1", now - 60_000, now - 50_000, ok=1, instances_ready=1)
+        for inst, cause, n in (
+            ("prox", "target_not_ready", "1"), ("prox", "dup_same_pass", "2"),
+            ("media", "target_not_ready", "4"), ("media", "dup_same_pass", "8"),
+        ):
+            _insert_action(s.db_path, "p1", "relocate", status="deferred",
+                           instance_to=inst, reason=n, decision=cause)
+        samples = {
+            labels: val for labels, val in _samples(_scrape(client), "curator_deferred_total")
+        }
+        assert samples == {
+            'to_instance="media",cause="dup_same_pass"': 8.0,
+            'to_instance="media",cause="target_not_ready"': 4.0,
+            'to_instance="prox",cause="dup_same_pass"': 2.0,
+            'to_instance="prox",cause="target_not_ready"': 1.0,
+        }
+
+
+def test_deferred_rows_without_a_decision_get_an_explicit_cause(tmp_path):
+    # Rows written before the split carry NULL/blank `decision`. They are REAL deferrals
+    # (their count must survive) but must never produce `cause=""` — an empty label reads
+    # as "no cause", not as "not recorded". Both NULL and '' land on the same explicit
+    # bucket, and a malformed count keeps the series at 0 instead of dropping it.
+    s = _settings(tmp_path)
+    app = create_app(s)
+    now = int(time.time() * 1000)
+    with TestClient(app) as client:
+        _insert_pass(s.db_path, "p1", now - 60_000, now - 50_000, ok=1, instances_ready=1)
+        _insert_action(s.db_path, "p1", "relocate", status="deferred",
+                       instance_to="prox", reason="4", decision=None)
+        _insert_action(s.db_path, "p1", "relocate", status="deferred",
+                       instance_to="prox", reason="1", decision="")
+        _insert_action(s.db_path, "p1", "relocate", status="deferred",
+                       instance_to="media", reason="not-a-number", decision=None)
+        body = _scrape(client)
+        samples = {
+            labels: val for labels, val in _samples(body, "curator_deferred_total")
+        }
+        assert samples == {
+            'to_instance="prox",cause="unknown"': 5.0,      # 4 + 1, both bucketed
+            'to_instance="media",cause="unknown"': 0.0,     # kept visible, not dropped
+        }
+        assert 'cause=""' not in body
+
+
+# --- restore-marker readability (§12) ---------------------------------------
+def test_restore_marker_unreadable_gauge(tmp_path):
+    """"Marker configured but unreadable" is otherwise an INVISIBLE state.
+
+    Backup-restore detection is then off for good — the classic path is a marker written
+    by a root helper under umask 077, landing 600 root:root where the uid-1000 container
+    can never read it, while every other fingerprint component travels inside the backup
+    and matches. The only trace is a log line every five minutes.
+
+    The runner writes ``"1"``/``"0"`` into ``settings``; this reads it at SCRAPE time
+    (from the DB, never process memory) so a restart cannot reset it to a healthy zero.
+    """
+    s = _settings(tmp_path)
+    app = create_app(s)
+    with TestClient(app) as client:
+        # ABSENT row — no pass has looked yet. Must be 0 AND present: a gauge that only
+        # appears once the fault occurs gives NoData for "it never ran" (§12), which is
+        # the exact silence this metric exists to break.
+        body = _scrape(client)
+        assert "curator_restore_marker_unreadable" in body
+        assert _scalar(body, "curator_restore_marker_unreadable") == 0.0
+
+        # The fault.
+        _set_setting(s.db_path, "curator_restore_marker_unreadable", "1")
+        assert _scalar(_scrape(client), "curator_restore_marker_unreadable") == 1.0
+
+        # Read again, or never configured.
+        _set_setting(s.db_path, "curator_restore_marker_unreadable", "0")
+        assert _scalar(_scrape(client), "curator_restore_marker_unreadable") == 0.0
+
+
+def test_restore_marker_gauge_never_invents_a_fault(tmp_path):
+    # Only the exact "1" is a failure. A blank or garbage value must read 0: the one
+    # thing this gauge must not do is manufacture an outage out of missing evidence.
+    s = _settings(tmp_path)
+    app = create_app(s)
+    with TestClient(app) as client:
+        for value in ("", "  ", "yes", "true", "2", "-1"):
+            _set_setting(s.db_path, "curator_restore_marker_unreadable", value)
+            assert _scalar(
+                _scrape(client), "curator_restore_marker_unreadable"
+            ) == 0.0, f"{value!r} was read as a fault"
+        # …and whitespace around a real "1" still counts as the fault.
+        _set_setting(s.db_path, "curator_restore_marker_unreadable", " 1 ")
+        assert _scalar(_scrape(client), "curator_restore_marker_unreadable") == 1.0

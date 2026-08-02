@@ -69,21 +69,33 @@ async def pause_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"paused_until": until, "pause_started_at": started})
 
 
-async def resume_endpoint(request: Request) -> JSONResponse:
-    """``DELETE /api/pause`` — manual resume (TTL shift + clear) then run a pass now."""
-    require_ext_token(request)
-    require_operational(request)
+async def resume_now(app) -> dict:
+    """Manual resume: TTL shift + clear the latch, THEN run a pass immediately (§7).
 
-    app = request.app
+    THE resume shape, shared by ``DELETE /api/pause`` and the MCP ``resume`` tool. §7
+    is explicit that a manual resume runs a pass at once («Снятие руками
+    (`DELETE /api/pause`) запускает проход немедленно») and that only a TIMEOUT expiry
+    defers behind a click. The MCP tool used to stop after the settings write, so an
+    agent's resume left the curator idle until the next tick — the same verb with two
+    behaviours. Returns ``{ttl_shift_ms, pass}``.
+    """
     now = _now_ms()
     shift = await app.state.db.write(lambda c: pause_ops.resume(c, now=now))
-
-    # Human at the keyboard → handle the backlog immediately (§7). The pause is now
-    # cleared, so this real (non-dry, non-confirm) pass runs normally past step 1.
+    # Human (or agent) asked for it → handle the backlog immediately (§7). The pause is
+    # now cleared, so this real (non-dry, non-confirm) pass runs normally past step 1.
     result = await runner.run_pass(
         app.state.db,
         app.state.ext_registry,
         app.state.settings,
         clock_guard=getattr(app.state, "curator_clock", None),
     )
-    return JSONResponse({"resumed": True, "ttl_shift_ms": shift, "pass": result})
+    return {"ttl_shift_ms": shift, "pass": result}
+
+
+async def resume_endpoint(request: Request) -> JSONResponse:
+    """``DELETE /api/pause`` — manual resume (TTL shift + clear) then run a pass now."""
+    require_ext_token(request)
+    require_operational(request)
+
+    outcome = await resume_now(request.app)
+    return JSONResponse({"resumed": True, **outcome})

@@ -3,9 +3,19 @@
 The startpage lives inside each extension and calls ``/api/*`` cross-origin; its
 ``Authorization: Bearer`` header forces a CORS preflight (§12), so the browser will
 only issue the real request if this middleware echoes the exact requesting origin.
-The allow-list is the SAME explicit set the ``/ext`` hello check uses
-(:func:`~src.ext.protocol.parse_origins`) — kept in one place so a CORS/hello
-mismatch (the §12 «бесшумный отказ») cannot arise from two divergent parsers.
+The allow-list is parsed from ``EXT_ALLOWED_ORIGINS`` by the SAME
+:func:`~src.ext.protocol.parse_origins` the ``/ext`` hello check uses, so the two can
+never disagree about WHICH origins are listed — a mismatch cannot come from two
+divergent parsers.
+
+They DO disagree about the EMPTY list, on purpose: ``/ext`` treats it as "any origin"
+(the extension id is unknown before the extension is loaded, and closing ``/ext`` would
+disconnect every instance of a deployment that never set the variable), while CORS can
+only ever treat it as "closed" — widening to ``*`` is forbidden by §12. That asymmetry
+is documented once, in ``parse_origins``; the warning below is this side of it, and
+``curator_auth_rejections_total{reason="cors_preflight"}`` (see
+:class:`CountingCORSMiddleware`) is what makes the resulting failure audible rather
+than the §12 «бесшумный отказ».
 
 Design invariants (do not relax):
 
@@ -14,8 +24,8 @@ Design invariants (do not relax):
   echo a listed origin or nothing.
 * Empty list (dev, real extension id still unknown) => the list stays EMPTY, which
   BLOCKS all cross-origin ``/api/*`` (the secure default) — it is NOT widened to
-  ``*``. A one-time loud warning is logged, mirroring the existing ``/ext`` open-
-  origin warning, so prod is reminded to set ``EXT_ALLOWED_ORIGINS``.
+  ``*``. A one-time loud warning is logged, naming BOTH consequences of the empty
+  value, so prod is reminded to set ``EXT_ALLOWED_ORIGINS``.
 * ``allow_credentials=False``: the token rides a Bearer header, not a cookie, so
   credentials stay off; with them off Starlette still echoes an explicit origin.
 """
@@ -66,7 +76,7 @@ def cors_kwargs(ext_allowed_origins: str) -> dict:
     :func:`~src.ext.protocol.parse_origins` the hello check uses — never ``*`` and
     never a widening ``allow_origin_regex``. An empty configured value yields an
     EMPTY list (cross-origin ``/api/*`` blocked, the secure default) and a one-time
-    loud warning; it is never turned into ``*``.
+    loud warning naming the ``/ext``-is-open half too; it is never turned into ``*``.
     """
     origins = sorted(parse_origins(ext_allowed_origins))
     # The "never *" invariant is absolute: a literal "*" in the env would make
@@ -80,11 +90,17 @@ def cors_kwargs(ext_allowed_origins: str) -> dict:
         )
         origins = [o for o in origins if o != "*"]
     if not origins:
+        # Name BOTH halves of the empty value in ONE message: /ext open + CORS closed
+        # is exactly the §12 «бесшумный отказ» shape (the instance looks healthy while
+        # the startpage silently serves a cache that never refreshes), so the operator
+        # must not have to read two log lines to see it.
         logger.warning(
-            "EXT_ALLOWED_ORIGINS is empty: cross-origin /api/* CORS is CLOSED "
-            "(no Access-Control-Allow-Origin is emitted for any origin) — set "
-            "EXT_ALLOWED_ORIGINS to the real chrome-extension://<id> before the "
-            "startpage can fetch /api/* (§12)"
+            "EXT_ALLOWED_ORIGINS is empty: cross-origin /api/* CORS is CLOSED (no "
+            "Access-Control-Allow-Origin is emitted for any origin) while /ext accepts "
+            "ANY origin — the startpage will connect over the websocket and still fail "
+            "every fetch on preflight (§12 silent failure; watch "
+            "curator_auth_rejections_total{reason=\"cors_preflight\"}). Set "
+            "EXT_ALLOWED_ORIGINS to the real chrome-extension://<id>."
         )
     return {
         "allow_origins": origins,      # explicit list — Starlette never echoes '*'

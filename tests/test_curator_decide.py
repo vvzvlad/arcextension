@@ -101,18 +101,112 @@ def test_q2_dedup_full_url_not_normalized():
 
 
 # --- phase-A copies made THIS pass are excluded from step 7/8 (frozen mirror) -
-def test_two_identical_sources_both_phase_a_no_same_pass_collapse():
-    # Two identical tabs in main both route to an EMPTY prox. Both must open (phase A);
-    # neither may be dedupe/singleton-collapsed against the OTHER's not-yet-created
-    # copy — the copies do not exist in the frozen mirror (§7 phase-A exclusion).
+def test_two_identical_sources_one_phase_a_other_deferred_no_same_pass_collapse():
+    # Two identical tabs in main both route to an EMPTY prox. Exactly ONE opens; the
+    # second is DEFERRED to the next pass — never a second phase A (that would be two
+    # copies the curator itself created, which §7 forbids: for a `main` target the dupe
+    # would survive forever, since `main` is a sink without dedup, §15).
+    #
+    # And the same-pass collapse ban still holds: neither tab may be dedupe- or
+    # singleton-closed against the OTHER's not-yet-created copy — the copies do not
+    # exist in the frozen mirror (§7 phase-A exclusion). The deferred tab WAITS; it is
+    # not closed.
     rules = [_rule(1, "grafana.lc", "prox")]
     tabs = [
         _tab("main", 20, "https://grafana.lc/d/abc"),
         _tab("main", 21, "https://grafana.lc/d/abc"),
     ]
     res = _decide(_mirror(tabs, [_inst("prox"), _inst("main")], rules), {"prox", "main"})
+    assert [d.tab.tab_id for d in res.phase_a] == [20]      # only the first opens
+    assert res.closes == []                                  # nothing collapsed in-pass
+    # The second is journalled as a deferral against the target, with the cause named.
+    assert res.deferred == {"prox": 1}
+    assert res.deferred_same_url == {"prox": 1}
+
+
+def test_two_identical_sources_to_main_do_not_both_open():
+    # The case that never self-heals: `main` is a sink WITHOUT dedup (§15), so a second
+    # copy the curator opens there survives forever, and next pass's question (b) cannot
+    # catch it either (phase B already closed both sources). Drop the per-pass
+    # (target, url) set and this reddens with two phase-A opens into main.
+    rules = [_rule(1, "grafana.lc", "main")]
+    tabs = [
+        _tab("prox", 20, "https://grafana.lc/d/abc"),
+        _tab("prox", 21, "https://grafana.lc/d/abc"),
+    ]
+    res = _decide(_mirror(tabs, [_inst("prox"), _inst("main")], rules), {"prox", "main"})
+    assert [d.tab.tab_id for d in res.phase_a] == [20]
+    assert res.deferred_same_url == {"main": 1}
+
+
+def test_two_DIFFERENT_urls_to_same_target_both_open():
+    # The gate is per (target, FULL url), not per target: two different urls headed for
+    # the same instance must BOTH open in one pass (else every relocation serializes).
+    rules = [_rule(1, "grafana.lc", "prox")]
+    tabs = [
+        _tab("main", 20, "https://grafana.lc/d/abc"),
+        _tab("main", 21, "https://grafana.lc/d/xyz"),
+    ]
+    res = _decide(_mirror(tabs, [_inst("prox"), _inst("main")], rules), {"prox", "main"})
     assert sorted(d.tab.tab_id for d in res.phase_a) == [20, 21]
+    assert res.deferred == {}
+
+
+# --- an orphaned rule wins the §8 ladder => deferred, never a foreign home ----
+def test_orphan_beats_a_broader_valid_rule_on_the_specificity_ladder():
+    """The specificity ladder (§8) must run ONCE, across valid and orphaned rules alike.
+
+    ``*.borneo.lc -> prox`` is valid; the more specific ``www.borneo.lc -> ghost`` was
+    orphaned (its instance retired). Before the flag the ladder picks the longer pattern,
+    the home is unreachable, and the tab is DEFERRED — untouched. Asking the valid rules
+    first and only then the orphans runs the ladder twice: ``*.borneo.lc`` wins by
+    default and the tab is relocated into ``prox`` — a home the owner never chose for it,
+    triggered by retiring an unrelated instance. Reddens under that two-step lookup:
+    phase_a becomes [(20, 'prox')] and deferred is empty.
+    """
+    rules = [
+        _rule(1, "*.borneo.lc", "prox"),
+        _rule(2, "www.borneo.lc", "ghost", invalid=1),
+    ]
+    tabs = [_tab("main", 20, "https://www.borneo.lc/page")]
+    res = _decide(
+        _mirror(tabs, [_inst("main"), _inst("prox")], rules), {"main", "prox"}
+    )
+    assert res.phase_a == []
     assert res.closes == []
+    assert res.deferred == {"ghost": 1}
+
+
+def test_broader_orphan_does_not_shadow_a_more_specific_valid_rule():
+    """The mirror image: when the VALID rule is the more specific one it still wins, so
+    flagging a broad orphan does not freeze everything underneath it."""
+    rules = [
+        _rule(1, "*.borneo.lc", "ghost", invalid=1),
+        _rule(2, "www.borneo.lc", "prox"),
+    ]
+    tabs = [_tab("main", 20, "https://www.borneo.lc/page")]
+    res = _decide(
+        _mirror(tabs, [_inst("main"), _inst("prox")], rules), {"main", "prox"}
+    )
+    assert [(d.tab.tab_id, d.home) for d in res.phase_a] == [(20, "prox")]
+    assert res.deferred == {}
+
+
+def test_orphaned_rule_defers_instead_of_draining_to_main():
+    """A tab whose only matching rule is orphaned must not fall into the unruled ->
+    main drain. A second, valid rule keeps the drain switched ON so the assertion is
+    not vacuous. Reddens if orphans are excluded from matching: the tab routes to main.
+    """
+    rules = [
+        _rule(1, "grafana.lc", "ghost", invalid=1),
+        _rule(2, "other.lc", "prox"),   # keeps has_active_rules() true => drain on
+    ]
+    tabs = [_tab("prox", 20, "https://grafana.lc/d/x")]
+    res = _decide(
+        _mirror(tabs, [_inst("main"), _inst("prox")], rules), {"main", "prox"}
+    )
+    assert res.phase_a == []
+    assert res.deferred == {"ghost": 1}
 
 
 # --- unruled tab in main lives forever --------------------------------------

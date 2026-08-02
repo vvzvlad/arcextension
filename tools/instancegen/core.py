@@ -13,7 +13,9 @@ import os
 import re
 import shutil
 import struct
+import tempfile
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -51,18 +53,74 @@ def _write_private_text(path, text: str) -> None:
 
     ``instance.json`` carries the ``EXT_TOKEN`` in cleartext — a credential as
     sensitive as the signing key (which is already 0600), so it must never be
-    group/world-readable at rest. Atomic create at 0600; the explicit ``chmod``
-    also covers an OVERWRITE (restamp rewrites the token in place) where an existing
-    file's mode would otherwise persist. The browser runs as the same user, so
-    owner-only loses no functionality.
+    group/world-readable at rest. The browser runs as the same user, so owner-only
+    loses no functionality. See :func:`write_private_bytes` for the atomicity and
+    permission guarantees.
     """
-    data = text.encode("utf-8")
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    write_private_bytes(path, text.encode("utf-8"))
+
+
+def write_private_bytes(path, data: bytes) -> None:
+    """Atomically and durably write *data* to *path* owner-only (0600).
+
+    Write-to-temp + fsync + ``os.replace``, not a truncating write in place. Writing
+    straight into the destination leaves a TRUNCATED file if the disk fills on
+    flush/close or the process is killed mid-write — and a truncated ``instance.json``
+    still passes every ``p.exists()`` check while being unparseable config. Here the
+    destination keeps its previous contents until a COMPLETE file is renamed over it;
+    ``os.replace`` is atomic within a directory, so a reader sees old or new, never
+    half.
+
+    The ``fsync`` before the rename is what makes that true across a POWER LOSS rather
+    than only across a crash: without it the rename can reach disk while the data
+    behind it has not, leaving an empty or partial file under the real name. The
+    directory is fsync'd too, so the rename itself survives.
+
+    ``tempfile.mkstemp`` supplies the temp file: it creates with ``O_EXCL`` and an
+    UNPREDICTABLE name at mode 0600. A fixed name like ``.<name>.tmp`` is guessable, so
+    in a shared/world-writable output dir a neighbour could pre-plant it as a symlink
+    and have this function write the ``EXT_TOKEN`` (or the signing key) wherever the
+    link points. ``os.fchmod`` re-asserts 0600 on the descriptor before any bytes are
+    written, and since ``os.replace`` makes this inode the destination, 0600 lands on
+    the final file regardless of the mode the OLD file had — which is what makes a
+    re-stamp over a stray 0644 ``instance.json`` safe.
+    """
+    path = Path(path)
+    # Same directory as the destination: os.replace is atomic only within a filesystem.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        os.write(fd, data)
+        os.fchmod(fd, 0o600)
+        # os.fdopen takes ownership of fd and closes it. A buffered writer writes
+        # everything or raises — a bare os.write() may write only PART of the buffer
+        # and return the short count without raising (a filling disk, a signal).
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _fsync_dir(directory: Path) -> None:
+    """fsync a directory so a rename into it survives a power loss.
+
+    Best-effort: some platforms/filesystems refuse to open a directory for this, and
+    failing the whole write over a durability nicety would be worse than the risk.
+    """
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
     finally:
-        os.close(fd)
-    os.chmod(path, 0o600)
+        os.close(dir_fd)
 
 
 def slugify(text: str) -> str:
@@ -133,7 +191,10 @@ def build_instance_json(
     if not service_url:
         raise ValueError("serviceUrl is required")
     if not token:
-        raise ValueError("token is required (pass --token or set EXT_TOKEN)")
+        raise ValueError(
+            "token is required (set EXT_TOKEN, or pass --token-file; there is no "
+            "--token option — a secret must not go in argv)"
+        )
     return {
         "instanceId": instance_id,
         "title": title,
@@ -333,6 +394,163 @@ def copy_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path) ->
     shutil.copytree(src, dst_extension_dir, ignore=_COPY_IGNORE)
 
 
+def _clear_instance_dir_keeping_profile(root: Path) -> None:
+    """Empty a regenerated instance's dir but KEEP ``profile/`` (§6/§13 invariant).
+
+    Everything the generator writes (the extension copy, the ``.app``) it can write
+    again; the profile it CANNOT. The profile holds the ``install_uuid`` minted by
+    the SW on first run — plus the session, cookies and saved passwords. An
+    ``--overwrite`` that rmtree'd the whole root silently destroyed all of it, and
+    the regenerated instance came back with a NEW install_uuid: a reconnect the
+    service is entitled to treat as a different install. Regeneration is therefore a
+    bundle-level operation only, exactly as ``InstancePaths`` documents.
+    """
+    for child in root.iterdir():
+        if child.name == _PROFILE_DIRNAME:
+            continue
+        # Symlinked dirs are unlinked, not walked into: rmtree would follow a
+        # planted link out of the instance dir.
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def _load_manifest(manifest_path: Path) -> dict:
+    """Parse an instance's copied manifest, with a message naming the file.
+
+    Used by the re-stamp PRE-FLIGHT as well as by the writers: every parse the apply
+    phase would do must first be done here, where a failure aborts the whole run
+    instead of splitting the fleet across two tokens.
+    """
+    if not manifest_path.is_file():
+        raise ValueError(f"{manifest_path} is missing — refusing to restamp")
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"{manifest_path} is not valid JSON: {exc}") from exc
+
+
+def _pinned_manifest_key(manifest_path: Path) -> str:
+    """The real ``key`` already pinned in an INSTANCE's copied manifest.
+
+    A code refresh must carry this key over from the old copy: the SOURCE bundle
+    ships the placeholder, so copying its manifest verbatim would re-derive a
+    different extension id — changing the ``chrome-extension://`` origin of every
+    instance at once and breaking ``EXT_ALLOWED_ORIGINS``/CORS (§12). Refusing loudly
+    is the only safe answer; there is nothing to guess here.
+    """
+    manifest = _load_manifest(manifest_path)
+    key_b64 = str(manifest.get("key") or "")
+    if not key_b64 or key_b64 == KEY_PLACEHOLDER:
+        raise ValueError(
+            f"{manifest_path} carries no pinned `key` — refusing to refresh the code "
+            "(it would change the extension id and every instance's origin)"
+        )
+    return key_b64
+
+
+def _refresh_instance_code(
+    extension_dir: Path,
+    source_extension_dir: str | Path,
+    service_url: str,
+    instance_json_text: str,
+) -> None:
+    """Replace one instance's extension CODE from *source_extension_dir* (§13).
+
+    The bundle is duplicated per instance (``instance.json`` lives inside it), and
+    ``protocolVersion`` is compared by exact equality (§6) — so a copy missed by an
+    update is rejected on ``hello`` FOREVER, visible only in the status bar. §13
+    therefore requires the re-stamp operation to carry the code as well; rotating a
+    token after a ``PROTOCOL_VERSION`` bump would otherwise kill the whole fleet.
+
+    Preserved across the refresh: the pinned manifest ``key`` (same extension id) and
+    the profile (a SIBLING of this directory, never touched).
+
+    The new tree — code, stamped manifest AND ``instance.json`` — is staged beside the
+    old one and swapped in only once complete. ``instance.json`` is written into the
+    staging tree BEFORE the rename, deliberately: writing it after the swap would open
+    a window in which the extension dir exists WITHOUT its config, and a crash there
+    leaves an instance that ``iter_instance_json_paths`` (globbing
+    ``*/extension/instance.json``) no longer finds — so the next re-stamp skips it
+    silently, reports one instance fewer, and that browser never connects again.
+    """
+    key_b64 = _pinned_manifest_key(extension_dir / "manifest.json")
+    materialize_extension_bundle(
+        extension_dir,
+        source_extension_dir,
+        service_url=service_url,
+        key_b64=key_b64,
+        instance_json_text=instance_json_text,
+    )
+
+
+def materialize_extension_bundle(
+    extension_dir: Path,
+    source_extension_dir: str | Path,
+    *,
+    service_url: str,
+    key_b64: str,
+    instance_json_text: str,
+) -> None:
+    """Build a COMPLETE extension dir (code + stamped manifest + config), then swap.
+
+    Shared by ``generate`` and the re-stamp code refresh, because both have the same
+    all-or-nothing requirement: an extension dir that exists WITHOUT ``instance.json``
+    is invisible to :func:`iter_instance_json_paths` (which globs
+    ``*/extension/instance.json``), so the next re-stamp silently skips that instance,
+    reports one fewer, and that browser never reconnects. Everything is therefore
+    assembled in a staging dir and renamed into place only once complete.
+
+    The swap itself is guarded: if the second rename fails, the previous tree is put
+    back, so a failure can never leave the instance with NO extension dir at all — a
+    worse state than the config-less tree this function exists to prevent. Only the
+    final cleanup of the old tree is best-effort; a leftover ``.extension.old`` is
+    cosmetic and the next run clears it.
+    """
+    staging = extension_dir.parent / f".{extension_dir.name}.new"
+    previous = extension_dir.parent / f".{extension_dir.name}.old"
+    for leftover in (staging, previous):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+
+    try:
+        copy_bundle(source_extension_dir, staging)
+        manifest_path = staging / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_path.write_text(
+            json.dumps(
+                stamp_manifest(manifest, host_from_service_url(service_url), key_b64),
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # The config joins the tree BEFORE the swap (see the docstring): after the
+        # rename the instance is complete, never briefly config-less.
+        _write_private_text(staging / INSTANCE_JSON, instance_json_text)
+    except BaseException:
+        # Drop the half-built tree; the live extension_dir was never touched.
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+
+    had_previous = extension_dir.exists()
+    if had_previous:
+        extension_dir.rename(previous)
+    try:
+        staging.rename(extension_dir)
+    except BaseException:
+        # Put the old tree back rather than leaving no extension dir at all.
+        if had_previous and previous.exists() and not extension_dir.exists():
+            previous.rename(extension_dir)
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    if had_previous:
+        shutil.rmtree(previous, ignore_errors=True)  # cosmetic; next run clears it
+
+
 # --------------------------------------------------------------------------- #
 # Generate + re-stamp
 # --------------------------------------------------------------------------- #
@@ -371,24 +589,22 @@ def generate_instance(
             raise FileExistsError(
                 f"{paths.root} already exists (use restamp to rotate, or --overwrite)"
             )
-        shutil.rmtree(paths.root)
+        _clear_instance_dir_keeping_profile(paths.root)
 
-    # 1. Copy the bundle (its own copy per instance).
-    copy_bundle(source_extension_dir, paths.extension_dir)
-
-    # 2. Write instance.json — the four fields — into the copied bundle.
+    # 1-3. The bundle (its own copy per instance), with <host>+key stamped into the
+    #      manifest and instance.json — the four fields — inside it. Assembled in a
+    #      staging dir and swapped in complete, so a kill mid-generate can never leave
+    #      an extension dir without its config (which the next re-stamp would silently
+    #      skip, rotating N-1 instances and reporting success).
     instance = build_instance_json(
         instance_id, title, service_url, token, allow_execute_js
     )
-    _write_private_text(paths.instance_json, json.dumps(instance, indent=2) + "\n")
-
-    # 3. Stamp <host> + key into the copied manifest.
-    host = host_from_service_url(service_url)
-    manifest_path = paths.extension_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest_path.write_text(
-        json.dumps(stamp_manifest(manifest, host, key_b64), indent=2) + "\n",
-        encoding="utf-8",
+    materialize_extension_bundle(
+        paths.extension_dir,
+        source_extension_dir,
+        service_url=service_url,
+        key_b64=key_b64,
+        instance_json_text=json.dumps(instance, indent=2) + "\n",
     )
 
     # 4. Empty profile dir (the --user-data-dir). Deliberately empty: the SW mints
@@ -450,6 +666,7 @@ class RestampChange:
     instance_id: str
     old_token_masked: str
     new_service_url: str | None
+    code_updated: bool = False
 
 
 def restamp_all(
@@ -457,8 +674,10 @@ def restamp_all(
     *,
     token: str,
     service_url: str | None = None,
+    source_extension_dir: str | Path | None = None,
+    on_change: Callable[[RestampChange], None] | None = None,
 ) -> list[RestampChange]:
-    """Rotate the token (and optionally serviceUrl) in EVERY instance (§13).
+    """Re-stamp EVERY instance: rotate the token, and refresh the code (§13).
 
     The §13 rotation path: rewrite ``instance.json`` in place for all instances,
     PRESERVING each ``instanceId`` and the profile (so ``install_uuid`` survives
@@ -467,15 +686,31 @@ def restamp_all(
     When *service_url* is given, the copied manifest's ``<host>`` is re-stamped to
     match so ``host_permissions`` stay consistent; the pinned ``key`` is left
     as-is (rotating the token must not change the extension id).
+
+    *source_extension_dir* is the §13 «перештамповать все инстансы, обновляя заодно
+    код» half: given, each instance's extension CODE is replaced from that bundle.
+    That is what the CLI passes by default, and it is not optional in practice — the
+    bundle is duplicated per instance while ``protocolVersion`` is compared by exact
+    equality (§6), so an update that bumps the protocol and is followed by a routine
+    token rotation would otherwise leave every copy on the old code, each rejected on
+    ``hello`` forever with the failure visible only in the status bar. Passing None
+    rotates configuration ONLY and is for callers that update the code separately.
     """
     if not token:
         raise ValueError("restamp needs a non-empty token")
 
-    changes: list[RestampChange] = []
     paths = iter_instance_json_paths(out_root)
     if not paths:
         raise FileNotFoundError(f"no instances found under {out_root}")
 
+    # --- PRE-FLIGHT: validate EVERY instance before mutating the first ----------
+    # This loop writes nothing. A per-instance check made mid-write would split the
+    # fleet: with a bad manifest on instance 3 of 6, the first two already hold the
+    # new token, the rest hold the old one — and the operator has typically already
+    # rotated EXT_TOKEN on the service, so half the fleet is dead with no single
+    # token that fixes it. Validating up front makes the whole operation refuse
+    # instead, leaving every instance on the old, consistent, WORKING token.
+    planned: list[tuple[Path, dict, str]] = []
     for ij in paths:
         data = json.loads(ij.read_text(encoding="utf-8"))
         instance_id = data.get("instanceId")
@@ -484,29 +719,64 @@ def restamp_all(
             # silently rewritten (an empty id is exactly the §6 reject case).
             raise ValueError(f"{ij} has no instanceId — refusing to restamp")
 
+        effective_url = service_url if service_url is not None else data.get("serviceUrl")
+        # Whatever the apply phase will PARSE or DERIVE must be checked here, in BOTH
+        # branches. The config-only branch still rewrites the manifest host when
+        # --service-url is given, and its json.loads throws on a corrupt manifest just
+        # as readily — checking that only under the code-refresh branch left exactly
+        # the split-fleet hole this pre-flight exists to close.
+        needs_manifest = source_extension_dir is not None or service_url is not None
+        if needs_manifest:
+            if not effective_url:
+                raise ValueError(
+                    f"{ij} has no serviceUrl — refusing to restamp "
+                    "(the manifest host cannot be derived)"
+                )
+            host_from_service_url(effective_url)  # raises on an underivable host
+            _load_manifest(ij.parent / "manifest.json")  # raises on corrupt/missing
+        if source_extension_dir is not None:
+            _pinned_manifest_key(ij.parent / "manifest.json")  # raises if unpinned
+        planned.append((ij, data, str(instance_id)))
+
+    # --- APPLY -----------------------------------------------------------------
+    changes: list[RestampChange] = []
+    for ij, data, instance_id in planned:
         old_token = str(data.get("token", ""))
         data["token"] = token  # instanceId is left untouched — immutable.
         if service_url is not None:
             data["serviceUrl"] = service_url
-            _restamp_manifest_host(ij.parent / "manifest.json", service_url)
+        new_text = json.dumps(data, indent=2) + "\n"
 
-        _write_private_text(ij, json.dumps(data, indent=2) + "\n")
-        changes.append(
-            RestampChange(
-                instance_json=ij,
-                instance_id=instance_id,
-                old_token_masked=_mask(old_token),
-                new_service_url=service_url,
+        if source_extension_dir is not None:
+            # Replaces the extension dir wholesale — including instance.json, which
+            # the refresh stages itself so the swapped-in tree is complete. It
+            # re-stamps the manifest host too, hence the elif.
+            _refresh_instance_code(
+                ij.parent, source_extension_dir, str(data["serviceUrl"]), new_text
             )
+        else:
+            if service_url is not None:
+                _restamp_manifest_host(ij.parent / "manifest.json", service_url)
+            _write_private_text(ij, new_text)
+
+        change = RestampChange(
+            instance_json=ij,
+            instance_id=instance_id,
+            old_token_masked=_mask(old_token),
+            new_service_url=service_url,
+            code_updated=source_extension_dir is not None,
         )
+        changes.append(change)
+        # Reported as it happens so a caller can still tell the operator WHICH
+        # instances already carry the new token if a later one blows up mid-apply.
+        if on_change is not None:
+            on_change(change)
     return changes
 
 
 def _restamp_manifest_host(manifest_path: Path, service_url: str) -> None:
     """Re-derive `host_permissions` for a changed serviceUrl; keep the pinned key."""
-    if not manifest_path.is_file():
-        return
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _load_manifest(manifest_path)
     host = host_from_service_url(service_url)
     # Rebuild the two host-scoped patterns from the schemes, preserving <all_urls>.
     new_perms = []

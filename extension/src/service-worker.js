@@ -84,9 +84,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // --- alarms: reconnect + tick ----------------------------------------------
 
+// ensureSocket() reads instance.json and touches storage: a malformed bundle config
+// rejects it. Log the reason — a floating promise would surface as an unhandled
+// rejection with no context, once per alarm, and the real fault (a broken
+// instance.json) would never be named.
+const ensureSocket = () =>
+  connection.ensureSocket().catch((e) =>
+    console.error("[ext] ensureSocket failed (check instance.json):", e),
+  );
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === RECONNECT_ALARM) {
-    connection.ensureSocket();
+    ensureSocket();
   } else if (alarm.name === TICK_ALARM) {
     logFail(onTick(now()));
     // Opportunistically drain the quick-links queue: an op enqueued offline flushes
@@ -97,24 +106,46 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// Register the alarms on install and on every worker start (idempotent). Period
-// 60 s (NOT 30 s): at 60 s the worker actually dies between ticks and the alarm
-// resurrection is exercised (§6).
-function ensureAlarms() {
-  chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: TICK_MS / 60000 });
-  chrome.alarms.create(TICK_ALARM, { periodInMinutes: TICK_MS / 60000 });
+// Register the alarms on install and on every worker start. Period 60 s (NOT 30 s):
+// at 60 s the worker actually dies between ticks and the alarm resurrection is
+// exercised (§6).
+//
+// CREATE ONLY WHAT IS MISSING. chrome.alarms.create on an EXISTING alarm resets its
+// phase — the next fire is pushed a full period out. A self-navigating tab (§5, the
+// Grafana playlist) wakes the worker every ~35–55 s and the worker dies in between,
+// so every cold start would re-arm a 60 s alarm that never gets to fire: the tick
+// stops happening at all, the watched tab ages unrecorded and the opportunistic
+// quick-links flush starves.
+async function ensureAlarms() {
+  for (const name of [RECONNECT_ALARM, TICK_ALARM]) {
+    const existing = await chrome.alarms.get(name);
+    if (!existing) {
+      chrome.alarms.create(name, { periodInMinutes: TICK_MS / 60000 });
+    }
+  }
 }
 
-chrome.runtime.onInstalled.addListener(ensureAlarms);
-chrome.runtime.onStartup.addListener(ensureAlarms);
+const ensureAlarmsSafely = () =>
+  ensureAlarms().catch((e) => console.error("[ext] alarm registration failed:", e));
+
+chrome.runtime.onInstalled.addListener(ensureAlarmsSafely);
+chrome.runtime.onStartup.addListener(ensureAlarmsSafely);
 
 // Connect immediately on worker start; the alarm keeps it alive afterwards.
-ensureAlarms();
-connection.ensureSocket();
+ensureAlarmsSafely();
+ensureSocket();
 
-// --- internal page <-> SW interface (§6, minimal stub) ---------------------
-// The startpage/options talk to the SW via runtime.sendMessage. Full surface is a
-// later phase; expose identity + connection state so those pages can be built.
+// Revive a STRANDED claimed quick-links batch (§10): if the worker died mid-POST, the
+// batch sits in storage marked claimed and nothing else would ever resend it — the
+// next enqueue only appends. flushQueue re-sends it verbatim, under its ORIGINAL
+// Idempotency-Key, so a POST that actually landed is a server-side no-op.
+flushQueue(quickLinksEnv()).catch((e) =>
+  console.error("[ext] quick-links flush on start failed:", e),
+);
+
+// --- internal page <-> SW interface (§6) -----------------------------------
+// The startpage/options talk to the SW via runtime.sendMessage: identity,
+// connection state, and the quick-links op queue.
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message !== "object") return false;
   if (message.type === "get_identity") {
@@ -127,12 +158,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true; // async response
   }
   if (message.type === "get_connection_state") {
-    sendResponse({
-      connected: connection.helloAcked,
-      lastSeenAt: null, // populated in a later phase
-      rejectReason: null,
-    });
-    return false;
+    // Real values (§6): `connected` is ack-gated, `lastSeenAt` is when the service was
+    // last heard from, `rejectReason` is the hello_ack rejection code. The last two
+    // are read back from storage.session so a worker resurrected between events does
+    // not report a healthy instance as never-connected.
+    connection
+      .getConnectionState()
+      .then(sendResponse)
+      .catch((e) => {
+        console.error("[ext] get_connection_state failed:", e);
+        sendResponse({ connected: false, lastSeenAt: null, rejectReason: null });
+      });
+    return true; // async response
   }
   if (message.type === "enqueue_quicklink_op") {
     // The startpage has already updated its own view optimistically; here the SW

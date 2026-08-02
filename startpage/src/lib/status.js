@@ -9,6 +9,11 @@
 //   stale    — connected but the mirror is older than STATE_FRESH-ish (half-open)
 //   ok       — connected and fresh
 
+// `now` MUST be in the SERVER clock scale (store.serverNow(), derived from
+// StateResponse.server_now): `snapshot_at` / `last_seen_at` are server stamps, and
+// comparing them to the laptop's Date.now() turns a couple of seconds of clock drift
+// into "зеркало устарело" on every instance forever — or hides a real half-open
+// socket. The store owns the offset; this function stays pure.
 export function instanceStatus(inst, now, staleMs) {
   if (!inst) return { state: "never", label: "никогда не подключался" };
   if (inst.reject_reason) {

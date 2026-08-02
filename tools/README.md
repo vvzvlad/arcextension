@@ -31,8 +31,12 @@ the bundle) on first run; the service rejects the second one as
 
 ## Usage
 
-The token is a secret — pass it via the `EXT_TOKEN` env, never on the command
-line. `make instance` / `make restamp` wrap the CLI (`tools/generate_instance.py`).
+The token is a secret — pass it via the `EXT_TOKEN` env, never on the command line.
+There is deliberately **no `--token` option**: argv is world-readable in `ps` output
+and is recorded in shell history. Note the assignment goes **before** the command, so
+it is an environment variable rather than an argument. For the file case there is
+`--token-file PATH`, which puts a *path* — not the secret — in argv.
+`make instance` / `make restamp` wrap the CLI (`tools/generate_instance.py`).
 
 ```bash
 # Create an instance
@@ -41,7 +45,7 @@ EXT_TOKEN=… make instance \
     OUT=~/arcextension-instances TITLE="Curator Main"
 
 # …or the CLI directly (more options: --key-file, --icon, --brave-binary,
-#   --allow-execute-js, --overwrite)
+#   --allow-execute-js, --overwrite, --token-file)
 EXT_TOKEN=… .venv/bin/python -m tools.generate_instance generate \
     --instance-id main --service-url wss://curator.example.com \
     --out ~/arcextension-instances --title "Curator Main"
@@ -51,21 +55,35 @@ The command prints the derived **extension id** and the exact
 `chrome-extension://<id>` origin to add to `EXT_ALLOWED_ORIGINS` (§12). All
 instances share **one** id/origin — one entry covers every instance.
 
-### Token rotation (re-stamp)
+### Re-stamp: token rotation **and** code updates
 
-Rotating `EXT_TOKEN` is a **single** operation over all instances — not a walk of
-N options pages (during which every instance would be silently dead):
+Re-stamp is a **single** operation over all instances — not a walk of N options
+pages (during which every instance would be silently dead):
 
 ```bash
 EXT_TOKEN=<new-token> make restamp OUT=~/arcextension-instances
 # then restart each browser so the SW re-reads instance.json
 ```
 
-Re-stamp rewrites the `token` in every instance's `instance.json`, **preserving**
-each `instanceId` and the profile (so `install_uuid` survives → a restart
-reconnects, not a duplicate). `instanceId` is **immutable**; a "rename" changes
-only `title` (delivered via `hello`). `restamp --service-url` also moves the
-`serviceUrl` and re-stamps the manifest host.
+It does two things to every instance:
+
+1. **Rotates the config.** Rewrites `token` in each `instance.json`, **preserving**
+   each `instanceId` and the profile (so `install_uuid` survives → a restart
+   reconnects, not a duplicate). `instanceId` is **immutable**; a "rename" changes
+   only `title` (delivered via `hello`). `restamp --service-url` also moves the
+   `serviceUrl` and re-stamps the manifest host.
+2. **Refreshes the extension code** from this repo's `extension/` (override with
+   `--extension-dir`). This is not optional in practice. Each instance owns a *copy*
+   of the bundle — because `instance.json` lives inside it — while `protocolVersion`
+   is compared by **exact equality** (§6). So shipping an extension update that bumps
+   `PROTOCOL_VERSION` and then rotating the token *without* carrying the code would
+   leave every copy on the old code, each rejected on `hello` **forever**, visible
+   only in the status bar (§13). Preserved across the refresh: the pinned manifest
+   `key` (so the extension id/origin never moves) and the profile.
+
+`--no-code-update` rotates config only. Do not use it after a protocol bump — that
+is the exact failure it re-opens. The new bundle is staged beside the old one and
+swapped in only once complete, so a failed copy leaves a working instance behind.
 
 ## The signing key (extension id pinning)
 

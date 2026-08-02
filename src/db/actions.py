@@ -22,6 +22,17 @@ from urllib.parse import urlsplit, urlunsplit
 # (a whole-pass rollback could not tell which row to reverse, and
 # ``curator_actions_last_pass{kind}`` summed two different operations). §4's prose
 # enum listed only the pre-Фаза-8 kinds; §7 is the canon for the pass and wins.
+#
+# ``undo_close`` is the pass-undo's copy-close (``src.api.undo._close_copy``): undoing
+# a relocation reopens the source AND closes the phase-A copy, and that close was the
+# only one in the system happening outside the journal. It needs a kind of its own —
+# recording it as ``relocate_close`` would tell the archive the relocation COMPLETED,
+# which is the opposite of what happened, and would confuse the phase-B readers
+# (``mirror.live_relocations``, ``undo._classify``, the reconcile step) that key on
+# that kind. It is deliberately NOT in :func:`read_pending_closes`: that reconciler
+# resolves a pass's own closes against ``instance_from``, whose meaning here is the
+# COPY's side, and an undo has no pass to reconcile in. ``_close_copy`` resolves its
+# own ``pending`` row on both the success and the failure path.
 ALLOWED_KINDS = frozenset(
     {
         "relocate",
@@ -31,6 +42,7 @@ ALLOWED_KINDS = frozenset(
         "window_merge",
         "reset",
         "restore",
+        "undo_close",
     }
 )
 

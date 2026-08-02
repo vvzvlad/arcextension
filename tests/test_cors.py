@@ -12,6 +12,7 @@ regex would make test 3 (evil origin) start receiving an ACAO.
 
 from types import SimpleNamespace
 
+from conftest import make_settings
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -25,28 +26,17 @@ AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        heartbeat_ms=600_000,
-        protocol_version=1,
-        ext_token=EXT_TOKEN,
-        metrics_token=METRICS_TOKEN,
-        ext_allowed_origins=GOOD_ORIGIN,
-        cmd_timeout_ms=2000,
-        snapshot_timeout_ms=2000,
-        state_fresh_ms=3_000_000,
-        restore_exemption_min=120,
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        pass_interval_min=5,
-        idle_minutes=60,
-        main_instance_id="main",
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **{**{
+            "ext_allowed_origins": 'chrome-extension://abc',
+            "pass_interval_min": 5,
+        }, **over})
 
 
 def _preflight(client, origin, path="/api/state", method="GET"):
@@ -174,3 +164,43 @@ def test_api_requires_ext_token(tmp_path):
         assert client.get(
             "/api/state", headers={"Authorization": f"Bearer {METRICS_TOKEN}"}
         ).status_code == 401
+
+
+# --- the empty-value asymmetry, pinned in ONE place --------------------------
+def test_empty_allowlist_is_open_on_ext_and_closed_on_cors(tmp_path):
+    """The two consumers of an EMPTY ``EXT_ALLOWED_ORIGINS`` read it differently on
+    purpose, and that is the §12 «бесшумный отказ» shape: the websocket connects (the
+    instance looks healthy everywhere) while the startpage's fetch dies on preflight.
+
+    Closing ``/ext`` by default is the worse option — the concrete
+    ``chrome-extension://<id>`` is unknowable before the extension is loaded, so it
+    would make bootstrap impossible and would disconnect every instance of a deployment
+    that never set the variable. CORS cannot widen to ``*`` (§12), so its empty case can
+    only be "closed". This test pins BOTH halves so the asymmetry stays a decision
+    rather than drifting, and the rejected preflight is counted (the audible signal).
+    """
+    from src.api.auth_metrics import auth_rejections
+    from src.ext.protocol import hello_reject_reason, parse_origins
+
+    allowed = parse_origins("")
+    assert allowed == set()
+    # /ext half: ANY origin passes the hello check when the list is empty.
+    hello = {
+        "protocolVersion": 1, "token": EXT_TOKEN, "instanceId": "i1",
+        "origin": "chrome-extension://whatever-id",
+    }
+    assert hello_reject_reason(hello, 1, EXT_TOKEN, allowed) is None
+    # …and a NON-empty list that does not contain it is rejected with 'origin', which
+    # is what makes a real mismatch visible in the status row.
+    assert hello_reject_reason(hello, 1, EXT_TOKEN, {GOOD_ORIGIN}) == "origin"
+
+    # CORS half: the same empty value emits no ACAO for anybody, and the rejection is
+    # counted into curator_auth_rejections_total (the audible signal for the mismatch).
+    app = create_app(_settings(tmp_path, ext_allowed_origins=""))
+    with TestClient(app) as client:
+        before = auth_rejections.by_reason()
+        r = _preflight(client, GOOD_ORIGIN)
+        assert r.status_code == 400
+        assert "access-control-allow-origin" not in r.headers
+        after = auth_rejections.by_reason()
+        assert after.get("cors_preflight", 0) > before.get("cors_preflight", 0)

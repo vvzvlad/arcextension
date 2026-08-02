@@ -29,6 +29,7 @@ from src.curator.mirror import load_mirror
 from src.db.actions import read_pending_closes
 from src.db.settings_store import get_setting, set_setting
 from src.ext import protocol
+from src.rules import access
 
 
 def _now_ms() -> int:
@@ -42,6 +43,18 @@ _PAUSE_STARTED_AT_KEY = "pause_started_at"
 # export curator_clock_step_seconds (§12): the clock-step abort happens BEFORE any
 # `passes` row is written, so settings is the only durable place to record it.
 _CLOCK_STEP_KEY = "curator_clock_step_seconds"
+# "1" while the CONFIGURED restore marker cannot be read (permissions, a wedged mount) —
+# i.e. restore-from-backup detection is blind. "0" when it read fine or is not configured;
+# an absent row means no pass has looked yet. Exported by /metrics as a 0/1 gauge (§12);
+# the row is the contract between this module and src/api/metrics.py.
+_MARKER_UNREADABLE_KEY = "curator_restore_marker_unreadable"
+
+# ``decision`` values on an aggregated `deferred` row — the CAUSE of the deferral (§7).
+# ``target_not_ready`` is the §7 one (connection / epoch change / an unreachable home);
+# ``dup_same_pass`` is the curator serialising itself, which is a different animal and
+# must stay tellable apart in the journal.
+_DEFER_UNREADY = "target_not_ready"
+_DEFER_SAME_URL = "dup_same_pass"
 
 
 @dataclass
@@ -69,6 +82,56 @@ def _finalize_pass(conn: sqlite3.Connection, pass_id: str, **cols) -> None:
             pass_id,
         ),
     )
+
+
+# --- step 2 helper: pause check + lease acquire in ONE transaction (§7) ------
+def _acquire_unless_paused(
+    conn: sqlite3.Connection, owner: str, now: int, ttl_ms: int, *, honor_pause: bool
+):
+    """Take the lease unless a pause is live. Returns ``(acquired, epoch, blocked_until)``.
+
+    ``pause_until`` and the lease both live in ``settings``, so this is one synchronous
+    ``fn(conn)`` inside a single ``BEGIN IMMEDIATE`` — which is what closes the window
+    between the step-1 pause read and the acquire. When a pause is live NOTHING is
+    touched (no epoch bump, no owner), and ``blocked_until`` names the deadline.
+
+    ``honor_pause`` is False only for an explicit ``dry_run``: §7 keeps the plan
+    readable while paused. The step-1 check stays where it is — it exits early without
+    ever touching the lease; this is the race-safe duplicate for the window after it.
+    """
+    if honor_pause:
+        blocked_until = pause.read_pause_until(conn)
+        if blocked_until is not None and blocked_until > now:
+            return False, 0, blocked_until
+    acquired, epoch = lease.acquire(conn, owner, now, ttl_ms)
+    return acquired, epoch, None
+
+
+# --- §12: rules are re-validated on EVERY pass -------------------------------
+def _revalidate_rules(conn: sqlite3.Connection, main_instance_id: str) -> int:
+    """Re-check every rule's target instance and pattern (§8/§12, one writer ``fn``).
+
+    §12 requires this on every pass, not only at save time: validation at save catches
+    a typo, but RETIRING an instance produces exactly the same orphaned rule afterwards
+    — silently, and preview cannot show it (it counts pattern matches, not target
+    existence). Orphans end up ``invalid=1``, which the existing
+    ``curator_rules_invalid`` alert and the editor highlight already surface.
+
+    **``MAIN_INSTANCE_ID`` counts as known even with no ``instances`` row**, exactly as
+    the save-time check does (``src.api.rules._validate_instance_or_422``): §12 demands
+    ONE rule ("валидируется ... при записи и на каждом проходе"), and a main that has
+    never connected is a state the product explicitly models (the
+    ``curator_main_instance_never_seen`` metric). Without the exemption a legally saved
+    "X -> main" rule is invalidated by the first pass; if it is the only rule,
+    ``has_active_rules`` then reports an empty policy, the unruled drain switches off
+    and the curator quietly stops doing anything at all — while an alert blames the
+    owner's rule.
+
+    Runs BEFORE the mirror is captured, so THIS pass already routes with the corrected
+    flags.
+    """
+    known = access.known_instance_ids(conn) | {main_instance_id}
+    return access.revalidate_rules(conn, known)
 
 
 # --- snapshot readiness (step 3), keyed on the pass's OWN ids ----------------
@@ -137,6 +200,9 @@ def _plan(decisions) -> dict:
         "phase_b_completions": len(phase_b),
         "closures": len(closures),
         "deferred": dict(decisions.deferred),
+        # Why part of `deferred` happened: an identical (target, url) pair was already
+        # scheduled for phase A this pass, so the second tab waits (§7).
+        "deferred_same_url": dict(decisions.deferred_same_url),
         "relocation_examples": relocations[:20],
         "closure_examples": closures[:20],
         "phase_b_examples": phase_b[:20],
@@ -181,55 +247,118 @@ async def run_pass(
             return {"status": "clock_step", "clock_step_seconds": skew}
 
     idle_ms = settings.idle_minutes * 60_000
+    # Tolerated via getattr so a settings shim without the (optional, default-empty)
+    # knob still runs a pass; an unset marker means "not configured" anyway (§7).
+    marker_path = getattr(settings, "restore_marker_path", "")
+    marker_cell: list = []  # holds at most one entry: the digest read for THIS pass
+
+    async def _marker():
+        """The restore marker for this pass — read AT MOST ONCE, and only if needed.
+
+        Once, because the two consumers (the step-1 comparison and the closing
+        ``_finish_continuity``) must agree: reading twice would compare one value and
+        store another, so a marker rewritten in between would be recorded as if it had
+        always been there and the break swallowed for good.
+
+        Lazily, because a pass that exits at the pause gate or fails to take the lease
+        must not touch the filesystem at all — that path is triggered by every
+        ``POST /api/run_pass`` and every pause/resume, and each touch of a wedged mount
+        parks a thread for ``_MARKER_READ_TIMEOUT_S``.
+        """
+        if not marker_cell:
+            value = await clockmod.read_restore_marker_async(marker_path)
+            marker_cell.append(value)
+            # §12 observability: "the restore detector is blind" must be a state /metrics
+            # can scrape, not just a log line every five minutes. A configured marker the
+            # service can never read (the classic one: the operator writes it as root with
+            # umask 077, the container runs as uid 1000) silently disables restore
+            # detection FOREVER — every pass drops the component and carries the old
+            # digest forward, and no other fingerprint component can catch a restore
+            # because they all travel inside the backup. Written to `settings` (not held
+            # in process memory) so a scrape reads it from the DB (§12). Best-effort: an
+            # observability write must never break a pass.
+            try:
+                await db.write(lambda c: set_setting(
+                    c, _MARKER_UNREADABLE_KEY,
+                    "1" if value == clockmod.MARKER_UNREADABLE else "0",
+                ))
+            except Exception:  # noqa: BLE001
+                logger.exception("curator: failed to publish restore-marker state")
+        return marker_cell[0]
 
     # --- step 1: pause / resume_pending / continuity gate (§7) ---------------
     effective_dry_run = dry_run
     armed_after_break = False
-    # SUGGESTION 7 (Фаза 16): a ``confirm_pending`` click confirms a DEFERRED plan, so
-    # it skips the resume_pending/continuity gate below — but it must STILL lose to a
-    # LIVE pause. If a pause was re-armed AFTER the plan was computed (the owner saw
-    # the plan and hit "stop" again), the confirm cannot run a full pass through an
-    # active emergency stop. dry_run is never muted (looking at the plan is why a
-    # pause is taken, §7), so this check is only for the confirm path.
-    if confirm_pending and not dry_run:
+    # ``dry_run`` is never muted by a pause — looking at the plan is exactly why a
+    # pause is taken (§7) — so the whole gate is skipped for it. Everything else,
+    # ``confirm_pending`` included, loses to a LIVE pause: if a pause was re-armed
+    # AFTER the plan was computed (the owner saw the plan and hit "stop" again), the
+    # confirm must not run a full pass through an active emergency stop (SUGGESTION 7).
+    if not dry_run:
         pause_until = get_setting_int(await _read_setting(db, _PAUSE_UNTIL_KEY))
         if pause_until is not None and pause_until > now:
             return {"status": "paused", "until": pause_until}
-    if not dry_run and not confirm_pending:
-        pause_until = get_setting_int(await _read_setting(db, _PAUSE_UNTIL_KEY))
-        if pause_until is not None and pause_until > now:
-            return {"status": "paused", "until": pause_until}
-        if await _read_setting(db, _RESUME_PENDING_KEY):
-            return {"status": "resume_pending"}
-        # A pause that EXPIRED but was never resumed by hand still has its start armed
-        # (``pause_started_at`` set — a manual resume/confirm clears it via the TTL
-        # shift). The FIRST pass after a timeout expiry must NOT auto-run and drain the
-        # night's backlog (§7 "истечение по таймауту — нет"): it computes a dry-run plan,
-        # arms ``resume_pending`` and waits for a click. The click
-        # (run_pass{confirm_pending}) applies the full TTL shift and runs the real pass.
-        pause_started = get_setting_int(await _read_setting(db, _PAUSE_STARTED_AT_KEY))
-        if pause_until is not None and pause_started is not None:
-            effective_dry_run = True
-            armed_after_break = True
-        else:
-            current_fp = await db.read(
-                lambda c: clockmod.current_fingerprint(
-                    c, idle_minutes=settings.idle_minutes,
-                    main_instance_id=settings.main_instance_id,
-                )
-            )
-            stored_fp = await db.read(clockmod.read_stored_fingerprint)
-            if clockmod.is_continuity_break(stored_fp, current_fp):
-                # First pass after a continuity break: compute a dry-run plan and arm
-                # resume_pending; the owner confirms with run_pass{confirm_pending} (§7).
+        resume_armed = bool(await _read_setting(db, _RESUME_PENDING_KEY))
+        # A ``confirm_pending`` confirms an ARMED plan. With no latch there is nothing
+        # to confirm, and honouring the flag anyway would let a client that sends it out
+        # of habit bypass the continuity gate AND have _finish_continuity overwrite the
+        # fingerprint — a break (say, a lowered IDLE_MINUTES) would be eaten silently and
+        # the promised confirmation never shown. So it degrades to an ordinary pass and
+        # goes through every gate below.
+        if confirm_pending and not resume_armed:
+            logger.info("curator: confirm_pending with no armed latch — running the normal gate")
+            confirm_pending = False
+        if not confirm_pending:
+            if resume_armed:
+                return {"status": "resume_pending"}
+            # A pause that EXPIRED but was never resumed by hand still has its start armed
+            # (``pause_started_at`` set — a manual resume/confirm clears it via the TTL
+            # shift). The FIRST pass after a timeout expiry must NOT auto-run and drain the
+            # night's backlog (§7 "истечение по таймауту — нет"): it computes a dry-run plan,
+            # arms ``resume_pending`` and waits for a click. The click
+            # (run_pass{confirm_pending}) applies the full TTL shift and runs the real pass.
+            pause_started = get_setting_int(await _read_setting(db, _PAUSE_STARTED_AT_KEY))
+            if pause_until is not None and pause_started is not None:
                 effective_dry_run = True
                 armed_after_break = True
+            else:
+                marker_now = await _marker()
+                current_fp = await db.read(
+                    lambda c: clockmod.current_fingerprint(
+                        c, idle_minutes=settings.idle_minutes,
+                        main_instance_id=settings.main_instance_id,
+                        restore_marker=marker_now,
+                    )
+                )
+                stored_fp = await db.read(clockmod.read_stored_fingerprint)
+                # The fresh-DB (first-run) arm of the same policy: no stored fingerprint
+                # AND a fleet already in the DB is the §7 "чистая БД" break.
+                populated = await db.read(clockmod.fleet_populated)
+                if clockmod.is_continuity_break(
+                    stored_fp, current_fp, fleet_populated=populated
+                ):
+                    # First pass after a continuity break: compute a dry-run plan and arm
+                    # resume_pending; the owner confirms with run_pass{confirm_pending} (§7).
+                    effective_dry_run = True
+                    armed_after_break = True
 
     # --- step 2: acquire the lease with a fencing epoch (§7) ------------------
     owner = f"pass-{uuid.uuid4()}"
-    acquired, epoch = await db.write(
-        lambda c: lease.acquire(c, owner, now, settings.lease_ttl_ms)
+    # The pause is re-read INSIDE the acquiring transaction. Step 1's check alone is a
+    # TOCTOU hole: a pause armed between that read and this write bumps the epoch to
+    # E+1, `acquire` immediately bumps it to E+2, and the pass then owns the freshest
+    # epoch — every guarded write passes, ``pause_until`` is never consulted again, and
+    # the owner who hit the emergency stop watches the curator close tabs for minutes
+    # (§7 "этого достаточно, чтобы остановить уже идущий проход"). Both values live in
+    # ``settings``, so the check costs one extra SELECT in the same ``fn(conn)`` — no
+    # await, no second transaction, no race left.
+    acquired, epoch, blocked_until = await db.write(
+        lambda c: _acquire_unless_paused(
+            c, owner, now, settings.lease_ttl_ms, honor_pause=not dry_run
+        )
     )
+    if blocked_until is not None:
+        return {"status": "paused", "until": blocked_until}
     if not acquired:
         return {"status": "lease_unavailable"}
     pass_start = now
@@ -264,6 +393,24 @@ async def run_pass(
         ready = await _await_ready(registry, sent, settings.snapshot_timeout_ms)
         ready_ids = set(ready)
 
+        # §12: re-validate the rules against the instances the DB now knows, under the
+        # lease guard, BEFORE the mirror is frozen so this pass already routes with the
+        # corrected flags.
+        #
+        # Runs for a dry_run TOO. "dry_run writes nothing" is a promise about the
+        # ACTIONS journal (§12) — the plan must cost no closures and no `passes` row —
+        # and `rules.invalid` is neither: it is the policy's own health, which §12 says
+        # every pass re-derives. Skipping it here would make the plan the owner CONFIRMS
+        # after a continuity break disagree with the pass that executes it: the plan
+        # would be routed on stale flags, the confirming pass would revalidate first and
+        # route differently, and "confirmed" would stop meaning "this is what will
+        # happen" for exactly the rules §12 wants re-checked.
+        await db.write(
+            lease.guarded(
+                epoch, lambda c: _revalidate_rules(c, settings.main_instance_id)
+            )
+        )
+
         # --- capture the frozen mirror; all decisions run against it ---------
         mirror = await db.read(load_mirror)
         ctx = phases.PassCtx(
@@ -281,6 +428,8 @@ async def run_pass(
         # the frozen mirror, so decide below still decides against the same picture;
         # a pending relocate_close is already excluded from live_relocations, so a
         # relocation is never both reconciled AND phase-B'd in the same pass.
+        # A row whose source instance did NOT answer THIS pass's snapshot is left
+        # alone by ``run_reconcile`` — see its readiness gate.
         if not effective_dry_run:
             for pending_row in await db.read(read_pending_closes):
                 await _isolated(phases.run_reconcile(ctx, pending_row))
@@ -311,9 +460,23 @@ async def run_pass(
         # were already re-routed in the SAME decide() call (they are not "owned").
         for ab in decisions.abandon:
             await _isolated(_abandon(ctx, ab))
-        # Aggregated deferred rows: one per (pass_id, instance_to) (§7 step 6).
+        # Aggregated deferred rows: one per (pass_id, instance_to, cause) (§7 step 6).
+        # §7 defines `deferred` as "вызвано соединением, сменой эпохи или слиянием окон",
+        # and the same-url hold-back (a tab waiting for the copy this pass is opening) is
+        # a DIFFERENT thing wearing the same status. Splitting the rows by ``decision``
+        # keeps curator_deferred_total exactly as it was (metrics sums every deferred row
+        # per instance_to) while making the cause answerable from the journal and
+        # separable by a later metrics change — see the report.
         for to_instance, count in decisions.deferred.items():
-            await _isolated(_write_deferred(ctx, to_instance, count))
+            same_url = decisions.deferred_same_url.get(to_instance, 0)
+            if count - same_url > 0:
+                await _isolated(
+                    _write_deferred(ctx, to_instance, count - same_url, _DEFER_UNREADY)
+                )
+            if same_url > 0:
+                await _isolated(
+                    _write_deferred(ctx, to_instance, same_url, _DEFER_SAME_URL)
+                )
         for dec in decisions.phase_b:
             await _isolated(phases.run_phase_b(ctx, dec))
         for dec in decisions.phase_a:
@@ -332,7 +495,10 @@ async def run_pass(
 
         # A real pass with established continuity refreshes the fingerprint and
         # clears any resume_pending it was confirming (§7).
-        await db.write(lease.guarded(epoch, lambda c: _finish_continuity(c, settings)))
+        marker_final = await _marker()
+        await db.write(
+            lease.guarded(epoch, lambda c: _finish_continuity(c, settings, marker_final))
+        )
     except lease.LeaseLost:
         error = "lease_lost"
         logger.info("curator: lease lost mid-pass {}; stopping", pass_id)
@@ -345,9 +511,13 @@ async def run_pass(
             await renew_task
         except asyncio.CancelledError:
             pass
-        # Release the lease (no-op if the epoch moved — never clear someone else's).
+        # Hand the slot back. Keyed on the OWNER, not the epoch: a pass fenced by a pause
+        # MUST still release (else the slot is hostage until the TTL), while a pass whose
+        # lease was taken over after expiry must NOT (someone else owns it now). This
+        # release is what keeps "one pass at a time" true — the slot stays taken for as
+        # long as this pass might still be talking to a browser.
         try:
-            await db.write(lambda c: lease.release(c, owner, epoch))
+            await db.write(lambda c: lease.release(c, owner))
         except Exception:  # noqa: BLE001
             logger.exception("curator: lease release failed for {}", pass_id)
 
@@ -388,26 +558,43 @@ async def _abandon(ctx, ab) -> None:
     await ctx.db.write(lease.guarded(ctx.epoch, lambda c: mark_action_abandoned(c, ab.reloc_id)))
 
 
-async def _write_deferred(ctx, to_instance: str, count: int) -> None:
+async def _write_deferred(ctx, to_instance: str, count: int, decision: str) -> None:
+    """One aggregated ``deferred`` row for (pass, target, cause).
+
+    ``reason`` stays the bare count — ``/metrics`` parses it as an int for
+    ``curator_deferred_total`` — so the cause goes in ``decision``, the column §4 keeps
+    for "the BASIS of the decision".
+    """
     from src.db.actions import insert_action
 
     def _w(conn):
         insert_action(
             conn, ts=ctx.now, kind="relocate", status="deferred", initiator="curator",
             pass_id=ctx.pass_id, instance_to=to_instance, reason=str(count),
+            decision=decision,
         )
 
     await ctx.db.write(lease.guarded(ctx.epoch, _w))
     ctx.actions_count += 1
 
 
-def _finish_continuity(conn: sqlite3.Connection, settings) -> None:
-    """Refresh the continuity fingerprint and clear resume_pending (a real pass ran)."""
-    fp = clockmod.current_fingerprint(
-        conn, idle_minutes=settings.idle_minutes,
-        main_instance_id=settings.main_instance_id,
-    )
-    clockmod.store_fingerprint(conn, fp)
+def _finish_continuity(conn: sqlite3.Connection, settings, marker: str | None = None) -> None:
+    """Refresh the continuity fingerprint and clear resume_pending (a real pass ran).
+
+    The fingerprint is stored ONLY for a pass that saw a fleet. A pass over a
+    completely empty DB (the service is up, no browser has ever connected) would
+    otherwise consume the first-run latch before there is anything to protect, and the
+    genuine clean-DB break — the whole fleet arriving with ``age_unknown=1`` and turning
+    eligible one hour later, all at once — would never be caught (§7). The latch itself
+    is always cleared: an empty pass still finishes whatever it was confirming.
+    """
+    if clockmod.fleet_populated(conn):
+        fp = clockmod.current_fingerprint(
+            conn, idle_minutes=settings.idle_minutes,
+            main_instance_id=settings.main_instance_id,
+            restore_marker=marker,
+        )
+        clockmod.store_fingerprint(conn, fp)
     set_setting(conn, _RESUME_PENDING_KEY, "")
 
 

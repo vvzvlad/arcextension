@@ -3,25 +3,19 @@ from types import SimpleNamespace
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from conftest import make_settings
 from starlette.testclient import TestClient
 
 from src.app import create_app, require_operational
 
 
-def _settings(tmp_path):
-    return SimpleNamespace(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        # Consumed by the /api/* CORS middleware wired in create_app (Фаза 13).
-        ext_allowed_origins="",
-        # Consumed by the retention loop started in the app lifespan (Фаза 4).
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        # Consumed by the curator clock guard + driver started in the lifespan (Фаза 8).
-        pass_interval_min=5,
-    )
+def _settings(tmp_path, **over):
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited.
+    """
+    return make_settings(tmp_path, **over)
 
 
 def test_healthz_ok_even_when_degraded(tmp_path):

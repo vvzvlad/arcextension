@@ -51,9 +51,18 @@ _BACKUP_GLOB = "curator-*.db"
 # The runtime settings keys read at scrape time.
 _PAUSE_UNTIL_KEY = "pause_until"
 _RESUME_PENDING_KEY = "resume_pending"
+# Label value for a deferred row whose ``decision`` is NULL/blank — rows written before
+# the cause split landed. They are real deferrals and must keep their count, but an empty
+# label value is not a legal answer (it reads as "no cause" rather than "not recorded").
+_DEFERRED_CAUSE_UNKNOWN = "unknown"
 # Persisted by the runner when the server-clock guard trips (see src.curator.runner):
 # the last observed wall-vs-monotonic step in seconds. 0/absent means "never stepped".
 CLOCK_STEP_KEY = "curator_clock_step_seconds"
+# Persisted by ``runner._marker()`` (best-effort, same shape as CLOCK_STEP_KEY): "1" when
+# the CONFIGURED restore marker could not be read on the last pass that needed it, "0"
+# when it was read or none is configured. An ABSENT row means no pass has looked yet and
+# reads as 0 — never as a failure.
+RESTORE_MARKER_UNREADABLE_KEY = "curator_restore_marker_unreadable"
 
 
 # --- the hand-rolled Prometheus text renderer -------------------------------
@@ -142,10 +151,15 @@ class Snapshot:
     rules_invalid: int = 0
     quarantined_total: int = 0
     relocations_incomplete: int = 0
-    deferred: dict[str, int] = field(default_factory=dict)
+    # {(instance_to, cause): count} — the cause is ``actions.decision`` (§7's
+    # ``target_not_ready`` vs the runner's ``dup_same_pass``); see ``_collect``.
+    deferred: dict[tuple[str, str], int] = field(default_factory=dict)
     pause_until: int | None = None
     resume_pending: bool = False
     clock_step_seconds: float = 0.0
+    # Default False, and that default is the answer for a brand-new install: "no pass has
+    # looked at the marker yet" is not "the marker is broken" (§12).
+    restore_marker_unreadable: bool = False
     main_never_seen: bool = True
 
 
@@ -185,19 +199,38 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
         ).fetchall():
             snap.actions_by_kind[kind] = int(count)
 
-        # Per-target deferred backlog of the last pass. One aggregated row per
-        # (pass_id, instance_to) carries the count in ``reason`` (src.curator.runner).
-        for instance_to, reason in conn.execute(
-            "SELECT instance_to, reason FROM actions "
+        # Per-target, per-CAUSE deferred backlog of the last pass. One aggregated row
+        # per (pass_id, instance_to, decision) carries the count in ``reason``
+        # (src.curator.runner._write_deferred).
+        #
+        # The cause has to ride along as its own label, because the two the runner
+        # distinguishes are not the same kind of event: ``target_not_ready`` means the
+        # home is unreachable (§7 connectivity — somebody has to fix something), while
+        # ``dup_same_pass`` is the curator serialising itself so it does not open a
+        # duplicate within one pass (routine, healthy, self-resolving next pass). Summed
+        # together they cannot be alerted on or even read: a rising number says nothing
+        # about whether anything is wrong.
+        # Grouped in PYTHON, not with a SQL ``GROUP BY``: ``reason`` is a TEXT column, so
+        # ``SUM(CAST(reason AS INTEGER))`` would silently turn a malformed value into 0
+        # and lose the series, whereas the guarded ``int()`` below keeps the (target,
+        # cause) pair visible at 0. It also stays correct if a pass ever writes more than
+        # one row for the same pair.
+        for instance_to, decision, reason in conn.execute(
+            "SELECT instance_to, decision, reason FROM actions "
             "WHERE pass_id = ? AND kind = 'relocate' AND status = 'deferred'",
             (snap.newest_pass_id,),
         ).fetchall():
             if instance_to is None:
                 continue
+            # Rows written before the cause split (and any future writer that forgets)
+            # carry NULL/blank: they are real deferrals and must still be counted, but
+            # never as an empty or garbage label value.
+            cause = decision if decision else _DEFERRED_CAUSE_UNKNOWN
+            key = (instance_to, cause)
             try:
-                snap.deferred[instance_to] = snap.deferred.get(instance_to, 0) + int(reason)
+                snap.deferred[key] = snap.deferred.get(key, 0) + int(reason)
             except (TypeError, ValueError):
-                snap.deferred[instance_to] = snap.deferred.get(instance_to, 0)
+                snap.deferred[key] = snap.deferred.get(key, 0)
 
     for iid, connected, last_seen_at, snapshot_at in conn.execute(
         "SELECT id, connected, last_seen_at, snapshot_at FROM instances ORDER BY id"
@@ -261,6 +294,16 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
         except (TypeError, ValueError):
             snap.clock_step_seconds = 0.0
 
+    # Restore-marker readability. Only the exact "1" is a failure: an absent row (no pass
+    # has needed the marker yet), a blank, or anything unparseable reads as 0, because
+    # the ONE thing this gauge must never do is invent an outage out of missing evidence.
+    marker_row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (RESTORE_MARKER_UNREADABLE_KEY,)
+    ).fetchone()
+    snap.restore_marker_unreadable = bool(
+        marker_row is not None and str(marker_row[0]).strip() == "1"
+    )
+
     # main_instance_never_seen: no row for MAIN_INSTANCE_ID, or last_seen_at IS NULL
     # (§12: the sticky, sleep-independent "stock branch is silently off" fact).
     main_row = conn.execute(
@@ -288,7 +331,17 @@ def _pass_overdue_seconds(snap: Snapshot, now_ms: int, interval_s: int, paused: 
     last FINISHED pass; if none ever finished, the OLDEST started_at is the anchor
     so a crash-loop (many started, none finished) trips and — being read from
     ``passes`` — is NOT reset by a fresh process. Zero pass rows at all => 0 (a truly
-    fresh install has no evidence a pass was ever due)."""
+    fresh install has no evidence a pass was ever due).
+
+    **After a pause EXPIRES the clock restarts from the expiry moment**, not from
+    ``last_pass_ts`` (§7: «`curator_pass_overdue_seconds` после истечения паузы
+    считается от момента истечения, а не от `last_pass_ts`»). Otherwise the hour-long
+    pause the gauge suppressed reappears as overdue the very second it lapses and the
+    alert fires immediately — while §7 promises a full 3×``PASS_INTERVAL`` for the human
+    to see the pending plan and click. ``pause_until`` survives a timeout expiry
+    (only a manual resume / confirm clears it), so it is exactly the "when did the stop
+    lapse" anchor; a resumed pause has no row and changes nothing here.
+    """
     if paused:
         return 0
     if snap.finished_at is not None:
@@ -297,6 +350,9 @@ def _pass_overdue_seconds(snap: Snapshot, now_ms: int, interval_s: int, paused: 
         reference_ms = snap.oldest_started_at
     else:
         return 0
+    # `paused` is False here, so a present pause_until is necessarily in the past.
+    if snap.pause_until is not None and snap.pause_until > reference_ms:
+        reference_ms = snap.pause_until
     overdue = (now_ms - reference_ms) // 1000 - interval_s
     return overdue if overdue > 0 else 0
 
@@ -416,11 +472,20 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         "gauge",
         [({}, snap.rules_invalid)],
     )
+    # NAME UNCHANGED on purpose: `deploy/alerts.yml` and the series-name guard in
+    # `tests/test_deploy_alerts.py` key on it. Only a second LABEL is added, which no
+    # existing rule can be broken by — no rule references this metric today, and any
+    # future one must aggregate (`sum by (to_instance)`) or select a cause explicitly.
     reg.metric(
         "curator_deferred_total",
-        "Per-target deferred tab count from the last pass.",
+        "Deferred tab count from the last pass, by target instance and CAUSE "
+        "(target_not_ready = home unreachable, needs attention; dup_same_pass = the "
+        "curator serialising itself, routine).",
         "gauge",
-        [({"to_instance": to}, n) for to, n in sorted(snap.deferred.items())],
+        [
+            ({"to_instance": to, "cause": cause}, n)
+            for (to, cause), n in sorted(snap.deferred.items())
+        ],
     )
     reg.metric(
         "curator_quarantined_total",
@@ -501,6 +566,22 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         "Last observed server-clock step (s) that aborted a pass; 0 if none.",
         "gauge",
         [({}, snap.clock_step_seconds)],
+    )
+    # Emitted on EVERY scrape, including the very first one on a fresh install (§12): a
+    # gauge that only appears once the fault occurs gives NoData for "it never ran", the
+    # exact silence this metric exists to break. "Marker configured but unreadable" is
+    # otherwise invisible — restore-from-backup detection is off for good (the classic
+    # path: the marker is written by a root helper under umask 077, so it lands 600
+    # root:root and the uid-1000 container can never read it), every other fingerprint
+    # component travels inside the backup and matches, and the only trace is a log line
+    # every five minutes.
+    reg.metric(
+        "curator_restore_marker_unreadable",
+        "1 iff the configured restore marker could not be read by the last pass that "
+        "needed it (backup-restore detection is blind); 0 if read, not configured, or "
+        "not yet looked at.",
+        "gauge",
+        [({}, 1 if snap.restore_marker_unreadable else 0)],
     )
     reg.metric(
         "curator_auth_rejections_total",

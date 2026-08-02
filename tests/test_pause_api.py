@@ -15,6 +15,7 @@ and grows once the pause has expired (the click-wait fires the alert).
 
 from types import SimpleNamespace
 
+from conftest import _recv, make_settings
 from starlette.testclient import TestClient
 
 from src.api.metrics import Snapshot, _pass_overdue_seconds
@@ -25,21 +26,19 @@ AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0", port=8000,
-        heartbeat_ms=600_000, protocol_version=1,
-        ext_token=EXT_TOKEN, metrics_token="m", ext_allowed_origins="",
-        idle_minutes=60, pass_interval_min=5, tick_ms=60000,
-        cmd_timeout_ms=1000, snapshot_timeout_ms=200, lease_ttl_ms=600_000,
-        restore_exemption_min=120, pause_default_min=60, incomplete_after_min=15,
-        self_nav_limit=10, state_fresh_ms=3000, quarantine_ttl_min=1440,
-        actions_retention_days=90, js_audit_retention_days=730,
-        main_instance_id="main", log_level="INFO",
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **{**{
+            "cmd_timeout_ms": 1000,
+            "pass_interval_min": 5,
+            "snapshot_timeout_ms": 200,
+            "state_fresh_ms": 3000,
+        }, **over})
 
 
 def _q(db_path, sql, params=()):
@@ -100,6 +99,12 @@ def test_pause_gate_blocks_mutations_only(tmp_path):
             ("delete", "/api/rules/1", None),
             ("post", "/api/rules/1/reset", {}),
             ("post", "/api/actions/1/restore", {}),
+            ("post", "/api/exemptions", {"instance_id": "main", "url": "https://a",
+                                         "minutes": 30}),
+            # DELETE carries the pair in the query string (httpx's `delete` shorthand
+            # takes no body — which is exactly why the endpoint accepts both).
+            ("delete", "/api/exemptions?instance_id=main&url=https%3A%2F%2Fa", None),
+            ("post", "/api/instances/main/merge_windows", {}),
         ]
         for method, path, body in gated:
             fn = getattr(client, method)
@@ -166,7 +171,7 @@ def test_delete_pause_resumes_and_runs_pass(tmp_path):
 def test_overdue_suppressed_while_paused_grows_after_expiry():
     interval_s = 300  # 5 min
     t0 = 1_000_000_000
-    now = t0 + 4 * interval_s * 1000  # 4 intervals since the last finished pass
+    now = t0 + 12 * interval_s * 1000  # 12 intervals since the last finished pass
     snap = Snapshot(finished_at=t0)
 
     # ACTIVE pause (pause_until > now): overdue is 0 — the routine hour is silent (§7).
@@ -176,7 +181,179 @@ def test_overdue_suppressed_while_paused_grows_after_expiry():
 
     # EXPIRED pause (waiting for the click): NOT paused → overdue grows past the
     # 3×PASS_INTERVAL alert threshold. Suppression lifts with the pause, not the click.
-    snap.pause_until = t0 + interval_s  # in the past relative to `now`
+    # The pause lapsed 8 intervals ago, so the click-wait is genuinely overdue.
+    snap.pause_until = t0 + 4 * interval_s * 1000
     paused = snap.pause_until is not None and snap.pause_until > now
     assert paused is False
     assert _pass_overdue_seconds(snap, now, interval_s, paused) >= 3 * interval_s
+
+
+def test_overdue_after_expiry_is_anchored_to_the_expiry_moment():
+    """§7: after a pause expires the clock restarts from the EXPIRY, not last_pass_ts.
+
+    A three-hour pause taken right after a pass would otherwise make the gauge read
+    ~3h overdue the very second it lapsed — the alert fires immediately, while §7
+    promises 3×PASS_INTERVAL for the human to see the pending plan and click. Reddens
+    to a big number if the ``max(reference, pause_until)`` anchor is removed.
+    """
+    interval_s = 300
+    t0 = 1_000_000_000
+    # Last pass finished at t0; a 3h pause ran from just after it and has just lapsed.
+    pause_until = t0 + 3 * 3_600_000
+    snap = Snapshot(finished_at=t0, pause_until=pause_until)
+
+    # The second the pause lapses: nothing is overdue yet.
+    assert _pass_overdue_seconds(snap, pause_until, interval_s, False) == 0
+    # Still inside the grace window §7 promises (2 intervals after expiry).
+    at_2_intervals = pause_until + 2 * interval_s * 1000
+    assert _pass_overdue_seconds(snap, at_2_intervals, interval_s, False) < 3 * interval_s
+    # Past it: the click-wait IS a degraded state and must alert (§7).
+    at_5_intervals = pause_until + 5 * interval_s * 1000
+    assert _pass_overdue_seconds(snap, at_5_intervals, interval_s, False) >= 3 * interval_s
+
+    # Non-vacuity: with the SAME data and no pause row, the gauge is already huge —
+    # so the zero above is the anchor working, not a trivially quiet snapshot.
+    no_pause = Snapshot(finished_at=t0)
+    assert _pass_overdue_seconds(no_pause, pause_until, interval_s, False) > 3 * 3600 - 600
+
+
+def test_overdue_ignores_a_pause_that_ended_before_the_last_pass():
+    # A pause resumed long ago must not hold the anchor: `max(reference, pause_until)`
+    # keeps the LAST PASS as the reference when the pause is older than it.
+    interval_s = 300
+    t0 = 1_000_000_000
+    snap = Snapshot(finished_at=t0, pause_until=t0 - 10 * 3_600_000)
+    now = t0 + 10 * interval_s * 1000
+    assert _pass_overdue_seconds(snap, now, interval_s, False) == 9 * interval_s
+
+
+# --- §7's ONE exception: force:true for the human's own buttons -------------
+def _seed_instance_and_action(db_path):
+    import sqlite3
+    from src.db.actions import insert_action
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(
+            "INSERT INTO instances (id, connected, session_id, snapshot_at) "
+            "VALUES ('main', 0, 's', 0)"
+        )
+        aid = insert_action(
+            conn, ts=1_000_000, kind="dedupe_close", status="done", initiator="curator",
+            instance_from="main", url="https://x/y", url_norm="https://x/y",
+            session_id_from="s",
+        )
+        conn.commit()
+        return aid
+    finally:
+        conn.close()
+
+
+def test_force_crosses_the_pause_gate_only_for_the_human_verbs(tmp_path):
+    """§7: «Пауза глушит всю автоматику… Исключение — собственные кнопки человека, и
+    то с явным `force:true`».
+
+    The three verbs §7 names — focus, restore, undo — accept the flag; everything else
+    keeps answering 423 no matter what the body says. Reddens in BOTH directions: drop
+    the ``force`` parameter and the first group 423s; wire it into the rest and the
+    second group stops 423-ing."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        aid = _seed_instance_and_action(db_path)
+        client.post("/api/pause", headers=AUTH, json={"minutes": 60})
+
+        # Human buttons WITH force: past the gate. They then fail on their own merits
+        # (no live socket => 409/502/422), which is the point — the PAUSE no longer
+        # decides, so anything but 423 proves the gate was crossed.
+        forced = [
+            ("/api/focus", {"instance": "main", "tabId": 1, "force": True}),
+            (f"/api/actions/{aid}/restore", {"force": True}),
+            ("/api/passes/pass-x/undo", {"force": True}),
+            # §9's «Кнопка "слить окна сейчас" на стартпейдже» is a human button too.
+            ("/api/instances/main/merge_windows", {"force": True}),
+        ]
+        for path, body in forced:
+            resp = client.post(path, headers=AUTH, json=body)
+            assert resp.status_code != 423, f"{path} should honour force:true"
+
+        # …and WITHOUT force they are still gated (force is explicit, never implied).
+        for path, body in forced:
+            plain = {k: v for k, v in body.items() if k != "force"}
+            resp = client.post(path, headers=AUTH, json=plain)
+            assert resp.status_code == 423, f"{path} must stay gated without force"
+
+        # NOT human buttons: force is ignored — a policy edit or an agent-shaped verb
+        # under an emergency stop is exactly what the stop is for (§7).
+        not_forcible = [
+            ("post", "/api/rules", {"pattern": "a.com", "instance_id": "main",
+                                    "force": True}),
+            ("put", "/api/rules/1", {"pattern": "a.com", "instance_id": "main",
+                                     "force": True}),
+            ("post", "/api/rules/1/reset", {"force": True}),
+            ("post", "/api/quick_links/ops", []),
+            ("post", "/api/exemptions", {"instance_id": "main", "url": "https://a",
+                                         "minutes": 5, "force": True}),
+        ]
+        for method, path, body in not_forcible:
+            resp = getattr(client, method)(path, headers=AUTH, json=body)
+            assert resp.status_code == 423, f"{method} {path} must ignore force"
+
+
+def test_forced_restore_is_journaled_as_user_and_marked_in_detail(tmp_path):
+    """§7: an action done with ``force`` is written as ``initiator=user`` and must be
+    tellable apart in the archive afterwards — using the existing ``detail`` column, no
+    new one. Reddens if the marker is dropped or the initiator changes."""
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+
+    from src.db.actions import insert_action
+
+    app = create_app(_settings(tmp_path, state_fresh_ms=3_000_000))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = client.websocket_connect("/ext").__enter__()
+        try:
+            ws.send_json({
+                "type": "hello", "protocolVersion": 1, "token": EXT_TOKEN,
+                "instanceId": "i1", "installUuid": "u", "origin": "chrome-extension://a",
+                "title": "T", "sessionId": "sess-1", "allowExecuteJs": False,
+            })
+            _recv(ws)                       # hello_ack
+            req = _recv(ws)                 # initial snapshot_request
+            ws.send_json({"type": "snapshot", "id": req["id"], "sessionId": "sess-1",
+                          "focusedWindowId": 1, "tabs": [],
+                          "windows": [{"id": 1, "type": "normal", "state": "normal"}]})
+            for _ in range(500):
+                row = _q(db_path, "SELECT snapshot_at FROM instances WHERE id='i1'")
+                if row and row[0][0] is not None:
+                    break
+                import time as _t
+                _t.sleep(0.01)
+
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA busy_timeout = 5000")
+            aid = insert_action(
+                conn, ts=1_000_000, kind="dedupe_close", status="done",
+                initiator="curator", instance_from="i1", url="https://x/y",
+                url_norm="https://x/y", session_id_from="sess-1",
+            )
+            conn.commit()
+            conn.close()
+
+            client.post("/api/pause", headers=AUTH, json={"minutes": 60})
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(lambda: client.post(
+                f"/api/actions/{aid}/restore", headers=AUTH, json={"force": True}
+            ))
+            cmd = _recv(ws)
+            assert cmd["command"] == "open_tab"     # the pause did NOT stop it
+            ws.send_json({"type": "response", "id": cmd["id"], "ok": True,
+                          "result": {"tabId": 9, "windowId": 1}})
+            assert fut.result(timeout=5).status_code == 200
+
+            assert _q(
+                db_path, "SELECT initiator, detail FROM actions WHERE kind='restore'"
+            ) == [("user", "restore:force")]
+        finally:
+            ws.__exit__(None, None, None)

@@ -16,6 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+from conftest import _recv, make_settings
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -26,27 +27,14 @@ AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        heartbeat_ms=600_000,
-        protocol_version=1,
-        ext_token=EXT_TOKEN,
-        ext_allowed_origins="",
-        cmd_timeout_ms=2000,
-        snapshot_timeout_ms=2000,
-        state_fresh_ms=3_000_000,
-        restore_exemption_min=120,
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        pass_interval_min=5,
-        idle_minutes=60,
-        main_instance_id="main",
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **over)
 
 
 def _hello(instance_id="src", session="sess-1", **over):
@@ -138,15 +126,21 @@ def _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=No
     """hello + answer the initial snapshot_request so the instance is FRESH."""
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
-    ws.receive_json()                # hello_ack
-    req = ws.receive_json()          # snapshot_request
+    _recv(ws)                # hello_ack
+    req = _recv(ws)          # snapshot_request
     ws.send_json(_snapshot(req["id"], tabs or [], session=session))
-    _wait_until(
+    # HARD assert, not a best-effort wait: the channel clears ``pending_snapshot_id``
+    # BEFORE it writes the snapshot, so "snapshot_at is set" is the proof that the
+    # request slot is free again. Letting an unlanded handshake slide made every later
+    # step race — ``/api/state``'s kick correctly SKIPS an instance whose slot is still
+    # occupied ("a refresh is already in flight"), and the test would then wait forever
+    # for a frame that was never going to be sent.
+    assert _wait_until(
         lambda: _db_row(
             db_path, "SELECT snapshot_at FROM instances WHERE id=?", (instance_id,)
         )[0]
         is not None
-    )
+    ), f"instance {instance_id!r} never applied its initial snapshot"
     return ws
 
 
@@ -280,7 +274,7 @@ def test_undo_pure_close_reopens_and_writes_exemption(tmp_path):
                     "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
                 )
             )
-            cmd = ws.receive_json()
+            cmd = _recv(ws)
             assert cmd["command"] == "open_tab"     # a reopen BY URL, never a close
             ws.send_json({"type": "response", "id": cmd["id"], "ok": True,
                           "result": {"tabId": 55, "windowId": 1}})
@@ -322,12 +316,12 @@ def test_undo_relocate_reopens_source_and_closes_copy(tmp_path):
                 )
             )
             # 1) reopen the source in instance_from ('src').
-            open_cmd = ws_src.receive_json()
+            open_cmd = _recv(ws_src)
             assert open_cmd["command"] == "open_tab"
             ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
                               "result": {"tabId": 55, "windowId": 1}})
             # 2) close the copy tab_id_to in instance_to ('dst') WITH step-4 expect.
-            close_cmd = ws_dst.receive_json()
+            close_cmd = _recv(ws_dst)
             assert close_cmd["command"] == "close_tab"
             assert close_cmd["params"]["tabId"] == 77
             assert close_cmd["params"]["expect"]["minIdleMs"] > 0  # step-4 guard carried
@@ -372,7 +366,7 @@ def test_undo_after_restart_does_not_close_foreign_copy(tmp_path):
                     "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
                 )
             )
-            open_cmd = ws_src.receive_json()
+            open_cmd = _recv(ws_src)
             assert open_cmd["command"] == "open_tab"     # reopen by URL still happens
             ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
                               "result": {"tabId": 55, "windowId": 1}})
@@ -411,7 +405,7 @@ def test_undo_window_merge_reports_un_undone(tmp_path):
                     "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
                 )
             )
-            cmd = ws.receive_json()          # the dedupe_close reopen
+            cmd = _recv(ws)          # the dedupe_close reopen
             assert cmd["command"] == "open_tab"
             ws.send_json({"type": "response", "id": cmd["id"], "ok": True,
                           "result": {"tabId": 55, "windowId": 1}})
@@ -461,11 +455,11 @@ def test_undo_relocate_close_finds_phase_a_in_another_pass(tmp_path):
                     "/api/passes/pB/undo", headers=AUTH, json={"confirm_impact": True}
                 )
             )
-            open_cmd = ws_src.receive_json()
+            open_cmd = _recv(ws_src)
             assert open_cmd["command"] == "open_tab"
             ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
                               "result": {"tabId": 55, "windowId": 1}})
-            close_cmd = ws_dst.receive_json()
+            close_cmd = _recv(ws_dst)
             assert close_cmd["command"] == "close_tab" and close_cmd["params"]["tabId"] == 77
             ws_dst.send_json({"type": "response", "id": close_cmd["id"], "ok": True, "result": {}})
             resp = fut.result(timeout=5)
@@ -508,10 +502,10 @@ def test_undo_pass_with_both_halves_reverses_once(tmp_path):
                     "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
                 )
             )
-            open_cmd = ws_src.receive_json()
+            open_cmd = _recv(ws_src)
             ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
                               "result": {"tabId": 55, "windowId": 1}})
-            close_cmd = ws_dst.receive_json()
+            close_cmd = _recv(ws_dst)
             ws_dst.send_json({"type": "response", "id": close_cmd["id"], "ok": True, "result": {}})
             resp = fut.result(timeout=5)
             assert resp.status_code == 200
@@ -523,4 +517,203 @@ def test_undo_pass_with_both_halves_reverses_once(tmp_path):
             assert _db_row(db_path, "SELECT restored_at FROM actions WHERE id=?", (close,))[0] is not None
         finally:
             ws_dst.__exit__(None, None, None)
+            ws_src.__exit__(None, None, None)
+
+
+# --- the copy close is JOURNALED, at-least-once (Фаза 16 discipline) --------
+def test_undo_copy_close_is_journaled_pending_then_done(tmp_path):
+    """Until now this was the ONLY close in the system performed outside the journal:
+    ``close_tab`` followed by a bare ``DELETE FROM tabs``. Фаза 16's at-least-once
+    discipline (``pending`` under the guards BEFORE the command, completed after)
+    applies here for the same reason — a process death between a successful close and
+    the completion write must not erase the evidence that a tab was closed.
+
+    The test freezes the moment the ``close_tab`` is on the wire: the row must already
+    exist as ``pending``, and become ``done`` only after the extension answers."""
+    app = create_app(_settings(tmp_path, cmd_timeout_ms=2000))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws_src = _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=[])
+        ws_dst = _connect_fresh(client, db_path, instance_id="dst", session="sess-9", tabs=[])
+        try:
+            _seed_pass(db_path, "p1")
+            reloc = _seed_action(
+                db_path, pass_id="p1", kind="relocate", status="done", initiator="curator",
+                instance_from="src", instance_to="dst", tab_id=5, session_id_from="sess-1",
+                tab_id_to=77, session_id_to="sess-9", url="https://a/b", url_norm="https://a/b",
+            )
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(
+                lambda: client.post(
+                    "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
+                )
+            )
+            open_cmd = _recv(ws_src)
+            ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
+                              "result": {"tabId": 55, "windowId": 1}})
+
+            close_cmd = _recv(ws_dst)             # on the wire, NOT answered
+            assert close_cmd["command"] == "close_tab"
+            # THE assertion: the journal row exists BEFORE the outcome is known.
+            row = _db_row(
+                db_path,
+                "SELECT kind, status, initiator, instance_from, tab_id, "
+                "session_id_from, origin_action_id, url FROM actions "
+                "WHERE kind='undo_close'",
+            )
+            assert row == ("undo_close", "pending", "user", "dst", 77, "sess-9",
+                           reloc, "https://a/b")
+            # It names the COPY's side, not the relocation's source — the tab actually
+            # being closed. (Recording it as `relocate_close` would tell the archive the
+            # relocation COMPLETED, the opposite of what an undo does.)
+
+            ws_dst.send_json({"type": "response", "id": close_cmd["id"], "ok": True,
+                              "result": {}})
+            assert fut.result(timeout=5).status_code == 200
+            # Completed, and the copy is gone from the mirror.
+            assert _db_row(
+                db_path, "SELECT status FROM actions WHERE kind='undo_close'"
+            ) == ("done",)
+            assert _db_row(
+                db_path, "SELECT COUNT(*) FROM tabs WHERE instance_id='dst' AND tab_id=77"
+            ) == (0,)
+        finally:
+            ws_dst.__exit__(None, None, None)
+            ws_src.__exit__(None, None, None)
+
+
+def test_undo_copy_close_refused_is_journaled_failed(tmp_path):
+    # precondition_failed (the human is using the copy right now) is not silence: the
+    # attempt is recorded with the §6 code, and the mirror row survives.
+    app = create_app(_settings(tmp_path, cmd_timeout_ms=2000))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws_src = _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=[])
+        ws_dst = _connect_fresh(client, db_path, instance_id="dst", session="sess-9", tabs=[])
+        try:
+            _seed_pass(db_path, "p1")
+            _seed_action(
+                db_path, pass_id="p1", kind="relocate", status="done", initiator="curator",
+                instance_from="src", instance_to="dst", tab_id=5, session_id_from="sess-1",
+                tab_id_to=77, session_id_to="sess-9", url="https://a/b", url_norm="https://a/b",
+            )
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(
+                lambda: client.post(
+                    "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
+                )
+            )
+            open_cmd = _recv(ws_src)
+            ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
+                              "result": {"tabId": 55, "windowId": 1}})
+            close_cmd = _recv(ws_dst)
+            ws_dst.send_json({
+                "type": "response", "id": close_cmd["id"], "ok": False,
+                "error": {"code": "precondition_failed", "message": "in use"},
+            })
+            resp = fut.result(timeout=5)
+            assert resp.status_code == 200
+            assert resp.json()["results"][0]["copy_closed"] is False
+            assert _db_row(
+                db_path, "SELECT status, reason FROM actions WHERE kind='undo_close'"
+            ) == ("failed", "precondition_failed")
+        finally:
+            ws_dst.__exit__(None, None, None)
+            ws_src.__exit__(None, None, None)
+
+
+def test_undo_skipped_copy_close_writes_no_row(tmp_path):
+    # The skip branches (no copy / target disconnected / session mismatch) send NO
+    # command, so there is nothing to journal — a row there would claim a close that
+    # never happened. Reddens if the pending write moves above the guards.
+    app = create_app(_settings(tmp_path, cmd_timeout_ms=400))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws_src = _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=[])
+        ws_dst = _connect_fresh(client, db_path, instance_id="dst", session="sess-NEW", tabs=[])
+        try:
+            _seed_pass(db_path, "p1")
+            _seed_action(
+                db_path, pass_id="p1", kind="relocate", status="done", initiator="curator",
+                instance_from="src", instance_to="dst", tab_id=5, session_id_from="sess-1",
+                tab_id_to=77, session_id_to="sess-OLD", url="https://a/b", url_norm="https://a/b",
+            )
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(
+                lambda: client.post(
+                    "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
+                )
+            )
+            open_cmd = _recv(ws_src)
+            ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
+                              "result": {"tabId": 55, "windowId": 1}})
+            resp = fut.result(timeout=5)
+            assert resp.json()["results"][0]["copy_reason"] == "session_mismatch"
+            assert _db_row(
+                db_path, "SELECT COUNT(*) FROM actions WHERE kind='undo_close'"
+            ) == (0,)
+        finally:
+            ws_dst.__exit__(None, None, None)
+            ws_src.__exit__(None, None, None)
+
+
+# --- a failed reopen must not destroy the per-row summary (§10) -------------
+def test_undo_survives_a_failed_open_and_still_reports_per_row(tmp_path):
+    """§10: "построчный итог" — partial undo is the norm, not a failure.
+
+    A ``CommandError`` from ``open_tab`` used to escape ``restore_row`` (it is not an
+    ``HTTPException``, which is all ``_undo_relocation`` catches and all ``create_app``
+    renders), so the client got a 500 AFTER some rows had already been reversed —
+    ``restored_at`` stamped, copies closed — with no record of what had happened.
+
+    Here the second pure close is answered and the first is left to time out; the
+    response must be 200 with one ``failed`` row carrying the §6 code and one undone."""
+    app = create_app(_settings(tmp_path, cmd_timeout_ms=400))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws_src = _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=[])
+        try:
+            _seed_pass(db_path, "p1")
+            older = _seed_action(
+                db_path, ts=1_000, pass_id="p1", kind="dedupe_close", status="done",
+                initiator="curator", instance_from="src", url="https://a/1",
+                url_norm="https://a/1", session_id_from="sess-1",
+            )
+            newer = _seed_action(
+                db_path, ts=2_000, pass_id="p1", kind="dedupe_close", status="done",
+                initiator="curator", instance_from="src", url="https://a/2",
+                url_norm="https://a/2", session_id_from="sess-1",
+            )
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(
+                lambda: client.post(
+                    "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
+                )
+            )
+            # Reverse ts order: the NEWER row is reopened first — answer it…
+            cmd1 = _recv(ws_src)
+            assert cmd1["command"] == "open_tab"
+            ws_src.send_json({"type": "response", "id": cmd1["id"], "ok": True,
+                              "result": {"tabId": 51, "windowId": 1}})
+            # …and let the older one's open_tab time out.
+            cmd2 = _recv(ws_src)
+            assert cmd2["command"] == "open_tab"
+
+            resp = fut.result(timeout=8)
+            assert resp.status_code == 200, "a failed row must not 500 the whole undo"
+            body = resp.json()
+            by_id = {r["action_id"]: r for r in body["results"]}
+            assert by_id[newer]["outcome"] == "undone" and by_id[newer]["reopened"] is True
+            assert by_id[older]["outcome"] == "failed"
+            # The §6 code is readable in the summary, not a Python repr.
+            assert "timeout" in by_id[older]["reason"]
+            assert body["counts"]["reopened"] == 1 and body["counts"]["failed"] == 1
+            # The successful half really was committed…
+            assert _db_row(db_path, "SELECT restored_at FROM actions WHERE id=?", (newer,))[0] is not None
+            # …and the failed half left neither a marker nor a stray exemption.
+            assert _db_row(db_path, "SELECT restored_at FROM actions WHERE id=?", (older,))[0] is None
+            assert _db_row(
+                db_path, "SELECT COUNT(*) FROM exemptions WHERE url='https://a/1'"
+            ) == (0,)
+        finally:
             ws_src.__exit__(None, None, None)

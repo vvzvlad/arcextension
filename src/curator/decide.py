@@ -104,6 +104,11 @@ class Decisions:
     abandon: list = field(default_factory=list)          # AbandonReloc
     phase_b: list = field(default_factory=list)          # PhaseBVerify
     deferred: dict = field(default_factory=dict)         # instance_to -> count
+    # Reason breakdown of ``deferred`` (a subset of it): tabs held back because an
+    # IDENTICAL (target, full url) pair is already planned for phase A this pass.
+    # Kept apart only so the dry-run plan can name the cause; the aggregated
+    # ``deferred`` action row and curator_deferred_total still count them once.
+    deferred_same_url: dict = field(default_factory=dict)  # instance_to -> count
     phase_a: list = field(default_factory=list)          # PhaseAOpen
     closes: list = field(default_factory=list)           # Close
     considered: int = 0                                  # tabs step 5-7 weighed
@@ -168,18 +173,68 @@ def step4_passes(tab, mirror, now: int, idle_ms: int) -> bool:
 
 
 # --- routing (§7 step 5) -----------------------------------------------------
-def _route(tab, compiled_rules, main_instance_id: str, drain_on: bool):
-    """Return ``(home_instance | None, rule | None)`` (§7 step 5).
+def compile_match_candidates(rules) -> list:
+    """Compile the §8 ladder over EVERY rule — the ``invalid`` ones included.
+
+    ``compile_rules`` drops invalid rules, which is right for "may this rule decide a
+    home" and wrong for "does this tab have a home at all". Matching the two sets
+    SEPARATELY (valid first, orphans only if nothing valid matched) is wrong too: it
+    silently runs the specificity ladder twice, and the ladder is not composable that
+    way. With ``*.borneo.lc -> prox`` (valid) and ``www.borneo.lc -> ghost`` (orphaned),
+    a tab on ``www.borneo.lc`` matches BOTH; the ladder says the longer, more specific
+    ``www.borneo.lc`` wins, so before the flag the tab is deferred to an unreachable
+    ``ghost`` — but a valid-first lookup finds ``*.borneo.lc`` and relocates the tab into
+    ``prox``, a home the owner never chose for it, the moment an unrelated instance is
+    retired.
+
+    So the ladder runs ONCE, over copies with the flag cleared, and the WINNER is then
+    asked whether it was flagged. Rules whose PATTERN no longer compiles still drop out
+    inside ``compile_rules``: those carry no usable statement at all.
+
+    Each entry carries ``_orphan`` (was it flagged) and ``_source`` (the mirror's own
+    row, which is what every downstream consumer — ``rule_id``, ``rule_pattern``,
+    singleton grouping — must see). Nothing here mutates the mirror.
+    """
+    candidates = [
+        {
+            "id": _rule_field(r, "id"),
+            "pattern": _rule_field(r, "pattern"),
+            "instance_id": _rule_field(r, "instance_id"),
+            "singleton": _rule_field(r, "singleton"),
+            "invalid": 0,  # cleared on the COPY so compile_rules keeps it
+            "_orphan": bool(_rule_field(r, "invalid")),
+            "_source": r,
+        }
+        for r in rules
+    ]
+    return compile_rules(candidates)
+
+
+def _route(tab, compiled_candidates, main_instance_id: str, drain_on: bool):
+    """Return ``(home_instance | None, rule | None, orphan_home | None)`` (§7 step 5).
 
     Rule → its home (applies to tabs in ``main`` too — my design decision, §7).
     No rule + themed instance + rules exist → ``main`` (drain). No rule + ``main``,
-    or an empty rules table (drain off, §8) → ``None`` (not touched)."""
-    rule = best_match_compiled(tab.url, compiled_rules)
-    if rule is not None:
-        return _rule_instance(rule), rule
+    or an empty rules table (drain off, §8) → ``None`` (not touched).
+
+    **An ``invalid`` rule means "this tab HAS a home, and it is unreachable" — not
+    "this tab is unruled".** Treating a flagged rule as absent would turn §12's request
+    to flag an orphan for the alert into "flag it AND physically relocate the owner's
+    tabs into main", and it would flip mid-life: ``insert_rule`` writes ``invalid=0``, so
+    the rule behaves for one pass and starts moving tabs on the next. When the ladder
+    winner is flagged we return its unreachable home as the third value instead, and the
+    caller journals a deferral — exactly what an unreachable target produced BEFORE it
+    was flagged (its instance is not in ``ready_ids``), so the flag changes the alert and
+    nothing else.
+    """
+    match = best_match_compiled(tab.url, compiled_candidates)
+    if match is not None:
+        if match["_orphan"]:
+            return None, None, match["instance_id"]
+        return match["instance_id"], match["_source"], None
     if tab.instance_id != main_instance_id and drain_on:
-        return main_instance_id, None
-    return None, None
+        return main_instance_id, None, None
+    return None, None, None
 
 
 def _rule_instance(rule):
@@ -207,7 +262,7 @@ def _rule_singleton(rule):
 def decide(mirror, ready_ids: set, *, now: int, idle_ms: int, main_instance_id: str) -> Decisions:
     """Compute all pass decisions against the frozen mirror (§7 steps 4-8)."""
     res = Decisions()
-    compiled_rules = compile_rules(mirror.rules)
+    compiled_candidates = compile_match_candidates(mirror.rules)
     drain_on = has_active_rules(mirror.rules)
 
     # Full-URL index of what each instance ALREADY holds (dedup is by the full
@@ -216,6 +271,20 @@ def decide(mirror, ready_ids: set, *, now: int, idle_ms: int, main_instance_id: 
     urls_at: dict[str, set] = {}
     for t in mirror.tabs:
         urls_at.setdefault(t.instance_id, set()).add(t.url)
+
+    # (target instance, full url) pairs THIS pass has already scheduled a phase-A open
+    # for. ``urls_at`` is built once from the frozen mirror and — correctly — does not
+    # grow with the copies this pass creates, so without this set two identical sources
+    # both answer question (b) with "no copy in the target" and BOTH open one: two
+    # copies the curator itself made, which §7 forbids outright ("дубли, которые создал
+    # бы сам куратор, не допускаются"). For a themed target the second copy collapses on
+    # the next pass, but for ``main`` it never does — ``main`` is a sink without dedup
+    # (§15) — and next pass's question (b) cannot catch it either, because phase B has
+    # already closed both sources. The second tab is therefore DEFERRED, not closed and
+    # not collapsed: it waits one pass, by which time the first copy is in the mirror and
+    # question (b) resolves it normally. Deferring also respects §7's ban on touching a
+    # copy created in the same pass — nothing is closed here, the tab simply waits.
+    planned_opens: set = set()
 
     # --- phase B: source-first per live relocate row (§7 question a) ---------
     owned: set = set()  # (instance_id, tab_id) handled by phase B => not re-routed
@@ -258,7 +327,14 @@ def decide(mirror, ready_ids: set, *, now: int, idle_ms: int, main_instance_id: 
         if not step4_passes(tab, mirror, now, idle_ms):
             continue
         res.considered += 1
-        home, rule = _route(tab, compiled_rules, main_instance_id, drain_on)
+        home, rule, orphan_home = _route(
+            tab, compiled_candidates, main_instance_id, drain_on
+        )
+        if orphan_home is not None:
+            # The tab's home exists as policy but not as an instance (§12 invalid rule).
+            # Same outcome as any unreachable target: deferred, untouched, journalled.
+            res.deferred[orphan_home] = res.deferred.get(orphan_home, 0) + 1
+            continue
         if home is None:
             continue  # unruled main tab, or drain off => not touched
         if home == tab.instance_id:
@@ -273,7 +349,12 @@ def decide(mirror, ready_ids: set, *, now: int, idle_ms: int, main_instance_id: 
             # => inter-instance dedup, NOT a relocation (§7 q2, exists for §15).
             survivor = _pick_target(mirror, home, tab.url)
             res.closes.append(Close(tab, "dedupe_close", "dedupe", survivor, rule))
+        elif (home, tab.url) in planned_opens:
+            # An identical copy is already being opened in this target THIS pass.
+            res.deferred[home] = res.deferred.get(home, 0) + 1
+            res.deferred_same_url[home] = res.deferred_same_url.get(home, 0) + 1
         else:
+            planned_opens.add((home, tab.url))
             res.phase_a.append(PhaseAOpen(tab, home, rule))
 
     # --- step 8: singleton, then exact intra-instance dedup in non-main ------

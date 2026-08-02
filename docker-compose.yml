@@ -10,6 +10,12 @@ volumes:
   # must not also swallow the nightly VACUUM INTO copies, and a copy volume can be
   # snapshotted / off-boxed independently.
   curator_backups:
+  # The restore marker lives on its OWN volume — outside the DB and outside the
+  # backups (§7). That separation IS the mechanism: any value kept inside the DB
+  # travels inside the backup, so a restore would bring the old value back with it
+  # and look perfectly continuous. Only a marker that stays put while the DB rolls
+  # back can turn "restored from backup" into a detectable continuity break.
+  curator_restore_marker:
 
 networks:
   docker_main_net:
@@ -33,6 +39,9 @@ services:
     volumes:
       - curator:/app/data              # all mutable state survives restart/update
       - curator_backups:/app/backups   # backup copies on a SEPARATE volume (§12)
+      # Read-only for the service: the OPERATOR writes the marker during a restore
+      # (deploy/DEPLOY.md §8), the curator only fingerprints its contents.
+      - curator_restore_marker:/app/restore:ro
     environment:
       # EXT_TOKEN opens /ext, /api/* and /mcp; METRICS_TOKEN is read-only for
       # /metrics. Both are REQUIRED — an empty value fails startup (§4).
@@ -41,6 +50,13 @@ services:
       # Backups live on the separate curator_backups volume above, NOT under
       # /app/data. The entrypoint mkdir+chowns this path before dropping to `app`.
       BACKUP_DIR: /app/backups
+      # Continuity marker (§7). Its CONTENTS join the curator's continuity
+      # fingerprint, so changing them is what makes the first pass after a restore a
+      # dry_run awaiting confirmation instead of one that acts on yesterday's rules
+      # and stale `relocate` rows. An absent file is a stable value, not an error —
+      # on a fresh deploy the marker simply does not exist yet. The restore
+      # procedure (DEPLOY.md §8) writes a NEW unique value here.
+      RESTORE_MARKER_PATH: /app/restore/continuity-marker
       # Real chrome-extension://<id> origins, comma-separated. MUST match the
       # installed extension id(s): a mismatch silently breaks the startpage's
       # /api/* fetch (CORS preflight) while /ext still connects (§12). Empty here

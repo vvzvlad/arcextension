@@ -45,6 +45,7 @@ import {
   INSTALL_UUID_KEY,
   SESSION_ID_KEY,
   ALLOW_EXECUTE_JS_KEY,
+  CONNECTION_STATE_KEY,
 } from "./constants.js";
 import { dispatchCommand } from "./commands.js";
 
@@ -88,6 +89,54 @@ export class Connection {
     this.installUuid = null;
     this.sessionId = null;
     this.helloAcked = false;
+    // §6 `get_connection_state` facts. In memory for the life of THIS worker and
+    // mirrored into storage.session so a resurrected worker still reports them.
+    this.lastSeenAt = null; // when the service was last heard from (any frame)
+    this.rejectReason = null; // hello_ack{ok:false}.error.code, cleared by a good ack
+    this._persistChain = Promise.resolve(); // orders the storage.session writes
+  }
+
+  // Read the persisted §6 facts, preferring what THIS worker observed. Never throws:
+  // a storage failure degrades to "what we know in memory".
+  async getConnectionState() {
+    let persisted = {};
+    try {
+      const got = await this.env.storageSessionGet(CONNECTION_STATE_KEY);
+      persisted = (got && got[CONNECTION_STATE_KEY]) || {};
+    } catch (e) {
+      this.env.log("reading connection state failed:", e);
+    }
+    return {
+      connected: !!this.helloAcked,
+      lastSeenAt: this.lastSeenAt ?? persisted.lastSeenAt ?? null,
+      rejectReason: this.rejectReason ?? persisted.rejectReason ?? null,
+    };
+  }
+
+  // Persist the facts a resurrected worker cannot re-derive. Called on inbound frames
+  // OTHER than `command`, not only on hello_ack: an MV3 worker dies between events, so
+  // persisting only at ack time throws away every sighting after it — a worker
+  // resurrected half an hour later reports the ack-time `lastSeenAt`, and the status
+  // bar's "закрыт N назад" is wrong by that whole half hour (§10 tells "closed" from
+  // "stale" by exactly this number).
+  //
+  // `command` frames are EXCLUDED because they are the hot path: a 200-tab pass is
+  // hundreds of them, and a storage write in front of every dispatch buys nothing —
+  // the 15 s heartbeat (`ping`) keeps the persisted value fresh to well within the
+  // second §10 needs, right through the pass.
+  //
+  // The writes are CHAINED and snapshot their payload at call time: two frames handled
+  // concurrently would otherwise race, and a late-landing ordinary frame could
+  // overwrite a `rejectReason` written after it.
+  _persistConnectionState() {
+    const payload = {
+      lastSeenAt: this.lastSeenAt,
+      rejectReason: this.rejectReason,
+    };
+    this._persistChain = this._persistChain
+      .then(() => this.env.storageSessionSet({ [CONNECTION_STATE_KEY]: payload }))
+      .catch((e) => this.env.log("persisting connection state failed:", e));
+    return this._persistChain;
   }
 
   // One-time-per-start init: config + ids. Safe to call repeatedly (idempotent).
@@ -134,7 +183,15 @@ export class Connection {
       );
     };
     ws.onclose = () => {
-      if (this.ws === ws) this.ws = null;
+      if (this.ws === ws) {
+        this.ws = null;
+        // A closed socket is NOT a connection (§6 `get_connection_state.connected`):
+        // leaving helloAcked true would show a dead instance as "на связи" until the
+        // next alarm. `lastSeenAt` deliberately stays — it is when we last heard from
+        // the service, which is what makes "closed N ago" distinguishable from
+        // "never seen" in the status bar (§10).
+        this.helloAcked = false;
+      }
       // Reconnect is the alarm's job; nothing scheduled here on purpose.
     };
     ws.onerror = () => {
@@ -190,15 +247,24 @@ export class Connection {
       return null;
     }
     const type = msg && msg.type;
+    // Any well-formed frame proves the service was alive just now: that is exactly what
+    // `lastSeenAt` reports to the startpage (§6). Persisting is fire-and-forget (the
+    // chain orders the writes and swallows failures) and SKIPPED for `command` — see
+    // _persistConnectionState for why the hot path is excluded.
+    this.lastSeenAt = this.env.now();
+    if (type !== "command") this._persistConnectionState();
     switch (type) {
       case "hello_ack":
         if (msg.ok) {
           // Ack-gated (§6): connection is "up" ONLY here, never on socket open.
           this.helloAcked = true;
+          this.rejectReason = null; // a good ack clears a previous rejection
         } else {
           this.env.log("hello rejected:", msg.error && msg.error.code);
           this.helloAcked = false;
+          this.rejectReason = (msg.error && msg.error.code) || "rejected";
         }
+        await this._persistConnectionState();
         return msg;
       case "snapshot_request": {
         const snap = await this.buildSnapshot(this.env.now(), this.sessionId);

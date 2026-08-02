@@ -73,19 +73,23 @@ async def test_retention_horizons_spare_js_audit(tmp_path):
 
 async def test_retention_prunes_old_idempotency_keys(tmp_path):
     """``qlkey:*`` markers grow ``settings`` unbounded; retention must sweep the OLD
-    ones while a RECENT one still de-dupes a retry. Seed one old (beyond the 7d
-    idempotency window) and one recent marker; run retention with the default
-    idempotency horizon; assert only the old one is pruned and the recent one still
-    reports ``idempotency_key_seen`` True. Widen the sweep to keep the old key (remove
-    the prune) and this reddens."""
+    ones while anything a client could still be holding keeps de-duping its retry.
+
+    Three markers straddle the horizon: ancient (swept), 20 days old (KEPT — this is the
+    one that reddens if the window goes back to 7 days), and recent (kept). Remove the
+    prune entirely and the ancient key survives, which reddens too."""
     db = await _make_db(tmp_path)
     try:
         now = 2_000 * _MS_PER_DAY
 
         def seed(c):
-            # Recorded 30d ago (older than the 7d idempotency window) -> pruned.
-            record_idempotency_key(c, "old-batch", now - 30 * _MS_PER_DAY)
-            # Recorded 1d ago (inside the window) -> kept and still de-dupes.
+            # 45d — past any plausible claim, and past the 30d horizon -> pruned.
+            record_idempotency_key(c, "ancient-batch", now - 45 * _MS_PER_DAY)
+            # 20d — INSIDE the 30d horizon but OUTSIDE the old 7d one. A batch can sit
+            # this long behind a repeatedly-extended pause (§7), so its marker must
+            # survive; reverting the horizon to 7 days reddens exactly here.
+            record_idempotency_key(c, "paused-batch", now - 20 * _MS_PER_DAY)
+            # 1d — comfortably inside any window.
             record_idempotency_key(c, "recent-batch", now - 1 * _MS_PER_DAY)
 
         await db.write(seed)
@@ -94,17 +98,70 @@ async def test_retention_prunes_old_idempotency_keys(tmp_path):
         )
         assert result.idempotency_keys_deleted == 1
 
-        # The recent key is still recorded, so a retry of THAT batch is a no-op.
+        # Both still-claimable batches de-dupe their retry.
         assert await db.read(lambda c: idempotency_key_seen(c, "recent-batch")) is True
-        # The old key is gone (would re-apply, but the batch is long finished).
-        assert await db.read(lambda c: idempotency_key_seen(c, "old-batch")) is False
+        assert await db.read(lambda c: idempotency_key_seen(c, "paused-batch")) is True
+        # The ancient key is gone (its batch cannot still be pending).
+        assert await db.read(lambda c: idempotency_key_seen(c, "ancient-batch")) is False
 
         # Non-idempotency settings rows are never touched by the sweep.
         remaining = await db.read(
-            lambda c: [
+            lambda c: sorted(
                 r[0] for r in c.execute("SELECT key FROM settings WHERE key LIKE 'qlkey:%'")
-            ]
+            )
         )
-        assert remaining == ["qlkey:recent-batch"]
+        assert remaining == ["qlkey:paused-batch", "qlkey:recent-batch"]
     finally:
         await db.close()
+
+
+async def test_idempotency_horizon_outlives_an_extended_pause(tmp_path):
+    """WHY the horizon is 30 days and not a week (§10 «оффлайн может длиться днями»).
+
+    The upper bound on how long a client holds a claimed batch is not the network: while
+    a pause is armed every flush answers 423, and a pause is extended by pressing the
+    button again with no cap on repeats (§7 — only each individual pause is finite). Sweep
+    the marker first and the batch is not dropped but RE-SENT, applying a second time —
+    a duplicated ``reorder``, which is the very thing the Idempotency-Key exists to stop
+    (the ops compose, they do not settle).
+
+    Simulates that directly: a batch claimed before a fortnight of extended pause, whose
+    retry lands 15 days later, must still be recognised. At the old 7-day horizon it is
+    not, and the retry double-applies.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        claimed_at = 2_000 * _MS_PER_DAY
+        await db.write(lambda c: record_idempotency_key(c, "batch-held-through-pause",
+                                                        claimed_at))
+
+        # Retention keeps running daily throughout the pause.
+        for day in range(1, 16):
+            await db.write(
+                lambda c, d=day: run_retention(
+                    c, claimed_at + d * _MS_PER_DAY, ACTIONS_DAYS, JS_AUDIT_DAYS
+                )
+            )
+
+        # The pause is lifted on day 15 and the client finally flushes its batch.
+        assert await db.read(
+            lambda c: idempotency_key_seen(c, "batch-held-through-pause")
+        ) is True, "the retry would have applied a SECOND time"
+    finally:
+        await db.close()
+
+
+def test_the_three_horizons_are_independent(tmp_path):
+    # The idempotency change must not move `actions` / `js_audit`: each cutoff is
+    # computed from its own window, so bumping one leaves the others exactly where they
+    # were. Pure arithmetic on the same `now`, so it reddens if the cutoffs ever share
+    # a horizon.
+    from src.db.retention import _DEFAULT_IDEMPOTENCY_RETENTION_DAYS
+
+    now = 1_000 * _MS_PER_DAY
+    assert cutoff_ms(now, ACTIONS_DAYS) == now - ACTIONS_DAYS * _MS_PER_DAY
+    assert cutoff_ms(now, JS_AUDIT_DAYS) == now - JS_AUDIT_DAYS * _MS_PER_DAY
+    # js_audit stays the LONGEST (§12: the only trace of arbitrary code execution)…
+    assert JS_AUDIT_DAYS > ACTIONS_DAYS > _DEFAULT_IDEMPOTENCY_RETENTION_DAYS
+    # …and the idempotency window is long enough to outlive an extended pause.
+    assert _DEFAULT_IDEMPOTENCY_RETENTION_DAYS >= 30

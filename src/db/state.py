@@ -9,6 +9,7 @@ background single-flight snapshot refresh — this module never does I/O or awai
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from src.curator.pause import RESUME_PENDING_KEY, read_pause_until
@@ -125,6 +126,28 @@ def _read_rule_counts(conn: sqlite3.Connection) -> tuple[int, int]:
     return (total, invalid)
 
 
+def _parse_pending_plan(raw) -> dict | None:
+    """The deferred pass plan the runner stashed in ``settings.resume_pending``.
+
+    The runner writes ``json.dumps({"since": <ms>, "plan": {...}})`` — the dry-run plan
+    computed when a pause expired by timeout (§7). Reducing it to a bare boolean, as
+    ``resume_pending`` does, throws away exactly the thing §7 says the human confirms
+    the burst BY: «план … выводится в статус-полосу», so the click is informed rather
+    than blind. Returned VERBATIM as parsed (``{"since": …, "plan": {relocations,
+    closures, deferred, examples…}}``) so no field is lost on the way to the status row.
+
+    Anything unparseable / non-object => ``None``: a malformed latch must degrade to
+    "no plan to show", never to a 500 on every ``/api/state``.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def build_state(conn: sqlite3.Connection, server_now: int) -> dict:
     """Assemble the full ``StateResponse`` (§10) from the mirror in ONE reader
     connection. ``server_now`` is stamped by the caller (server clock)."""
@@ -138,6 +161,7 @@ def build_state(conn: sqlite3.Connection, server_now: int) -> dict:
     resume_row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (RESUME_PENDING_KEY,)
     ).fetchone()
+    resume_raw = resume_row[0] if resume_row is not None else None
     return {
         "server_now": server_now,
         "last_pass_at": last_pass_at,
@@ -145,7 +169,10 @@ def build_state(conn: sqlite3.Connection, server_now: int) -> dict:
         "rules_total": rules_total,
         "rules_invalid": rules_invalid,
         "paused_until": read_pause_until(conn),
-        "resume_pending": bool(resume_row is not None and resume_row[0]),
+        # The boolean stays EXACTLY as it was (clients are built on it); the plan is a
+        # new, additive field next to it.
+        "resume_pending": bool(resume_raw),
+        "pending_plan": _parse_pending_plan(resume_raw),
         "instances": _read_instances(conn),
         "tabs": _read_tabs(conn),
         "quick_links": _read_quick_links(conn),

@@ -86,3 +86,34 @@ def test_empty_metrics_token_fails(monkeypatch):
     monkeypatch.setenv("METRICS_TOKEN", "")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_identical_tokens_fail_at_startup(monkeypatch):
+    # §12: METRICS_TOKEN exists ONLY because of where it is stored — a scrape config in
+    # git, in plaintext. Making it equal to EXT_TOKEN publishes /ext, /api/* and /mcp in
+    # that same file while the config still LOOKS separated. Project convention
+    # (AGENTS.md): a misconfigured credential fails at startup.
+    monkeypatch.setenv("EXT_TOKEN", "same-secret")
+    monkeypatch.setenv("METRICS_TOKEN", "same-secret")
+    with pytest.raises(ValidationError) as ei:
+        Settings(_env_file=None)
+    msg = str(ei.value)
+    assert "EXT_TOKEN" in msg  # the message names what to change
+    # And the error is attached to METRICS_TOKEN, so load_settings_or_exit prints the
+    # env var name rather than a bare "?".
+    assert any(err["loc"] == ("metrics_token",) for err in ei.value.errors())
+
+
+def test_distinct_tokens_still_load(monkeypatch):
+    _base_env(monkeypatch)
+    assert Settings(_env_file=None).metrics_token == "metrics-secret"
+
+
+def test_restore_marker_path_defaults_to_unset(monkeypatch):
+    # §7 WARNING 2: no default path — an invented one would either never exist (silently
+    # disabling the detector) or sit inside the backup (detecting nothing). Empty means
+    # "not configured", which is the pre-existing behaviour.
+    _base_env(monkeypatch)
+    assert Settings(_env_file=None).restore_marker_path == ""
+    monkeypatch.setenv("RESTORE_MARKER_PATH", "/app/state/restore-marker")
+    assert Settings(_env_file=None).restore_marker_path == "/app/state/restore-marker"

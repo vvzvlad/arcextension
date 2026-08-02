@@ -47,6 +47,20 @@ class Settings(BaseSettings):
     # the list is rejected with reject_reason='origin'.
     ext_allowed_origins: str = ""
 
+    # Path to the EXTERNAL restore-from-backup marker (§7 WARNING 2). DEFAULT EMPTY =
+    # detection off — which the continuity fingerprint records as a state ("no marker
+    # configured"), not as a missing component: an install that stays off never breaks,
+    # but switching detection on or off later is a break like any other fingerprint
+    # config change (deliberate — a silent switch-OFF would drop restore detection with
+    # no signal; see clock.is_continuity_break). When set, it must point at a small file
+    # on a
+    # volume that is NOT part of the DB backup, holding a fresh uuid written on every
+    # restore — see src/curator/clock.read_restore_marker for the operator contract and
+    # deploy/DEPLOY.md for the procedure. No default path: an invented one would either
+    # never exist (silently disabling the detector) or accidentally sit inside the
+    # backup (detecting nothing).
+    restore_marker_path: str = ""
+
     # --- Non-secret infra defaults ----------------------------------------------
     log_level: str = "INFO"
     db_path: str = "data/curator.db"  # all mutable state lives under data/
@@ -64,6 +78,26 @@ class Settings(BaseSettings):
         # a blank token can never silently become a live credential.
         if v is None or not v.strip():
             raise ValueError("must not be empty or blank")
+        return v
+
+    @field_validator("metrics_token")
+    @classmethod
+    def _must_differ_from_ext_token(cls, v: str, info) -> str:
+        # The ONLY reason METRICS_TOKEN exists is its storage location (§12): the scrape
+        # config lives in git as plaintext, so the credential that goes there must open
+        # nothing but /metrics. Setting it to the same string as EXT_TOKEN publishes the
+        # key to /ext, /api/* and /mcp in that same plaintext file — the separation
+        # becomes decorative while looking configured. Fail at startup instead (project
+        # convention: a misconfigured credential never starts).
+        # ``ext_token`` is declared first, so it is already validated in ``info.data``;
+        # if it failed its own validation it is absent and there is nothing to compare.
+        ext = info.data.get("ext_token")
+        if ext is not None and v == ext:
+            raise ValueError(
+                "must differ from EXT_TOKEN — METRICS_TOKEN is the read-only /metrics "
+                "credential that lives in a plaintext scrape config; reusing EXT_TOKEN "
+                "there would expose /ext, /api/* and /mcp"
+            )
         return v
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

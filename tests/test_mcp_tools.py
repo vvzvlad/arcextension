@@ -8,6 +8,7 @@ Covers each tool's handler plus the guards the reviewer mutation-checks:
 """
 
 import asyncio
+from conftest import make_settings
 from types import SimpleNamespace
 
 import pytest
@@ -38,15 +39,13 @@ class FakeWS:
 
 
 def _settings(**over):
-    s = dict(
-        idle_minutes=60, pass_interval_min=5, cmd_timeout_ms=1000,
-        snapshot_timeout_ms=200, lease_ttl_ms=600_000, state_fresh_ms=3000,
-        quarantine_ttl_min=1440, main_instance_id="main", pause_default_min=60,
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, from the shared surface in ``tests/conftest.py``.
 
-
+    No ``tmp_path``: nothing here builds an app — these tests call the functions
+    directly and open their own ``Database`` — so the factory leaves ``db_path`` /
+    ``backup_dir`` off entirely rather than inventing one.
+    """
+    return make_settings(**{**{"cmd_timeout_ms": 1000, "snapshot_timeout_ms": 200, "state_fresh_ms": 3000}, **over})
 async def _make_db(tmp_path):
     db = Database(str(tmp_path / "curator.db"), str(tmp_path / "backups"))
     await db.open()
@@ -182,13 +181,39 @@ async def test_delete_rule_always_gated(tmp_path):
     assert await db.read(ra.list_rules) == []
 
 
-async def test_reset_singleton_returns_canonical_url(tmp_path):
+async def test_reset_singleton_navigates_and_journals_like_http(tmp_path):
+    # MCP parity (§11): reset_singleton runs the SAME core as POST /api/rules/:id/reset
+    # — a real navigate_tab plus an actions(kind='reset') row — and the ONLY difference
+    # is initiator='mcp'. Reddens if the tool goes back to reporting an "intent".
     db = await _make_db(tmp_path)
     from src.rules import access as ra
+    now = tools._now_ms()
+    await _insert_instance(db, "main", session_id="sess-1", snapshot_at=now, connected=1)
+    await _insert_tab(db, "main", 5, url="https://x.com/dash", last_active_at=now)
     rid = await db.write(lambda c: ra.insert_rule(
-        c, pattern="x.com", instance_id="main", canonical_url="https://x.com/home", created_at=1))
-    out = await tools.reset_singleton(_app(db), rule_id=rid)
-    assert out["ok"] is True and out["canonical_url"] == "https://x.com/home"
+        c, pattern="x.com", instance_id="main", singleton=True,
+        canonical_url="https://x.com/home", created_at=1))
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="sess-1")
+    app = _app(db, reg)
+
+    out, frame = await _run_with_response(
+        lambda: tools.reset_singleton(app, rule_id=rid), cs, ws, {},
+    )
+    assert out["ok"] is True and out["reset"] is True and out["tab_id"] == 5
+    assert frame["command"] == protocol.CMD_NAVIGATE_TAB
+    assert frame["params"] == {"tabId": 5, "url": "https://x.com/home"}
+    row = await db.read(lambda c: c.execute(
+        "SELECT kind, status, initiator, instance_from, tab_id, url FROM actions"
+    ).fetchone())
+    assert row == ("reset", "done", "mcp", "main", 5, "https://x.com/home")
+
+
+async def test_reset_singleton_missing_rule_is_a_tool_error(tmp_path):
+    db = await _make_db(tmp_path)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.reset_singleton(_app(db), rule_id=999)
+    assert ei.value.code == "not_found"
 
 
 # --- commands: initiator='mcp' ----------------------------------------------
@@ -301,10 +326,65 @@ async def test_pause_writes_setting_and_bumps_epoch(tmp_path):
     assert await db.read(pause_ops.read_pause_until) is None
 
 
+async def test_mcp_resume_runs_a_pass_like_the_http_twin(tmp_path):
+    """§7/§11 parity: a manual resume runs a pass IMMEDIATELY, whichever door it came
+    through. The MCP tool used to stop after the settings write, so an agent's resume
+    left the curator idle until the next tick — the same verb with two behaviours.
+    Reddens (no `pass` key, no `passes` row) if the tool stops writing settings only."""
+    db = await _make_db(tmp_path)
+    app = _app(db)
+    await tools.pause(app, minutes=30)
+
+    out = await tools.resume(app)
+    assert out["ok"] is True
+    assert "ttl_shift_ms" in out
+    # A REAL pass ran (no instances are connected here → no_ready_instances) and left
+    # its row in `passes`, exactly like DELETE /api/pause does.
+    assert out["pass"]["status"] == "no_ready_instances"
+    assert await db.read(
+        lambda c: c.execute("SELECT COUNT(*) FROM passes").fetchone()
+    ) == (1,)
+
+
+async def test_list_instances_exposes_resume_pending(tmp_path):
+    """§7 verbatim: «`resume_pending` виден в `StateResponse` и в `list_instances`».
+
+    Without it an agent sees `paused_until` in the past and no passes happening and
+    concludes the curator is broken, when it is deliberately waiting for a click."""
+    db = await _make_db(tmp_path)
+    app = _app(db)
+    assert (await tools.list_instances(app))["resume_pending"] is False
+
+    from src.db.settings_store import set_setting
+    await db.write(lambda c: set_setting(
+        c, pause_ops.RESUME_PENDING_KEY, '{"since": 1, "plan": {"closures": 3}}'
+    ))
+    assert (await tools.list_instances(app))["resume_pending"] is True
+
+    # Cleared with the pause (resume clears the latch) → flag drops again.
+    await db.write(lambda c: pause_ops.resume(c, now=tools._now_ms()))
+    assert (await tools.list_instances(app))["resume_pending"] is False
+
+
+async def test_mcp_merge_windows_delegates_to_the_shared_core(tmp_path):
+    # §9: one implementation behind the startpage button and the MCP tool. The tool
+    # must surface the extension's `merged` count, not a bespoke shape.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.merge_windows(app, instance="main", auth_ctx="s"),
+        cs, ws, {"merged": 4},
+    )
+    assert frame["command"] == protocol.CMD_MERGE_WINDOWS
+    assert out["ok"] is True and out["merged"] == 4
+
+
 async def test_pause_refuses_mutating_verb_and_sends_nothing(tmp_path):
     db = await _make_db(tmp_path)
     reg = Registry()
-    _, ws = _put_conn(reg, "main")
+    cs, ws = _put_conn(reg, "main")
     app = _app(db, reg)
     await tools.pause(app, minutes=30)  # arm the pause
 
@@ -315,17 +395,14 @@ async def test_pause_refuses_mutating_verb_and_sends_nothing(tmp_path):
 
     # A read is NOT gated by pause.
     assert "instances" in await tools.list_instances(app)
-    # After resume the same verb proceeds.
+    # After resume the same verb proceeds. (resume itself runs a pass — §7 — so it puts
+    # its own snapshot_request on the socket; _run_with_response waits for a NEW frame.)
     await tools.resume(app)
-    task = asyncio.create_task(tools.open_tab(app, instance="main", url="https://a", auth_ctx="s"))
-    for _ in range(400):
-        if ws.sent:
-            break
-        await asyncio.sleep(0.005)
-    assert ws.sent, "verb should proceed after resume"
-    resolve_response(reg.get("main"),
-                     {"type": "response", "id": ws.sent[-1]["id"], "ok": True, "result": {"tabId": 1}})
-    assert (await task)["ok"] is True
+    out, _frame = await _run_with_response(
+        lambda: tools.open_tab(app, instance="main", url="https://a", auth_ctx="s"),
+        cs, ws, {"tabId": 1},
+    )
+    assert out["ok"] is True
 
 
 # --- run_pass ----------------------------------------------------------------

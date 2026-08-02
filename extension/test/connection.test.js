@@ -110,13 +110,20 @@ describe("helloAcked is ack-gated, not open-gated (§6)", () => {
     expect(conn.helloAcked).toBe(true); // marked ONLY here
   });
 
-  it("hello_ack{ok:false} keeps it unacked", async () => {
+  it("hello_ack{ok:false} keeps it unacked AND records why", async () => {
     const conn = makeConnection();
     await conn.ensureSocket();
     conn.ws._open();
     conn.ws._serverSend({ type: "hello_ack", ok: false, error: { code: "auth" } });
     await flush();
+    // `helloAcked === false` ALONE is vacuous: it is also the value when the message
+    // never reached the handler at all (a broken onmessage wiring, a frame dropped by
+    // JSON.parse). The reject reason is the POSITIVE half — it can only be set by the
+    // handler having actually run on this frame — so the two together prove the
+    // negative for the right reason (§6/§10: the four states must be distinguishable).
     expect(conn.helloAcked).toBe(false);
+    expect(conn.rejectReason).toBe("auth");
+    expect(conn.lastSeenAt).not.toBe(null);
   });
 });
 

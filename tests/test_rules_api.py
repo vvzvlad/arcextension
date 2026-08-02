@@ -14,8 +14,10 @@ instance forcing confirm, the active snapshot request, the survivor ladder).
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+from conftest import _recv, make_settings
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -32,26 +34,16 @@ def _now_ms():
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        heartbeat_ms=600_000,       # no ping interferes with the ws-driven tests
-        protocol_version=1,
-        ext_token=EXT_TOKEN,
-        ext_allowed_origins="",
-        cmd_timeout_ms=2000,
-        snapshot_timeout_ms=2000,
-        state_fresh_ms=3000,        # the REALISTIC default — no 10**12 masking
-        idle_minutes=60,
-        main_instance_id="main",
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        pass_interval_min=5,  # curator clock guard + driver (Фаза 8 lifespan)
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **{**{
+            "state_fresh_ms": 3000,
+        }, **over})
 
 
 def _conn(db_path):
@@ -83,6 +75,19 @@ def _seed_tab(db_path, iid, tab_id, url, title="t", pinned=0, active=0, audible=
             "self_navigating, audible, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (iid, tab_id, window_id, url, title, None, pinned, active, 0,
              last_active_at, 0, 0, audible, 0),
+        )
+        c.commit()
+    finally:
+        c.close()
+
+
+def _set_setting(db_path, key, value):
+    c = _conn(db_path)
+    try:
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
         )
         c.commit()
     finally:
@@ -168,15 +173,21 @@ def _connect_fresh(client, db_path, instance_id, session="sess-1", tabs=None):
     """
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
-    ws.receive_json()                # hello_ack
-    req = ws.receive_json()          # snapshot_request
+    _recv(ws)                # hello_ack
+    req = _recv(ws)          # snapshot_request
     ws.send_json(_snapshot(req["id"], tabs or [], session=session))
-    _wait_until(
+    # HARD assert, not a best-effort wait: the channel clears ``pending_snapshot_id``
+    # BEFORE it writes the snapshot, so "snapshot_at is set" is the proof that the
+    # request slot is free again. Letting an unlanded handshake slide made every later
+    # step race — ``/api/state``'s kick correctly SKIPS an instance whose slot is still
+    # occupied ("a refresh is already in flight"), and the test would then wait forever
+    # for a frame that was never going to be sent.
+    assert _wait_until(
         lambda: _db_row(
             db_path, "SELECT snapshot_at FROM instances WHERE id=?", (instance_id,)
         )[0]
         is not None
-    )
+    ), f"instance {instance_id!r} never applied its initial snapshot"
     return ws
 
 
@@ -188,8 +199,8 @@ def _connect_unanswered(client, instance_id, session="sess-1"):
     """
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
-    ws.receive_json()                # hello_ack
-    ws.receive_json()                # initial snapshot_request (discarded)
+    _recv(ws)                # hello_ack
+    _recv(ws)                # initial snapshot_request (discarded)
     return ws
 
 
@@ -422,14 +433,24 @@ def test_preview_marks_unanswering_instance_not_counted(tmp_path):
 
 # --- WARNING 1: preview ACTIVELY requests a snapshot to be able to count ------
 def test_preview_requests_snapshot_to_count(tmp_path):
-    # prox is connected but has never delivered a snapshot (snapshot_at NULL). The
-    # tabs exist ONLY in the snapshot preview requests: if preview did not actively
-    # request one, prox would stay uncountable and closures would be 0. Answering the
-    # request lets the two singleton tabs collapse to one => closures==1. Reddens if
-    # the snapshot request is removed from the refresh path.
-    app = create_app(_settings(tmp_path, snapshot_timeout_ms=1500))
+    # prox is connected with a STALE mirror and a free request slot. The tabs exist only
+    # in the snapshot preview asks for: if preview did not actively request one, prox
+    # would count against the stale mirror and closures would be 0. Answering the request
+    # lets the two singleton tabs collapse to one => closures==1. Reddens if the snapshot
+    # request is removed from the refresh path.
+    #
+    # The mirror is aged by REWRITING snapshot_at, and the handshake IS answered, so the
+    # slot is provably free: this test is about "preview asks", not about how long it
+    # waits for somebody else's in-flight request (that is
+    # test_preview_waits_for_a_pass_snapshot_instead_of_clobbering_it).
+    app = create_app(_settings(tmp_path, snapshot_timeout_ms=1500, state_fresh_ms=3000))
+    db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
-        ws = _connect_unanswered(client, "prox")
+        ws = _connect_fresh(client, db_path, "prox", tabs=[])
+        c = _conn(db_path)
+        c.execute("UPDATE instances SET snapshot_at = 0 WHERE id='prox'")
+        c.commit()
+        c.close()
         try:
             # Answer the snapshot_request from a daemon thread, run the preview in
             # another, and wait on the PREVIEW (never block on ws.receive in the main
@@ -446,7 +467,7 @@ def test_preview_requests_snapshot_to_count(tmp_path):
                 )
 
             def _answer():
-                req = ws.receive_json()             # preview's snapshot_request
+                req = _recv(ws)             # preview's snapshot_request
                 if req.get("type") == "snapshot_request":
                     ws.send_json(_snapshot(req["id"], [
                         _tab(1, "https://grafana.lc/a"),
@@ -529,17 +550,300 @@ def test_singleton_survivor_example_follows_ladder(tmp_path):
             ws.__exit__(None, None, None)
 
 
-# --- reset endpoint ---------------------------------------------------------
-def test_reset_returns_intent(tmp_path):
+# --- GET /api/rules/:id -----------------------------------------------------
+def test_get_one_rule_matches_the_list_element(tmp_path):
+    # §10's `GET /api/rules[/:id]`. The single-rule body must be byte-for-byte the
+    # object the list puts in `rules[]` — reddens if the two ever grow separate mappers.
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "prox")
+        rid = _seed_rule(db_path, "grafana.lc", "prox", singleton=1)
+        listed = client.get("/api/rules", headers=AUTH).json()["rules"]
+        one = client.get(f"/api/rules/{rid}", headers=AUTH)
+        assert one.status_code == 200
+        assert one.json() == next(r for r in listed if r["id"] == rid)
+        assert client.get("/api/rules/999", headers=AUTH).status_code == 404
+        assert client.get(f"/api/rules/{rid}").status_code == 401
+
+
+# --- reset: the ONE thing that changes tab content (§8, §10) ----------------
+def _set_canonical(db_path, rule_id, url):
+    c = _conn(db_path)
+    try:
+        c.execute("UPDATE rules SET canonical_url=? WHERE id=?", (url, rule_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def test_reset_navigates_survivor_and_journals_it(tmp_path):
+    # The real manual reset: the SURVIVING tab of the rule (§8 ladder — tab 2 is the
+    # more recently active) is navigated to canonical_url and an actions(kind='reset')
+    # row lands. Reddens to a hang/500 if the navigate_tab command is not sent, and to
+    # a missing row if the archive write is dropped.
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    now = _now_ms()
+    with TestClient(app) as client:
+        rid = _seed_rule(db_path, "grafana.lc", "prox", singleton=1)
+        _set_canonical(db_path, rid, "https://grafana.lc/home")
+        ws = _connect_fresh(
+            client, db_path, "prox",
+            tabs=[
+                _tab(1, "https://grafana.lc/a", age_ms=OLD * 2),   # older -> loses
+                _tab(2, "https://grafana.lc/b", age_ms=OLD),       # survivor
+            ],
+        )
+        try:
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(lambda: client.post(f"/api/rules/{rid}/reset", headers=AUTH))
+            cmd = _recv(ws)
+            assert cmd["type"] == "command"
+            assert cmd["command"] == "navigate_tab"
+            assert cmd["sessionId"] == "sess-1"            # §5 session stamped
+            assert cmd["params"] == {"tabId": 2, "url": "https://grafana.lc/home"}
+            ws.send_json({"type": "response", "id": cmd["id"], "ok": True, "result": {}})
+            resp = fut.result(timeout=5)
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["reset"] is True and body["tab_id"] == 2
+            assert body["canonical_url"] == "https://grafana.lc/home"
+
+            row = _db_row(
+                db_path,
+                "SELECT kind, status, initiator, instance_from, tab_id, rule_id, url, "
+                "detail FROM actions WHERE kind='reset'",
+            )
+            assert row == ("reset", "done", "user", "prox", 2, rid,
+                           "https://grafana.lc/home", "https://grafana.lc/b")
+            assert _db_row(db_path, "SELECT COUNT(*) FROM actions") == (1,)
+            assert row[0] and now  # the row is the pass-free manual action (no pass_id)
+            assert _db_row(
+                db_path, "SELECT pass_id FROM actions WHERE kind='reset'"
+            ) == (None,)
+        finally:
+            ws.__exit__(None, None, None)
+
+
+def test_reset_with_no_tabs_is_not_an_error(tmp_path):
+    # §8: a rule that currently holds no tab has nothing to reset. That is a 200 with
+    # reset=false, NOT an error and NOT a command — reddens if the no-tab branch starts
+    # sending navigate_tab (the ws would receive a frame and the call would hang out).
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        rid = _seed_rule(db_path, "grafana.lc", "prox")
+        _set_canonical(db_path, rid, "https://grafana.lc/home")
+        ws = _connect_fresh(client, db_path, "prox", tabs=[_tab(1, "https://other.io/x")])
+        try:
+            resp = client.post(f"/api/rules/{rid}/reset", headers=AUTH)
+            assert resp.status_code == 200
+            assert resp.json()["reset"] is False
+            assert resp.json()["reason"] == "no_tabs"
+            assert _db_row(db_path, "SELECT COUNT(*) FROM actions") == (0,)
+        finally:
+            ws.__exit__(None, None, None)
+
+
+def test_reset_refuses_disconnected_instance_and_missing_rule(tmp_path):
+    # An unreachable instance cannot be navigated: 409 like every other command path,
+    # never a silent success. A rule with no canonical_url has no target: 422.
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "prox", connected=0)
+        rid = _seed_rule(db_path, "grafana.lc", "prox")
+        _set_canonical(db_path, rid, "https://grafana.lc/home")
+        assert client.post(f"/api/rules/{rid}/reset", headers=AUTH).status_code == 409
+
+        bare = _seed_rule(db_path, "other.io", "prox")          # no canonical_url
+        assert client.post(f"/api/rules/{bare}/reset", headers=AUTH).status_code == 422
+        assert client.post("/api/rules/999/reset", headers=AUTH).status_code == 404
+        assert _db_row(db_path, "SELECT COUNT(*) FROM actions") == (0,)
+
+
+def test_reset_refused_while_paused(tmp_path):
+    # §7: a pause silences the mutating verbs, and reset is one — no force here (it is
+    # not one of the three human buttons §7 names).
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         _seed_instance(db_path, "prox")
         rid = _seed_rule(db_path, "grafana.lc", "prox")
-        c = _conn(db_path)
-        c.execute("UPDATE rules SET canonical_url='https://grafana.lc/home' WHERE id=?", (rid,))
-        c.commit(); c.close()
+        _set_canonical(db_path, rid, "https://grafana.lc/home")
+        _set_setting(db_path, "pause_until", str(_now_ms() + 3_600_000))
         resp = client.post(f"/api/rules/{rid}/reset", headers=AUTH)
-        assert resp.status_code == 200
-        assert resp.json()["canonical_url"] == "https://grafana.lc/home"
-        assert client.post("/api/rules/999/reset", headers=AUTH).status_code == 404
+        assert resp.status_code == 423
+        assert resp.json()["error"] == "paused"
+        # force is NOT honoured for reset.
+        forced = client.post(
+            f"/api/rules/{rid}/reset", headers=AUTH, json={"force": True}
+        )
+        assert forced.status_code == 423
+        assert _db_row(db_path, "SELECT COUNT(*) FROM actions") == (0,)
+
+
+def test_reset_failure_is_journaled(tmp_path):
+    # The extension refuses (no_such_tab: the mirror named a tab that is gone). The
+    # attempt must still land in the archive as status='failed' with the §6 code —
+    # reddens if the failure path skips the row.
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        rid = _seed_rule(db_path, "grafana.lc", "prox")
+        _set_canonical(db_path, rid, "https://grafana.lc/home")
+        ws = _connect_fresh(
+            client, db_path, "prox", tabs=[_tab(1, "https://grafana.lc/a")]
+        )
+        try:
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(lambda: client.post(f"/api/rules/{rid}/reset", headers=AUTH))
+            cmd = _recv(ws)
+            ws.send_json({
+                "type": "response", "id": cmd["id"], "ok": False,
+                "error": {"code": "no_such_tab", "message": "gone"},
+            })
+            resp = fut.result(timeout=5)
+            assert resp.status_code == 409
+            assert resp.json()["error"] == "no_such_tab"
+            assert _db_row(
+                db_path, "SELECT kind, status, reason FROM actions"
+            ) == ("reset", "failed", "no_such_tab")
+        finally:
+            ws.__exit__(None, None, None)
+
+
+# --- preview never ejects an instance from a running pass -------------------
+def test_preview_waits_for_a_pass_snapshot_instead_of_clobbering_it(tmp_path):
+    """A preview opened WHILE a curator pass is collecting snapshots must not overwrite
+    the pass's ``pending_snapshot_id``: the channel matches ids exactly, so the
+    instance's answer to the pass would be dropped and it would be silently excluded
+    from that pass (§7). Preview waits for the pass's snapshot instead — the same
+    mirror it wanted anyway.
+
+    Reddens if the guard is removed: the slot becomes a ``req-`` id at the mid-flight
+    assertion, and the ``pass-abc`` snapshot below is then rejected by the channel, so
+    prox never becomes countable and the closure count collapses to 0."""
+    app = create_app(_settings(tmp_path, state_fresh_ms=5_000, snapshot_timeout_ms=4_000))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect_fresh(client, db_path, "prox", tabs=[])
+        try:
+            # Make the mirror stale so preview has to freshen it.
+            c = _conn(db_path)
+            c.execute("UPDATE instances SET snapshot_at = 0 WHERE id='prox'")
+            c.commit(); c.close()
+
+            cs = client.app.state.ext_registry.get("prox")
+            cs.pending_snapshot_id = "pass-abc"        # a pass is awaiting THIS id
+            cs.pending_sent_at = _now_ms()
+
+            holder = {}
+
+            def _do_preview():
+                holder["resp"] = client.post(
+                    "/api/rules/preview", headers=AUTH,
+                    json={"pattern": "grafana.lc", "instance_id": "prox",
+                          "singleton": True},
+                )
+
+            previewer = threading.Thread(target=_do_preview, daemon=True)
+            previewer.start()
+            time.sleep(0.4)
+            assert cs.pending_snapshot_id == "pass-abc", "preview clobbered the pass slot"
+
+            # The instance answers the PASS's id: it stays in the pass, and preview gets
+            # the fresh mirror it was waiting for.
+            ws.send_json(_snapshot("pass-abc", [
+                _tab(1, "https://grafana.lc/a"),
+                _tab(2, "https://grafana.lc/b"),
+            ], session="sess-1"))
+            previewer.join(timeout=8)
+            assert not previewer.is_alive(), "preview did not return"
+            payload = holder["resp"].json()
+            prox = next(i for i in payload["instances"] if i["id"] == "prox")
+            assert prox["counted"] is True
+            assert payload["closures"] == 1            # counted off the pass's snapshot
+            assert cs.last_applied_snapshot_id == "pass-abc"   # still in the pass
+        finally:
+            ws.__exit__(None, None, None)
+
+
+# --- preview freshens instances CONCURRENTLY, not one after another ---------
+def test_preview_refreshes_instances_in_parallel(tmp_path):
+    """Two unresponsive instances must cost ONE budget, not two.
+
+    As a sequential loop the per-instance waits added up, so the wall time of an
+    interactive rule edit grew with the size of the fleet — exactly backwards. Reddens
+    (roughly doubles) if the ``asyncio.gather`` in ``_refresh_for_preview`` goes back to
+    a comprehension with an ``await`` inside.
+    """
+    app = create_app(_settings(tmp_path, snapshot_timeout_ms=700, state_fresh_ms=3000))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        # Two connected instances whose mirrors are stale and which never answer.
+        sockets = [
+            _connect_fresh(client, db_path, iid, session=sess, tabs=[])
+            for iid, sess in (("prox", "s-prox"), ("media", "s-media"))
+        ]
+        try:
+            c = _conn(db_path)
+            c.execute("UPDATE instances SET snapshot_at = 0")
+            c.commit()
+            c.close()
+
+            started = time.time()
+            resp = client.post(
+                "/api/rules/preview", headers=AUTH,
+                json={"pattern": "other.com", "instance_id": "prox"},
+            )
+            elapsed = time.time() - started
+
+            assert resp.status_code == 200
+            reasons = {i["id"]: i["reason"] for i in resp.json()["instances"]}
+            assert reasons["prox"] == "timeout" and reasons["media"] == "timeout"
+            # One budget (0.7s) plus slack — NOT the ~1.4s a sequential fan-out costs.
+            assert elapsed < 1.2, f"instances were refreshed sequentially ({elapsed:.2f}s)"
+        finally:
+            # An unclosed websocket wedges TestClient.__exit__ (the portal waits for it),
+            # which turns a failure here into a hang instead of a red test.
+            for ws in sockets:
+                ws.__exit__(None, None, None)
+
+
+# --- canonical_url is validated at SAVE, not only at the extension edge -----
+def test_canonical_url_is_validated_on_save(tmp_path):
+    """§12 wants the edge check «а не только» rule validation — there was no server-side
+    one. Since the manual reset really sends this value in a ``navigate_tab``, an
+    unvalidated one fails at the far end: the extension refuses it, the human gets a bare
+    ``precondition_failed`` and an ``actions`` row saying ``failed``, and nothing says
+    "the URL you typed is not a URL"."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "prox")
+        for bad in ("data:text/html,x", "javascript:alert(1)", "grafana.lc/home",
+                    "file:///etc/passwd", "https://", 42):
+            r = client.post(
+                "/api/rules", headers=AUTH,
+                json={"pattern": "grafana.lc", "instance_id": "prox",
+                      "canonical_url": bad, "confirm_impact": True},
+            )
+            assert r.status_code == 422, f"{bad!r} was accepted"
+        assert client.get("/api/rules", headers=AUTH).json()["rules"] == []
+
+        # Absent/empty stays legal — canonical_url is optional (a rule without one just
+        # has no reset target).
+        ok = client.post(
+            "/api/rules", headers=AUTH,
+            json={"pattern": "grafana.lc", "instance_id": "prox", "confirm_impact": True},
+        )
+        assert ok.status_code == 201
+        # …and a real URL is accepted.
+        rid = ok.json()["id"]
+        assert client.put(
+            f"/api/rules/{rid}", headers=AUTH,
+            json={"pattern": "grafana.lc", "instance_id": "prox",
+                  "canonical_url": "https://grafana.lc/home", "confirm_impact": True},
+        ).status_code == 200

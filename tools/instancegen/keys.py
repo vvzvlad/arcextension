@@ -26,6 +26,8 @@ import hashlib
 import os
 from pathlib import Path
 
+from .core import write_private_bytes
+
 # A placeholder id -> chars mapping: the Chromium id is 32 chars over 'a'..'p'.
 _ID_ALPHABET_BASE = ord("a")
 
@@ -56,11 +58,14 @@ def load_or_create_private_key_pem(path: str | os.PathLike[str]) -> bytes:
     )
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Write private-key material 0600 (owner-only): it is a per-deployment secret.
-    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, pem)
-    finally:
-        os.close(fd)
+    #
+    # Atomic + durable + owner-only, via the shared writer. A PARTIAL key file is worse
+    # here than anywhere else: the `p.exists()` check above would reuse a truncated PEM
+    # forever, and the pinned extension id — hence every instance's chrome-extension://
+    # origin — would be lost permanently. Because the destination only ever appears via
+    # a rename of a complete, fsync'd file, a crash or power loss simply means "no key
+    # yet" and the next run generates one cleanly.
+    write_private_bytes(p, pem)
     return pem
 
 

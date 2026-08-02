@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from loguru import logger
 
@@ -46,6 +46,7 @@ class PassCtx:
     struck: set               # (instance_id, url_norm) already struck THIS pass (cap 1/pass)
     ready: dict               # instance_id -> Readiness captured at step 3 (§7)
     actions_count: int = 0    # incremented on every action row written
+    closed: set = field(default_factory=set)  # (instance_id, tab_id) closed THIS pass
 
 
 def _ready_unchanged(ctx: PassCtx, instance_id: str) -> bool:
@@ -130,6 +131,19 @@ def _expect(tab, idle_ms: int) -> dict:
     }
 
 
+async def _guard_before_command(ctx: PassCtx) -> None:
+    """Raise :class:`~src.curator.lease.LeaseLost` if the fencing epoch already moved.
+
+    Used ONLY by the two units that send their browser command before their first
+    guarded write (phase A's ``open_tab``, step 9's ``merge_windows``); every other unit
+    writes first and is fenced by that write. A read, not the :func:`lease.guard`
+    write-UPDATE, so it costs no write-lock. See :func:`src.curator.lease.holds` for
+    what this does and does not guarantee.
+    """
+    if not await ctx.db.read(lambda c: lease.holds(c, ctx.epoch)):
+        raise lease.LeaseLost(f"lease epoch {ctx.epoch} no longer held")
+
+
 def _strike_once(conn, ctx: PassCtx, instance_id, url_norm, reason) -> None:
     """Add at most ONE quarantine strike per (instance, url_norm) per pass (§7)."""
     pair = (instance_id, url_norm)
@@ -153,6 +167,14 @@ async def run_phase_a(ctx: PassCtx, dec) -> None:
     if not _ready_unchanged(ctx, home) or not _ready_unchanged(ctx, tab.instance_id):
         logger.info("phase A deferred (instance readiness changed): {} -> {}", tab.url, home)
         return
+    # Phase A is one of the two units whose browser command precedes its first guarded
+    # write, so nothing else would notice a pause armed a moment ago until AFTER a tab
+    # was opened. Check the fencing epoch first: a lost lease stops the whole pass (§7)
+    # instead of opening one more tab in a curator the owner just switched off. This
+    # narrows the window, it does not remove it — a pause landing between this check and
+    # the send still gets one open through; the lease SLOT, held until this pass
+    # finishes, is what keeps two passes from overlapping.
+    await _guard_before_command(ctx)
     seed_age_ms = ctx.now - tab.last_active_at
     seed_opened_ago_ms = ctx.now - tab.opened_at
     try:
@@ -310,6 +332,9 @@ async def run_phase_b(ctx: PassCtx, dec) -> None:
         convergence.reset_strikes(conn, reloc.instance_from, url_norm)
 
     await ctx.db.write(lease.guarded(ctx.epoch, _done))
+    # Step 9 plans from the SAME frozen mirror, so it must not journal this tab as
+    # "moved" — it no longer exists (§9).
+    ctx.closed.add((reloc.instance_from, source_tab.tab_id))
     ctx.actions_count += 1
 
 
@@ -410,6 +435,9 @@ async def run_close(ctx: PassCtx, dec) -> None:
         convergence.reset_strikes(conn, tab.instance_id, url_norm)  # success on the pair (§7)
 
     await ctx.db.write(lease.guarded(ctx.epoch, _done))
+    # Step 9 plans from the SAME frozen mirror, so it must not journal this tab as
+    # "moved" — it no longer exists (§9).
+    ctx.closed.add((tab.instance_id, tab.tab_id))
     ctx.actions_count += 1
 
 
@@ -431,6 +459,20 @@ def _source_present(mirror, row) -> bool:
     the extension edge, so an in-use tab is not force-closed and we never double-close
     (the original tab, if it truly closed, is gone — a live match is a different tab
     holding the same url, which the rule wants curated anyway).
+
+    ⚠️ KNOWN LIMITATION, deliberately not fixed. The match is by URL only, so with
+    THREE OR MORE tabs holding the same url in one instance, closing one of them still
+    leaves a match and the (successful) close is journaled ``abandoned`` instead of
+    ``done``. It cannot be tightened with what a pending row carries: ``tab_id`` is
+    discard-volatile even inside one session and ``session_id`` is wiped by a
+    reconnect (§5), which is exactly the case this function exists to survive.
+    Counting instead of matching does not help either — the pre-close count is not
+    recorded, and recording it would still be wrong the moment the human opens or
+    closes a fourth copy mid-pass. The cost of the miss is bounded and self-healing:
+    an ``abandoned`` close is re-issued by ``decide`` (dedup/singleton still sees the
+    duplicates) or, for a relocate, one pass later — never a lost tab, only a journal
+    row that under-reports. The readiness gate in :func:`run_reconcile` removes the
+    far more damaging version of the same failure (a whole instance's stale mirror).
     """
     return any(t.url == row["url"] for t in mirror.tabs_of(row["instance_from"]))
 
@@ -441,6 +483,22 @@ async def run_reconcile(ctx: PassCtx, row) -> None:
     Runs EARLY in the pass (before decide), per row isolated, every write lease-guarded.
     Idempotent and safe to run every pass: a pending row is resolved to exactly one
     terminal state and never revisited.
+
+    **Gated on the source instance's readiness for THIS pass.** The verdict is read off
+    a mirror, and a mirror is only as fresh as the snapshot that filled it. An instance
+    that did not answer this pass's ``snapshot_request`` within ``SNAPSHOT_TIMEOUT_MS``
+    (the laptop is asleep, the service worker has not woken) leaves the mirror showing
+    the world as it was BEFORE the close — ``_source_present`` then says "still there"
+    and a close that really happened is terminally journaled ``abandoned``. For a
+    ``relocate_close`` that is permanent: ``abandoned`` does not retire the relocation,
+    so a completed relocation looks abandoned forever. §7 fixes instance readiness for
+    the whole pass by ``(instance_id, conn_epoch, session_id, snapshot_id)`` and takes an
+    instance out of the pass ENTIRELY when it changes — that applies here too, so an
+    unready source leaves the row ``pending`` for a pass with a fresh snapshot. That is
+    precisely the at-least-once semantics ``pending`` was introduced for. (An instance
+    retired for good therefore leaves its pending rows pending: an unresolved journal
+    row that ``ACTIONS_RETENTION_DAYS`` eventually collects is a far cheaper wrong than
+    a terminal verdict invented from a mirror nobody refreshed.)
 
     * Source ABSENT (the close happened, just wasn't journaled) → ``pending`` → ``done``
       and reset the pair's strikes; the source tab is already gone from the mirror, so
@@ -453,6 +511,12 @@ async def run_reconcile(ctx: PassCtx, row) -> None:
       is still in the mirror) or next pass (a relocate_close: the relocation re-enters
       ``live_relocations`` once the pending is no longer pending) — closed exactly once.
     """
+    if not _ready_unchanged(ctx, row["instance_from"]):
+        logger.info(
+            "reconcile deferred (source instance not ready this pass) for action {}",
+            row["id"],
+        )
+        return
     if _source_present(ctx.mirror, row):
         await ctx.db.write(
             lease.guarded(ctx.epoch, lambda c: mark_action_abandoned(c, row["id"]))
@@ -496,6 +560,10 @@ async def run_window_merge(ctx: PassCtx, merge) -> None:
     if not _ready_unchanged(ctx, merge.instance_id):
         logger.info("window merge deferred (instance readiness changed): {}", merge.instance_id)
         return
+    # Like phase A, this command precedes the unit's first guarded write — check the
+    # fencing epoch so a paused curator stops rearranging windows (see
+    # ``_guard_before_command``).
+    await _guard_before_command(ctx)
 
     try:
         result = await send_command(
@@ -511,11 +579,27 @@ async def run_window_merge(ctx: PassCtx, merge) -> None:
         logger.info("window merge deferred for {}: {}", merge.instance_id, exc.code)
         return
 
+    # §9 wants the list of tabs that were actually MOVED. The plan came from the mirror
+    # frozen BEFORE steps 4-8, so tab_ids this very pass closed would describe a move
+    # that never happened; drop them. The extension answers ``merge_windows`` with a
+    # ``{merged: N}`` COUNT and no ids, so the server's own bookkeeping is all there is:
+    # if the command ever starts returning the moved ids, take them verbatim instead of
+    # reconstructing — they are the only authoritative answer.
+    #
+    # What this list still cannot know, and deliberately does not pretend to:
+    # a close that failed connection-class (its outcome is UNKNOWN, so the tab is not in
+    # ``ctx.closed`` and stays listed), and tabs the human opened in a source window
+    # after the snapshot (moved by the extension, absent from the plan). ``merged`` is
+    # recorded beside the list precisely so the two can be compared when they disagree.
+    moved_tab_ids = [
+        tab_id for tab_id in merge.moved_tab_ids
+        if (merge.instance_id, tab_id) not in ctx.closed
+    ]
     detail = json.dumps(
         {
             "targetWindowId": merge.target_window_id,
             "windowIds": merge.source_window_ids,
-            "moved_tab_ids": merge.moved_tab_ids,
+            "moved_tab_ids": moved_tab_ids,
             "merged": result.get("merged"),
         }
     )

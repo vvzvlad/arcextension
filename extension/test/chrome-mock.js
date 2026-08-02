@@ -81,6 +81,8 @@ export function createChromeMock(opts = {}) {
     lastFocused: opts.lastFocused || { id: -1, focused: false },
     idleState: opts.idleState || "active",
     nextTabId: opts.nextTabId || 1000, // id counter for tabs.create
+    nextWindowId: opts.nextWindowId || 500, // id counter for windows.create
+    createWindowError: opts.createWindowError || null, // when set, windows.create throws
     moveError: opts.moveError || null, // when set, tabs.move throws this message
     scriptResults: opts.scriptResults || [{ result: null }], // scripting.executeScript return
   };
@@ -91,6 +93,12 @@ export function createChromeMock(opts = {}) {
       local,
     },
     tabs: {
+      // ⚠️ The query FILTER IS IGNORED — every call gets every tab. That is faithful
+      // today because every call site under this mock passes `{}` (snapshot.js,
+      // commands.js), but it is a silent-default trap for the future: add a filtered
+      // query to src/ and the code under test will receive tabs it asked to exclude,
+      // and a test asserting on the result would pass for the wrong reason. Implement
+      // the filter here the moment a filtered call site appears.
       query: async (_query) => {
         await tick();
         return state.tabs.map((t) => ({ ...t }));
@@ -150,6 +158,33 @@ export function createChromeMock(opts = {}) {
         await tick();
         return state.windows.map((w) => ({ ...w }));
       },
+      // windows.create resolves to the created Window WITH its `tabs` array — that is
+      // how open_tab learns the id of the tab it just opened in a fresh window (§9,
+      // the "browser with zero normal windows" branch).
+      create: async (props = {}) => {
+        await tick();
+        if (state.createWindowError) throw new Error(state.createWindowError);
+        const id = state.nextWindowId++;
+        const win = {
+          id,
+          type: "normal",
+          state: props.state || "normal",
+          focused: !!props.focused,
+        };
+        state.windows.push(win);
+        const tab = props.url
+          ? {
+              id: state.nextTabId++,
+              windowId: id,
+              url: props.url,
+              pinned: false,
+              active: true,
+              audible: false,
+            }
+          : null;
+        if (tab) state.tabs.push(tab);
+        return { ...win, tabs: tab ? [{ ...tab }] : [] };
+      },
       getLastFocused: async () => {
         await tick();
         return { ...state.lastFocused };
@@ -169,13 +204,22 @@ export function createChromeMock(opts = {}) {
       },
     },
     alarms: {
-      _alarms: {},
+      _alarms: { ...(opts.alarms || {}) },
       create: (name, info) => {
+        // Record the CREATION ORDER too: re-creating an existing alarm resets its
+        // phase in the real API, so a test must be able to see a redundant create.
+        chrome.alarms._created.push(name);
         chrome.alarms._alarms[name] = info;
+      },
+      // MV3 promise form: resolves to the alarm or undefined when there is none.
+      get: async (name) => {
+        await tick();
+        return chrome.alarms._alarms[name];
       },
       clear: (name) => {
         delete chrome.alarms._alarms[name];
       },
+      _created: [],
       onAlarm: new FakeEvent(),
     },
     idle: {

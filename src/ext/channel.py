@@ -115,8 +115,10 @@ async def _handle_hello(
     if not allowed and not getattr(app.state, "warned_open_origin", False):
         app.state.warned_open_origin = True
         logger.warning(
-            "EXT_ALLOWED_ORIGINS is empty: /ext accepts any origin (open) — "
-            "tighten this once the extension id is known (§12)"
+            "EXT_ALLOWED_ORIGINS is empty: /ext accepts any origin (open) while "
+            "/api/* CORS is CLOSED for the same empty value — an instance will look "
+            "healthy here and the startpage's fetch will still die on preflight (§12). "
+            "Tighten this to the real chrome-extension://<id> once it is known."
         )
 
     reason = protocol.hello_reject_reason(

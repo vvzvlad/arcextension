@@ -223,3 +223,121 @@ async def test_confirm_pending_refuses_under_active_pause(tmp_path):
         db, reg, settings, confirm_pending=True, now=now0 + 1_000
     )
     assert res["status"] == "paused" and res["until"] > now0
+
+
+# --- a pause armed BETWEEN the step-1 read and the step-2 acquire still wins --
+class _PauseRacer:
+    """A ``Database`` proxy that arms a pause in the window step 1 cannot see.
+
+    Step 1 only READS, so the pass's very first ``write`` is the lease acquire. Arming
+    the pause immediately before that write reproduces the exact TOCTOU interleaving:
+    the step-1 check saw no pause, and the acquire is next.
+    """
+
+    def __init__(self, db, *, now, minutes):
+        self._db = db
+        self._now = now
+        self._minutes = minutes
+        self.armed_at_until = None
+
+    async def read(self, fn):
+        return await self._db.read(fn)
+
+    async def write(self, fn):
+        if self.armed_at_until is None:
+            self.armed_at_until = await self._db.write(
+                lambda c: pause_ops.pause(c, now=self._now, minutes=self._minutes)
+            )
+        return await self._db.write(fn)
+
+
+async def test_pause_armed_between_step1_and_acquire_blocks_the_pass(tmp_path):
+    """BLOCKER: the pause check must live INSIDE the acquiring transaction.
+
+    A pause armed after the step-1 read bumps the epoch to E+1, but ``acquire`` bumps it
+    straight to E+2 — the pass then owns the freshest epoch, every guarded write passes
+    and ``pause_until`` is never read again, so the owner who hit the emergency stop
+    watches tabs close for minutes (§7 "этого достаточно, чтобы остановить уже идущий
+    проход"). Reddens if the in-transaction check is removed: the pass starts and
+    reports ok/no_ready_instances instead of `paused`.
+    """
+    db = await _make_db(tmp_path)
+    now0 = 30_000_000
+    racer = _PauseRacer(db, now=now0, minutes=30)
+
+    res = await runner.run_pass(racer, Registry(), _settings(), now=now0 + 1)
+    assert res["status"] == "paused"
+    assert res["until"] == racer.armed_at_until
+    # Nothing started: no passes row, and the blocked pass never took the lease
+    # (acquire was not reached, so the slot was never written at all).
+    assert await db.read(
+        lambda c: c.execute("SELECT COUNT(*) FROM passes").fetchone()) == (0,)
+    assert (await db.read(lease.read_lease))["until"] is None
+
+
+async def test_dry_run_is_not_muted_by_the_in_transaction_pause_check(tmp_path):
+    """§7: looking at the plan is exactly why a pause is taken, so ``dry_run`` must NOT
+    be blocked by the same-transaction check (only the real pass is)."""
+    db = await _make_db(tmp_path)
+    now0 = 40_000_000
+    racer = _PauseRacer(db, now=now0, minutes=30)
+    res = await runner.run_pass(racer, Registry(), _settings(), dry_run=True, now=now0 + 1)
+    assert res["status"] == "dry_run"
+
+
+# --- a fenced pass releases ITS OWN slot; the pause does not do it for it ----
+async def test_fenced_pass_releases_its_own_slot_pause_does_not(tmp_path):
+    """§7 "снятие руками (DELETE /api/pause) запускает проход немедленно" — WITHOUT
+    ever letting two passes overlap.
+
+    ``release`` is keyed on the OWNER (a fresh uuid per acquire), not on the epoch, so
+    a pass fenced by a pause can still hand its slot back when it finishes. Keying it on
+    the epoch too meant the fenced pass could never release: renewal stops,
+    ``pass_lease_until`` sits in the future for the whole ``LEASE_TTL_MS`` (10 min), and
+    a pause lifted after two minutes is answered with ``lease_unavailable`` until the TTL
+    burns out.
+
+    The pause itself must NOT free the slot: ``run_phase_a`` / ``run_window_merge`` send
+    their browser command BEFORE their first guarded write, so a slot freed at pause time
+    lets the resume's pass start while the fenced one is still inside ``send_command``.
+    Reddens both ways — restore the epoch condition in ``release`` and the last acquire
+    fails; free the slot inside ``pause()`` and the mid-flight assertion fails.
+    """
+    db = await _make_db(tmp_path)
+    acquired, epoch = await db.write(lambda c: lease.acquire(c, "pass-1", 0, 600_000))
+    assert acquired
+    assert (await db.read(lease.read_lease))["until"] == 600_000  # held
+
+    await db.write(lambda c: pause_ops.pause(c, now=1_000, minutes=30))
+
+    # MID-FLIGHT: the pass is fenced (its guarded writes fail) but STILL owns the slot,
+    # so nobody else can start while it may still be talking to a browser.
+    with pytest.raises(lease.LeaseLost):
+        await db.write(lease.guarded(epoch, lambda c: c.execute(
+            "INSERT INTO settings (key, value) VALUES ('x','y')")))
+    assert (await db.read(lease.read_lease))["until"] == 600_000
+    blocked, _ = await db.write(lambda c: lease.acquire(c, "pass-2", 2_000, 600_000))
+    assert blocked is False
+
+    # The fenced pass reaches its `finally` and releases despite the moved epoch.
+    await db.write(lambda c: lease.release(c, "pass-1"))
+    assert (await db.read(lease.read_lease))["until"] == 0
+
+    # Now the pass triggered by the manual resume acquires at once — no TTL wait.
+    acquired2, epoch2 = await db.write(lambda c: lease.acquire(c, "pass-2", 3_000, 600_000))
+    assert acquired2 and epoch2 > epoch
+
+
+async def test_release_still_never_clears_a_foreign_lease(tmp_path):
+    """The invariant owner-keying must preserve: a pass whose lease EXPIRED and was
+    taken over by another must not clear the new holder's slot on its way out."""
+    db = await _make_db(tmp_path)
+    _, epoch1 = await db.write(lambda c: lease.acquire(c, "pass-1", 0, 1_000))
+    # pass-1's TTL expires; pass-2 takes over.
+    ok, epoch2 = await db.write(lambda c: lease.acquire(c, "pass-2", 5_000, 600_000))
+    assert ok and epoch2 > epoch1
+    # pass-1 finally wakes up and releases: a NO-OP, pass-2 keeps the lease.
+    await db.write(lambda c: lease.release(c, "pass-1"))
+    assert (await db.read(lease.read_lease))["owner"] == "pass-2"
+    blocked, _ = await db.write(lambda c: lease.acquire(c, "pass-3", 6_000, 600_000))
+    assert blocked is False

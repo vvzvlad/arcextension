@@ -11,6 +11,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import _recv, make_settings
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -21,22 +22,14 @@ EXT_TOKEN = "test-ext-token"
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        heartbeat_ms=600_000,  # far larger than any test => no ping interferes
-        protocol_version=1,
-        ext_token=EXT_TOKEN,
-        ext_allowed_origins="",
-        # Consumed by the retention loop started in the app lifespan (Фаза 4).
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        pass_interval_min=5,  # curator clock guard + driver (Фаза 8 lifespan)
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **over)
 
 
 def _hello(**over):
@@ -83,13 +76,13 @@ def test_hello_happy_path_acks_and_requests_snapshot(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello())
-            ack = ws.receive_json()
+            ack = _recv(ws)
             assert ack["type"] == "hello_ack"
             assert ack["ok"] is True
             assert ack["instanceId"] == "i1"
             assert isinstance(ack["connEpoch"], int)
 
-            req = ws.receive_json()
+            req = _recv(ws)
             assert req["type"] == "snapshot_request"
             assert "id" in req
 
@@ -107,10 +100,10 @@ def test_wrong_protocol_version_rejected_and_recorded(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello(protocolVersion=999))
-            ack = ws.receive_json()
+            ack = _recv(ws)
             assert ack == {"type": "hello_ack", "ok": False, "error": {"code": "protocol"}}
             with pytest.raises(WebSocketDisconnect):
-                ws.receive_json()
+                _recv(ws)
         assert _db_row(db_path, "SELECT reject_reason FROM instances WHERE id='i1'") == (
             "protocol",
         )
@@ -123,7 +116,7 @@ def test_wrong_token_rejected(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello(token="nope"))
-            ack = ws.receive_json()
+            ack = _recv(ws)
             assert ack["ok"] is False
             assert ack["error"]["code"] == "auth"
         assert _db_row(db_path, "SELECT reject_reason FROM instances WHERE id='i1'") == (
@@ -137,7 +130,7 @@ def test_missing_instance_id_rejected_without_db_row(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello(instanceId="   "))
-            ack = ws.receive_json()
+            ack = _recv(ws)
             assert ack["ok"] is False
             assert ack["error"]["code"] == "instance"
         # A blank instanceId cannot key an instances row; only the counter moved.
@@ -151,7 +144,7 @@ def test_origin_not_in_allowlist_rejected(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello(origin="chrome-extension://evil"))
-            ack = ws.receive_json()
+            ack = _recv(ws)
             assert ack["ok"] is False
             assert ack["error"]["code"] == "origin"
 
@@ -163,15 +156,15 @@ def test_old_socket_disconnect_does_not_clobber_new(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws1:
             ws1.send_json(_hello())  # installUuid uuid-A
-            e1 = ws1.receive_json()["connEpoch"]
-            ws1.receive_json()  # snapshot_request
+            e1 = _recv(ws1)["connEpoch"]
+            _recv(ws1)  # snapshot_request
 
             # Reconnect with the SAME installUuid => legitimate takeover: evicts
             # ws1 and bumps the epoch.
             with client.websocket_connect("/ext") as ws2:
                 ws2.send_json(_hello())
-                e2 = ws2.receive_json()["connEpoch"]
-                ws2.receive_json()  # snapshot_request
+                e2 = _recv(ws2)["connEpoch"]
+                _recv(ws2)  # snapshot_request
                 assert e2 == e1 + 1
 
                 # DB now reflects the live newer connection.
@@ -203,18 +196,18 @@ def test_duplicate_instance_rejected_first_socket_survives(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws1:
             ws1.send_json(_hello(installUuid="uuid-A"))
-            e1 = ws1.receive_json()["connEpoch"]
-            req = ws1.receive_json()  # snapshot_request for ws1
+            e1 = _recv(ws1)["connEpoch"]
+            req = _recv(ws1)  # snapshot_request for ws1
 
             # Second hello, SAME instanceId but a DIFFERENT installUuid => copied
             # bundle => duplicate. It must be rejected and closed.
             with client.websocket_connect("/ext") as ws2:
                 ws2.send_json(_hello(installUuid="uuid-B"))
-                ack2 = ws2.receive_json()
+                ack2 = _recv(ws2)
                 assert ack2["ok"] is False
                 assert ack2["error"]["code"] == "duplicate_instance"
                 with pytest.raises(WebSocketDisconnect):
-                    ws2.receive_json()
+                    _recv(ws2)
 
             assert client.app.state.ext_rejections == 1
             # The first connection is untouched: same epoch, still connected.
@@ -265,7 +258,7 @@ def test_degraded_ext_rejected_no_row_no_registry(tmp_path):
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello())
             with pytest.raises(WebSocketDisconnect):
-                ws.receive_json()   # accept then close 1011, no hello handling
+                _recv(ws)   # accept then close 1011, no hello handling
         # No instance row was written and nothing registered.
         assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
         assert client.app.state.ext_registry.get("i1") is None
@@ -277,7 +270,7 @@ def test_non_str_token_rejected_cleanly(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello(token=12345))     # int, not str
-            ack = ws.receive_json()
+            ack = _recv(ws)
             assert ack["ok"] is False and ack["error"]["code"] == "auth"
 
 
@@ -289,7 +282,7 @@ def test_non_ascii_token_rejected_cleanly(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello(token="токен-日本語"))   # non-ASCII string
-            ack = ws.receive_json()
+            ack = _recv(ws)
             assert ack["ok"] is False and ack["error"]["code"] == "auth"
 
 
@@ -304,8 +297,8 @@ def test_snapshot_without_id_is_ignored(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello())
-            ws.receive_json()                     # hello_ack
-            req = ws.receive_json()               # snapshot_request
+            _recv(ws)                     # hello_ack
+            req = _recv(ws)               # snapshot_request
             ws.send_json({"type": "snapshot", "id": req["id"], "sessionId": "sess-1",
                           "focusedWindowId": 1, "tabs": [tab],
                           "windows": [{"id": 1, "type": "normal", "state": "normal"}]})
@@ -328,13 +321,13 @@ def test_heartbeat_closes_after_two_missed_pongs(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello())
-            assert ws.receive_json()["type"] == "hello_ack"
-            assert ws.receive_json()["type"] == "snapshot_request"
+            assert _recv(ws)["type"] == "hello_ack"
+            assert _recv(ws)["type"] == "snapshot_request"
             # Receive ping frames without answering; the socket closes after the
             # second miss => WebSocketDisconnect. range() gives ample headroom.
             with pytest.raises(WebSocketDisconnect):
                 for _ in range(10):
-                    frame = ws.receive_json()
+                    frame = _recv(ws)
                     assert frame["type"] == "ping"
 
 
@@ -346,10 +339,10 @@ def test_heartbeat_pong_keeps_connection_alive(tmp_path):
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_hello())
-            ws.receive_json()  # hello_ack
-            ws.receive_json()  # snapshot_request
+            _recv(ws)  # hello_ack
+            _recv(ws)  # snapshot_request
             for _ in range(4):
-                frame = ws.receive_json()
+                frame = _recv(ws)
                 assert frame["type"] == "ping"  # never a close while we pong
                 ws.send_json({"type": "pong"})
             assert _db_row(db_path, "SELECT connected FROM instances WHERE id='i1'") == (1,)

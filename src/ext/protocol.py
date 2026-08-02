@@ -82,7 +82,29 @@ def heartbeat_step(alive: bool, misses: int) -> tuple[int, bool]:
 def parse_origins(raw: str) -> set[str]:
     """Parse the comma-separated ``EXT_ALLOWED_ORIGINS`` value into a set.
 
-    Empty / blank => empty set, which the caller treats as "accept any origin".
+    Empty / blank => the EMPTY SET. **The two consumers of that empty set deliberately
+    read it differently, and this is the one place both are written down:**
+
+    * ``/ext`` (:func:`hello_reject_reason`, below) — **open**: an empty list skips the
+      origin check entirely and any origin may connect.
+    * ``/api/*`` CORS (:mod:`src.api.cors`) — **closed**: an empty list is an empty
+      allow-list, so no ``Access-Control-Allow-Origin`` is emitted for anybody.
+
+    The asymmetry is intentional and is the LESSER evil, not an oversight. The concrete
+    ``chrome-extension://<id>`` is not knowable before the extension is loaded, so
+    closing ``/ext`` by default would make the bootstrap impossible — and on an
+    already-running deployment that never set the variable it would disconnect every
+    instance at once, which is strictly worse than the CORS-closed state. CORS, by
+    contrast, must never widen to ``*`` (§12), so its empty case can only be "closed".
+
+    §12 warns that a MISMATCH between this list and the real extension id fails
+    SILENTLY — ``/ext`` connects, the instance looks healthy, and only the startpage's
+    ``fetch`` dies on preflight. Two things make the empty case audible instead:
+    a one-time loud WARNING from each side at startup / first hello, and the
+    ``curator_auth_rejections_total{reason="cors_preflight"}`` counter, which ticks on
+    every preflight this list rejects (:class:`src.api.cors.CountingCORSMiddleware`).
+    A NON-empty list that simply lists the wrong id is caught by the check below:
+    ``reject_reason='origin'`` lands in ``instances`` and the status row goes red.
     """
     return {part.strip() for part in raw.split(",") if part.strip()}
 
@@ -111,8 +133,9 @@ def hello_reject_reason(
     instance_id = msg.get("instanceId")
     if not isinstance(instance_id, str) or not instance_id.strip():
         return REJECT_INSTANCE
-    # Empty allow-list => accept any origin (the concrete chrome-extension:// id
-    # is unknown until the extension/generator phases; §12 tightens this later).
+    # Empty allow-list => accept ANY origin here, while /api/* CORS treats the same
+    # empty list as CLOSED. Deliberate asymmetry — see parse_origins' docstring for the
+    # full reasoning and for how the empty case is made audible (§12).
     if allowed_origins:
         origin = msg.get("origin")
         if origin not in allowed_origins:

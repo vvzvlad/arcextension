@@ -125,20 +125,131 @@ export async function dispatchCommand(frame, ctx = {}) {
 
 // --- verbs ------------------------------------------------------------------
 
+// §9's window predicate, byte-for-byte the service's own (`_window_mergeable` in
+// src/curator/decide.py): type `normal` AND state NOT `fullscreen`. A popup/app/
+// devtools window and a fullscreen showcase "are neither folded NOR merged into".
+//
+// The fullscreen half is not a detail: on macOS a wall dashboard lives as a fullscreen
+// window on its own Space (§1, ledger row 43). Letting it be a merge TARGET dumps every
+// other window's tabs into the showcase — and a window merge is explicitly NOT undoable
+// (§9), so there is nothing to restore the layout from. The same predicate keeps a
+// curator-opened copy (open_tab) out of that showcase.
+//
+// A `maximized` window IS eligible: "не fullscreen" is the spec's wording and the
+// service's fork note says the same, so a tab step 4 may relocate never lives in a
+// window step 9 refuses to touch.
+export function isMergeableWindow(w) {
+  return (
+    !!w && w.type === "normal" && w.state !== "fullscreen" && w.id !== undefined && w.id !== null
+  );
+}
+
+// §9's ONE target rule, pure and shared: "обычное окно с наибольшим числом вкладок;
+// при равенстве — меньший window_id". Returns null when nothing is eligible.
+// `windows` may be the raw getAll() list — the predicate lives here so both callers
+// (open_tab's target and merge_windows' target fallback) get the identical answer and
+// cannot drift apart.
+//
+// The tie-break is load-bearing because chrome.windows.getAll() promises no order: two
+// equal-sized windows would otherwise be chosen differently on each call, and
+// "детерминированно" is exactly the property §9 asks for.
+export function pickNormalWindow(windows, tabs) {
+  const eligible = (windows || []).filter(isMergeableWindow);
+  if (eligible.length === 0) return null;
+  const counts = new Map(eligible.map((w) => [w.id, 0]));
+  for (const t of tabs || []) {
+    if (counts.has(t.windowId)) counts.set(t.windowId, counts.get(t.windowId) + 1);
+  }
+  let best = null;
+  let bestCount = -1;
+  for (const w of eligible) {
+    const c = counts.get(w.id);
+    if (c > bestCount || (c === bestCount && w.id < best)) {
+      best = w.id;
+      bestCount = c;
+    }
+  }
+  return best;
+}
+
+// Create the curator's tab either in `windowId` or — when it is null — in a brand new
+// BACKGROUND normal window (§9: on macOS the browser lives with zero windows daily, and
+// a background window does not interrupt the human). Returns the created tab.
+async function createCuratorTab(params, windowId) {
+  if (windowId !== null && windowId !== undefined) {
+    return await chrome.tabs.create({
+      url: params.url,
+      pinned: !!params.pinned,
+      active: false, // a curator-opened copy never steals focus
+      windowId,
+    });
+  }
+  const win = await chrome.windows.create({
+    url: params.url,
+    focused: false,
+    state: "normal",
+  });
+  const tab = win && win.tabs && win.tabs[0];
+  if (!tab || tab.id === undefined) return null;
+  // windows.create takes no `pinned`; apply it to the created tab afterwards.
+  if (params.pinned) {
+    await chrome.tabs.update(tab.id, { pinned: true });
+  }
+  return tab;
+}
+
+// The live-state wrapper for open_tab. Skips the tab query when nothing is eligible —
+// that branch creates a window instead (§9).
+async function pickNormalWindowId() {
+  const windows = await chrome.windows.getAll();
+  if (!windows.some(isMergeableWindow)) return null;
+  const tabs = await chrome.tabs.query({});
+  return pickNormalWindow(windows, tabs);
+}
+
 // open_tab {url, pinned, active:false, seed_age_ms, seed_opened_ago_ms,
-// seed_age_unknown}. Validate the scheme at the edge, create the tab, then seed
-// the activity map so the freshly opened copy inherits the source's age rather
-// than reading as brand-new. The seed races onCreated, but the map's single
-// mutation chain reconciles them.
+// seed_age_unknown}. Validate the scheme at the edge, PICK THE WINDOW
+// DETERMINISTICALLY (§9), create the tab, then seed the activity map so the freshly
+// opened copy inherits the source's age rather than reading as brand-new. The seed
+// races onCreated, but the map's single mutation chain reconciles them.
+//
+// The explicit windowId is the point (§9): a bare chrome.tabs.create lands in the
+// last-focused window, which may be a popup — the copy would then live where the
+// pass does not look and phase B would never finish. With ZERO normal windows (on
+// macOS the browser lives with none daily) we CREATE one unfocused instead of
+// failing: a failure would push the relocation to `deferred` and on to quarantine.
 async function openTab(params, nowFn, map) {
   if (!isHttpUrl(params.url)) {
     return fail(ERR_PRECONDITION_FAILED, "open_tab accepts only http/https urls");
   }
-  const tab = await chrome.tabs.create({
-    url: params.url,
-    pinned: !!params.pinned,
-    active: false, // a curator-opened copy never steals focus
-  });
+  const windowId = await pickNormalWindowId();
+  let tab;
+  try {
+    tab = await createCuratorTab(params, windowId);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    // Chromium refuses tab edits mid-drag ("Tabs cannot be edited right now (user may
+    // be dragging a tab)") — the SAME transient merge_windows classifies below. It is
+    // NOT a vanished window, and answering it by opening a window would leave one
+    // stray background window per relocation, three per pass, with no self-healing (a
+    // one-tab window is never picked again, so the next open repeats it). An honest
+    // refusal is cheaper: phase A treats an open failure as "defer, never a strike —
+    // the tab retries next pass" (src/curator/phases.py), so nothing is quarantined.
+    if (/drag/i.test(msg)) {
+      return fail(ERR_BUSY_DRAGGING, msg);
+    }
+    // ONLY the race the explicit windowId introduced: the chosen window was closed
+    // between getAll() and create() (a bare tabs.create had no window to lose). Retry
+    // in a window we make ourselves — windows.create cannot lose that race.
+    if (windowId !== null && /no window/i.test(msg)) {
+      tab = await createCuratorTab(params, null);
+    } else {
+      throw e; // anything else is a genuine fault => internal, which is the truth
+    }
+  }
+  if (!tab || tab.id === undefined) {
+    return fail(ERR_NO_WINDOW, "could not create a tab for open_tab");
+  }
   await map.seedCuratorTab(tab.id, params, nowFn());
   return ok({ tabId: tab.id, windowId: tab.windowId });
 }
@@ -258,43 +369,94 @@ async function navigateTab(params) {
 // the target window. Mark BOTH the source and target windows BEFORE moving (a
 // move activates a neighbour in the emptied source and re-activates in the
 // target). Empty params = the manual "merge all" button (§9): every other normal
-// window folds into the focused one. A move rejected because the user is dragging
-// a tab surfaces as busy_dragging.
+// window folds into the focused normal one, or — with nothing normal focused — into
+// the deterministic §9 window (see the target block below). A move rejected because
+// the user is dragging a tab surfaces as busy_dragging.
 async function mergeWindows(params, nowFn, map) {
   let targetWindowId = params.targetWindowId;
   let windowIds = params.windowIds;
 
   const allWindows = await chrome.windows.getAll();
-  // §9 operates on NORMAL windows only: getAll()/getLastFocused() include popup/app
-  // windows, and neither their tabs may be folded nor may one become the target.
-  const normalWindows = allWindows.filter((w) => w.type === "normal");
+  // §9's mergeable set — the ONE predicate for BOTH roles (source and target):
+  // `isMergeableWindow` = normal && not fullscreen, the service's own
+  // `_window_mergeable`. getAll()/getLastFocused() also report popup/app windows and a
+  // fullscreen showcase; none of them may be folded, and none may be merged INTO.
+  const mergeable = allWindows.filter(isMergeableWindow);
+  const mergeableIds = new Set(mergeable.map((w) => w.id));
+  // ONE live read of the tab list and of the focused window, serving BOTH the target
+  // choice and the edge re-check further down. Two separate getLastFocused calls could
+  // disagree with each other inside a single command.
+  const tabs = await chrome.tabs.query({});
+  const focusedNow = await chrome.windows.getLastFocused();
+  // On-screen window id (for the volatile "the owner is looking at it" guard): ANY
+  // normal window counts here, fullscreen included — it is very much on screen.
+  const onScreenId =
+    focusedNow &&
+    focusedNow.type === "normal" &&
+    focusedNow.id !== undefined &&
+    focusedNow.id !== -1
+      ? focusedNow.id
+      : null;
+
   if (targetWindowId === undefined || targetWindowId === null) {
-    const focused = await chrome.windows.getLastFocused();
-    const focusedNormal =
-      focused && focused.type === "normal" && focused.id !== undefined && focused.id !== -1;
-    targetWindowId =
-      (focusedNormal && focused.id) || (normalWindows[0] && normalWindows[0].id);
+    // Empty params = the manual "слить всё сейчас" button (§9). TWO criteria, in order:
+    //
+    //  1. The focused window IF it is mergeable, and that is not cosmetic. The edge
+    //     re-check below refuses to move a window whose active tab is on screen, so a
+    //     focused window used as a SOURCE would simply be dropped — the button would
+    //     leave unmerged exactly the window the human is looking at. As the TARGET it
+    //     is never dropped: idle sources fold INTO the window in use. The mergeability
+    //     test is what stops focus from smuggling a FULLSCREEN showcase in as the
+    //     destination of an irreversible merge.
+    //  2. Otherwise §9's stated rule — "обычное окно с наибольшим числом вкладок; при
+    //     равенстве — меньший window_id" — via the SAME helper open_tab uses. The old
+    //     `normalWindows[0]` was not that rule and not deterministic at all:
+    //     chrome.windows.getAll() promises no order, so the target flipped between
+    //     calls and the fewest-moves property §9 buys with "наибольшее число вкладок"
+    //     was lost.
+    //
+    // `??` (not `||`): windowId 0 is a legal id that `||` would discard.
+    const focusedTargetId = onScreenId !== null && mergeableIds.has(onScreenId) ? onScreenId : null;
+    targetWindowId = focusedTargetId ?? pickNormalWindow(mergeable, tabs);
   }
-  if (targetWindowId === undefined || targetWindowId === null) {
-    return fail(ERR_NO_WINDOW, "no normal target window to merge into");
+  // VALIDATE the target, however it was chosen — including one the SERVICE named. It
+  // decided on the step-3 snapshot and a pass runs for minutes: by command time that
+  // window may be closed, or have become a popup/fullscreen. Without this check
+  // chrome.tabs.move throws and the command answers `internal`, which the service maps
+  // to 502 — while `no_window` is in its _CLIENT_ERRORS set (src/api/instances.py) and
+  // comes back as 409 + refetch, i.e. "your picture of the windows is stale, re-read it".
+  if (
+    targetWindowId === undefined ||
+    targetWindowId === null ||
+    !mergeableIds.has(targetWindowId)
+  ) {
+    return fail(ERR_NO_WINDOW, "no mergeable normal target window to merge into");
   }
   if (!Array.isArray(windowIds)) {
-    windowIds = normalWindows.map((w) => w.id).filter((id) => id !== targetWindowId);
+    windowIds = mergeable.map((w) => w.id).filter((id) => id !== targetWindowId);
+  } else {
+    // The mergeable filter applies to the SERVICE-SUPPLIED list too, not only to the
+    // manual `{}` branch (§9 "Окна типа popup/devtools/app не сливаются"). Same reason
+    // as the target validation above: the named window may be a popup or a fullscreen
+    // showcase by the time the command lands.
+    windowIds = windowIds.filter((id) => mergeableIds.has(id));
   }
 
   // §9 edge re-check (parity with close_tab's `expect`): the merge was decided on the
   // step-3 snapshot, so re-verify the VOLATILE guards against LIVE state before moving.
   // A SOURCE window the owner returned to in the sub-second gap before step 9 — it has
-  // an audible tab, or its active tab is the one on screen (in the focused window) — is
-  // dropped here and re-decided next pass ("пока с окном работают, оно не трогается",
-  // §9). The target is never dropped: idle sources fold INTO the window in use.
-  const tabs = await chrome.tabs.query({});
-  const focusedNow = await chrome.windows.getLastFocused();
-  const focusedId =
-    focusedNow && focusedNow.type === "normal" && focusedNow.id !== -1 ? focusedNow.id : null;
+  // an audible tab, or its active tab is the one on screen — is dropped here and
+  // re-decided next pass ("пока с окном работают, оно не трогается", §9). The target is
+  // never dropped: idle sources fold INTO the window in use.
+  //
+  // fullscreen is NOT re-checked here: it is a STRUCTURAL disqualification handled by
+  // `isMergeableWindow` above, which — unlike this filter — also bars it from being the
+  // TARGET. Keeping it only here was the bug: the line below deliberately exempts the
+  // target, so a fullscreen showcase passed straight through as the destination.
+  // `tabs` / `onScreenId` are the live reads taken at the top of this command.
   const inUse = new Set();
   for (const t of tabs) {
-    if (t.audible || (t.active && t.windowId === focusedId)) inUse.add(t.windowId);
+    if (t.audible || (t.active && t.windowId === onScreenId)) inUse.add(t.windowId);
   }
   windowIds = windowIds.filter((id) => id === targetWindowId || !inUse.has(id));
 

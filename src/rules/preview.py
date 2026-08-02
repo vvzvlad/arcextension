@@ -20,21 +20,31 @@ edited rule:
 
 This is a faithful ESTIMATE the human confirms; it deliberately models the
 determinable guards (§7 step 4) and the routing/dedup/singleton decisions, not the
-in-flight phase-A/phase-B relocate bookkeeping (which needs the pass writer of a
-later phase and no live ``relocate`` rows exist yet).
+in-flight phase-A/phase-B relocate bookkeeping (live ``relocate`` rows own their source
+tab in the pass; preview does not read them).
+
+**The routing decision itself is IMPORTED from the pass** (:func:`src.curator.decide._route`
+plus :func:`~src.curator.decide.compile_orphan_rules`) rather than restated here, and
+the same-pass ``planned_opens`` rule is mirrored. §8 is explicit that a second
+implementation of the routing/matching is exactly what must not exist, and this module
+drifted that way once: the pass grew an orphaned-rule branch (a tab whose rule points at
+a retired instance is DEFERRED, not drained to ``main``) and a same-pass duplicate branch
+(the second identical tab is deferred, not opened twice), while the preview kept its own
+copy and reported relocations that would never happen — to the wrong destination.
+``tests/test_rules_preview_parity.py`` runs both engines over one fixture and is the
+guard against a third drift.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from src.db.actions import normalize_url
 from src.rules.matcher import (
     InvalidPattern,
-    best_match_compiled,
     compile_pattern,
-    compile_rules,
     normalize_target,
 )
 
@@ -103,6 +113,11 @@ class PreviewResult:
     instances: list = field(default_factory=list)  # per-instance freshness
     enables_drain: bool = False
     disables_curation: bool = False
+    # Per-target deferral counts, the SAME shape ``decide`` produces
+    # (``Decisions.deferred``). Kept next to the scalar ``deferred`` (which clients
+    # already read) so the parity test can compare the two engines dict-to-dict
+    # instead of on a total that could match by coincidence.
+    deferred_by_target: dict = field(default_factory=dict)
 
     @property
     def impact(self) -> int:
@@ -115,6 +130,7 @@ class PreviewResult:
             "relocations": self.relocations,
             "closures": self.closures,
             "deferred": self.deferred,
+            "deferred_by_target": self.deferred_by_target,
             "impact": self.impact,
             "relocation_examples": self.relocation_examples,
             "closure_examples": self.closure_examples,
@@ -178,6 +194,14 @@ def _guarded(tab, inp: PreviewInput, exempt: set, quar: set, focused: dict) -> b
 
 def simulate(inp: PreviewInput) -> PreviewResult:
     """Run the whole-pass simulation and return the counts + examples (§8)."""
+    # THE routing decision (§7 step 5) comes FROM the pass; it is never restated here.
+    # Imported inside the function because ``src.curator.decide`` imports
+    # ``has_active_rules`` from this module — the layering says preview is the lower
+    # one, and a leaf import is how the rest of this codebase breaks that knot
+    # (cf. ``src.api.guards.require_not_paused``). Hoisting ``_route`` into a neutral
+    # module would be cleaner, but ``decide.py`` belongs to the pass.
+    from src.curator.decide import _route, compile_match_candidates
+
     res = PreviewResult()
     res.enables_drain = has_active_rules(inp.rules)  # drain state UNDER the candidate
     res.disables_curation = not res.enables_drain
@@ -234,8 +258,16 @@ def simulate(inp: PreviewInput) -> PreviewResult:
     consumed: set = set()  # (instance_id, tab_id) already accounted for
 
     # Compile every rule's pattern ONCE, before the tab loop (§8: "compile patterns
-    # once") — best_match_compiled then does zero compilation per tab.
-    compiled_rules = compile_rules(inp.rules)
+    # once") — `_route` then does zero compilation per tab. The candidate set includes
+    # the ``invalid`` rules: the pass runs ONE specificity ladder over all of them and
+    # asks the WINNER whether it was flagged, because a flagged rule still means "this
+    # tab HAS a home and it is unreachable", not "this tab is unruled".
+    compiled_candidates = compile_match_candidates(inp.rules)
+
+    # (target, full url) pairs this simulated pass has already scheduled an open for.
+    # The pass defers the SECOND identical tab rather than opening a copy of its own
+    # (§7), so counting it as a relocation would over-report by one per duplicate.
+    planned_opens: set = set()
 
     # --- routing: relocation vs inter-instance dedup vs deferred --------------
     stayers: list = []  # candidates whose home == their own instance
@@ -246,27 +278,39 @@ def simulate(inp: PreviewInput) -> PreviewResult:
         if not _guarded(tab, inp, exempt, quar, focused):
             continue
         url = _field(tab, "url")
-        rule = best_match_compiled(url, compiled_rules)
-        if rule is not None:
-            home = _field(rule, "instance_id")
-        elif inst != inp.main_instance_id and res.enables_drain:
-            home = inp.main_instance_id  # unruled themed tab drains to main (§7)
-        else:
-            home = None  # unruled main tab, or drain off => not touched
-
+        # ONE routing implementation, shared with the pass. `_route` reads attributes,
+        # while a preview tab is a sqlite3.Row/dict, so it is passed a thin view rather
+        # than being re-implemented for the other access style.
+        home, rule, orphan_home = _route(
+            SimpleNamespace(url=url, instance_id=inst),
+            compiled_candidates,
+            inp.main_instance_id,
+            res.enables_drain,
+        )
+        key = (inst, _field(tab, "tab_id"))
+        if orphan_home is not None:
+            # Home exists as policy but not as an instance (§12 invalid rule): the pass
+            # defers and leaves the tab alone — it does NOT drain it to main.
+            _add_deferred(res, orphan_home)
+            consumed.add(key)
+            continue
         if home is None:
             continue
         if home == inst:
             stayers.append((tab, rule))
             continue
-        key = (inst, _field(tab, "tab_id"))
         if home not in counted:
-            res.deferred += 1  # target not ready => deferred, not relocated (§7 step 6)
+            _add_deferred(res, home)  # target not ready => deferred, not relocated (§7 step 6)
             consumed.add(key)
             continue
         if url in urls_at.get(home, set()):
             _add_closure(res, tab, inst, "dedupe_close")  # §7 step-7 q2
+        elif (home, url) in planned_opens:
+            # A copy of this exact URL is already being opened in this target THIS
+            # pass; the second tab waits a pass instead of producing a second copy (§7).
+            _add_deferred(res, home)
         else:
+            planned_opens.add((home, url))
             _add_relocation(res, tab, inst, home)
         consumed.add(key)
 
@@ -318,6 +362,13 @@ def simulate(inp: PreviewInput) -> PreviewResult:
             consumed.add((inst, _field(tab, "tab_id")))
 
     return res
+
+
+def _add_deferred(res: PreviewResult, target: str) -> None:
+    """Count one deferral, in both shapes: the scalar clients read and the per-target
+    map that mirrors ``Decisions.deferred``."""
+    res.deferred += 1
+    res.deferred_by_target[target] = res.deferred_by_target.get(target, 0) + 1
 
 
 def _add_relocation(res: PreviewResult, tab, frm: str, to: str) -> None:

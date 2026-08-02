@@ -6,6 +6,7 @@ No websocket needed — seed rows directly and assert the filtered/paginated vie
 import sqlite3
 from types import SimpleNamespace
 
+from conftest import make_settings
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -16,27 +17,16 @@ AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        heartbeat_ms=600_000,
-        protocol_version=1,
-        ext_token=EXT_TOKEN,
-        ext_allowed_origins="",
-        cmd_timeout_ms=2000,
-        snapshot_timeout_ms=2000,
-        state_fresh_ms=3_000_000,
-        restore_exemption_min=120,
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        pass_interval_min=5,
-        idle_minutes=60,
-        main_instance_id="main",
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **{**{
+            "pass_interval_min": 5,
+        }, **over})
 
 
 def _seed(db_path, **kw):

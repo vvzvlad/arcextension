@@ -333,6 +333,13 @@ async def _mkdb(tmp_path):
     db = Database(str(tmp_path / "curator.db"), str(tmp_path / "backups"))
     await db.open()
     assert not db.degraded
+    # Establish continuity so the pass below is a steady-state one: without a stored
+    # fingerprint the FIRST pass over a populated DB is a §7 first-run break (dry_run +
+    # resume_pending), which is tested in tests/test_curator_runner.py.
+    from src.curator import clock as clockmod
+    fp = await db.read(lambda c: clockmod.current_fingerprint(
+        c, idle_minutes=60, main_instance_id="main"))
+    await db.write(lambda c: clockmod.store_fingerprint(c, fp))
     return db
 
 
@@ -398,5 +405,65 @@ async def test_pass_issues_merge_command_journals_and_keeps_ages(tmp_path):
         cls = _classify(rows)
         assert cls["impact"] == 0
         assert any(u["kind"] == "window_merge" for u in cls["un_undoable"])
+    finally:
+        await db.close()
+
+
+async def test_merge_journal_excludes_tabs_closed_by_the_same_pass(tmp_path):
+    """§9 wants the list of tabs that were actually MOVED.
+
+    The merge plan is built from the mirror frozen BEFORE steps 4-8, so a tab that this
+    very pass closed would otherwise be journalled as "moved" — a move that never
+    happened, in a row the archive treats as the record of what the merge did. Here main
+    tab 20 (in the source window) is dedupe-closed against prox, so only tab 21 is left
+    to move. Reddens if the plan's raw ``moved_tab_ids`` is journalled: 20 reappears.
+    """
+    db = await _mkdb(tmp_path)
+    try:
+        await db.write(lambda c: c.execute(
+            "INSERT INTO rules (pattern, instance_id, singleton, invalid, created_at) "
+            "VALUES ('grafana.lc', 'prox', 0, 0, 0)"))
+        ext = _Ext(db)
+        # main: window 1 = two unruled tabs (target), window 2 = the ruled tab 20 plus
+        # an unruled 21 (source). Tie on tab count => target is the smaller id, 1.
+        await ext.add_instance(
+            "main",
+            tabs=[
+                _tabinfo(10, window_id=1, url="https://a/"),
+                _tabinfo(11, window_id=1, url="https://b/"),
+                _tabinfo(20, window_id=2, url="https://grafana.lc/d/x"),
+                _tabinfo(21, window_id=2, url="https://c/"),
+            ],
+            windows=[
+                {"id": 1, "type": "normal", "state": "normal"},
+                {"id": 2, "type": "normal", "state": "normal"},
+            ],
+            focused=None,
+        )
+        # prox already holds the identical url => main:20 is a dedupe_close, not a move.
+        await ext.add_instance(
+            "prox",
+            tabs=[_tabinfo(99, window_id=1, url="https://grafana.lc/d/x")],
+            windows=[{"id": 1, "type": "normal", "state": "normal"}],
+            focused=None,
+        )
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_GET_TAB:
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": "https://grafana.lc/d/x"}}}
+            if cmd == protocol.CMD_MERGE_WINDOWS:
+                return {"ok": True, "result": {"merged": 1}}
+            return {"ok": True, "result": {"ok": True}}
+        ext.responder = respond
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+        # The dedupe really happened (so 20 is gone from the mirror).
+        assert await _rows(db, "SELECT status FROM actions WHERE kind='dedupe_close'") == [("done",)]
+        assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='main' AND tab_id=20") == [(0,)]
+        # ... and the merge journal lists only the tab that could still move.
+        detail = (await _rows(db, "SELECT detail FROM actions WHERE kind='window_merge'"))[0][0]
+        assert '"moved_tab_ids": [21]' in detail
     finally:
         await db.close()

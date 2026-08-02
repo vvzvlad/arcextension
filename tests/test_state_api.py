@@ -7,11 +7,14 @@ thread can drive the websocket while the request is in flight.
 """
 
 import asyncio
+import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
+from conftest import _recv, make_settings
 from starlette.testclient import TestClient
 
 from src.api.state import kick_state_refresh
@@ -22,27 +25,14 @@ AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
-    s = dict(
-        db_path=str(tmp_path / "curator.db"),
-        backup_dir=str(tmp_path / "backups"),
-        host="0.0.0.0",
-        port=8000,
-        heartbeat_ms=600_000,
-        protocol_version=1,
-        ext_token=EXT_TOKEN,
-        ext_allowed_origins="",
-        cmd_timeout_ms=2000,
-        snapshot_timeout_ms=2000,
-        state_fresh_ms=3_000_000,
-        restore_exemption_min=120,
-        actions_retention_days=90,
-        js_audit_retention_days=730,
-        pass_interval_min=5,
-        idle_minutes=60,
-        main_instance_id="main",
-    )
-    s.update(over)
-    return SimpleNamespace(**s)
+    """This file's settings, built on the ONE shared surface in ``tests/conftest.py``.
+
+    Only what this file deliberately differs on is listed below; everything else — and
+    every field ``src.settings.Settings`` grows later — is inherited, so a missing
+    attribute can no longer surface as an AttributeError inside an unrelated background
+    curator pass (which a TestClient's real lifespan does start).
+    """
+    return make_settings(tmp_path, **over)
 
 
 def _hello(instance_id="i1", session="sess-1", **over):
@@ -94,15 +84,21 @@ def _wait_until(fn, timeout=5.0, interval=0.01):
 def _connect_fresh(client, db_path, instance_id="i1", session="sess-1", tabs=None):
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
-    ws.receive_json()                 # hello_ack
-    req = ws.receive_json()           # snapshot_request
+    _recv(ws)                 # hello_ack
+    req = _recv(ws)           # snapshot_request
     ws.send_json(_snapshot(req["id"], tabs or [], session=session))
-    _wait_until(
+    # HARD assert, not a best-effort wait: the channel clears ``pending_snapshot_id``
+    # BEFORE it writes the snapshot, so "snapshot_at is set" is the proof that the
+    # request slot is free again. Letting an unlanded handshake slide made every later
+    # step race — ``/api/state``'s kick correctly SKIPS an instance whose slot is still
+    # occupied ("a refresh is already in flight"), and the test would then wait forever
+    # for a frame that was never going to be sent.
+    assert _wait_until(
         lambda: _db_row(
             db_path, "SELECT snapshot_at FROM instances WHERE id=?", (instance_id,)
         )[0]
         is not None
-    )
+    ), f"instance {instance_id!r} never applied its initial snapshot"
     return ws
 
 
@@ -149,11 +145,13 @@ def test_state_returns_mirror_shape(tmp_path):
             # Exact §10 StateResponse top-level shape.
             assert set(body.keys()) == {
                 "server_now", "last_pass_at", "last_pass_ok", "rules_total",
-                "rules_invalid", "paused_until", "resume_pending",
+                "rules_invalid", "paused_until", "resume_pending", "pending_plan",
                 "instances", "tabs", "quick_links",
             }
-            # Not paused / not waiting for a click on a fresh mirror (§7).
+            # Not paused / not waiting for a click on a fresh mirror (§7); with no
+            # latch armed the deferred plan is null, not a stray object.
             assert body["paused_until"] is None and body["resume_pending"] is False
+            assert body["pending_plan"] is None
             assert isinstance(body["server_now"], int)
             assert body["rules_total"] == 0 and body["rules_invalid"] == 0
             # The instance is present with the §10 fields.
@@ -178,21 +176,40 @@ def test_state_returns_mirror_shape(tmp_path):
 
 
 # --- immediate return + background refresh kicked on a stale mirror ----------
+def _stale_the_mirror(db_path, instance_id="i1"):
+    """Age the mirror out by REWRITING ``snapshot_at``, not by waiting.
+
+    The old form asked for staleness with ``state_fresh_ms=1`` and let real time supply
+    the millisecond. It usually did — but the whole handshake→GET path can complete
+    inside one millisecond, and then ``_is_stale`` compares ``now - snapshot_at == 0``
+    against ``>= 1``, the kick correctly declines, and the test fails on timing rather
+    than on behaviour. Writing the timestamp makes "the mirror is old" a fact.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("UPDATE instances SET snapshot_at = 0 WHERE id = ?", (instance_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_state_kicks_background_refresh_when_stale(tmp_path):
-    # state_fresh_ms=1 => the mirror is stale immediately after the initial
-    # snapshot, so GET /api/state must kick a background refresh: the ws receives a
-    # NEW snapshot_request. snapshot_timeout small so the detached poll-task dies
-    # quickly. If the refresh were removed, no second snapshot_request would arrive.
-    app = create_app(_settings(tmp_path, state_fresh_ms=1, snapshot_timeout_ms=300))
+    # A mirror older than STATE_FRESH_MS must make GET /api/state kick a background
+    # refresh: the ws receives a NEW snapshot_request. snapshot_timeout small so the
+    # detached poll-task dies quickly. If the refresh were removed, no second
+    # snapshot_request would arrive and `_recv` fails within its deadline.
+    app = create_app(_settings(tmp_path, state_fresh_ms=3000, snapshot_timeout_ms=300))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         ws = _connect_fresh(client, db_path, tabs=[])
         try:
+            _stale_the_mirror(db_path)
             resp = client.get("/api/state", headers=AUTH)
             assert resp.status_code == 200
             # The background task (after the response) kicked a refresh: a fresh
             # snapshot_request is now waiting on the socket.
-            frame = ws.receive_json()
+            frame = _recv(ws)
             assert frame["type"] == "snapshot_request"
         finally:
             ws.__exit__(None, None, None)
@@ -211,7 +228,7 @@ def test_focus_sends_focus_tab_and_returns_ok(tmp_path):
                     "/api/focus", json={"instance": "i1", "tabId": 42}, headers=AUTH
                 )
             )
-            cmd = ws.receive_json()
+            cmd = _recv(ws)
             assert cmd["type"] == "command" and cmd["command"] == "focus_tab"
             assert cmd["params"] == {"tabId": 42}
             assert cmd["sessionId"] == "sess-1"     # current session stamped (§5)
@@ -235,7 +252,7 @@ def test_focus_no_such_tab_is_clear_error(tmp_path):
                     "/api/focus", json={"instance": "i1", "tabId": 999}, headers=AUTH
                 )
             )
-            cmd = ws.receive_json()
+            cmd = _recv(ws)
             ws.send_json({
                 "type": "response", "id": cmd["id"], "ok": False,
                 "error": {"code": "no_such_tab", "message": "gone"},
@@ -382,3 +399,160 @@ def test_state_refresh_does_not_clobber_a_pending_pass_snapshot():
     assert requests == []
     # The single-flight flag was never claimed (the kick skipped the instance).
     assert cs.state_refresh_inflight is False
+
+
+# --- the deferred plan reaches the client (§7) ------------------------------
+def _set_setting(db_path, key, value):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_state_carries_the_pending_plan_not_just_the_flag(tmp_path):
+    """§7: after a timeout expiry the runner stores ``{since, plan}`` and the plan «выводится
+    в статус-полосу» — the human confirms the burst SEEING what it will do. Reducing the
+    latch to a boolean threw exactly that away. ``resume_pending`` stays a bool (clients
+    are built on it) and ``pending_plan`` is additive next to it."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        body = client.get("/api/state", headers=AUTH).json()
+        assert body["resume_pending"] is False and body["pending_plan"] is None
+
+        _set_setting(db_path, "resume_pending", json.dumps({
+            "since": 1_700_000_000_000,
+            "plan": {"relocations": 2, "closures": 7, "deferred": {},
+                     "closure_examples": [{"url": "https://a/b", "instance": "main",
+                                           "kind": "dedupe_close"}]},
+        }))
+        body = client.get("/api/state", headers=AUTH).json()
+        # The boolean is untouched…
+        assert body["resume_pending"] is True
+        # …and the plan is there, whole: the status row can name the numbers and show
+        # the examples instead of a bare "something is pending".
+        assert body["pending_plan"]["since"] == 1_700_000_000_000
+        assert body["pending_plan"]["plan"]["closures"] == 7
+        assert body["pending_plan"]["plan"]["closure_examples"][0]["url"] == "https://a/b"
+
+
+def test_state_pending_plan_degrades_to_null_on_a_malformed_latch(tmp_path):
+    # A corrupt latch must not 500 every /api/state — the flag still says "waiting",
+    # the plan degrades to null.
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _set_setting(db_path, "resume_pending", "{not json")
+        body = client.get("/api/state", headers=AUTH).json()
+        assert body["resume_pending"] is True
+        assert body["pending_plan"] is None
+
+        _set_setting(db_path, "resume_pending", "[1, 2]")   # valid JSON, wrong shape
+        assert client.get("/api/state", headers=AUTH).json()["pending_plan"] is None
+
+
+# --- the kick and the "do not clobber" guard, pinned DETERMINISTICALLY -------
+# These two reproduce, by construction rather than by timing luck, the interleaving that
+# used to make this file hang for minutes. No sleeps, no load, no retries: the state is
+# frozen at the exact instant that matters and asserted.
+def test_state_kick_respects_an_in_flight_pass_request_and_still_refreshes(tmp_path):
+    """A pass is collecting snapshots when the newtab opens (§7/§10).
+
+    ``/api/state`` must NOT put a competing ``req-`` id in the slot — the channel matches
+    snapshot ids exactly, so clobbering a ``pass-`` id drops the instance's answer to the
+    PASS and ejects it silently. The refresh the page wanted is the one ALREADY in
+    flight, so the correct behaviour is: skip the send, and let THAT request's answer be
+    the refresh. Both halves are asserted here, which is what "the kick and the guard
+    coexist" means.
+    """
+    app = create_app(_settings(tmp_path, state_fresh_ms=3000, snapshot_timeout_ms=300))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect_fresh(client, db_path, tabs=[])
+        try:
+            _stale_the_mirror(db_path)   # a refresh is genuinely wanted, by fact not timing
+            cs = client.app.state.ext_registry.get("i1")
+            # Freeze the interleaving instead of hoping for it: the pass's request sits
+            # in the slot at the exact moment /api/state runs its kick.
+            cs.pending_snapshot_id = "pass-frozen"
+            cs.pending_sent_at = int(time.time() * 1000)
+            assert _db_row(db_path, "SELECT COUNT(*) FROM tabs")[0] == 0
+
+            assert client.get("/api/state", headers=AUTH).status_code == 200
+            # (a) the slot is untouched => the instance stays in the pass.
+            assert cs.pending_snapshot_id == "pass-frozen"
+
+            # (b) answering the IN-FLIGHT request is what refreshes the mirror — the
+            # page never needed a second one. (Asserted on the tab that arrives, not on
+            # ``snapshot_at``: the handshake and this reply can share a millisecond.)
+            ws.send_json(_snapshot("pass-frozen", [
+                {"tabId": 3, "windowId": 1, "url": "https://x/y", "title": "X"}
+            ]))
+            assert _wait_until(
+                lambda: _db_row(db_path, "SELECT COUNT(*) FROM tabs")[0] == 1
+            ), "the in-flight snapshot never landed"
+            assert cs.last_applied_snapshot_id == "pass-frozen"
+            body = client.get("/api/state", headers=AUTH).json()
+            assert [t["tab_id"] for t in body["tabs"]] == [3]
+        finally:
+            ws.__exit__(None, None, None)
+
+
+def test_an_unlanded_handshake_leaves_the_slot_occupied_and_is_caught(tmp_path):
+    """WHY ``_connect_fresh`` now HARD-asserts that the initial snapshot landed.
+
+    If it does not land, the request slot stays occupied; ``/api/state``'s kick then
+    CORRECTLY skips the instance ("a refresh is already in flight") and no frame is ever
+    sent. A test waiting for that frame used to wait forever — long enough, past
+    ``PASS_INTERVAL_MIN``, for the app's real curator driver to wake up inside it. The
+    whole chain is reproduced here deterministically by answering with a foreign id,
+    which §6 drops by design.
+    """
+    app = create_app(_settings(tmp_path, state_fresh_ms=3000, snapshot_timeout_ms=200))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = client.websocket_connect("/ext").__enter__()
+        try:
+            ws.send_json(_hello())
+            _recv(ws)                       # hello_ack
+            _recv(ws)                       # snapshot_request (its id is DISCARDED)
+            ws.send_json(_snapshot("req-a-foreign-id", []))
+
+            cs = client.app.state.ext_registry.get("i1")
+            # The foreign reply is dropped: the mirror stays empty and the slot occupied.
+            assert _db_row(db_path, "SELECT snapshot_at FROM instances WHERE id='i1'")[0] is None
+            assert cs.pending_snapshot_id is not None
+
+            # …so the kick sends nothing, and the wait for a frame now FAILS FAST with a
+            # readable message instead of hanging (bounded by `_recv`).
+            assert client.get("/api/state", headers=AUTH).status_code == 200
+            with pytest.raises(AssertionError, match="no websocket frame"):
+                _recv(ws, timeout=0.5)
+        finally:
+            ws.__exit__(None, None, None)
+
+
+def test_focus_reports_the_missing_field_not_a_body_error(tmp_path):
+    # `{}` is a well-formed JSON object that merely lacks the fields, so it must fail
+    # like `{"instance": ""}` — 422 naming what is missing — not 400 "request body must
+    # be JSON". Malformed JSON is still 400.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        assert client.post("/api/focus", headers=AUTH, json={}).status_code == 422
+        assert client.post("/api/focus", headers=AUTH).status_code == 422
+        assert client.post(
+            "/api/focus", headers=AUTH, json={"instance": "i1"}
+        ).status_code == 422
+        bad = client.post(
+            "/api/focus",
+            headers={**AUTH, "content-type": "application/json"},
+            content=b"{not json",
+        )
+        assert bad.status_code == 400

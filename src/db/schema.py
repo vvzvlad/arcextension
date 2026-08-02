@@ -86,7 +86,14 @@ _V1_STATEMENTS: list[str] = [
         origin_action_id INTEGER,             -- phase B -> phase A row; restore -> close
         rule_id INTEGER,                      -- which rule decided; NULL for the drain
         rule_pattern TEXT,                    -- copy of the pattern: rule may be deleted
-        decision TEXT,                        -- rule_home | unruled_drain | dedupe | singleton
+        -- WHY this row exists. On a row with status='deferred' this is the CAUSE and
+        -- `reason` carries the aggregated COUNT, not a message — /metrics builds the
+        -- `curator_deferred_total{cause}` label from this column, so the vocabulary is
+        -- load-bearing rather than descriptive:
+        --   pass routing : rule_home | unruled_drain | dedupe | singleton
+        --   deferrals    : target_not_ready | dup_same_pass
+        --   manual verbs : reset (§8) | undo (§10) | mcp_relocate (§11)
+        decision TEXT,
         src_opened_at INTEGER,                -- source clock, inherited by the copy
         src_last_active_at INTEGER,
         src_age_unknown INTEGER NOT NULL DEFAULT 0,

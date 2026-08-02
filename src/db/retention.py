@@ -26,10 +26,25 @@ _MS_PER_DAY = 86_400_000
 # time-critical, and a coarse period keeps it off the hot path.
 _RETENTION_INTERVAL_S = 24 * 60 * 60
 
-# Idempotency markers (``qlkey:*``) only guard a client's retry of a still-pending
-# offline flush; a week is generous (and the ops themselves are idempotent), so the
-# recorded keys can be swept well inside the actions horizon to keep ``settings`` small.
-_DEFAULT_IDEMPOTENCY_RETENTION_DAYS = 7
+# Idempotency markers (``qlkey:*``) guard a client's retry of a still-pending offline
+# flush (§10). The horizon has to outlive the LONGEST a claimed batch can stay
+# unconfirmed — and the real upper bound is not the network.
+#
+# A week looks generous against "offline can last days" (§10) until the pause is taken
+# into account: while a pause is armed EVERY flush answers 423, and a pause is extended
+# by simply pressing the button again, with no cap on how many times (§7 — only each
+# individual pause is finite). So the client can legitimately sit on one claimed batch,
+# key and all, for far longer than a week. Sweeping the marker first is not a harmless
+# cleanup: the batch is not dropped, it is RE-SENT, and with the marker gone it applies a
+# SECOND time — a duplicated ``reorder``, exactly the outcome this whole mechanism
+# exists to prevent, and the ops are NOT self-idempotent (``reorder`` and ``add`` both
+# compose rather than settle).
+#
+# 30 days is chosen to swallow a realistically-forgotten pause plus a long absence, and
+# it costs nothing: one short ``settings`` row per FLUSH (not per op), pruned by age.
+# Even a daily flusher leaves ~30 rows. The horizon stays well inside ``actions``' own
+# (90 days by default), so this is not a new storage class either.
+_DEFAULT_IDEMPOTENCY_RETENTION_DAYS = 30
 
 
 def cutoff_ms(now_ms: int, retention_days: int) -> int:
@@ -67,9 +82,10 @@ def run_retention(
 
     Each cutoff is computed independently — ``js_audit`` uses its own, longer window —
     so a row old enough to drop from ``actions`` survives in ``js_audit`` (§12). The
-    ``qlkey:*`` idempotency markers get their own short window (they only guard a
-    pending offline retry). This single ``fn(conn)`` is what the app's periodic task
-    hands to ``Database.write``.
+    ``qlkey:*`` idempotency markers get their own THIRD window, sized to outlive an
+    indefinitely-extended pause rather than a network outage (see the constant above).
+    Three windows, three independent cutoffs: changing one never moves another. This
+    single ``fn(conn)`` is what the app's periodic task hands to ``Database.write``.
     """
     a = delete_old_actions(conn, cutoff_ms(now_ms, actions_retention_days))
     j = delete_old_js_audit(conn, cutoff_ms(now_ms, js_audit_retention_days))

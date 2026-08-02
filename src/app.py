@@ -21,7 +21,9 @@ from starlette.routing import Route, WebSocketRoute
 
 from src.api.actions import list_actions
 from src.api.cors import CountingCORSMiddleware, cors_kwargs
+from src.api.exemptions import create_exemption, delete_exemption, list_exemptions
 from src.api.guards import require_operational
+from src.api.instances import merge_windows_endpoint
 from src.api.metrics import metrics
 from src.api.pause import pause_endpoint, resume_endpoint
 from src.api.quick_links import quick_links_ops
@@ -30,6 +32,7 @@ from src.api.state import focus, get_state
 from src.api.rules import (
     create_rule,
     delete_rule,
+    get_rule,
     list_rules,
     preview_rule,
     reset_rule,
@@ -183,9 +186,22 @@ def create_app(settings) -> Starlette:
         Route("/api/rules", list_rules, methods=["GET"]),
         Route("/api/rules", create_rule, methods=["POST"]),
         Route("/api/rules/preview", preview_rule, methods=["POST"]),
+        Route("/api/rules/{rule_id:int}", get_rule, methods=["GET"]),
         Route("/api/rules/{rule_id:int}", update_rule, methods=["PUT"]),
         Route("/api/rules/{rule_id:int}", delete_rule, methods=["DELETE"]),
         Route("/api/rules/{rule_id:int}/reset", reset_rule, methods=["POST"]),
+        # Exemptions (§10): the human's «не трогать до …», the same table the pass's
+        # step-4 guards read and restore has always written to.
+        Route("/api/exemptions", list_exemptions, methods=["GET"]),
+        Route("/api/exemptions", create_exemption, methods=["POST"]),
+        Route("/api/exemptions", delete_exemption, methods=["DELETE"]),
+        # Manual window merge (§9/§10): the startpage's «слить окна сейчас» button;
+        # the same core the MCP merge_windows tool runs. -> {"merged": <int>}.
+        Route(
+            "/api/instances/{instance_id}/merge_windows",
+            merge_windows_endpoint,
+            methods=["POST"],
+        ),
         # Curator pass (§7): trigger one pass (dry_run / confirm_pending optional).
         Route("/api/run_pass", run_pass_endpoint, methods=["POST"]),
         # Pause (§7): POST arms/extends a finite pause; DELETE resumes (TTL shift +

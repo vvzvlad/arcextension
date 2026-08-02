@@ -79,11 +79,11 @@ async def test_release_only_own_lease(tmp_path):
     try:
         _, epoch = await db.write(lambda c: lease.acquire(c, "A", now=1000, ttl_ms=10_000))
         # A foreign owner's release is a no-op — the live lease stays live.
-        await db.write(lambda c: lease.release(c, "OTHER", epoch))
+        await db.write(lambda c: lease.release(c, "OTHER"))
         blocked, _ = await db.write(lambda c: lease.acquire(c, "C", now=1500, ttl_ms=10_000))
         assert blocked is False
         # The true owner releases; now the lease is acquirable immediately.
-        await db.write(lambda c: lease.release(c, "A", epoch))
+        await db.write(lambda c: lease.release(c, "A"))
         ok, e2 = await db.write(lambda c: lease.acquire(c, "C", now=1600, ttl_ms=10_000))
         assert ok and e2 == epoch + 1
     finally:

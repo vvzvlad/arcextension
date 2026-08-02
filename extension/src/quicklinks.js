@@ -12,7 +12,8 @@
 // under vitest (a fake env). Pure helpers are exported for unit tests.
 
 export const STATE_CACHE_KEY = "stateCache"; // { state: StateResponse, cached_at }
-export const QUEUE_KEY = "quickLinkQueue"; // { ops: [...] }
+// { ops: [...], claimed: {ops:[...], key} | null } — see readQueue/flushQueue.
+export const QUEUE_KEY = "quickLinkQueue";
 
 // KEEP IN SYNC: `httpBaseFromServiceUrl` is duplicated in startpage/src/lib/adapters.js
 // and `applyOpToQuickLinks` below in startpage/src/lib/quicklinks.js. The two live in
@@ -65,13 +66,36 @@ export function applyOpToQuickLinks(list, op) {
   return links;
 }
 
+// The durable value under QUEUE_KEY is `{ops, claimed}`:
+//   ops     — operations not yet handed to any POST;
+//   claimed — `{ops, key}` of the batch a flush is CURRENTLY (or was LAST) posting,
+//             kept in storage until the server confirms it.
+// `claimed` is what makes both the Idempotency-Key and the durability promises hold
+// (§10); see flushQueue.
 async function readQueue(env) {
   const got = await env.storageLocalGet(QUEUE_KEY);
   const q = got && got[QUEUE_KEY];
-  // Tolerate the legacy `{key, ops}` shape: the Idempotency-Key is now minted per
-  // flush (see flushQueue), so only the ops carry over.
-  if (q && Array.isArray(q.ops)) return { ops: q.ops };
-  return { ops: [] };
+  const ops = q && Array.isArray(q.ops) ? q.ops : [];
+  const claimed =
+    q && q.claimed && Array.isArray(q.claimed.ops) && q.claimed.ops.length > 0 && q.claimed.key
+      ? { ops: q.claimed.ops, key: q.claimed.key }
+      : null;
+  // The LEGACY `{key, ops}` shape reads as "nothing claimed" and its key is DROPPED —
+  // deliberately, do not "fix" this by moving the key into `claimed`.
+  //
+  // The two shapes are not equivalent. Legacy minted the key at the FIRST enqueue and
+  // kept appending ops to the same list (`if (!q.key) q.key = uuid(); q.ops.push(op)`),
+  // so `{key: K, ops: [o1..oN]}` is a SUPERSET of whatever went out under K: a POST may
+  // have carried [o1..oM], M<N, applied, and lost its response. Re-sending [o1..oN]
+  // under K makes the server's `idempotency_key_seen(K)` skip the batch WHOLE
+  // (apply_ops_with_key, src/db/quick_links.py) and answer 2xx — o(M+1)..oN are dropped
+  // forever. That is the "grown batch under a consumed key" this module warns about in
+  // flushQueue, hit from the other side.
+  //
+  // A fresh key re-applies [o1..oN] instead. That is safe by construction: every op is
+  // idempotent under last-write-wins (add upserts the title, remove is stable, reorder
+  // is absolute), so replaying the superset lands on the same final state.
+  return { ops, claimed };
 }
 
 // ---------------------------------------------------------------------------
@@ -107,58 +131,121 @@ function runExclusiveQueue(env, fn) {
 // Test seam: reset the chain between tests (the storage mock is recreated per test).
 export function __resetQueueChain() {
   chain = Promise.resolve();
+  flushInFlight = false;
 }
 
-// Enqueue one op: durable queue (serialized) + optimistic cache edit. Returns the queue.
+// Enqueue one op: durable queue + optimistic cache edit, BOTH inside ONE serialized
+// link. Returns the queue.
+//
+// The cache edit belongs in the chain even though it touches a DIFFERENT storage key:
+// it is a read-modify-write, so two enqueues a few ms apart (two clicks, or a click
+// while the tick flush runs) interleave their get/await/set and the second silently
+// overwrites the first's edit — the added link disappears from the rendered cache
+// while sitting in the queue (§10 "Постановка в очередь сразу правит кэш").
+// ORDER MATTERS: the DURABLE queue is written FIRST, the cache mirror second. The
+// worker can die between the two writes, and only one order is survivable — queue then
+// cache leaves an op that will be flushed but is not yet shown (self-heals on the next
+// render), while cache then queue leaves a link that is SHOWN but exists in no queue:
+// it never reaches the server and the first successful /api/state silently erases it.
+// (runExclusiveQueue also writes the queue after `fn` returns; that repeat write is the
+// same value, so it is a harmless no-op.)
 export async function enqueueOp(env, op) {
-  const q = await runExclusiveQueue(env, (queue) => {
+  return runExclusiveQueue(env, async (queue) => {
     queue.ops.push(op);
-    return queue;
-  });
-
-  // Optimistic cache edit (§10): the shown quick_links change immediately. This is a
-  // SEPARATE storage key (best-effort mirror), independent of the durable queue.
-  const cacheGot = await env.storageLocalGet(STATE_CACHE_KEY);
-  const wrap = cacheGot && cacheGot[STATE_CACHE_KEY];
-  if (wrap && wrap.state) {
-    wrap.state.quick_links = applyOpToQuickLinks(wrap.state.quick_links, op);
-    await env.storageLocalSet({ [STATE_CACHE_KEY]: wrap });
-  }
-  return q;
-}
-
-// Put claimed ops back at the FRONT of the queue (they are older than anything
-// enqueued during the failed POST) so a later flush retries them (§10). Serialized.
-function restoreClaimed(env, claimedOps) {
-  return runExclusiveQueue(env, (queue) => {
-    queue.ops = [...claimedOps, ...queue.ops];
+    await env.storageLocalSet({ [QUEUE_KEY]: queue });
+    const cacheGot = await env.storageLocalGet(STATE_CACHE_KEY);
+    const wrap = cacheGot && cacheGot[STATE_CACHE_KEY];
+    if (wrap && wrap.state) {
+      wrap.state.quick_links = applyOpToQuickLinks(wrap.state.quick_links, op);
+      await env.storageLocalSet({ [STATE_CACHE_KEY]: wrap });
+    }
     return queue;
   });
 }
 
 // Flush the queue to POST /api/quick_links/ops. Never throws.
 //
-// The claim is ATOMIC (serialized link): it reads the current ops, mints a FRESH
-// Idempotency-Key, and clears the queue in the SAME link. So ops enqueued DURING the
-// POST below land in the now-empty queue — never swept into this batch nor cleared by
-// it — and a grown batch can never reuse a consumed key (which the server's
-// `idempotency_key_seen` would skip whole, silently dropping the newer op, §10). On
-// success: reconcile the cache. On any failure: put the claimed ops back for a retry.
+// TWO invariants, both riding on the durable `claimed` slot (§10):
+//
+//   1. A RETRY RESENDS THE SAME BATCH UNDER THE SAME KEY. The server records the
+//      Idempotency-Key and skips a repeat (src/db/quick_links.py) — but only if the
+//      key is the same. Minting a fresh key per attempt turns a lost RESPONSE (the
+//      POST applied, the reply died in the network) into a DOUBLE APPLY: a repeated
+//      `add` overwrites the title, a repeated `reorder` undoes a newer arrangement.
+//      So the key is minted WITH the claim and stored beside it.
+//   2. THE OPS SURVIVE A SERVICE-WORKER DEATH. Clearing the queue at claim time and
+//      restoring it only after the response loses the batch outright if the worker
+//      dies (or the browser quits) mid-POST — while §10's "offline may last days"
+//      promise rests on that queue. So the claim MOVES the batch into `claimed` in
+//      the same storage value instead of deleting it; only a confirmed 2xx removes it,
+//      and a flush that finds a stranded `claimed` resends it verbatim.
+//
+// The claim stays ATOMIC (one serialized link), so ops enqueued DURING the POST land
+// in the now-empty `ops` and are never swept into the claimed batch — a GROWN batch
+// under a consumed key would be skipped whole by the server, dropping the newer ops.
+//
+// ⚠️ KNOWN LIMIT — the key's protection is bounded by the server's marker retention:
+// `qlkey:*` rows are swept after _DEFAULT_IDEMPOTENCY_RETENTION_DAYS (30 days,
+// src/db/retention.py — chosen to swallow a forgotten pause plus a long absence). A
+// batch still claimed past that horizon would, on resend, apply a SECOND time. The
+// client cannot close this alone: the marker lifetime is the server's. What the client
+// does do is stop feeding it — a definitively-refused batch (4xx, including the 423
+// pause gate) is un-claimed below instead of sitting claimed for weeks.
 export async function flushQueue(env) {
+  // ONE flush at a time per worker. Two flushes can easily be triggered together (the
+  // worker start-up flush and a tick alarm firing right after it): both would read the
+  // same `claimed` slot and POST the SAME batch under the SAME key in parallel. The
+  // server does dedupe them, but only via its writer serialization — the client must
+  // not be spending that protection routinely. Worker-local by design: the queue's own
+  // owner is the worker, and a fresh worker has nothing in flight.
+  if (flushInFlight) return { flushed: false, error: "in_flight" };
+  flushInFlight = true;
+  try {
+    return await flushQueueInner(env);
+  } finally {
+    flushInFlight = false;
+  }
+}
+
+let flushInFlight = false;
+
+async function flushQueueInner(env) {
   const claim = await runExclusiveQueue(env, (queue) => {
+    // A stranded claimed batch (a previous flush that failed, or a worker that died
+    // mid-POST) is re-sent VERBATIM, key included — never re-keyed, never merged with
+    // whatever accumulated since.
+    if (queue.claimed) return queue.claimed;
     if (queue.ops.length === 0) return null;
-    const claimedOps = queue.ops;
-    queue.ops = []; // clear atomically WITH the claim (same serialized link)
-    return { claimedOps, key: env.randomUUID() };
+    const claimed = { ops: queue.ops, key: env.randomUUID() };
+    queue.claimed = claimed;
+    queue.ops = []; // move (not delete) atomically WITH the claim
+    return claimed;
   });
   if (!claim) return { flushed: false };
+
+  // Drop the claimed batch — ONLY on a confirmed server answer. `claimed` is compared
+  // by key so a concurrent claim (impossible today, but cheap to be exact about) can
+  // never be cleared by an older flush's late success.
+  const releaseClaim = () =>
+    runExclusiveQueue(env, (queue) => {
+      if (queue.claimed && queue.claimed.key === claim.key) queue.claimed = null;
+    });
+
+  // Give the batch back to the queue (at the FRONT — it is the oldest) and drop the
+  // claim. Only ever called when the server proved it did NOT apply the batch.
+  const unclaimToFront = () =>
+    runExclusiveQueue(env, (queue) => {
+      if (queue.claimed && queue.claimed.key === claim.key) {
+        queue.ops = [...queue.claimed.ops, ...queue.ops];
+        queue.claimed = null;
+      }
+    });
 
   let config;
   try {
     config = await env.getInstanceConfig();
   } catch {
-    await restoreClaimed(env, claim.claimedOps);
-    return { flushed: false, error: "config" };
+    return { flushed: false, error: "config" }; // batch stays claimed for the retry
   }
   const base = httpBaseFromServiceUrl(config.serviceUrl);
   try {
@@ -169,25 +256,44 @@ export async function flushQueue(env) {
         Authorization: "Bearer " + config.token,
         "Idempotency-Key": claim.key,
       },
-      body: JSON.stringify(claim.claimedOps),
+      body: JSON.stringify(claim.ops),
     });
     if (!resp.ok) {
-      await restoreClaimed(env, claim.claimedOps);
+      if (resp.status >= 400 && resp.status < 500) {
+        // DEFINITIVELY REFUSED => nothing was applied. A 4xx is produced before (or
+        // instead of) the write: 401 after a token rotation, 400 on a malformed body,
+        // 423 from the pause gate (§7). Keeping such a batch claimed poisons the head of
+        // the queue — every later op sits behind a POST that can only fail, so a token
+        // rotation or a long pause silently stops quick links entirely. Un-claim it back
+        // to the FRONT of the queue (it is older than anything enqueued since): the ops
+        // survive, they merge with the newcomers, and the whole lot goes out under a
+        // FRESH key once the refusal is over. Safe precisely because nothing applied —
+        // this is the one case where re-keying cannot double-apply.
+        await unclaimToFront();
+        return { flushed: false, error: "http_" + resp.status, unclaimed: true };
+      }
+      // 5xx: the server may have applied the batch and failed afterwards, so the batch
+      // stays claimed and the SAME key is retried. A 2xx is the only proof it took it.
       return { flushed: false, error: "http_" + resp.status };
     }
     const body = await resp.json();
-    // Reconcile the cache with the server's authoritative list. The queue was already
-    // cleared at claim time; ops enqueued during the POST stay for the next flush.
-    const cacheGot = await env.storageLocalGet(STATE_CACHE_KEY);
-    const wrap = (cacheGot && cacheGot[STATE_CACHE_KEY]) || { state: {}, cached_at: env.now() };
-    wrap.state = wrap.state || {};
-    if (body && Array.isArray(body.quick_links)) {
-      wrap.state.quick_links = body.quick_links;
+    await releaseClaim();
+    // Reconcile the cache with the server's authoritative list, then re-apply the ops
+    // still queued (enqueued during this POST) so the rendered cache never regresses.
+    await runExclusiveQueue(env, async (queue) => {
+      if (!body || !Array.isArray(body.quick_links)) return;
+      const cacheGot = await env.storageLocalGet(STATE_CACHE_KEY);
+      const wrap = (cacheGot && cacheGot[STATE_CACHE_KEY]) || { state: {}, cached_at: env.now() };
+      wrap.state = wrap.state || {};
+      let links = body.quick_links;
+      for (const op of [...(queue.claimed ? queue.claimed.ops : []), ...queue.ops]) {
+        links = applyOpToQuickLinks(links, op);
+      }
+      wrap.state.quick_links = links;
       await env.storageLocalSet({ [STATE_CACHE_KEY]: wrap });
-    }
+    });
     return { flushed: true, quick_links: body && body.quick_links };
   } catch {
-    await restoreClaimed(env, claim.claimedOps);
-    return { flushed: false, error: "network" };
+    return { flushed: false, error: "network" }; // batch stays claimed for the retry
   }
 }

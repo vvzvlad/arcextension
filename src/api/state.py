@@ -26,8 +26,13 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_not_paused, require_operational
-from src.api.restore import _is_fresh, _request_snapshot
+from src.api.freshness import is_fresh, request_snapshot
+from src.api.guards import (
+    read_force_body,
+    require_ext_token,
+    require_not_paused,
+    require_operational,
+)
 from src.db import state as state_read
 from src.ext import protocol
 from src.ext.commands import CommandError, send_command
@@ -58,7 +63,7 @@ async def _clear_when_settled(registry, db, instance_id, conn_state, settings) -
             await asyncio.sleep(0.05)
             if registry.get(instance_id) is not conn_state:
                 return  # socket superseded/dropped underneath us
-            if await _is_fresh(db, instance_id, conn_state, settings):
+            if await is_fresh(db, instance_id, conn_state, settings):
                 return
     except Exception:  # noqa: BLE001 - a detached refresh must never crash the loop
         pass
@@ -88,7 +93,8 @@ async def kick_state_refresh(app, db, settings) -> None:
         # kick must NOT clobber it. Overwriting a pass's id ejects the instance from
         # that pass — the instance's answer to the pass id is dropped (the channel
         # matches ids exactly), ``last_applied_snapshot_id`` never matches, and it is
-        # silently excluded (the exact trap restore.py:124-128 warns about). A
+        # silently excluded. This guard is now THE shared rule, factored into
+        # :mod:`src.api.freshness` and obeyed by restore / preview / reset too. A
         # dropped/never-answered pending id self-clears on the next applied snapshot
         # (the channel sets it None), so kicks resume. Read+decide SYNCHRONOUSLY (no
         # await before the guard below sets its flag), same discipline as
@@ -104,7 +110,7 @@ async def kick_state_refresh(app, db, settings) -> None:
         # Set the guard SYNCHRONOUSLY (before the send await) so single-flight holds.
         conn_state.state_refresh_inflight = True
         try:
-            await _request_snapshot(conn_state)
+            await request_snapshot(conn_state)
         except Exception:  # noqa: BLE001 - a dead socket must not wedge the flag
             conn_state.state_refresh_inflight = False
             continue
@@ -139,14 +145,16 @@ async def get_state(request: Request) -> JSONResponse:
 async def focus(request: Request) -> JSONResponse:
     require_ext_token(request)
     require_operational(request)
-    await require_not_paused(request)  # a paused curator silences focus too (§7)
 
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="request body must be JSON")
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    # No `if not body` shortcut: `{}` is a well-formed JSON object that simply lacks the
+    # fields, so it must fail the SAME way as `{"instance": ""}` — 422 naming the missing
+    # field, not 400 "request body must be JSON". A truly absent body lands there too,
+    # which is the more useful of the two answers. Malformed JSON is still 400, inside
+    # `read_force_body`.
+    body = await read_force_body(request)
+    # A paused curator silences focus too (§7) — unless the human clicked with an
+    # explicit force:true. Jumping to a tab is one of the human's own buttons.
+    await require_not_paused(request, force=body.get("force") is True)
 
     instance_id = body.get("instance")
     tab_id = body.get("tabId")

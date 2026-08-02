@@ -9,6 +9,10 @@
   failure means the schema cannot be trusted for authoritative writes). ``/healthz``
   deliberately does NOT call it: liveness must stay green so an orchestrator keeps
   routing to the container (§12).
+* :func:`require_not_paused` — 423 while the emergency-stop pause is armed (§7), with
+  the ``force=True`` exception reserved for the human's own buttons.
+* :func:`read_force_body` — the optional-JSON-body reader those endpoints use to see
+  ``{"force": true}`` before the gate runs.
 
 Every 401 here increments the process-memory ``curator_auth_rejections_total``
 counter (§12) via :mod:`src.api.auth_metrics` — a leaf module, so no import cycle.
@@ -65,7 +69,25 @@ def require_operational(request: Request) -> None:
         raise HTTPException(status_code=503, detail="service degraded")
 
 
-async def require_not_paused(request: Request) -> None:
+async def read_force_body(request: Request) -> dict:
+    """Parse an OPTIONAL JSON-object request body; ``{}`` when there is none.
+
+    Exists so the pause gate can see ``{"force": true}`` BEFORE it decides (§7). A
+    present-but-malformed / non-object body is a flat 400 — the same shape the
+    endpoints that already parse a body use, so nothing changes for them.
+    """
+    if not await request.body():
+        return {}
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="request body must be JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    return data
+
+
+async def require_not_paused(request: Request, *, force: bool = False) -> None:
     """Refuse a mutating ``/api/*`` verb while a pause is armed (§7).
 
     Mirrors :func:`require_operational` but for the pause "kill switch": a paused
@@ -78,10 +100,40 @@ async def require_not_paused(request: Request) -> None:
     ``{"error": "paused", "until": <ms>}`` body (rendered by the app's dict-detail
     exception handler). 423 (the automation is locked) is used consistently for the
     pause gate; the MCP path returns the parallel ``ToolError("paused", …)``.
+
+    ``force`` is §7's ONE exception: «Исключение — собственные кнопки человека, и то с
+    явным ``force:true``, который пишется в ``actions`` как ``initiator=user``». The
+    caller passes it ONLY for a verb that IS a button on the startpage, read from the
+    request body via :func:`read_force_body`. Those four:
+
+    * ``POST /api/focus`` — jump to a tab (§10),
+    * ``POST /api/actions/:id/restore`` — bring a taken tab back (§10),
+    * ``POST /api/passes/:id/undo`` — roll a pass back (§10),
+    * ``POST /api/instances/:id/merge_windows`` — §9's «Кнопка "слить окна сейчас" на
+      стартпейдже», kept explicitly as a human button «для случая, когда ждать час не
+      хочется».
+
+    It is deliberately NOT wired into rules CRUD, ``/api/rules/:id/reset``, quick-links
+    or ``/api/exemptions`` (policy edits, not buttons), and NOT into any MCP tool: an
+    agent is not a human at the keyboard, and a paused system exists precisely to stop
+    the MCP caller (§7/§12).
+
+    §7 adds that a forced action «пишется в `actions` как `initiator=user`». That applies
+    to the verbs which MUTATE the world — restore, undo and merge_windows each write
+    their row as ``initiator='user'`` and mark ``detail`` (``restore:force``,
+    ``undo_close:force``, ``{"force": true}``) so a forced action is tellable apart in the
+    archive without a new column. ``/api/focus`` writes NOTHING, on purpose: it activates
+    a tab and raises a window, moving and closing nothing, while ``actions`` is the
+    journal of what the curator DID to tabs. A row per jump would be pure noise in the
+    archive the human reads to answer "why is this tab gone", and there is nothing to
+    undo or reconcile. Forcing a jump through a pause is still gated and still explicit —
+    it is simply not an archived event.
     """
     # Leaf import (no import cycle): pause.py never imports the api package.
     from src.curator.pause import read_pause_until
 
     until = await request.app.state.db.read(read_pause_until)
     if until is not None and until > int(time.time() * 1000):
+        if force:
+            return
         raise HTTPException(status_code=423, detail={"error": "paused", "until": until})

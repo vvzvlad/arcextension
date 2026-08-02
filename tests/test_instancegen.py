@@ -11,11 +11,12 @@ Each test is written to redden if its guard is removed (noted inline).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from tools.instancegen import core, keys, macos
+from tools.instancegen import cli, core, keys, macos
 
 REPO_EXTENSION = Path(__file__).resolve().parents[1] / "extension"
 
@@ -265,6 +266,296 @@ def test_restamp_empty_root_raises(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Re-stamp also carries the CODE (§13): the bundle is duplicated per instance and
+# protocolVersion is compared by exact equality, so a rotation that left the copies
+# on old code would reject every instance on hello forever.
+# --------------------------------------------------------------------------- #
+def _source_bundle(tmp_path: Path, marker: str) -> Path:
+    """A minimal stand-in extension bundle carrying an identifiable code file."""
+    src = tmp_path / f"src-{marker}"
+    src.mkdir(exist_ok=True)  # idempotent: callers re-request the same version
+    (src / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "x",
+                "key": core.KEY_PLACEHOLDER,
+                "host_permissions": ["https://<host>/*", "wss://<host>/*", "<all_urls>"],
+            }
+        )
+    )
+    (src / "sw.js").write_text(f"// {marker}\n")
+    return src
+
+
+def test_restamp_updates_the_extension_code(tmp_path):
+    out = tmp_path / "out"
+    v1 = _source_bundle(tmp_path, "v1")
+    core.generate_instance(
+        out_root=out, source_extension_dir=v1, instance_id="alpha", title="Alpha",
+        service_url="wss://h.example.com", token="old", key_b64="PINNEDKEY==",
+        extension_id="a" * 32,
+    )
+    v2 = _source_bundle(tmp_path, "v2")
+    (v2 / "new_file.js").write_text("// added in v2\n")
+
+    core.restamp_all(out, token="new", source_extension_dir=v2)
+
+    ext = out / "alpha" / "extension"
+    # Redden: drop source_extension_dir handling -> the copy keeps the v1 code and
+    # every instance is rejected on hello after a PROTOCOL_VERSION bump.
+    assert (ext / "sw.js").read_text() == "// v2\n"
+    assert (ext / "new_file.js").is_file()
+
+
+def test_restamp_code_update_keeps_instance_json_correct_and_0600(tmp_path):
+    # instance.json lives INSIDE the extension dir, so the code refresh necessarily
+    # replaces the directory holding it. The rewritten config must survive intact —
+    # with the NEW token — and keep its owner-only perms.
+    out = tmp_path / "out"
+    v1 = _source_bundle(tmp_path, "v1")
+    core.generate_instance(
+        out_root=out, source_extension_dir=v1, instance_id="alpha", title="Alpha",
+        service_url="wss://h.example.com", token="old-secret", key_b64="PINNEDKEY==",
+        extension_id="a" * 32,
+    )
+    core.restamp_all(out, token="new-secret", source_extension_dir=_source_bundle(tmp_path, "v2"))
+
+    ij = out / "alpha" / "extension" / "instance.json"
+    data = json.loads(ij.read_text())
+    assert data == {
+        "instanceId": "alpha",
+        "title": "Alpha",
+        "serviceUrl": "wss://h.example.com",
+        "token": "new-secret",
+        "allowExecuteJs": False,
+    }
+    assert (ij.stat().st_mode & 0o777) == 0o600, oct(ij.stat().st_mode & 0o777)
+
+
+def test_restamp_code_update_preserves_pinned_key_and_host(tmp_path):
+    # The SOURCE manifest ships the placeholder key. Copying it verbatim would change
+    # the extension id — i.e. every instance's chrome-extension:// origin at once,
+    # breaking EXT_ALLOWED_ORIGINS/CORS. The pinned key must be carried over.
+    out = tmp_path / "out"
+    core.generate_instance(
+        out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+        instance_id="alpha", title="Alpha", service_url="wss://h.example.com",
+        token="old", key_b64="PINNEDKEY==", extension_id="a" * 32,
+    )
+    core.restamp_all(out, token="new", source_extension_dir=_source_bundle(tmp_path, "v2"))
+
+    manifest = json.loads((out / "alpha" / "extension" / "manifest.json").read_text())
+    assert manifest["key"] == "PINNEDKEY=="
+    assert manifest["key"] != core.KEY_PLACEHOLDER
+    # <host> must be re-stamped in the fresh copy too, not left as a placeholder.
+    assert "wss://h.example.com/*" in manifest["host_permissions"]
+    assert "https://h.example.com/*" in manifest["host_permissions"]
+    assert "<all_urls>" in manifest["host_permissions"]
+    assert not any("<host>" in p for p in manifest["host_permissions"])
+
+
+def test_restamp_code_update_preserves_the_profile(tmp_path):
+    out = tmp_path / "out"
+    core.generate_instance(
+        out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+        instance_id="alpha", title="Alpha", service_url="wss://h.example.com",
+        token="old", key_b64="PINNEDKEY==", extension_id="a" * 32,
+    )
+    marker = out / "alpha" / "profile" / "Local State"
+    marker.write_text('{"installUuid":"born-in-profile"}')
+
+    core.restamp_all(out, token="new", source_extension_dir=_source_bundle(tmp_path, "v2"))
+
+    # The profile is a SIBLING of the extension dir precisely so a code refresh
+    # cannot touch it (§6/§13). Redden: refresh the instance ROOT instead.
+    assert marker.read_text() == '{"installUuid":"born-in-profile"}'
+
+
+def test_restamp_refuses_code_update_without_a_pinned_key(tmp_path):
+    # A copy whose manifest lost its real key cannot be refreshed silently: the
+    # placeholder would re-derive a different extension id for the whole fleet.
+    out = tmp_path / "out"
+    core.generate_instance(
+        out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+        instance_id="alpha", title="Alpha", service_url="wss://h.example.com",
+        token="old", key_b64="PINNEDKEY==", extension_id="a" * 32,
+    )
+    manifest_path = out / "alpha" / "extension" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["key"] = core.KEY_PLACEHOLDER
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="pinned"):
+        core.restamp_all(out, token="new", source_extension_dir=_source_bundle(tmp_path, "v2"))
+
+
+def test_restamp_preflight_refuses_before_touching_any_instance(tmp_path):
+    # restamp mutates instances one by one, so a per-instance check made mid-write
+    # would split the fleet: earlier instances get the new token, later ones keep the
+    # old, and the operator has usually already rotated EXT_TOKEN on the service — so
+    # no single token revives everyone. Validation must therefore happen BEFORE the
+    # first write. Redden: move the manifest check back inside the apply loop.
+    out = tmp_path / "out"
+    for iid in ("alpha", "beta", "gamma"):
+        core.generate_instance(
+            out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+            instance_id=iid, title=iid, service_url="wss://h.example.com",
+            token="old-token", key_b64="PINNEDKEY==", extension_id="a" * 32,
+        )
+    # Break the LAST instance alphabetically, so a naive implementation would already
+    # have rewritten alpha and beta by the time it notices.
+    broken = out / "gamma" / "extension" / "manifest.json"
+    manifest = json.loads(broken.read_text())
+    manifest["key"] = core.KEY_PLACEHOLDER
+    broken.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="pinned"):
+        core.restamp_all(
+            out, token="new-token", source_extension_dir=_source_bundle(tmp_path, "v2")
+        )
+
+    # Every instance still holds the OLD token: the fleet stays consistent and alive.
+    for iid in ("alpha", "beta", "gamma"):
+        data = json.loads((out / iid / "extension" / "instance.json").read_text())
+        assert data["token"] == "old-token", f"{iid} was mutated before the failure"
+        assert (out / iid / "extension" / "sw.js").read_text() == "// v1\n"
+
+
+def test_restamp_preflight_covers_the_config_only_branch(tmp_path):
+    # --no-code-update still rewrites the manifest host when --service-url is given, so
+    # a corrupt manifest throws during APPLY too. Validating that only under the
+    # code-refresh branch left the split fleet the pre-flight exists to prevent.
+    # Redden: move the manifest check back under `if source_extension_dir is not None`.
+    out = tmp_path / "out"
+    for iid in ("alpha", "beta", "gamma"):
+        core.generate_instance(
+            out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+            instance_id=iid, title=iid, service_url="wss://h.example.com",
+            token="old-token", key_b64="PINNEDKEY==", extension_id="a" * 32,
+        )
+    (out / "gamma" / "extension" / "manifest.json").write_text("NOT JSON")
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        core.restamp_all(out, token="new-token", service_url="wss://new.example.com")
+
+    for iid in ("alpha", "beta"):
+        data = json.loads((out / iid / "extension" / "instance.json").read_text())
+        assert data["token"] == "old-token", f"{iid} was mutated before the failure"
+        assert data["serviceUrl"] == "wss://h.example.com"
+
+
+def test_restamp_reports_progress_for_a_partial_apply(tmp_path):
+    # The CLI needs to tell the operator WHICH instances already hold the new token if
+    # the run dies partway — they have usually rotated EXT_TOKEN on the service by then.
+    out = tmp_path / "out"
+    for iid in ("alpha", "beta"):
+        core.generate_instance(
+            out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+            instance_id=iid, title=iid, service_url="wss://h.example.com",
+            token="old-token", key_b64="PINNEDKEY==", extension_id="a" * 32,
+        )
+    seen: list[core.RestampChange] = []
+    core.restamp_all(out, token="new-token", on_change=seen.append)
+    assert [c.instance_id for c in seen] == ["alpha", "beta"]
+
+
+def test_restamp_preflight_catches_an_underivable_service_url(tmp_path):
+    out = tmp_path / "out"
+    for iid in ("alpha", "beta"):
+        core.generate_instance(
+            out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+            instance_id=iid, title=iid, service_url="wss://h.example.com",
+            token="old-token", key_b64="PINNEDKEY==", extension_id="a" * 32,
+        )
+    ij = out / "beta" / "extension" / "instance.json"
+    data = json.loads(ij.read_text())
+    del data["serviceUrl"]
+    ij.write_text(json.dumps(data))
+
+    with pytest.raises(ValueError, match="serviceUrl"):
+        core.restamp_all(
+            out, token="new-token", source_extension_dir=_source_bundle(tmp_path, "v2")
+        )
+    assert json.loads(
+        (out / "alpha" / "extension" / "instance.json").read_text()
+    )["token"] == "old-token"
+
+
+def test_restamp_stages_instance_json_before_the_swap(tmp_path):
+    # The swapped-in tree must already contain instance.json. If it were written
+    # after the rename, a crash in that window would leave an extension dir with no
+    # config — which iter_instance_json_paths (globbing */extension/instance.json)
+    # no longer finds, so the NEXT restamp silently skips that instance forever.
+    out = tmp_path / "out"
+    core.generate_instance(
+        out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+        instance_id="alpha", title="Alpha", service_url="wss://h.example.com",
+        token="old", key_b64="PINNEDKEY==", extension_id="a" * 32,
+    )
+
+    real_replace = os.replace
+    seen: dict[str, bool] = {}
+
+    def spy(src, dst, *a, **kw):
+        # At the moment the staged tree is renamed into place it must be complete.
+        if str(dst).endswith("/extension"):
+            seen["complete"] = (Path(src) / "instance.json").is_file()
+        return real_replace(src, dst, *a, **kw)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(os, "replace", spy)
+        # Path.rename is what performs the directory swap; route it through the spy.
+        monkey.setattr(
+            Path, "rename", lambda self, target: (spy(self, target), Path(target))[1]
+        )
+        core.restamp_all(out, token="new", source_extension_dir=_source_bundle(tmp_path, "v2"))
+    finally:
+        monkey.undo()
+
+    assert seen.get("complete") is True, "the tree was swapped in without instance.json"
+    assert json.loads(
+        (out / "alpha" / "extension" / "instance.json").read_text()
+    )["token"] == "new"
+
+
+def test_restamp_without_source_leaves_code_untouched(tmp_path):
+    # The config-only path stays available for callers that update code separately.
+    out = tmp_path / "out"
+    core.generate_instance(
+        out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+        instance_id="alpha", title="Alpha", service_url="wss://h.example.com",
+        token="old", key_b64="PINNEDKEY==", extension_id="a" * 32,
+    )
+    changes = core.restamp_all(out, token="new")
+    assert (out / "alpha" / "extension" / "sw.js").read_text() == "// v1\n"
+    assert changes[0].code_updated is False
+
+
+def test_restamp_failed_code_update_leaves_the_instance_working(tmp_path):
+    # A missing/invalid source must not consume the live copy: the new tree is staged
+    # beside the old one and swapped in only once complete.
+    out = tmp_path / "out"
+    core.generate_instance(
+        out_root=out, source_extension_dir=_source_bundle(tmp_path, "v1"),
+        instance_id="alpha", title="Alpha", service_url="wss://h.example.com",
+        token="old", key_b64="PINNEDKEY==", extension_id="a" * 32,
+    )
+    not_a_bundle = tmp_path / "empty"
+    not_a_bundle.mkdir()
+
+    with pytest.raises(ValueError):
+        core.restamp_all(out, token="new", source_extension_dir=not_a_bundle)
+
+    ext = out / "alpha" / "extension"
+    assert (ext / "sw.js").read_text() == "// v1\n"
+    assert (ext / "instance.json").is_file()
+    assert json.loads((ext / "instance.json").read_text())["token"] == "old"
+    # No staging leftovers next to the live copy.
+    assert not [p for p in ext.parent.iterdir() if p.name.startswith(".extension")]
+
+
+# --------------------------------------------------------------------------- #
 # Launcher content: Brave, per-instance flags
 # --------------------------------------------------------------------------- #
 def test_launcher_targets_brave_with_per_instance_flags(tmp_path):
@@ -354,6 +645,53 @@ def test_overwrite_replaces_existing(tmp_path):
     assert data["token"] == "second"
 
 
+def test_overwrite_preserves_the_browser_profile(tmp_path):
+    # The generator can rewrite the bundle; it CANNOT recreate the profile, which
+    # holds install_uuid, the session, cookies and saved passwords. An --overwrite
+    # that rmtree'd the whole instance root destroyed all of it silently and the
+    # instance came back as a different install (§6/§13, InstancePaths docstring).
+    _gen(tmp_path, "alpha", token="first")
+    profile = tmp_path / "alpha" / "profile"
+    uuid_marker = profile / "Local State"
+    uuid_marker.write_text('{"installUuid":"born-in-profile"}')
+    cookies = profile / "Default" / "Cookies"
+    cookies.parent.mkdir(parents=True)
+    cookies.write_text("session-data")
+
+    core.generate_instance(
+        out_root=tmp_path, source_extension_dir=REPO_EXTENSION, instance_id="alpha",
+        title="alpha", service_url="wss://h.example.com", token="second",
+        key_b64="K==", extension_id="a" * 32, overwrite=True,
+    )
+
+    # Redden: restore `shutil.rmtree(paths.root)` -> both of these vanish.
+    assert uuid_marker.read_text() == '{"installUuid":"born-in-profile"}'
+    assert cookies.read_text() == "session-data"
+    # …while the bundle really was regenerated.
+    data = json.loads((tmp_path / "alpha" / "extension" / "instance.json").read_text())
+    assert data["token"] == "second"
+
+
+def test_overwrite_still_clears_stale_bundle_files(tmp_path):
+    # Sparing the profile must not turn --overwrite into a merge: files the previous
+    # generation left in the bundle/.app must be gone, or a renamed .app or a removed
+    # extension file would linger forever.
+    res = _gen(tmp_path, "alpha", title="Old Title", token="first")
+    stale = res.paths.extension_dir / "stale.js"
+    stale.write_text("// from the previous generation\n")
+    old_app = res.paths.app_dir
+
+    core.generate_instance(
+        out_root=tmp_path, source_extension_dir=REPO_EXTENSION, instance_id="alpha",
+        title="New Title", service_url="wss://h.example.com", token="second",
+        key_b64="K==", extension_id="a" * 32, overwrite=True,
+    )
+
+    assert not stale.exists()
+    assert not old_app.exists()  # the .app named after the OLD title is gone
+    assert (tmp_path / "alpha" / "new-title.app").is_dir()
+
+
 # --------------------------------------------------------------------------- #
 # Path-traversal safety: a malicious/typo title cannot escape the out-root
 # --------------------------------------------------------------------------- #
@@ -388,3 +726,89 @@ def test_restamp_keeps_instance_json_0600(tmp_path):
     core.restamp_all(tmp_path, token="new-secret")
     ij = next(iter(core.iter_instance_json_paths(tmp_path)))
     assert (ij.stat().st_mode & 0o777) == 0o600, oct(ij.stat().st_mode & 0o777)
+
+
+# --------------------------------------------------------------------------- #
+# Private writes must be COMPLETE, not just created
+# --------------------------------------------------------------------------- #
+def _break_os_write(monkeypatch):
+    """Make a bare os.write() write only the first half of its buffer.
+
+    That is the real short-write failure mode (a filling disk, an interrupted
+    syscall): os.write returns the short count and raises nothing, so the caller
+    that ignores the return value leaves a TRUNCATED file which still satisfies
+    `p.exists()`. io.FileIO writes at the C level and does not route through this
+    patch, so a correct implementation is unaffected — an os.write-based one is not.
+    """
+    real_write = os.write
+
+    def half_write(fd, data):
+        return real_write(fd, bytes(data)[: max(1, len(bytes(data)) // 2)])
+
+    monkeypatch.setattr(os, "write", half_write)
+
+
+def test_instance_json_is_written_whole_under_short_writes(tmp_path, monkeypatch):
+    # A truncated instance.json is unparseable config that survives every existence
+    # check and gets loaded as authoritative. Redden: go back to a bare
+    # `os.write(fd, data)` -> the file is cut in half and json.loads raises.
+    payload = {"instanceId": "alpha", "note": "x" * 5000}
+    target = tmp_path / "instance.json"
+    _break_os_write(monkeypatch)
+
+    core._write_private_text(target, json.dumps(payload, indent=2) + "\n")
+
+    assert json.loads(target.read_text()) == payload
+    assert (target.stat().st_mode & 0o777) == 0o600  # perms survive the fix
+
+
+def test_signing_key_is_written_whole_under_short_writes(tmp_path, monkeypatch):
+    # A truncated PEM is worse than a missing one: `p.exists()` makes it look
+    # generated, so it is REUSED forever and the pinned extension id is lost.
+    key_path = tmp_path / ".instancegen" / "signing_key.pem"
+    _break_os_write(monkeypatch)
+
+    pem = keys.load_or_create_private_key_pem(key_path)
+
+    assert key_path.read_bytes() == pem
+    assert (key_path.stat().st_mode & 0o777) == 0o600
+    # The persisted key must still be usable — a half PEM would fail to parse.
+    assert keys.public_key_b64_from_pem(key_path.read_bytes())
+
+
+# --------------------------------------------------------------------------- #
+# The token is never a command-line argument
+# --------------------------------------------------------------------------- #
+def test_cli_has_no_token_option(tmp_path):
+    # argv is world-readable in `ps` for the whole run and lands in shell history,
+    # so the secret must not be expressible there. Redden: re-add `--token`.
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):  # argparse exits 2 on an unknown option
+        parser.parse_args(
+            ["generate", "--instance-id", "a", "--service-url", "wss://h",
+             "--out", str(tmp_path), "--token", "leaked-secret"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["restamp", "--out", str(tmp_path), "--token", "leaked-secret"])
+
+    # And it must not sneak back in as a PREFIX of --token-file: argparse's default
+    # abbreviation matching would otherwise resolve `--token SECRET` to it, quietly
+    # restoring the argv path. Redden: drop allow_abbrev=False.
+    args = parser.parse_args(["restamp", "--out", str(tmp_path), "--token-file", "/p"])
+    assert args.token_file == "/p"
+    assert not hasattr(args, "token")
+
+
+def test_token_comes_from_env_and_token_file_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("EXT_TOKEN", "from-env")
+    assert cli._resolve_token(None) == "from-env"
+
+    # --token-file puts a PATH in argv, never the secret itself.
+    token_file = tmp_path / "token.txt"
+    token_file.write_text("from-file\n")
+    assert cli._resolve_token(str(token_file)) == "from-file"
+
+    # Nothing is defaulted: a missing token fails loudly (AGENTS.md).
+    monkeypatch.delenv("EXT_TOKEN")
+    with pytest.raises(SystemExit):
+        cli._resolve_token(None)

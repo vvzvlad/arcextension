@@ -7,6 +7,10 @@
 // itself (§6). Identity + connection state come from the SW over runtime.sendMessage.
 
 export const STATE_CACHE_KEY = "stateCache"; // storage.local: { state: StateResponse, cached_at }
+// KEEP IN SYNC with extension/src/quicklinks.js `QUEUE_KEY` and its value shape
+// `{ops, claimed:{ops,key}|null}` — the SW owns the queue, this page only READS it, and
+// the two live in separate build contexts (see httpBaseFromServiceUrl below).
+export const QUEUE_KEY = "quickLinkQueue";
 
 // KEEP IN SYNC with extension/src/quicklinks.js `httpBaseFromServiceUrl`: duplicated
 // across separate build contexts (SW module vs this Vue page bundle); mirror any change.
@@ -49,6 +53,23 @@ export async function writeCache(chromeApi, state, cachedAt) {
   await chromeApi.storage.local.set({ [STATE_CACHE_KEY]: { state, cached_at: cachedAt } });
 }
 
+// The quick-link ops the SW has NOT yet had confirmed by the server, oldest first
+// (§10). `claimed` is the batch of an in-flight/failed POST — it is older than
+// anything still in `ops`, so it applies first.
+//
+// The page must overlay these on the server's quick_links: a GET /api/state can win
+// the race against the (up to 60 s) tick flush, and applying its list verbatim would
+// erase a link added offline both from the view AND from the cache — invisible for
+// days while the queue still holds it (§10 "Постановка в очередь сразу правит кэш").
+export async function readQueuedOps(chromeApi) {
+  const got = await chromeApi.storage.local.get(QUEUE_KEY);
+  const q = got && got[QUEUE_KEY];
+  if (!q) return [];
+  const claimed = q.claimed && Array.isArray(q.claimed.ops) ? q.claimed.ops : [];
+  const ops = Array.isArray(q.ops) ? q.ops : [];
+  return [...claimed, ...ops];
+}
+
 export async function fetchState(fetchFn, base, token) {
   const resp = await fetchFn(base + "/api/state", {
     headers: { Authorization: "Bearer " + token },
@@ -59,11 +80,18 @@ export async function fetchState(fetchFn, base, token) {
 
 // Foreign jump (§10): the instance activates the tab and raises its own window. A
 // no_such_tab / refetch signal tells the page to re-fetch state and re-render.
-export async function postFocus(fetchFn, base, token, instance, tabId) {
+//
+// `force` is §7's ONE exception to the pause gate: while a pause is armed every
+// mutating verb answers 423, and the human's own buttons are allowed through with an
+// explicit `{force: true}` (recorded server-side as `initiator=user`). It is never
+// sent automatically — only after the human is told WHY the jump was refused.
+export async function postFocus(fetchFn, base, token, instance, tabId, { force = false } = {}) {
+  const payload = { instance, tabId };
+  if (force) payload.force = true;
   const resp = await fetchFn(base + "/api/focus", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
-    body: JSON.stringify({ instance, tabId }),
+    body: JSON.stringify(payload),
   });
   let body = null;
   try {
@@ -71,6 +99,22 @@ export async function postFocus(fetchFn, base, token, instance, tabId) {
   } catch {
     body = null;
   }
+  return { status: resp.status, body };
+}
+
+// "Слить окна сейчас" (§9): fold this instance's normal windows into one NOW instead
+// of waiting for the pass's hour-long idle delay. Answers `{merged: <int>}`; `force`
+// carries the same §7 pause exception as postFocus.
+export async function postMergeWindows(fetchFn, base, token, instanceId, { force = false } = {}) {
+  const resp = await fetchFn(
+    base + "/api/instances/" + encodeURIComponent(instanceId) + "/merge_windows",
+    {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify(force ? { force: true } : {}),
+    },
+  );
+  const body = await resp.json().catch(() => null);
   return { status: resp.status, body };
 }
 
