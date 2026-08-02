@@ -277,6 +277,18 @@ def test_non_str_token_rejected_cleanly(tmp_path):
             assert ack["ok"] is False and ack["error"]["code"] == "auth"
 
 
+def test_non_ascii_token_rejected_cleanly(tmp_path):
+    # A non-ASCII token must not raise TypeError in compare_digest (which, since
+    # _handle_hello runs outside a try, would escape ext_channel as a 500). Bytes
+    # comparison rejects it cleanly with `auth`.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_hello(token="токен-日本語"))   # non-ASCII string
+            ack = ws.receive_json()
+            assert ack["ok"] is False and ack["error"]["code"] == "auth"
+
+
 # --- a snapshot with NO id must be ignored, never wipe tabs ------------------
 def test_snapshot_without_id_is_ignored(tmp_path):
     import time as _time

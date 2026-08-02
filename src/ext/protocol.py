@@ -72,9 +72,12 @@ def hello_reject_reason(
     if msg.get("protocolVersion") != protocol_version:
         return REJECT_PROTOCOL
     # Constant-time compare — a short-circuiting `!=` leaks the token byte-by-byte
-    # via timing. str-coerce both sides: compare_digest raises TypeError on a
-    # non-str / str-vs-bytes mismatch, and this runs outside any try/except.
-    if not hmac.compare_digest(str(msg.get("token") or ""), str(ext_token)):
+    # via timing. Compare as BYTES: compare_digest raises TypeError on a non-ASCII
+    # str (Starlette/JSON can carry any codepoint), and this runs outside any
+    # try/except, so a non-ASCII token would escape as an unhandled 500/crash.
+    token = msg.get("token")
+    token_bytes = token.encode("utf-8") if isinstance(token, str) else b""
+    if not hmac.compare_digest(token_bytes, str(ext_token).encode("utf-8")):
         return REJECT_AUTH
     instance_id = msg.get("instanceId")
     if not isinstance(instance_id, str) or not instance_id.strip():
