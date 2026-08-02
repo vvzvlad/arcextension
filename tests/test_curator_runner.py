@@ -281,6 +281,36 @@ async def test_completed_relocation_retired_from_live_relocations(tmp_path):
         await db.close()
 
 
+# --- a FAILED phase-B close is a retry, NOT a retirement --------------------
+async def test_failed_relocate_close_leaves_relocation_live(tmp_path):
+    # `relocate_close status='failed'` (a transient precondition_failed — source
+    # turned active/pinned/audible between snapshot and close) is a RETRY, not a
+    # completion. The relocation must stay live so phase B retries by tab_id_to
+    # (drift-resistant: get_tab by id). Retiring on a failed close would re-route
+    # the source through decide and, on url drift, open a SECOND copy.
+    from src.curator.mirror import load_mirror
+    from src.db.actions import insert_action
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await ext.add_instance("main")
+        await ext.add_instance("prox")
+        reloc_id = await _seed_relocate(
+            db, instance_from="main", instance_to="prox", tab_id=20,
+            session_id_from="s", tab_id_to=99, session_id_to="s",
+            url="https://grafana.lc/d/abc", url_norm="https://grafana.lc/d/abc",
+        )
+        await db.write(lambda c: insert_action(
+            c, ts=2, kind="relocate_close", status="failed", initiator="curator",
+            origin_action_id=reloc_id, instance_from="main", instance_to="prox",
+            url="https://grafana.lc/d/abc", url_norm="https://grafana.lc/d/abc"))
+        # Retire ONLY on a done close => a failed close keeps the row live.
+        m = await db.read(load_mirror)
+        assert [r.id for r in m.live_relocations] == [reloc_id]
+    finally:
+        await db.close()
+
+
 # --- phase B: source URL mismatch => abandoned, NO un-quenchable close loop --
 async def test_phase_b_source_mismatch_abandons_no_loop(tmp_path):
     db = await _mkdb(tmp_path)

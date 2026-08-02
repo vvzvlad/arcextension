@@ -142,12 +142,21 @@ def load_mirror(conn: sqlite3.Connection) -> Mirror:
     # sessions. A session change already wiped that instance's `tabs` (§5), so a dead
     # row's join simply finds no copy; we filter here so phase B never chases one.
     #
-    # "Phase B NOT yet completed" = no `relocate_close` references this relocate. A
-    # completed relocation's source is already closed, so without this exclusion the
-    # done relocate row re-enters `live_relocations` next pass, `decide` finds no
-    # source (closed) and wrongly marks the SUCCESS as `abandoned` — corrupting the
-    # §10 journal/metrics and letting the stale row capture a new same-URL tab.
-    # Indexed by actions_origin (§4). This is the retirement of a finished relocation.
+    # "Phase B NOT yet completed" = no SUCCESSFUL `relocate_close` references this
+    # relocate. A completed relocation's source is already closed, so without this
+    # exclusion the done relocate row re-enters `live_relocations` next pass,
+    # `decide` finds no source (closed) and wrongly marks the SUCCESS `abandoned` —
+    # corrupting the §10 journal/metrics and letting the stale row capture a new
+    # same-URL tab.
+    #
+    # ⚠️ ONLY a `status='done'` relocate_close retires the row. Phase B writes a
+    # `relocate_close status='failed'` on a `precondition_failed` (the source turned
+    # active/pinned/audible between snapshot and close); that is a TRANSIENT retry,
+    # not a completion. Retiring on a failed close would drop the relocation identity
+    # and re-route the source through normal `decide` — and if the copy's url drifted
+    # (Grafana slug / OAuth nonce, §7:1000-1004) the full-url dedup misses and phase A
+    # opens a SECOND copy. Leaving a failed row live lets phase B retry by `tab_id_to`
+    # (drift-resistant: get_tab by id, not url). Indexed by actions_origin (§4).
     live_relocations = []
     for r in conn.execute(
         "SELECT id, instance_from, session_id_from, tab_id, instance_to, "
@@ -156,7 +165,8 @@ def load_mirror(conn: sqlite3.Connection) -> Mirror:
         "FROM actions a WHERE a.kind = 'relocate' AND a.status = 'done' "
         "AND a.restored_at IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM actions rc "
-        "WHERE rc.kind = 'relocate_close' AND rc.origin_action_id = a.id)"
+        "WHERE rc.kind = 'relocate_close' AND rc.status = 'done' "
+        "AND rc.origin_action_id = a.id)"
     ).fetchall():
         src = instances.get(r["instance_from"])
         dst = instances.get(r["instance_to"])
