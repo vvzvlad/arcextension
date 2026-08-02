@@ -53,6 +53,19 @@ class Settings(BaseSettings):
     # operator-facing list without bound. 64 is generous for a human-scale fleet while
     # still bounding the pre-auth list.
     enroll_max_pending: int = 64
+    # Lifetime of a PENDING enroll_request (§13, acceptance 12). A request is filtered out
+    # of GET /admin/enroll/requests once its FROZEN first_seen_at is older than this, and a
+    # frequent sweep (TICK_MS, ~60s) physically deletes it — so a stale/abandoned request
+    # self-clears within TTL+~60s instead of lingering in the operator list forever. 60
+    # minutes is chosen as: (a) comfortably LONGER than the enrollment window
+    # (ENROLL_WINDOW_MIN, 10 min) so an operator who opens a window always has a live
+    # request to approve — an approvable request must outlast the window; (b) long enough
+    # that a human noticing the request and approving it is unhurried; yet (c) bounded, so a
+    # copied/abandoned install's request does not sit in the pre-auth list indefinitely
+    # (the same self-clearing discipline the pending-cap and window give the pre-auth
+    # surface). Also equals the window's own MAX (ENROLL_WINDOW_MAX_MIN=60), so a request
+    # cannot expire under even a maximally-armed window.
+    enroll_request_ttl_min: int = 60
     # Ceiling on simultaneously-open /ext sockets that have been accepted but have not
     # yet completed a hello/enroll (§2). Refused BEFORE accept() (a handshake rejection,
     # no TLS session), so a flood of opened-but-silent sockets cannot exhaust memory or

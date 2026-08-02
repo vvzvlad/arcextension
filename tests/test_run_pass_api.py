@@ -28,6 +28,7 @@ def _settings(tmp_path, **over):
         self_nav_limit=10, state_fresh_ms=3000, quarantine_ttl_min=1440,
         actions_retention_days=90, js_audit_retention_days=730,
         main_instance_id="main", log_level="INFO",
+        enroll_request_ttl_min=60,
     )
     s.update(over)
     return SimpleNamespace(**s)

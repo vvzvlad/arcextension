@@ -270,6 +270,228 @@ def count_active_instances(conn: sqlite3.Connection) -> int:
     return int(row[0])
 
 
+# --- /admin enrollment API helpers (Task E) ---------------------------------
+# The read/approve/reject/list SQL the /admin JSON endpoints run. Kept HERE next to
+# the other enroll_requests helpers (upsert / count) so all the enrollment SQL lives in
+# one mutation-testable place — the endpoints never inline SQL of their own.
+
+
+class ApproveConflict(Exception):
+    """An approve that must answer HTTP 409 (issue #35 acceptance 11).
+
+    Raised when the target id is ALREADY active — a re-approve of a live id, detected by
+    the ``WHERE instances.status != 'active'`` guard matching zero rows. The OTHER 409
+    path — a second active instance carrying the SAME ``secret_hash`` — surfaces as a raw
+    ``sqlite3.IntegrityError`` from the ``UNIQUE(secret_hash)`` index (§1); the handler
+    maps BOTH to 409. Together they make two racing approves resolve to exactly one 200
+    and one 409, with exactly one active row / one secret left in the DB.
+    """
+
+
+# Read-time listing of PENDING enroll requests, already TTL-filtered (acceptance 12). A
+# row whose FROZEN ``first_seen_at`` is older than the cutoff is never returned — the
+# physical DELETE (delete_expired_enroll_requests) then removes it within TTL+tick. The
+# EXISTS sub-select is the ``id_exists`` hint: whether an ``instances`` row already
+# carries this request's ``install_uuid`` — i.e. this install was enrolled before (a
+# revoked/pending re-enrol), so the operator can reuse the same id (the re-approve /
+# MAIN-restore path). It is a UI hint only; approval never depends on it.
+_LIST_PENDING_ENROLL_REQUESTS = """
+SELECT
+    e.install_uuid,
+    e.origin,
+    e.suggested_title,
+    e.protocol_version,
+    e.first_seen_at,
+    e.last_seen_at,
+    EXISTS(SELECT 1 FROM instances i WHERE i.install_uuid = e.install_uuid) AS id_exists
+FROM enroll_requests e
+WHERE e.first_seen_at >= ?
+ORDER BY e.first_seen_at ASC
+"""
+
+
+def list_pending_enroll_requests(
+    conn: sqlite3.Connection, *, now: int, ttl_ms: int
+) -> list[dict]:
+    """Return the pending enroll requests not past TTL, newest-first-frozen order.
+
+    ``cutoff = now - ttl_ms``: a request whose ``first_seen_at`` is strictly OLDER than
+    the cutoff is filtered out at read time (never returned after TTL, acceptance 12).
+    ``install_uuid_short`` is the first 8 chars for a compact display; ``origin`` /
+    ``suggested_title`` are UNTRUSTED (length already clamped server-side in slice B) and
+    returned VERBATIM — the JSON API never HTML-encodes; the #36 page uses ``textContent``.
+    """
+    cutoff = now - ttl_ms
+    rows = conn.execute(_LIST_PENDING_ENROLL_REQUESTS, (cutoff,)).fetchall()
+    out: list[dict] = []
+    for (install_uuid, origin, suggested_title, proto, first_seen_at,
+         last_seen_at, id_exists) in rows:
+        out.append({
+            "install_uuid": install_uuid,
+            "install_uuid_short": (install_uuid or "")[:8],
+            "origin": origin,
+            "suggested_title": suggested_title,
+            "protocol_version": proto,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": last_seen_at,
+            "id_exists": bool(id_exists),
+        })
+    return out
+
+
+def get_enroll_request(
+    conn: sqlite3.Connection, install_uuid: str, *, now: int, ttl_ms: int
+) -> dict | None:
+    """Return one pending, NOT-expired enroll request by ``install_uuid`` (or ``None``).
+
+    The approve handler reads this FIRST (own read txn) to 404 an absent/expired request
+    and to capture the ``secret_hash`` it will enroll. Reading it out of band is what
+    lets two racing approves BOTH hold the secret and so collide on the write (the
+    ``UNIQUE(secret_hash)`` / already-active guards) rather than one silently 404-ing.
+    Applies the SAME ``first_seen_at >= now - ttl_ms`` filter as the list (an expired
+    request is not approvable, matching the read-time TTL of acceptance 12).
+    """
+    cutoff = now - ttl_ms
+    row = conn.execute(
+        "SELECT install_uuid, secret_hash, suggested_title, first_seen_at "
+        "FROM enroll_requests WHERE install_uuid = ? AND first_seen_at >= ?",
+        (install_uuid, cutoff),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "install_uuid": row[0],
+        "secret_hash": row[1],
+        "suggested_title": row[2],
+        "first_seen_at": row[3],
+    }
+
+
+# Create-or-REACTIVATE the operator-assigned instance row in ONE statement (§1, acc 11).
+# A brand-new id INSERTs; an EXISTING revoked/pending id is UPDATEd back to 'active' —
+# this is the ONLY path that restores a revoked MAIN (Task D leaves MAIN revoked). The
+# ``WHERE instances.status != 'active'`` guard makes re-approving an ALREADY-active id a
+# no-op (rowcount 0 → ApproveConflict → 409), so an approve never silently overwrites a
+# live instance. ``conn_epoch`` / ``connected`` are LEFT untouched on the update path so
+# a reactivation does not disturb a socket that somehow still holds the id.
+_APPROVE_UPSERT = """
+INSERT INTO instances (id, status, secret_hash, install_uuid, enrolled_at, title)
+VALUES (?, 'active', ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    status = 'active',
+    secret_hash = excluded.secret_hash,
+    install_uuid = excluded.install_uuid,
+    enrolled_at = excluded.enrolled_at,
+    title = excluded.title
+WHERE instances.status != 'active'
+"""
+
+
+def approve_enroll_request(
+    conn: sqlite3.Connection,
+    *,
+    instance_id: str,
+    secret_hash: str,
+    install_uuid: str,
+    title: str | None,
+    now: int,
+) -> None:
+    """Enroll ``instance_id`` from a captured ``secret_hash`` in ONE write txn (acc 11).
+
+    Runs :data:`_APPROVE_UPSERT` then, on success, DELETEs the consumed enroll_request
+    (idempotent — the loser of a race deletes an already-gone row). Two 409 guards:
+
+    * ``rowcount == 0`` ⇒ the id was already active (the ``WHERE status != 'active'``
+      guard matched nothing) ⇒ :class:`ApproveConflict`;
+    * a ``UNIQUE(secret_hash)`` collision (a DIFFERENT active id already carries this
+      secret) raises ``sqlite3.IntegrityError`` straight out of ``conn.execute`` — the
+      write txn rolls back, so no partial row and the request stays for a retry.
+
+    The whole body is one synchronous ``fn(conn)`` (Фаза 2 contract): the caller runs it
+    under ``Database.write`` so the upsert and the delete commit together or not at all.
+    """
+    cur = conn.execute(
+        _APPROVE_UPSERT, (instance_id, secret_hash, install_uuid, now, title)
+    )
+    if cur.rowcount == 0:
+        # The id exists and is already 'active' — a re-approve of a live instance. Refuse
+        # rather than clobber it; the request is left in place (not consumed).
+        raise ApproveConflict(
+            f"instance {instance_id!r} is already active; refusing to overwrite"
+        )
+    conn.execute(
+        "DELETE FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
+    )
+
+
+def reject_enroll_request(conn: sqlite3.Connection, install_uuid: str) -> bool:
+    """Delete the pending enroll request for ``install_uuid``; return whether a row went.
+
+    Idempotent: rejecting an already-gone request removes nothing and returns ``False``
+    (the handler still answers 200 — the desired end state, request absent, holds).
+    """
+    cur = conn.execute(
+        "DELETE FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
+    )
+    return cur.rowcount > 0
+
+
+_LIST_INSTANCES = """
+SELECT id, title, status, connected, last_seen_at, enrolled_at, revoked_at
+FROM instances
+ORDER BY id
+"""
+
+
+def list_instances(conn: sqlite3.Connection) -> list[dict]:
+    """Return EVERY instance (all statuses) for the operator console.
+
+    Unlike the curator's ``status='active'`` reads, this lists revoked/pending rows too
+    so the operator can see a revoked MAIN awaiting re-approval or a stuck pending id.
+    """
+    rows = conn.execute(_LIST_INSTANCES).fetchall()
+    return [
+        {
+            "id": r[0],
+            "title": r[1],
+            "status": r[2],
+            # revoke clears status/session but leaves the `connected` column to the
+            # channel's async socket teardown (not guaranteed if there is no live socket),
+            # so report `connected` only for an ACTIVE row — a revoked/pending instance is
+            # never "connected" for the operator console, whatever the stale flag says.
+            "connected": bool(r[3]) and r[2] == "active",
+            "last_seen_at": r[4],
+            "enrolled_at": r[5],
+            "revoked_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def insert_admin_audit(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    action: str,
+    initiator: str,
+    install_uuid: str | None = None,
+    instance_id: str | None = None,
+    detail: str | None = None,
+) -> int:
+    """Append one ``admin_audit`` row (approve / reject / revoke / window_open …).
+
+    The security trail of operator/admin actions (schema §1) — deliberately OUTSIDE
+    retention, so it is never swept. ``initiator`` names who acted ('admin' for an
+    ADMIN_TOKEN caller). Returns the new row id.
+    """
+    cur = conn.execute(
+        "INSERT INTO admin_audit (ts, action, install_uuid, instance_id, initiator, detail) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (now, action, install_uuid, instance_id, initiator, detail),
+    )
+    return int(cur.lastrowid)
+
+
 def mark_disconnected(
     conn: sqlite3.Connection, instance_id: str, conn_epoch: int
 ) -> None:

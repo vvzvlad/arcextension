@@ -63,6 +63,7 @@ _DEFAULTS: dict = {
     "enroll_window_min": 10,
     "enroll_max_pending": 64,
     "enroll_preauth_max": 128,
+    "enroll_request_ttl_min": 60,
 }
 
 # Parked far beyond any test's lifetime. ``src.app._curator_driver`` sleeps this long
