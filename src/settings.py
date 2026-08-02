@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     js_audit_retention_days: int = 730
     main_instance_id: str = "main"
     protocol_version: int = 1
+    # Comma-separated allow-list for the extension's `hello.origin`. DEFAULT
+    # EMPTY = accept any origin and log a one-time warning (the concrete
+    # chrome-extension:// id is unknown until the extension/generator phases;
+    # §12 tightens this later). When non-empty, a hello whose origin is not in
+    # the list is rejected with reject_reason='origin'.
+    ext_allowed_origins: str = ""
 
     # --- Non-secret infra defaults ----------------------------------------------
     log_level: str = "INFO"
