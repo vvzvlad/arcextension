@@ -4,8 +4,8 @@ Order (§7): (0) server-clock check; (1) pause / resume_pending / continuity gat
 (2) lease with fencing epoch + a SEPARATE renewal task; (3) snapshot freshness keyed
 on the pass's OWN request ids; (4-8) guards / routing / phase A / phase B / dedup /
 singleton, each tab isolated; the ``passes`` row is written for every real pass
-(even an empty one). Window merge (step 9, §9) is a SEPARATE phase (Фаза 15) and is
-left as a documented hook.
+(even an empty one). Window merge (step 9, §9) runs LAST, after the tab decisions,
+so those decide against a stable window picture (Фаза 15).
 
 Every mutation is a lease-guarded ``Database.write`` (§7): a lost lease raises
 :class:`~src.curator.lease.LeaseLost`, which stops the pass at once. WS I/O and the
@@ -276,7 +276,14 @@ async def run_pass(
         for dec in decisions.closes:
             await _isolated(phases.run_close(ctx, dec))
 
-        # step 9 — window merge (§9) is Фаза 15; intentionally a no-op hook here.
+        # --- step 9: window merge (§9), LAST — the tab decisions (4-8) ran against
+        # the STABLE window picture; only now do the instance's windows collapse into
+        # one. Planned purely from the same frozen mirror; each instance isolated so
+        # one bad merge cannot sink the pass; every write lease-guarded (§7/§9).
+        for merge in decidemod.decide_window_merges(
+            mirror, ready_ids, now=now, idle_ms=idle_ms
+        ):
+            await _isolated(phases.run_window_merge(ctx, merge))
 
         # A real pass with established continuity refreshes the fingerprint and
         # clears any resume_pending it was confirming (§7).

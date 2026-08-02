@@ -80,6 +80,26 @@ class Close:
 
 
 @dataclass
+class WindowMerge:
+    """A step-9 window-merge decision for one instance (§9).
+
+    Fold the ``source_window_ids`` **unpinned** tabs into ``target_window_id``.
+    Pinned tabs are never moved (a cross-window ``tabs.move`` silently resets
+    ``pinned`` — the §9 trap that would destroy the owner's only "do not touch"
+    shield), so a source window that keeps pinned tabs simply does NOT vanish; the
+    extension enforces the unpinned-only move at the edge. ``moved_tab_ids`` is the
+    server's expectation from the frozen mirror (the sources' unpinned tabs) recorded
+    in the NON-undoable ``window_merge`` journal (§9 "список перенесённых tab_id");
+    the extension re-queries live and returns the actual moved count.
+    """
+
+    instance_id: str
+    target_window_id: int
+    source_window_ids: list        # source windows with >=1 unpinned tab, ascending
+    moved_tab_ids: list            # the sources' unpinned tab_ids (journal only)
+
+
+@dataclass
 class Decisions:
     abandon: list = field(default_factory=list)          # AbandonReloc
     phase_b: list = field(default_factory=list)          # PhaseBVerify
@@ -322,3 +342,96 @@ def _rule_field(rule, name):
         return rule[name]
     except (KeyError, IndexError, TypeError):
         return getattr(rule, name, None)
+
+
+# --- §9 step 9: window merge (pure planning; execution lives in phases.py) ----
+def _window_mergeable(meta) -> bool:
+    """True if a window may be a merge SOURCE or TARGET (§9).
+
+    The SAME window predicate step 4 uses for tabs (§9 "гард — то же бездействие,
+    что и везде"): type ``normal`` and state NOT ``fullscreen``. popup/app/devtools
+    windows and a fullscreen showcase are neither folded nor merged into.
+
+    FORK (maximized): a ``maximized`` state is "не fullscreen", so a maximized,
+    hour-idle window IS mergeable here — deliberately matching ``step4_passes``
+    (``wtype != "normal" or wstate == "fullscreen"``) rather than restricting to a
+    plain ``normal`` state, so a tab that step 4 may relocate cannot live in a window
+    step 9 refuses to collapse. Only ``fullscreen`` (the macOS dedicated-Space
+    showcase, ledger 43) is exempt.
+    """
+    wtype, wstate = meta
+    return wtype == "normal" and wstate != "fullscreen"
+
+
+def _source_eligible(tabs, focused_window_id, now: int, idle_ms: int) -> bool:
+    """True if a window is a merge SOURCE (§9): EVERY tab idle longer than
+    ``IDLE_MINUTES``, NO on-screen tab (active in the instance's focused window),
+    and NO audible tab. Guards apply to ALL tabs — pinned ones too — because the
+    delay is the whole shield ("пока с окном работают, оно не трогается", §9).
+
+    An empty tab list is NOT a source on its own; the caller additionally requires
+    at least one unpinned tab (an all-pinned or empty window can never be emptied).
+
+    Unlike step 4, this does NOT consult exemptions/quarantine: a merge is a COSMETIC
+    cross-window move of unpinned tabs (it neither closes nor relocates), so the
+    don't-destroy guards those tables provide do not apply — a recently-restored or
+    quarantined tab is unharmed by being folded into another window."""
+    if not tabs:
+        return False
+    for t in tabs:
+        if t.audible:
+            return False  # background media (§6): the copy would open silent
+        if t.active and t.window_id is not None and t.window_id == focused_window_id:
+            return False  # a tab on screen right now — the owner is here
+        if (now - t.last_active_at) < idle_ms:
+            return False  # not idle long enough (age_unknown reads as fresh => blocks)
+    return True
+
+
+def decide_window_merges(mirror, ready_ids: set, *, now: int, idle_ms: int) -> list:
+    """Plan every instance's window merge for step 9 (§9). Pure over the frozen
+    mirror, so the guards are unit- and mutation-testable without a socket.
+
+    Per instance: among its mergeable windows pick the TARGET (most tabs; tie ->
+    smallest ``window_id``, §9), then fold every OTHER mergeable window that clears
+    the source guard AND still has an unpinned tab to move. An instance with fewer
+    than two mergeable windows, or no eligible source, yields no decision."""
+    merges: list = []
+    for instance_id in ready_ids:
+        inst = mirror.instances.get(instance_id)
+        focused_window_id = inst.focused_window_id if inst is not None else None
+
+        win_ids = [
+            w
+            for (i, w), meta in mirror.windows.items()
+            if i == instance_id and _window_mergeable(meta)
+        ]
+        if len(win_ids) < 2:
+            continue  # need a source AND a distinct target
+
+        tabs_by_win: dict = {}
+        for t in mirror.tabs:
+            if t.instance_id == instance_id and t.window_id in win_ids:
+                tabs_by_win.setdefault(t.window_id, []).append(t)
+
+        # Target: most tabs, tie -> smallest window_id (§9). popup/app/devtools are
+        # already excluded from win_ids, so they never win nor count.
+        target = min(win_ids, key=lambda w: (-len(tabs_by_win.get(w, [])), w))
+
+        source_windows: list = []
+        moved: list = []
+        for w in sorted(win_ids):
+            if w == target:
+                continue
+            wtabs = tabs_by_win.get(w, [])
+            if not _source_eligible(wtabs, focused_window_id, now, idle_ms):
+                continue
+            unpinned = [t.tab_id for t in wtabs if not t.pinned]
+            if not unpinned:
+                continue  # only pinned tabs => the window can't be emptied (§9)
+            source_windows.append(w)
+            moved.extend(unpinned)
+        if not source_windows:
+            continue
+        merges.append(WindowMerge(instance_id, target, source_windows, moved))
+    return merges

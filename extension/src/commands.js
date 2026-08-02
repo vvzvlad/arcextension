@@ -282,15 +282,35 @@ async function mergeWindows(params, nowFn, map) {
     windowIds = normalWindows.map((w) => w.id).filter((id) => id !== targetWindowId);
   }
 
+  // §9 edge re-check (parity with close_tab's `expect`): the merge was decided on the
+  // step-3 snapshot, so re-verify the VOLATILE guards against LIVE state before moving.
+  // A SOURCE window the owner returned to in the sub-second gap before step 9 — it has
+  // an audible tab, or its active tab is the one on screen (in the focused window) — is
+  // dropped here and re-decided next pass ("пока с окном работают, оно не трогается",
+  // §9). The target is never dropped: idle sources fold INTO the window in use.
+  const tabs = await chrome.tabs.query({});
+  const focusedNow = await chrome.windows.getLastFocused();
+  const focusedId =
+    focusedNow && focusedNow.type === "normal" && focusedNow.id !== -1 ? focusedNow.id : null;
+  const inUse = new Set();
+  for (const t of tabs) {
+    if (t.audible || (t.active && t.windowId === focusedId)) inUse.add(t.windowId);
+  }
+  windowIds = windowIds.filter((id) => id === targetWindowId || !inUse.has(id));
+
   // The windows whose activity we must not count while Chrome reshuffles them.
   const marked = [...new Set([...windowIds, targetWindowId])].filter(
     (id) => id !== undefined && id !== null,
   );
   await map.markCuratorCause(marked, nowFn());
 
-  const tabs = await chrome.tabs.query({});
+  // §9: NEVER move a pinned tab across windows — a cross-window tabs.move silently
+  // resets `pinned` (undocumented Chromium; intra-window move keeps it), and a lost
+  // turn between the move and re-pinning would destroy the owner's only "do not
+  // touch by hand" shield. Only unpinned tabs migrate; a source window left with
+  // pinned tabs simply does not disappear.
   const toMove = tabs
-    .filter((t) => windowIds.includes(t.windowId) && t.windowId !== targetWindowId)
+    .filter((t) => windowIds.includes(t.windowId) && t.windowId !== targetWindowId && !t.pinned)
     .map((t) => t.id);
 
   try {

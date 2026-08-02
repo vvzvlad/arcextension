@@ -339,6 +339,107 @@ describe("merge_windows", () => {
     expect(move.mock.calls[0][0]).toEqual([200]); // not 300 (popup)
   });
 
+  it("moves ONLY unpinned tabs; pinned tabs stay, the window is not emptied (§9)", async () => {
+    // A cross-window tabs.move resets `pinned` (§9 trap) — pinned tabs must never
+    // migrate. Window 2 holds one pinned + one unpinned tab: only the unpinned one
+    // moves, so window 2 keeps its pinned tab and does not vanish. Drop `!t.pinned`
+    // from the toMove filter and this reddens (the pinned tab 200 would move too).
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", pinned: false },
+        { id: 200, windowId: 2, url: "https://pin/", pinned: true },
+        { id: 201, windowId: 2, url: "https://b/", pinned: false },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 1 }); // only the unpinned tab 201 moved
+    expect(move.mock.calls[0][0]).toEqual([201]); // NOT 200 (pinned)
+    // BOTH windows were marked BEFORE the move (§6: no rejuvenation of either side).
+    const marked = map.markCuratorCause.mock.calls[0][0];
+    expect([...marked].sort()).toEqual([1, 2]);
+    // The pinned tab is still in window 2 (never moved) => the window survives.
+    const stillThere = (await chrome.tabs.query({})).find((t) => t.id === 200);
+    expect(stillThere.windowId).toBe(2);
+  });
+
+  it("a source window of ONLY pinned tabs yields an empty move (§9)", async () => {
+    // Window 2 is all-pinned: nothing may migrate, so the move set is empty and the
+    // window stays. (chrome.tabs.move must not be called with an empty list.)
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", pinned: false },
+        { id: 200, windowId: 2, url: "https://pin1/", pinned: true },
+        { id: 201, windowId: 2, url: "https://pin2/", pinned: true },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 0 });
+    expect(move).not.toHaveBeenCalled(); // no empty tabs.move
+  });
+
+  it("EDGE re-check: a source the owner returned to (active tab in the focused window) is NOT moved (§9)", async () => {
+    // The merge was decided on the step-3 snapshot; if the owner focused window 2 and
+    // its active tab is on screen in the sub-second gap before step 9, that window must
+    // NOT collapse (parity with close_tab's expect). Drop the edge re-check and this
+    // reddens (tab 200 would move into window 1).
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://b/", active: true },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 2, type: "normal", focused: true }, // owner is IN window 2 now
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 0 }); // window 2 dropped by the edge re-check
+    expect(move).not.toHaveBeenCalled();
+  });
+
+  it("EDGE re-check: a source with an audible tab is NOT moved; an unfocused active source still moves (§9)", async () => {
+    // Audible => dropped even if unfocused (background media). Control: window 3's
+    // active tab is NOT in the focused window (1), so it is NOT on screen and DOES move
+    // — proving the re-check is specific, not a blanket refusal.
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/" },
+        { id: 200, windowId: 2, url: "https://sound/", audible: true },
+        { id: 300, windowId: 3, url: "https://c/", active: true }, // active but window 3 not focused
+      ],
+      windows: [
+        { id: 1, type: "normal" }, { id: 2, type: "normal" }, { id: 3, type: "normal" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MERGE_WINDOWS, { windowIds: [2, 3], targetWindowId: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ merged: 1 }); // only window 3 (not the audible window 2)
+    expect(move.mock.calls[0][0]).toEqual([300]);
+  });
+
   it("busy_dragging when a drag is in progress; curatorCause cleared", async () => {
     chromeTwoWindows();
     chrome.__state.moveError = "Tabs cannot be edited right now (user may be dragging a tab).";
