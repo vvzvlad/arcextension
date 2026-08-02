@@ -215,7 +215,10 @@ async function getTab(params) {
   return ok({ tab });
 }
 
-// focus_tab {tabId} -> activate the tab and focus its window.
+// focus_tab {tabId} -> activate the tab and focus its window. The resulting
+// onActivated stamp counting as activity is BY DESIGN: focus_tab exists to put a
+// tab in front of the human (the startpage "jump", §10), so it genuinely IS a
+// view — it should reset the idle clock.
 async function focusTab(params) {
   let tab;
   try {
@@ -230,6 +233,15 @@ async function focusTab(params) {
 
 // navigate_tab {tabId, url}. Validate the scheme at the edge (same anti-smuggle
 // rule as open_tab), then point the tab at the url.
+//
+// NOTE (§7/§5): the resulting onUpdated document-change stamps the tab's
+// lastActive, so a curator navigation reads as activity and refreshes the idle
+// clock. This is accepted BY DESIGN for now: it errs SAFE (a too-fresh tab is
+// never wrongly closed; it self-heals within IDLE_MINUTES), navigate_tab has no
+// curator caller yet (reset defers the content change; MCP is a later phase), and
+// per-tab curator-nav suppression is a new mechanism best added with its first
+// real caller. curatorCause is per-WINDOW (for a close/move neighbour activation),
+// which cannot express "suppress this one tab's navigation".
 async function navigateTab(params) {
   if (!isHttpUrl(params.url)) {
     return fail(ERR_PRECONDITION_FAILED, "navigate_tab accepts only http/https urls");
@@ -306,6 +318,19 @@ async function executeJs(params) {
   const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
   if (!allowed) {
     return fail(ERR_JS_DISABLED, "execute_js is disabled in this copy's options");
+  }
+  // Edge-guard the TARGET tab's scheme, exactly like open_tab/navigate_tab (§12):
+  // with <all_urls> granted, a raw target could inject into a file:///view-source:
+  // page (a MAIN-world eval on file:// reads local files same-origin). Make the
+  // http/https invariant independent of host_permissions, not a side effect of it.
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "execute_js target is not an http/https tab");
   }
   const results = await chrome.scripting.executeScript({
     target: { tabId: params.tabId },

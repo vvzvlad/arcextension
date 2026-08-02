@@ -363,6 +363,7 @@ describe("execute_js checkbox gate (§12)", () => {
   });
 
   it("checkbox ON => runs executeScript in the requested world and returns {results}", async () => {
+    globalThis.chrome = createChromeMock({ tabs: [{ id: 5, windowId: 1, url: "https://x/" }] });
     await chrome.storage.local.set({ allowExecuteJs: true });
     chrome.__state.scriptResults = [{ result: 4 }];
     const exec = vi.spyOn(chrome.scripting, "executeScript");
@@ -377,5 +378,20 @@ describe("execute_js checkbox gate (§12)", () => {
     expect(injection.target).toEqual({ tabId: 5 });
     expect(injection.world).toBe("MAIN");
     expect(injection.args).toEqual(["2+2"]); // the curator code is passed as an arg
+  });
+
+  it("checkbox ON but target is a non-http tab => precondition_failed, NOT executed (§12)", async () => {
+    // Even with <all_urls> granted, execute_js must edge-guard the target's scheme
+    // so it can never inject into file:///view-source: (a MAIN-world eval on file://
+    // reads local files same-origin). Drop the target guard and this reddens.
+    globalThis.chrome = createChromeMock({ tabs: [{ id: 7, windowId: 1, url: "file:///etc/passwd" }] });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(frame(CMD_EXECUTE_JS, { code: "1", tabId: 7 }), ctx());
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "precondition_failed", message: expect.any(String) },
+    });
+    expect(exec).not.toHaveBeenCalled();
   });
 });

@@ -161,9 +161,9 @@ async def send_command(
         # execute_js attempt), THEN the switch is checked. When off we record
         # outcome='disabled' and REFUSE — no frame is ever put on the socket.
         if not await db.read(is_execute_js_enabled):
-            await db.write(
-                lambda c: update_js_audit_outcome(c, audit_id, "disabled", "kill_switch")
-            )
+            # best-effort like every other outcome-update: a failure here must not
+            # mask the intended CommandError (the audit row is already committed).
+            await _safe_update_outcome(db, audit_id, "disabled", "kill_switch")
             raise CommandError(
                 protocol.ERR_JS_DISABLED,
                 "execute_js is disabled by the runtime kill-switch",

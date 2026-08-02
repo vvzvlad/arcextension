@@ -15,10 +15,11 @@
     "idle"
   ],
 
-  "//host_permissions": "TWO patterns, not one: in Chromium match-patterns ws/wss are distinct schemes and the https pattern does NOT cover a wss request (§6). <host> is a deploy-time placeholder stamped by the instance generator (§13). <all_urls> is deliberately NOT requested here — it is only for execute_js and is added in that phase (least privilege).",
+  "//host_permissions": "TWO patterns, not one: in Chromium match-patterns ws/wss are distinct schemes and the https pattern does NOT cover a wss request (§6). <host> is a deploy-time placeholder stamped by the instance generator (§13). <all_urls> IS requested — SECURITY-SENSITIVE, deliberate (§6: '<all_urls> — только ради execute_js'): execute_js runs curator-supplied JS in the arbitrary http/https tabs this instance manages, which needs host access to those origins. It is gated by the per-copy options checkbox (default OFF) + the server kill-switch, AND commands.js edge-guards the target tab to http/https only (no file://view-source:), so the grant cannot be abused past those gates.",
   "host_permissions": [
     "https://<host>/*",
-    "wss://<host>/*"
+    "wss://<host>/*",
+    "<all_urls>"
   ],
 
   "background": {
