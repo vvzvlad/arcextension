@@ -19,6 +19,7 @@ from starlette.routing import Route, WebSocketRoute
 
 from src.api.actions import list_actions
 from src.api.guards import require_operational
+from src.api.metrics import metrics
 from src.api.quick_links import quick_links_ops
 from src.api.restore import restore_action
 from src.api.state import focus, get_state
@@ -140,6 +141,10 @@ def create_app(settings) -> Starlette:
 
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
+        # Prometheus scrape (§12): SEPARATE METRICS_TOKEN Bearer, read-only, and
+        # served even in degraded mode. Pass/instance gauges are computed at scrape
+        # time from `passes`/`instances`, never from process memory.
+        Route("/metrics", metrics, methods=["GET"]),
         # Startpage state + jump (§10). /api/state returns the mirror immediately and
         # kicks a background single-flight refresh; /api/focus raises a foreign tab.
         Route("/api/state", get_state, methods=["GET"]),

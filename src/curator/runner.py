@@ -36,6 +36,10 @@ def _now_ms() -> int:
 
 _RESUME_PENDING_KEY = "resume_pending"
 _PAUSE_UNTIL_KEY = "pause_until"
+# The last observed server-clock step (seconds) is persisted here so /metrics can
+# export curator_clock_step_seconds (§12): the clock-step abort happens BEFORE any
+# `passes` row is written, so settings is the only durable place to record it.
+_CLOCK_STEP_KEY = "curator_clock_step_seconds"
 
 
 @dataclass
@@ -165,6 +169,12 @@ async def run_pass(
         skew = clock_guard.check()
         if clock_guard.exceeds(skew):
             await _snapshot_request_everyone(registry)
+            # Persist the step for curator_clock_step_seconds (§12). Best-effort: a
+            # write fault here must not stop the abort/recovery path.
+            try:
+                await db.write(lambda c: set_setting(c, _CLOCK_STEP_KEY, str(skew)))
+            except Exception:  # noqa: BLE001 - observability write must never break the abort
+                logger.exception("curator: failed to persist clock step")
             logger.warning("curator: server clock step {:.1f}s — pass aborted", skew)
             return {"status": "clock_step", "clock_step_seconds": skew}
 

@@ -43,6 +43,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 
+from src.api.auth_metrics import auth_rejections
 from src.mcpiface import tools
 
 # The streamable-HTTP session id of the CURRENT request, set by the ASGI wrapper
@@ -230,6 +231,8 @@ class _MCPAsgi:
         if scheme.lower() != "bearer" or not secrets.compare_digest(
             token.encode("utf-8", "ignore"), settings.ext_token.encode("utf-8")
         ):
+            # Count the rejection for curator_auth_rejections_total (§12).
+            auth_rejections.incr("mcp_token")
             await PlainTextResponse("missing or invalid bearer token", status_code=401)(
                 scope, receive, send
             )

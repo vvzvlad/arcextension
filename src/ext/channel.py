@@ -23,6 +23,7 @@ from typing import Any
 from loguru import logger
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from src.api.auth_metrics import auth_rejections
 from src.db import queries
 from src.ext import protocol
 from src.ext.commands import resolve_response
@@ -211,6 +212,9 @@ def _new_request_id() -> str:
 async def _reject(websocket: WebSocket, app, instance_id: str | None, reason: str) -> None:
     """Record (when we have an id), count, send a failing hello_ack, and close."""
     _count_rejection(app)
+    # Also feed the process-memory curator_auth_rejections_total (§12); the reason
+    # is the protocol reject code (auth / protocol / origin / duplicate / instance).
+    auth_rejections.incr(reason)
     if instance_id:
         db = app.state.db
         await db.write(
