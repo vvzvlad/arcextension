@@ -137,17 +137,26 @@ def load_mirror(conn: sqlite3.Connection) -> Mirror:
         ).fetchall()
     ]
 
-    # Live relocate rows: status='done', not restored, not abandoned, AND — the §7
-    # liveness rule — BOTH sessions still match their instances' current sessions.
-    # A session change already wiped that instance's `tabs` (§5), so a dead row's
-    # join simply finds no copy; we filter here so phase B never chases one.
+    # Live relocate rows: phase A done, not restored, phase B NOT yet completed, AND
+    # — the §7 liveness rule — BOTH sessions still match their instances' current
+    # sessions. A session change already wiped that instance's `tabs` (§5), so a dead
+    # row's join simply finds no copy; we filter here so phase B never chases one.
+    #
+    # "Phase B NOT yet completed" = no `relocate_close` references this relocate. A
+    # completed relocation's source is already closed, so without this exclusion the
+    # done relocate row re-enters `live_relocations` next pass, `decide` finds no
+    # source (closed) and wrongly marks the SUCCESS as `abandoned` — corrupting the
+    # §10 journal/metrics and letting the stale row capture a new same-URL tab.
+    # Indexed by actions_origin (§4). This is the retirement of a finished relocation.
     live_relocations = []
     for r in conn.execute(
         "SELECT id, instance_from, session_id_from, tab_id, instance_to, "
         "session_id_to, tab_id_to, url, url_norm, rule_id, rule_pattern, "
         "src_opened_at, src_last_active_at, src_age_unknown "
-        "FROM actions WHERE kind = 'relocate' AND status = 'done' "
-        "AND restored_at IS NULL"
+        "FROM actions a WHERE a.kind = 'relocate' AND a.status = 'done' "
+        "AND a.restored_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM actions rc "
+        "WHERE rc.kind = 'relocate_close' AND rc.origin_action_id = a.id)"
     ).fetchall():
         src = instances.get(r["instance_from"])
         dst = instances.get(r["instance_to"])

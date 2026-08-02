@@ -248,6 +248,39 @@ async def test_source_discard_between_phases_completes(tmp_path):
         await db.close()
 
 
+# --- a COMPLETED relocation is retired, not re-marked abandoned next pass -----
+async def test_completed_relocation_retired_from_live_relocations(tmp_path):
+    # Once phase B writes a `relocate_close` for a relocation, the source is closed
+    # and the relocation is complete. It must NOT re-enter live_relocations next
+    # pass — else `decide` finds no source and wrongly marks the SUCCESS `abandoned`
+    # (corrupting the §10 journal, inflating metrics, capturing a new same-url tab).
+    from src.curator.mirror import load_mirror
+    from src.db.actions import insert_action
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await ext.add_instance("main")
+        await ext.add_instance("prox")
+        reloc_id = await _seed_relocate(
+            db, instance_from="main", instance_to="prox", tab_id=20,
+            session_id_from="s", tab_id_to=99, session_id_to="s",
+            url="https://grafana.lc/d/abc", url_norm="https://grafana.lc/d/abc",
+        )
+        # Before phase B: the relocation is live.
+        m1 = await db.read(load_mirror)
+        assert [r.id for r in m1.live_relocations] == [reloc_id]
+        # Phase B completes: a relocate_close references the relocate row.
+        await db.write(lambda c: insert_action(
+            c, ts=2, kind="relocate_close", status="done", initiator="curator",
+            origin_action_id=reloc_id, instance_from="main", instance_to="prox",
+            url="https://grafana.lc/d/abc", url_norm="https://grafana.lc/d/abc"))
+        # Now RETIRED: excluded from live_relocations (drop the NOT EXISTS => reddens).
+        m2 = await db.read(load_mirror)
+        assert [r.id for r in m2.live_relocations] == []
+    finally:
+        await db.close()
+
+
 # --- phase B: source URL mismatch => abandoned, NO un-quenchable close loop --
 async def test_phase_b_source_mismatch_abandons_no_loop(tmp_path):
     db = await _mkdb(tmp_path)
