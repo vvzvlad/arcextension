@@ -26,6 +26,9 @@ from src.api.rules import (
     reset_rule,
     update_rule,
 )
+from src.api.run_pass import run_pass_endpoint
+from src.curator import runner
+from src.curator.clock import ClockGuard
 from src.db.access import Database
 from src.db.backup import nightly_backup_loop
 from src.db.retention import retention_loop
@@ -42,6 +45,27 @@ async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+async def _curator_driver(app, db, settings) -> None:
+    """Periodic driver: one curator pass every ``PASS_INTERVAL_MIN`` (§7).
+
+    The lease (with its fencing epoch) is the real guard against concurrent passes,
+    so this loop needs no lock of its own. A pass failure is logged and the loop
+    continues — never let one bad pass stop the driver.
+    """
+    interval = settings.pass_interval_min * 60
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await runner.run_pass(
+                db, app.state.ext_registry, settings,
+                clock_guard=app.state.curator_clock,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a bad pass must not kill the driver
+            logger.exception("curator driver: pass failed")
+
+
 def create_app(settings) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette):
@@ -55,6 +79,10 @@ def create_app(settings) -> Starlette:
         # counter a later phase's /metrics exports (curator_auth_rejections_total).
         app.state.ext_registry = Registry()
         app.state.ext_rejections = 0
+        # The server-clock guard (§7) is a persistent monotonic-vs-wall comparator
+        # shared by the periodic driver and POST /api/run_pass; the lease is the real
+        # single-run guard, so sharing one guard across both callers is safe.
+        app.state.curator_clock = ClockGuard(settings.pass_interval_min * 60)
 
         background_tasks: list[asyncio.Task] = []
         if not result.degraded:
@@ -69,6 +97,11 @@ def create_app(settings) -> Starlette:
                         settings.js_audit_retention_days,
                     )
                 )
+            )
+            # The curator pass driver: run one pass every PASS_INTERVAL_MIN. Only one
+            # pass ever runs at a time — enforced by the fencing lease, not this loop.
+            background_tasks.append(
+                asyncio.create_task(_curator_driver(app, db, settings))
             )
         else:
             logger.warning(
@@ -102,6 +135,8 @@ def create_app(settings) -> Starlette:
         Route("/api/rules/{rule_id:int}", update_rule, methods=["PUT"]),
         Route("/api/rules/{rule_id:int}", delete_rule, methods=["DELETE"]),
         Route("/api/rules/{rule_id:int}/reset", reset_rule, methods=["POST"]),
+        # Curator pass (§7): trigger one pass (dry_run / confirm_pending optional).
+        Route("/api/run_pass", run_pass_endpoint, methods=["POST"]),
         WebSocketRoute("/ext", ext_channel),
     ]
     return Starlette(routes=routes, lifespan=lifespan)

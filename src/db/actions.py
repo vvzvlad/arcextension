@@ -15,8 +15,23 @@ from urllib.parse import urlsplit, urlunsplit
 
 # Physical operation kinds (§4). ``relocate`` is the phase-A open; the *_close
 # kinds are evictions; ``restore`` reopens a taken tab.
+#
+# ``relocate_close`` is added in Фаза 8: §7 MANDATES a DISTINCT kind for the
+# phase-B close ("Отдельный kind обязателен") — while phase B wrote ``dedupe_close``
+# the completion of a relocation was indistinguishable from collapsing a duplicate
+# (a whole-pass rollback could not tell which row to reverse, and
+# ``curator_actions_last_pass{kind}`` summed two different operations). §4's prose
+# enum listed only the pre-Фаза-8 kinds; §7 is the canon for the pass and wins.
 ALLOWED_KINDS = frozenset(
-    {"relocate", "dedupe_close", "singleton_close", "window_merge", "reset", "restore"}
+    {
+        "relocate",
+        "relocate_close",
+        "dedupe_close",
+        "singleton_close",
+        "window_merge",
+        "reset",
+        "restore",
+    }
 )
 
 # Terminal statuses. ``abandoned`` is introduced in Фаза 4: restore of an

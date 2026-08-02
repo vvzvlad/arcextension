@@ -31,6 +31,12 @@ class ConnState:
     # whose id != pending_snapshot_id is stale and ignored (§6).
     pending_snapshot_id: str | None = None
     pending_sent_at: int | None = None
+    # The id of the LAST snapshot that was actually applied (set by the channel
+    # after apply_snapshot). The curator pass keys its per-instance readiness on
+    # its OWN request id via this field, NOT on the ``snapshot_at`` column (§6/§7):
+    # a human Cmd+T lands a foreign snapshot mid-pass and moves the column, which —
+    # if readiness were column-keyed — would eject the whole fleet from the pass.
+    last_applied_snapshot_id: str | None = None
     heartbeat_task: asyncio.Task | None = None
     # Outstanding service->extension commands keyed by request id (§6). Each
     # `send_command` stores a Future here and awaits it; the receive loop
@@ -47,6 +53,14 @@ class Registry:
 
     def get(self, instance_id: str) -> ConnState | None:
         return self._by_id.get(instance_id)
+
+    def items(self) -> list[tuple[str, ConnState]]:
+        """Snapshot of the live (instance_id, ConnState) pairs.
+
+        A COPY (list) so a caller can iterate while the map mutates underneath it
+        (the curator pass sends snapshot_requests to every connected instance).
+        """
+        return list(self._by_id.items())
 
     def put(self, instance_id: str, state: ConnState) -> None:
         self._by_id[instance_id] = state
