@@ -255,11 +255,15 @@ async def run_phase_b(ctx: PassCtx, dec) -> None:
         return
 
     # Copy is alive => close the SOURCE with the full expect (§6/§7).
-    # TODO(Фаза 16): WARNING 1 — once ``lease.bump_epoch`` can shift the epoch mid-pass
-    # (pause endpoints), a lease lost BETWEEN this ``close_tab`` and the guarded write
-    # below leaves the source closed with no ``relocate_close`` row (unrecorded /
-    # unrecoverable). Needs an at-least-once "pending-then-complete" write: record the
-    # intent BEFORE the close, reconcile after. The Фаза-8 sub-path is closed by the
+    # WARNING 1 (ACTIVE since Фаза 11): ``lease.bump_epoch`` CAN now shift the epoch
+    # mid-pass — the MCP ``pause`` tool (Фаза 11, src/curator/pause.py) is the first
+    # live caller. A pause landing BETWEEN this ``close_tab`` and the guarded write
+    # below leaves the source closed with no ``relocate_close`` row (unrecorded, and —
+    # now that #27 undo is live — un-undoable). Narrow (a sub-race of an active pass's
+    # phase B) and NOT data-loss (tab end-state is correct), but a real audit/undo gap.
+    # The fix — an at-least-once "pending-then-complete" write (record intent BEFORE the
+    # close, reconcile after) — is a core-pass change that lands with the pause surface
+    # in Фаза 16, not bolted onto the MCP PR. The Фаза-8 sub-path is closed by the
     # hardened renewal loop (runner ``_renew_loop``); this remains for the bump_epoch case.
     try:
         await send_command(
@@ -356,9 +360,10 @@ async def run_close(ctx: PassCtx, dec) -> None:
         logger.info("close deferred (source readiness changed) for {}", tab.url)
         return
 
-    # TODO(Фаза 16): WARNING 1 — same at-least-once gap as phase B: once bump_epoch can
-    # shift the epoch mid-pass, a lease lost between this close and the guarded write
-    # loses the close's record. Needs a pending-then-complete write when pause lands.
+    # WARNING 1 (ACTIVE since Фаза 11): same at-least-once gap as phase B — ``bump_epoch``
+    # can now shift the epoch mid-pass (MCP ``pause``, Фаза 11), so a lease lost between
+    # this close and the guarded write loses the close's record. The pending-then-complete
+    # fix lands with the pause surface in Фаза 16 (see the phase-B note above).
     try:
         await send_command(
             ctx.registry, ctx.db, tab.instance_id, protocol.CMD_CLOSE_TAB,
