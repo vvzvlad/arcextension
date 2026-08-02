@@ -15,10 +15,12 @@ from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 
 from src.db.access import Database
 from src.db.backup import nightly_backup_loop
+from src.ext.channel import ext_channel
+from src.ext.registry import Registry
 
 
 def require_operational(request: Request) -> None:
@@ -44,8 +46,13 @@ def create_app(settings) -> Starlette:
         db = Database(settings.db_path, settings.backup_dir)
         result = await db.open()
         app.state.db = db
+        app.state.settings = settings
         app.state.degraded = result.degraded
         app.state.migration_reason = result.reason
+        # Per-process /ext state: the live-connection registry and the rejections
+        # counter a later phase's /metrics exports (curator_auth_rejections_total).
+        app.state.ext_registry = Registry()
+        app.state.ext_rejections = 0
 
         backup_task: asyncio.Task | None = None
         if not result.degraded:
@@ -66,5 +73,6 @@ def create_app(settings) -> Starlette:
 
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
+        WebSocketRoute("/ext", ext_channel),
     ]
     return Starlette(routes=routes, lifespan=lifespan)
