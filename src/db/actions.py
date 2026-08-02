@@ -63,8 +63,11 @@ ALLOWED_KINDS = frozenset(
 # B is in-flight), and ``undo`` skips a pending row (in-flight, nothing to reverse).
 ALLOWED_STATUSES = frozenset({"done", "failed", "deferred", "abandoned", "pending"})
 
-# Who initiated the action; orthogonal to ``kind`` (§4).
-ALLOWED_INITIATORS = frozenset({"curator", "mcp", "user"})
+# Who initiated the action; orthogonal to ``kind`` (§4). ``admin`` (issue #35 §5) is an
+# ``/api/*`` write authenticated by ADMIN_TOKEN — distinct from ``mcp`` (the MCP
+# transport), from ``user`` (the human at the startpage, authenticated by the instance
+# secret) and from ``curator`` (the autonomous pass).
+ALLOWED_INITIATORS = frozenset({"curator", "mcp", "user", "admin"})
 
 # Column order for the INSERT below — kept next to the SQL so the two never drift.
 _ACTION_COLUMNS = (

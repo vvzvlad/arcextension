@@ -17,8 +17,11 @@ from starlette.testclient import TestClient
 from src.app import create_app
 from src.db.actions import insert_action
 
-EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):

@@ -40,8 +40,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from src.api.guards import (
+    initiator_for,
     read_force_body,
-    require_ext_token,
+    require_api_caller,
     require_not_paused,
     require_operational,
 )
@@ -150,7 +151,8 @@ def _preview_payload(pass_id: str, cls: dict) -> dict:
 
 # --- the copy-close (step-4 guards + §5 session guard) ----------------------
 def _write_pending_undo_close(
-    conn: sqlite3.Connection, reloc: sqlite3.Row, *, now: int, detail: str
+    conn: sqlite3.Connection, reloc: sqlite3.Row, *, now: int, detail: str,
+    initiator: str = "user",
 ) -> int:
     """Journal the copy-close BEFORE the browser command, as ``pending`` (Фаза 16).
 
@@ -170,7 +172,7 @@ def _write_pending_undo_close(
         ts=now,
         kind="undo_close",
         status="pending",
-        initiator="user",
+        initiator=initiator,
         origin_action_id=reloc["id"],
         instance_from=reloc["instance_to"],
         tab_id=reloc["tab_id_to"],
@@ -183,7 +185,10 @@ def _write_pending_undo_close(
     )
 
 
-async def _close_copy(app, reloc: sqlite3.Row, idle_ms: int, *, forced: bool = False) -> dict:
+async def _close_copy(
+    app, reloc: sqlite3.Row, idle_ms: int, *, forced: bool = False,
+    initiator: str = "user",
+) -> dict:
     """Close the phase-A copy ``tab_id_to`` in ``instance_to`` WITH the step-4 guards.
 
     Reuses the guarded close path: a ``close_tab`` carrying the full ``expect`` so the
@@ -230,7 +235,9 @@ async def _close_copy(app, reloc: sqlite3.Row, idle_ms: int, *, forced: bool = F
     }
     detail = "undo_close:force" if forced else "undo_close"
     action_id = await db.write(
-        lambda c: _write_pending_undo_close(c, reloc, now=_now_ms(), detail=detail)
+        lambda c: _write_pending_undo_close(
+            c, reloc, now=_now_ms(), detail=detail, initiator=initiator
+        )
     )
     try:
         await send_command(
@@ -240,7 +247,7 @@ async def _close_copy(app, reloc: sqlite3.Row, idle_ms: int, *, forced: bool = F
             protocol.CMD_CLOSE_TAB,
             {"tabId": tab_id_to, "expect": expect},
             cmd_timeout_ms=settings.cmd_timeout_ms,
-            initiator="user",
+            initiator=initiator,
         )
     except CommandError as exc:
         # precondition_failed (the human is using the copy), no_such_tab (already gone),
@@ -299,21 +306,26 @@ def _http_reason(exc: HTTPException) -> str:
 
 
 async def _undo_relocation(
-    app, reloc: sqlite3.Row, trigger: sqlite3.Row, idle_ms: int, *, forced: bool = False
+    app, reloc: sqlite3.Row, trigger: sqlite3.Row, idle_ms: int, *, forced: bool = False,
+    initiator: str = "user",
 ) -> dict:
     """Reverse a relocation as a unit: reopen the source, then close the copy.
 
     Source FIRST (data safety): if the reopen cannot be made fresh (§6) we do NOT
     close the copy — closing it after a failed reopen would delete the last copy of
     the URL. ``write_on_present=True`` so the exemptions + ``restored_at`` markers are
-    written even when the source tab is still live (an unfinished relocation)."""
+    written even when the source tab is still live (an unfinished relocation).
+    ``initiator`` ('user'/'admin', §35 §5) is threaded onto both the reopen and the
+    copy-close rows so the whole undo is attributed to the caller that triggered it."""
     result = {
         "action_id": trigger["id"],
         "kind": trigger["kind"],
         "relocate_id": reloc["id"],
     }
     try:
-        rr = await restore_row(app, reloc, write_on_present=True, forced=forced)
+        rr = await restore_row(
+            app, reloc, write_on_present=True, forced=forced, initiator=initiator
+        )
     except HTTPException as exc:
         # Source not restorable => leave the copy in place; report and move on.
         result["outcome"] = "failed"
@@ -323,19 +335,23 @@ async def _undo_relocation(
     result["source_already_present"] = rr["reason"] == "already_present"
     # Mark the paired phase-B close(s) undone so undoing their pass later skips them.
     await app.state.db.write(lambda c: _mark_linked_closes(c, reloc["id"], _now_ms()))
-    close = await _close_copy(app, reloc, idle_ms, forced=forced)
+    close = await _close_copy(app, reloc, idle_ms, forced=forced, initiator=initiator)
     result["copy_closed"] = close["copy_closed"]
     result["copy_reason"] = close.get("reason")
     result["outcome"] = "undone"
     return result
 
 
-async def _undo_pure_close(app, row: sqlite3.Row, *, forced: bool = False) -> dict:
+async def _undo_pure_close(
+    app, row: sqlite3.Row, *, forced: bool = False, initiator: str = "user"
+) -> dict:
     """Reverse a ``dedupe_close`` / ``singleton_close``: reopen the source only (there
     is no copy to close — these evictions never opened one)."""
     result = {"action_id": row["id"], "kind": row["kind"]}
     try:
-        rr = await restore_row(app, row, write_on_present=True, forced=forced)
+        rr = await restore_row(
+            app, row, write_on_present=True, forced=forced, initiator=initiator
+        )
     except HTTPException as exc:
         result["outcome"] = "failed"
         result["reason"] = _http_reason(exc)
@@ -363,13 +379,15 @@ _body = read_force_body
 
 
 async def undo_pass(request: Request) -> JSONResponse:
-    require_ext_token(request)      # 401 before anything else
+    caller = await require_api_caller(request)  # 401 before anything else
     require_operational(request)    # 503 in degraded mode
 
     # Body BEFORE the pause gate: undo is one of the human's own buttons, so §7 lets
-    # an explicit force:true cross an armed pause (and only that).
+    # an explicit force:true cross an armed pause (and only that) — but only for the
+    # instance caller (the human); an admin's force cannot cross (§35 §4).
     body = await _body(request)
-    forced = body.get("force") is True
+    forced = body.get("force") is True and caller.kind == "instance"
+    initiator = initiator_for(caller)  # 'user' (instance) or 'admin' (§35 §5)
     await require_not_paused(request, force=forced)  # 423 while paused (§7 gate)
 
     pass_id = request.path_params["pass_id"]
@@ -424,7 +442,10 @@ async def undo_pass(request: Request) -> JSONResponse:
                 skipped.append({**entry, "reason": "paired_already_undone"})
                 continue
             results.append(
-                await _isolated(_undo_relocation(app, r, r, idle_ms, forced=forced), entry)
+                await _isolated(
+                    _undo_relocation(app, r, r, idle_ms, forced=forced, initiator=initiator),
+                    entry,
+                )
             )
             handled.add(rid)
         elif kind == "relocate_close":
@@ -432,7 +453,9 @@ async def undo_pass(request: Request) -> JSONResponse:
             if reloc is None:
                 # Orphan close (no phase-A row found): reopen the source from this row.
                 results.append(
-                    await _isolated(_undo_pure_close(app, r, forced=forced), entry)
+                    await _isolated(
+                        _undo_pure_close(app, r, forced=forced, initiator=initiator), entry
+                    )
                 )
                 continue
             if reloc["id"] in handled or reloc["restored_at"] is not None:
@@ -440,13 +463,18 @@ async def undo_pass(request: Request) -> JSONResponse:
                 continue
             results.append(
                 await _isolated(
-                    _undo_relocation(app, reloc, r, idle_ms, forced=forced), entry
+                    _undo_relocation(
+                        app, reloc, r, idle_ms, forced=forced, initiator=initiator
+                    ),
+                    entry,
                 )
             )
             handled.add(reloc["id"])
         elif kind in _PURE_CLOSE_KINDS:
             results.append(
-                await _isolated(_undo_pure_close(app, r, forced=forced), entry)
+                await _isolated(
+                    _undo_pure_close(app, r, forced=forced, initiator=initiator), entry
+                )
             )
         else:
             skipped.append({**entry, "reason": f"kind_{kind}"})

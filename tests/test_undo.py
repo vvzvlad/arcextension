@@ -16,14 +16,23 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, approve_instance, make_settings, secret_hash_for
+from conftest import (
+    _recv,
+    approve_instance,
+    instance_headers,
+    make_settings,
+    secret_hash_for,
+)
 from starlette.testclient import TestClient
 
 from src.app import create_app
 from src.db.actions import insert_action
 
-EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
@@ -545,9 +554,13 @@ def test_undo_copy_close_is_journaled_pending_then_done(tmp_path):
                 tab_id_to=77, session_id_to="sess-9", url="https://a/b", url_norm="https://a/b",
             )
             pool = ThreadPoolExecutor(1)
+            # Authenticate the undo as an instance (src's secretHash) so its rows are
+            # attributed to 'user' — the value this test pins on the undo_close row.
             fut = pool.submit(
                 lambda: client.post(
-                    "/api/passes/p1/undo", headers=AUTH, json={"confirm_impact": True}
+                    "/api/passes/p1/undo",
+                    headers=instance_headers(secret_hash_for("src")),
+                    json={"confirm_impact": True},
                 )
             )
             open_cmd = _recv(ws_src)

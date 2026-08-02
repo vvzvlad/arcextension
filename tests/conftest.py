@@ -112,6 +112,22 @@ def settings_factory():
 # test converges on the same shape instead of hand-rolling INSERTs.
 
 
+def admin_headers() -> dict:
+    """Authorization for an ADMIN_TOKEN caller on ``/api/*`` and ``/mcp`` (issue #35 §4).
+
+    The human/agent credential: opens every ``/api/*`` route of either caller kind, and
+    is the DB-free branch of :func:`src.api.guards.require_api_caller`.
+    """
+    return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
+def instance_headers(secret_hash: str) -> dict:
+    """Authorization for an INSTANCE caller on ``/api/*`` — its ``secretHash`` (issue #35
+    §4), the SAME credential the client sends on /ext hello. Pair with
+    :func:`approve_instance` to have an active row the secret resolves to."""
+    return {"Authorization": f"Bearer {secret_hash}"}
+
+
 def secret_for(instance_id: str) -> str:
     """A deterministic per-instance secret for tests (never a real credential)."""
     return f"secret-{instance_id}"

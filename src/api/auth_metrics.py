@@ -7,7 +7,7 @@ those must survive a crash-loop restart, whereas a rejections counter legitimate
 resets on restart like any Prometheus process counter.
 
 A single module-level singleton is incremented at every auth-rejection site
-(``require_ext_token`` / ``require_metrics_token`` 401s, the MCP Bearer reject, and
+(``require_api_caller`` / ``require_metrics_token`` 401s, the MCP Bearer reject, and
 the ``/ext`` hello reject). Kept in its own leaf module (no project imports) so the
 guards, the MCP ASGI wrapper, the ext channel and the metrics endpoint can all
 import it without an import cycle through ``src.api.metrics``.

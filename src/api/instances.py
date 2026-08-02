@@ -38,8 +38,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from src.api.guards import (
+    initiator_for,
     read_force_body,
-    require_ext_token,
+    require_api_caller,
     require_not_paused,
     require_operational,
 )
@@ -121,18 +122,22 @@ async def merge_windows(app, instance_id: str, params: dict | None = None,
 
 async def merge_windows_endpoint(request: Request) -> JSONResponse:
     """``POST /api/instances/:id/merge_windows`` → ``200 {"merged": <int>}`` (§10)."""
-    require_ext_token(request)      # 401 before anything else
+    caller = await require_api_caller(request)  # 401 before anything else
     require_operational(request)    # 503 in degraded mode
     # A merge is automation the pause silences (§7) — unless the human clicked the §9
     # button with an explicit force:true. Body BEFORE the gate so the flag is visible.
+    # force is honoured only for the instance caller (the human); an admin's force
+    # cannot cross the pause (§35 §4). initiator: 'user' (instance) / 'admin' (§35 §5).
     body = await read_force_body(request)
-    forced = body.get("force") is True
+    forced = body.get("force") is True and caller.kind == "instance"
     await require_not_paused(request, force=forced)
 
     instance_id = request.path_params["instance_id"]
     try:
         return JSONResponse(
-            await merge_windows(request.app, instance_id, forced=forced)
+            await merge_windows(
+                request.app, instance_id, initiator=initiator_for(caller), forced=forced
+            )
         )
     except CommandError as exc:
         status_code = 409 if exc.code in _CLIENT_ERRORS else 502

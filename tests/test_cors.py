@@ -18,11 +18,14 @@ from starlette.testclient import TestClient
 from src.app import create_app
 
 EXT_TOKEN = "test-ext-token"
+ADMIN_TOKEN = "test-admin-token"
 METRICS_TOKEN = "test-metrics-token"
 GOOD_ORIGIN = "chrome-extension://abc"
 EVIL_ORIGIN = "https://evil.com"
 OTHER_EXT_ORIGIN = "chrome-extension://zzz"  # a non-listed extension id
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+# /api/* now authenticates a caller (issue #35 §4); the CORS behaviour is orthogonal, so
+# the generic admin credential is used to reach a 200.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):

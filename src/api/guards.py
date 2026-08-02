@@ -1,7 +1,11 @@
 """Request guards shared by every ``/api/*`` endpoint.
 
-* :func:`require_ext_token` — the Bearer ``EXT_TOKEN`` check (§12: one token opens
-  ``/ext``, ``/api/*`` and ``/mcp``). A missing/wrong token is a flat 401.
+* :func:`require_api_caller` — the per-caller ``/api/*`` Bearer check (issue #35 §4).
+  ADMIN_TOKEN authenticates the human/agent (``Caller("admin")``); any other Bearer is
+  resolved as an ACTIVE instance's ``secretHash`` — the SAME credential the client uses
+  on ``/ext`` hello — yielding ``Caller("instance", id)``. Anything else is a flat 401;
+  a DB failure during the instance lookup is a 503, never a silent pass (revocation must
+  act instantly, so the resolution is NOT cached).
 * :func:`require_metrics_token` — the SEPARATE Bearer ``METRICS_TOKEN`` check for
   ``/metrics`` only (§12: the scrape credential lives in git plaintext, so it must
   never be able to touch anything but ``/metrics``; it must NOT accept ``EXT_TOKEN``).
@@ -25,6 +29,8 @@ from __future__ import annotations
 
 import secrets
 import time
+from dataclasses import dataclass
+from typing import Literal
 
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -44,11 +50,93 @@ def _bearer_ok(request: Request, expected: str) -> bool:
     )
 
 
-def require_ext_token(request: Request) -> None:
-    """Enforce ``Authorization: Bearer <EXT_TOKEN>``; raise 401 otherwise."""
-    if not _bearer_ok(request, request.app.state.settings.ext_token):
-        auth_rejections.incr("ext_token")
+def _bearer_token(request: Request) -> str | None:
+    """Return the raw Bearer token, or ``None`` when the header is missing/not Bearer."""
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    return token
+
+
+@dataclass(frozen=True)
+class Caller:
+    """Who authenticated an ``/api/*`` request (issue #35 §4).
+
+    ``kind='admin'`` is the human at the startpage OR the MCP agent, both bearing
+    ADMIN_TOKEN; ``instance_id`` is None. ``kind='instance'`` is a curated browser
+    instance authenticating with its own ``secretHash`` (the /ext hello credential);
+    ``instance_id`` is the server-assigned id that secret resolved to.
+    """
+
+    kind: Literal["instance", "admin"]
+    instance_id: str | None = None
+
+
+def initiator_for(caller: Caller) -> str:
+    """Map an ``/api/*`` caller to the ``actions.initiator`` it writes (issue #35 §5).
+
+    An instance caller is the human at the startpage → ``'user'`` (§7's forced-button
+    initiator). An admin caller is an ADMIN_TOKEN-authenticated ``/api/*`` write →
+    ``'admin'`` (distinct from ``'mcp'``, the MCP transport, and ``'curator'``, the
+    autonomous pass). Only the mutating force-verbs (restore, undo, merge_windows) use
+    this; ``/api/focus`` still writes nothing.
+    """
+    return "user" if caller.kind == "instance" else "admin"
+
+
+async def require_api_caller(request: Request) -> Caller:
+    """Authenticate an ``/api/*`` request and return (and store) its :class:`Caller`.
+
+    Order matters (issue #35 §4):
+
+    1. A missing / non-Bearer header is a flat 401.
+    2. **ADMIN first, no DB, constant-time**: a token equal to ADMIN_TOKEN is the
+       admin caller — resolved before any DB touch so admin wins even against a token
+       that might also happen to hash to an instance secret, and so admin auth never
+       depends on the DB being reachable.
+    3. Otherwise the token is treated as an instance ``secretHash`` and resolved to an
+       **active** instances row (the same credential the client sent on /ext hello; the
+       raw 32-byte secret never leaves the client). A match is the instance caller.
+    4. A DB failure during that lookup is a **503, never a silent pass** — a revocation
+       we cannot check must not fall through to admin/anon. No caching: revocation is
+       instant, so the secret is resolved on every request.
+
+    The result is stored on ``request.state.caller`` AND returned (callers may use
+    either); the four force-verbs and the mutating verbs read ``.kind`` off it.
+    """
+    token = _bearer_token(request)
+    if token is None:
+        auth_rejections.incr("api_token")
         raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+    # (2) ADMIN first — constant-time compare, no DB.
+    if _bearer_ok(request, request.app.state.settings.admin_token):
+        caller = Caller(kind="admin")
+        request.state.caller = caller
+        return caller
+
+    # (3) Resolve the token as an instance secretHash. Leaf import (no cycle):
+    # src.db.queries never imports the api package.
+    from src.db.queries import resolve_secret
+
+    try:
+        resolved = await request.app.state.db.read(
+            lambda c: resolve_secret(c, token)
+        )
+    except Exception:
+        # (4) The revocation check itself failed. Fail CLOSED with 503 — never let a
+        # DB outage degrade into an anonymous or admin pass.
+        raise HTTPException(status_code=503, detail="auth backend unavailable")
+
+    if resolved is not None and resolved[1] == "active":
+        caller = Caller(kind="instance", instance_id=resolved[0])
+        request.state.caller = caller
+        return caller
+
+    # No admin match and no active instance (unknown / revoked / pending secret) → 401.
+    auth_rejections.incr("api_token")
+    raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
 
 def require_metrics_token(request: Request) -> None:
@@ -104,7 +192,11 @@ async def require_not_paused(request: Request, *, force: bool = False) -> None:
     ``force`` is §7's ONE exception: «Исключение — собственные кнопки человека, и то с
     явным ``force:true``, который пишется в ``actions`` как ``initiator=user``». The
     caller passes it ONLY for a verb that IS a button on the startpage, read from the
-    request body via :func:`read_force_body`. Those four:
+    request body via :func:`read_force_body`. Under issue #35 §4 the startpage human
+    authenticates with the INSTANCE secret, so the caller ANDs ``force`` with
+    ``caller.kind == "instance"``: an admin/agent bearing ADMIN_TOKEN never crosses the
+    pause with ``{"force": true}`` (else it would bypass §7's kill-switch outside MCP).
+    Those four force-verbs:
 
     * ``POST /api/focus`` — jump to a tab (§10),
     * ``POST /api/actions/:id/restore`` — bring a taken tab back (§10),

@@ -210,7 +210,7 @@ def create_app(settings) -> Starlette:
         Route("/api/pause", resume_endpoint, methods=["DELETE"]),
         # MCP over streamable HTTP (§11): an exact Route at /mcp (NOT a Mount under
         # /mcp, which would double the path to /mcp/mcp and add a 307). Auth is the
-        # same EXT_TOKEN Bearer, enforced inside the ASGI handler.
+        # ADMIN_TOKEN Bearer (the agent equals the human, §35), enforced inside the ASGI handler.
         mcp_route(mcp),
         WebSocketRoute("/ext", ext_channel),
     ]

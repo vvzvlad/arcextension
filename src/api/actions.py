@@ -26,7 +26,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_api_caller, require_operational
 from src.db.actions import normalize_url
 
 # Columns surfaced in the archive list — enough to render a row and drive a restore,
@@ -137,7 +137,7 @@ def _list_actions(conn: sqlite3.Connection, clause: str, args: list, limit: int,
 
 
 async def list_actions(request: Request) -> JSONResponse:
-    require_ext_token(request)      # 401 before anything else
+    await require_api_caller(request)  # 401 before anything else
     require_operational(request)    # 503 in degraded mode
 
     params = request.query_params
