@@ -1,6 +1,6 @@
 // MV3 service worker entry (type: module). Wires chrome events to the activity
-// map (§5) and drives the /ext connection (§6). Command EXECUTION is the NEXT
-// phase — see the `onCommand` hook passed to the Connection.
+// map (§5) and drives the /ext connection (§6), which executes service commands
+// through the §6 dispatcher (src/commands.js).
 //
 // The SW may die and be resurrected at any time; nothing here caches state in
 // worker memory across an await that it could not rebuild — the activity map is
@@ -31,14 +31,10 @@ const logFail = (p) => {
   }
 };
 
-const connection = new Connection(chromeEnv(), {
-  buildSnapshot,
-  onCommand: (frame) => {
-    // NEXT PHASE hook: execute open_tab/close_tab/execute_js and reply with a
-    // `response` frame. Deliberately a no-op here.
-    console.log("[ext] command received (execution is a later phase):", frame && frame.command);
-  },
-});
+// The Connection defaults its commandHandler to the real §6 dispatcher
+// (src/commands.js): a `command` frame is executed against chrome.tabs/windows/
+// scripting + the activity map and answered with a `response` frame.
+const connection = new Connection(chromeEnv(), { buildSnapshot });
 
 // --- tab / window activity events (§5 table) -------------------------------
 

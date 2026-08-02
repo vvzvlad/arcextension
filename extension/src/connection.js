@@ -44,7 +44,9 @@ export function chromeEnv() {
 import {
   INSTALL_UUID_KEY,
   SESSION_ID_KEY,
+  ALLOW_EXECUTE_JS_KEY,
 } from "./constants.js";
+import { dispatchCommand } from "./commands.js";
 
 // installUuid lives in chrome.storage.local (in the profile, NOT copied with the
 // bundle — that is the whole point, §6): a copied instance.json shares instanceId
@@ -73,12 +75,14 @@ async function ensureSessionId(env) {
 
 export class Connection {
   // `buildSnapshot(now, sessionId)` is injected so this module does not import
-  // the map/snapshot directly under test; the SW wires the real one. `onCommand`
-  // is the NEXT-phase hook (default: log and ignore).
-  constructor(env, { buildSnapshot, onCommand } = {}) {
+  // the map/snapshot directly under test; the SW wires the real one.
+  // `commandHandler(frame, ctx)` executes a `command` frame and returns
+  // `{ok, result|error}`; it defaults to the real §6 dispatcher and is
+  // overridable so the wiring can be tested in isolation.
+  constructor(env, { buildSnapshot, commandHandler } = {}) {
     this.env = env;
     this.buildSnapshot = buildSnapshot;
-    this.onCommand = onCommand || ((frame) => env.log("command (ignored, next phase):", frame && frame.command));
+    this.commandHandler = commandHandler || dispatchCommand;
     this.ws = null;
     this.config = null;
     this.installUuid = null;
@@ -117,7 +121,10 @@ export class Connection {
     this.helloAcked = false;
     const ws = new this.env.WebSocketImpl(url);
     this.ws = ws;
-    ws.onopen = () => this._sendHello();
+    // _sendHello reads the execute_js checkbox from storage (async), so surface a
+    // rejected read instead of dropping the hello as an unhandled rejection.
+    ws.onopen = () =>
+      this._sendHello().catch((e) => this.env.log("hello send failed:", e));
     // _onMessage is async (snapshot_request builds a snapshot); catch its
     // rejection so a failed buildSnapshot/tabs.query surfaces instead of becoming
     // an unhandled rejection that silently drops the reply.
@@ -141,7 +148,7 @@ export class Connection {
     }
   }
 
-  _sendHello() {
+  async _sendHello() {
     this._send({
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
@@ -151,9 +158,26 @@ export class Connection {
       origin: this.env.origin || (typeof location !== "undefined" ? location.origin : undefined),
       title: this.config.title,
       sessionId: this.sessionId,
-      // execute_js is gated by the options page (a later phase); default off.
-      allowExecuteJs: !!this.config.allowExecuteJs,
+      // The AUTHORITATIVE execute_js state is the options checkbox in
+      // storage.local (§12), not instance.json — a copied bundle shares the
+      // config default but sets its own checkbox. Report the stored value.
+      allowExecuteJs: await this._readAllowExecuteJs(),
     });
+  }
+
+  // Report EXACTLY what the execute_js gate enforces (§12: "инстанс сообщает
+  // состояние галочки, дефолт выкл"). The gate in commands.js reads ONLY
+  // storage.local and defaults OFF — it never consults instance.json — so hello
+  // must mirror that, or the service would hold a false "can execute_js" state and
+  // send a doomed execute_js. An unset key (or a read error) => OFF.
+  async _readAllowExecuteJs() {
+    try {
+      const got = await this.env.storageLocalGet(ALLOW_EXECUTE_JS_KEY);
+      return !!(got && got[ALLOW_EXECUTE_JS_KEY]);
+    } catch (e) {
+      this.env.log("reading execute_js checkbox failed:", e);
+      return false;
+    }
   }
 
   // Frames are JSON; correlation is by `id` (§6). Returns the frame handled (for
@@ -192,12 +216,25 @@ export class Connection {
         // pong is the only unsolicited-ish client message and is required (§6).
         this._send({ type: "pong" });
         return msg;
-      case "command":
-        // NEXT PHASE: verbs (open_tab/close_tab/execute_js) are executed here and
-        // answered with {type:'response', id, ok, result|error}. For now, hand to
-        // the hook and do NOT act.
-        this.onCommand(msg);
+      case "command": {
+        // Execute the verb (§6) and answer with a correlated `response`. The
+        // handler owns the session check and every guard; it never throws (an
+        // unexpected failure comes back as {ok:false, error:{code:'internal'}}),
+        // but wrap defensively so a bug still yields a reply rather than a silent
+        // drop that leaves the service awaiting forever.
+        let outcome;
+        try {
+          outcome = await this.commandHandler(msg, {
+            sessionId: this.sessionId,
+            now: this.env.now,
+          });
+        } catch (e) {
+          this.env.log("command handler crashed:", e);
+          outcome = { ok: false, error: { code: "internal", message: String((e && e.message) || e) } };
+        }
+        this._send({ type: "response", id: msg.id, ...outcome });
         return msg;
+      }
       default:
         return null; // unknown/late frame — ignore (§6)
     }

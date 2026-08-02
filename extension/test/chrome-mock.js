@@ -80,6 +80,9 @@ export function createChromeMock(opts = {}) {
     windows: opts.windows ? [...opts.windows] : [], // array of {id, type, state}
     lastFocused: opts.lastFocused || { id: -1, focused: false },
     idleState: opts.idleState || "active",
+    nextTabId: opts.nextTabId || 1000, // id counter for tabs.create
+    moveError: opts.moveError || null, // when set, tabs.move throws this message
+    scriptResults: opts.scriptResults || [{ result: null }], // scripting.executeScript return
   };
 
   const chrome = {
@@ -98,6 +101,44 @@ export function createChromeMock(opts = {}) {
         if (!t) throw new Error("no such tab");
         return { ...t };
       },
+      // create/remove/update/move mutate the "live browser" state so the command
+      // dispatcher can be exercised end to end; each resolves on a macrotask.
+      create: async (props) => {
+        await tick();
+        const id = state.nextTabId++;
+        const tab = {
+          id,
+          windowId: props.windowId ?? (state.lastFocused && state.lastFocused.id) ?? 1,
+          url: props.url,
+          pinned: !!props.pinned,
+          active: !!props.active,
+          audible: false,
+        };
+        state.tabs.push(tab);
+        return { ...tab };
+      },
+      remove: async (tabId) => {
+        await tick();
+        const i = state.tabs.findIndex((x) => x.id === tabId);
+        if (i === -1) throw new Error("no such tab");
+        state.tabs.splice(i, 1);
+      },
+      update: async (tabId, props) => {
+        await tick();
+        const t = state.tabs.find((x) => x.id === tabId);
+        if (!t) throw new Error("no such tab");
+        Object.assign(t, props);
+        return { ...t };
+      },
+      move: async (tabIds, moveProps) => {
+        await tick();
+        if (state.moveError) throw new Error(state.moveError);
+        const ids = Array.isArray(tabIds) ? tabIds : [tabIds];
+        for (const id of ids) {
+          const t = state.tabs.find((x) => x.id === id);
+          if (t) t.windowId = moveProps.windowId;
+        }
+      },
       onCreated: new FakeEvent(),
       onActivated: new FakeEvent(),
       onUpdated: new FakeEvent(),
@@ -113,7 +154,19 @@ export function createChromeMock(opts = {}) {
         await tick();
         return { ...state.lastFocused };
       },
+      update: async (windowId, props) => {
+        await tick();
+        const w = state.windows.find((x) => x.id === windowId);
+        if (w) Object.assign(w, props);
+        return w ? { ...w } : { id: windowId, ...props };
+      },
       onFocusChanged: new FakeEvent(),
+    },
+    scripting: {
+      executeScript: async (_injection) => {
+        await tick();
+        return state.scriptResults;
+      },
     },
     alarms: {
       _alarms: {},

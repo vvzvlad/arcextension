@@ -44,7 +44,34 @@ export const WINDOW_ID_NONE = -1;
 export const MAP_KEY = "activityMap"; // chrome.storage.session — the activity map
 export const SESSION_ID_KEY = "sessionId"; // chrome.storage.session — the epoch
 export const INSTALL_UUID_KEY = "installUuid"; // chrome.storage.local — survives sessions
+// The execute_js opt-in checkbox (§12): per-copy, default OFF, lives in
+// chrome.storage.local (survives a session, is set from the options page). It is
+// the AUTHORITATIVE runtime state — read fresh on every execute_js and reported
+// in `hello` — so a copied instance.json cannot smuggle the gate open.
+export const ALLOW_EXECUTE_JS_KEY = "allowExecuteJs";
 
 // The reconnect alarm name.
 export const RECONNECT_ALARM = "ext-reconnect";
 export const TICK_ALARM = "ext-tick";
+
+// --- Command verbs (§6 "Команды (сервис → расширение)") ---------------------
+// The `command` field of a service->extension command frame. Mirrors the
+// service-side CMD_* strings in src/ext/protocol.py — the two sides MUST agree.
+export const CMD_OPEN_TAB = "open_tab";
+export const CMD_CLOSE_TAB = "close_tab";
+export const CMD_GET_TAB = "get_tab";
+export const CMD_FOCUS_TAB = "focus_tab";
+export const CMD_NAVIGATE_TAB = "navigate_tab";
+export const CMD_MERGE_WINDOWS = "merge_windows";
+export const CMD_EXECUTE_JS = "execute_js";
+
+// --- Command error codes (§6) -----------------------------------------------
+// The `error.code` a failing `response` carries. Mirrors the ERR_* strings in
+// src/ext/protocol.py.
+export const ERR_STALE_SESSION = "stale_session";
+export const ERR_PRECONDITION_FAILED = "precondition_failed";
+export const ERR_NO_SUCH_TAB = "no_such_tab";
+export const ERR_NO_WINDOW = "no_window";
+export const ERR_JS_DISABLED = "js_disabled";
+export const ERR_BUSY_DRAGGING = "busy_dragging";
+export const ERR_INTERNAL = "internal";

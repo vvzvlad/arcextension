@@ -37,7 +37,7 @@ function makeConnection(overrides = {}) {
       tabs: [{ tabId: 1, ageMs: 0, openedAgoMs: 0 }],
       windows: [{ id: 5, type: "normal", state: "normal" }],
     }));
-  return new Connection(chromeEnv(), { buildSnapshot, onCommand: overrides.onCommand });
+  return new Connection(chromeEnv(), { buildSnapshot, commandHandler: overrides.commandHandler });
 }
 
 describe("ids & config (§6)", () => {
@@ -67,6 +67,9 @@ describe("hello (§6)", () => {
     await conn.ensureSocket();
     const ws = conn.ws;
     ws._open();
+    // hello now reads the execute_js checkbox from storage.local first, so it is
+    // sent on a macrotask — flush before asserting.
+    await flush();
     expect(ws.sent).toHaveLength(1);
     expect(ws.sent[0]).toMatchObject({
       type: "hello",
@@ -77,6 +80,19 @@ describe("hello (§6)", () => {
       sessionId: conn.sessionId,
       allowExecuteJs: false,
     });
+  });
+
+  it("reports the checkbox state, NOT instance.json (gate default OFF, §12)", async () => {
+    const conn = makeConnection();
+    await conn.init();
+    // instance.json opted in, but the per-copy checkbox is UNSET => the gate is
+    // OFF, so hello must report false (else the service holds a false "can
+    // execute_js" and sends a doomed execute_js). Old config-fallback => true.
+    conn.config.allowExecuteJs = true;
+    expect(await conn._readAllowExecuteJs()).toBe(false);
+    // With the checkbox explicitly on, it reports true.
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    expect(await conn._readAllowExecuteJs()).toBe(true);
   });
 });
 
@@ -132,18 +148,56 @@ describe("snapshot_request / ping (§6)", () => {
   });
 });
 
-describe("command hook (NEXT phase) (§6)", () => {
-  it("hands a command frame to the hook and sends NO response (verbs deferred)", async () => {
-    const onCommand = vi.fn();
-    const conn = makeConnection({ onCommand });
+describe("command execution wiring (§6)", () => {
+  it("runs the handler with the current session and sends a correlated response", async () => {
+    const commandHandler = vi.fn(async (_frame, ctx) => ({
+      ok: true,
+      result: { seenSession: ctx.sessionId },
+    }));
+    const conn = makeConnection({ commandHandler });
     await conn.ensureSocket();
     const ws = conn.ws;
     ws._open();
     ws.sent.length = 0; // ignore the hello
-    ws._serverSend({ type: "command", id: "c1", command: "open_tab", params: {} });
+    ws._serverSend({ type: "command", id: "c1", command: "get_tab", params: { tabId: 3 } });
     await flush();
-    expect(onCommand).toHaveBeenCalledOnce();
-    expect(ws.sent.find((m) => m.type === "response")).toBeUndefined();
+    expect(commandHandler).toHaveBeenCalledOnce();
+    // The handler is fed the extension's CURRENT session (for its own §5 check).
+    expect(commandHandler.mock.calls[0][1].sessionId).toBe(conn.sessionId);
+    const resp = ws.sent.find((m) => m.type === "response");
+    expect(resp).toBeDefined();
+    expect(resp.id).toBe("c1"); // correlated by id
+    expect(resp.ok).toBe(true);
+    expect(resp.result).toEqual({ seenSession: conn.sessionId });
+  });
+
+  it("still replies (internal error) when the handler throws", async () => {
+    const commandHandler = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    const conn = makeConnection({ commandHandler });
+    await conn.ensureSocket();
+    const ws = conn.ws;
+    ws._open();
+    ws.sent.length = 0;
+    ws._serverSend({ type: "command", id: "c9", command: "get_tab", params: {} });
+    await flush();
+    const resp = ws.sent.find((m) => m.type === "response");
+    expect(resp).toMatchObject({ id: "c9", ok: false, error: { code: "internal" } });
+  });
+});
+
+describe("hello reports the STORED execute_js checkbox (§12)", () => {
+  it("sends the storage.local value, overriding the instance.json default", async () => {
+    // instance.json default is off (CONFIG.allowExecuteJs=false); the owner
+    // ticked the options checkbox => storage.local wins and hello reports true.
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    const ws = conn.ws;
+    ws._open();
+    await flush();
+    expect(ws.sent[0]).toMatchObject({ type: "hello", allowExecuteJs: true });
   });
 });
 
