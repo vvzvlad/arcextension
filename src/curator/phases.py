@@ -402,3 +402,59 @@ async def run_close(ctx: PassCtx, dec) -> None:
 
     await ctx.db.write(lease.guarded(ctx.epoch, _done))
     ctx.actions_count += 1
+
+
+# --- step 9: window merge (§9) ----------------------------------------------
+async def run_window_merge(ctx: PassCtx, merge) -> None:
+    """Execute one §9 window merge: fold the source windows' UNPINNED tabs into the
+    target, then journal a NON-UNDOABLE ``window_merge`` row.
+
+    The server only names ``{windowIds, targetWindowId}``; the extension moves the
+    unpinned tabs (pinned ones stay — a cross-window ``tabs.move`` resets ``pinned``,
+    §9) and, BEFORE the move, marks the curator cause on BOTH windows so the neighbour
+    activation the move triggers does not rejuvenate the merged window (§6). The
+    server does NOT re-stamp any tab age here.
+
+    ``busy_dragging`` (the human is holding a tab), a connection-class code, or
+    ``no_window`` are NOT failures: no row is written and the merge re-decides against
+    a fresh mirror next pass (§9). On success one ``window_merge`` row records the
+    executed plan for the archive; NO pre-merge layout is stored (there is none in the
+    schema), so ``undo._classify`` honestly reports the merge as not undone (§9)."""
+    # §7 mid-pass eject: a reconnect / session change since readiness was captured
+    # invalidates the snapshot's window & tab ids; defer (no command, no row).
+    if not _ready_unchanged(ctx, merge.instance_id):
+        logger.info("window merge deferred (instance readiness changed): {}", merge.instance_id)
+        return
+
+    try:
+        result = await send_command(
+            ctx.registry, ctx.db, merge.instance_id, protocol.CMD_MERGE_WINDOWS,
+            {
+                "windowIds": merge.source_window_ids,
+                "targetWindowId": merge.target_window_id,
+            },
+            cmd_timeout_ms=ctx.settings.cmd_timeout_ms,
+        )
+    except CommandError as exc:
+        # Transient (busy_dragging) or connection-class: retry next pass, no row (§9).
+        logger.info("window merge deferred for {}: {}", merge.instance_id, exc.code)
+        return
+
+    detail = json.dumps(
+        {
+            "targetWindowId": merge.target_window_id,
+            "windowIds": merge.source_window_ids,
+            "moved_tab_ids": merge.moved_tab_ids,
+            "merged": result.get("merged"),
+        }
+    )
+
+    def _write(conn: sqlite3.Connection) -> None:
+        # Non-undoable (§9): a plain archival record; no pre-merge layout is kept.
+        insert_action(
+            conn, ts=ctx.now, kind="window_merge", status="done", initiator="curator",
+            pass_id=ctx.pass_id, instance_from=merge.instance_id, detail=detail,
+        )
+
+    await ctx.db.write(lease.guarded(ctx.epoch, _write))
+    ctx.actions_count += 1
