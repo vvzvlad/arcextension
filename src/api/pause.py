@@ -10,9 +10,10 @@ the MCP ``pause`` / ``resume`` tools.
   §7). Extending while paused is allowed, so this route is deliberately NOT behind the
   pause gate. Returns ``{paused_until, pause_started_at}``.
 * ``DELETE /api/pause`` — manual resume. Shifts the TTL protections by the ACTUAL pause
-  duration, clears the pause + the ``resume_pending`` latch, THEN triggers a real pass
-  immediately: a human at the keyboard wants the backlog handled now, unlike a timeout
-  expiry which defers behind a click (§7). Also NOT gated (it is a resume verb).
+  duration, clears the pause, THEN triggers a real CONFIRMING pass immediately: a human
+  at the keyboard wants the backlog handled now, unlike a timeout expiry which defers
+  behind a click (§7). The pass is what clears the ``resume_pending`` latch — see
+  :func:`resume_now`. Also NOT gated (it is a resume verb).
 
 authed via ``require_api_caller`` (Bearer ADMIN_TOKEN or an instance secret — §35 §4);
 both refuse degraded mode (``require_operational``).
@@ -71,7 +72,7 @@ async def pause_endpoint(request: Request) -> JSONResponse:
 
 
 async def resume_now(app) -> dict:
-    """Manual resume: TTL shift + clear the latch, THEN run a pass immediately (§7).
+    """Manual resume: TTL shift + clear the pause, THEN a CONFIRMING pass now (§7).
 
     THE resume shape, shared by ``DELETE /api/pause`` and the MCP ``resume`` tool. §7
     is explicit that a manual resume runs a pass at once («Снятие руками
@@ -81,7 +82,15 @@ async def resume_now(app) -> dict:
     behaviours. Returns ``{ttl_shift_ms, pass}``.
     """
     now = _now_ms()
-    shift = await app.state.db.write(lambda c: pause_ops.resume(c, now=now))
+    # Apply the TTL shift and clear the pause — but deliberately NOT the
+    # ``resume_pending`` latch (which is why this is ``apply_resume_shift`` and not
+    # ``pause_ops.resume``): the confirming pass below is what consumes it, and it has
+    # to still SEE it. The runner degrades ``confirm_pending`` to an ordinary pass when
+    # no latch is armed (a client sending the flag out of habit must not bypass the
+    # continuity gate), so clearing the latch first turned the confirm into an ordinary
+    # pass — which on a continuity break walks straight back into the gate that armed
+    # it. A real pass clears the latch itself, in ``runner._finish_continuity``.
+    shift = await app.state.db.write(lambda c: pause_ops.apply_resume_shift(c, now=now))
     # Human (or agent) asked for it → handle the backlog immediately (§7).
     #
     # ``confirm_pending=True`` is REQUIRED, not decorative. Clearing the pause is not
@@ -94,6 +103,10 @@ async def resume_now(app) -> dict:
     #
     # Passing it unconditionally is safe: with no armed latch the runner logs and
     # degrades it to an ordinary pass (see ``confirm_pending and not resume_armed``).
+    #
+    # A pass that never got to run (a re-armed pause, an unavailable lease, a clock
+    # step) leaves the latch armed — which is the truth: its plan is still pending, and
+    # the button can be pressed again.
     result = await runner.run_pass(
         app.state.db,
         app.state.ext_registry,

@@ -153,13 +153,18 @@ def apply_resume_shift(conn: sqlite3.Connection, *, now: int) -> int:
 
 
 def resume(conn: sqlite3.Connection, *, now: int) -> int:
-    """Manual resume (§7): apply the TTL shift once, then clear the pause + the latch.
+    """Apply the TTL shift once, then clear the pause AND the ``resume_pending`` latch.
 
     ``apply_resume_shift`` clears ``pause_until`` and ``pause_started_at``; this also
-    clears ``resume_pending`` so a resume both lifts the block AND drops any
-    "waiting for a click" state. The caller (HTTP ``DELETE /api/pause``) triggers a real
-    pass right after — a human at the keyboard wants the backlog handled now (§7).
-    Returns the applied shift (ms), for tests/diagnostics.
+    drops any "waiting for a click" state in one write. Returns the applied shift (ms).
+
+    NOT what the resume BUTTON runs. :func:`src.api.pause.resume_now` composes
+    ``apply_resume_shift`` with a CONFIRMING pass instead, precisely because that pass
+    must still see the latch: the runner turns ``confirm_pending`` into an ordinary pass
+    when nothing is armed, and an ordinary pass after a continuity break walks straight
+    back into the gate that armed the latch. The pass clears it (``_finish_continuity``)
+    once it has actually run. This whole-state clear is kept for a caller that wants the
+    settings write alone, with no pass behind it.
     """
     shift = apply_resume_shift(conn, now=now)
     set_setting(conn, RESUME_PENDING_KEY, "")

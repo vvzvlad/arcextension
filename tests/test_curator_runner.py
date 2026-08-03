@@ -104,7 +104,13 @@ class Ext:
             resp = self.responder(instance_id, frame["command"], frame["params"]) if self.responder else {"ok": True, "result": {}}
             resolve_response(cs, {"type": protocol.TYPE_RESPONSE, "id": frame["id"], **resp})
 
-    async def run_pass(self, **kw):
+    async def with_driver(self, coro):
+        """Await ``coro`` while the emulator answers every frame the pass sends.
+
+        Split out of :meth:`run_pass` so a caller that reaches the runner through
+        something OTHER than ``runner.run_pass`` — ``src.api.pause.resume_now``, the
+        resume button — gets the same live fleet underneath it.
+        """
         stop = asyncio.Event()
 
         async def driver():
@@ -120,10 +126,22 @@ class Ext:
 
         d = asyncio.create_task(driver())
         try:
-            return await runner.run_pass(self.db, self.registry, _settings(), **kw)
+            return await coro
         finally:
             stop.set()
             await d
+
+    async def run_pass(self, **kw):
+        return await self.with_driver(
+            runner.run_pass(self.db, self.registry, _settings(), **kw)
+        )
+
+    def as_app(self, settings=None):
+        """The ``app`` shape ``src.api.pause.resume_now`` reads (``app.state.*``)."""
+        return SimpleNamespace(state=SimpleNamespace(
+            db=self.db, ext_registry=self.registry,
+            settings=settings if settings is not None else _settings(),
+        ))
 
 
 def _tabinfo(tab_id, url, *, window_id=1, pinned=False, active=False, audible=False,
@@ -975,6 +993,74 @@ async def test_clean_db_with_empty_fleet_runs_normally(tmp_path):
         # first pass that actually meets a fleet still defers behind the click.
         from src.curator import clock as clockmod
         assert await db.read(clockmod.read_stored_fingerprint) is None
+    finally:
+        await db.close()
+
+
+# --- the resume BUTTON is the way out of a continuity-break latch (§7) ------
+async def test_resume_now_escapes_a_continuity_break_latch_and_executes(tmp_path):
+    """The exit from ``resume_pending`` armed by a CONTINUITY BREAK, end to end.
+
+    The latch is armed by two events: an expired pause and a continuity break. For the
+    pause there is something to clear, so a plain resume works. For a break there is
+    NOT: no ``pause_until``, no ``pause_started_at`` — only the stale fingerprint, which
+    is refreshed by a REAL pass and by nothing else. An unconfirmed pass returns
+    ``{"status": "resume_pending"}`` at step 1 before doing anything, so the pass that
+    would lift the latch is exactly the pass the latch blocks. Every press of the button
+    cleared nothing, ran nothing and left the latch armed — the state had no exit
+    through the UI at all.
+
+    So this asserts the whole way out, not just a status string: the pass genuinely
+    EXECUTES (the deferred relocation lands in ``actions``), the latch is gone, the
+    stored fingerprint now matches the running config, and the NEXT pass is an ordinary
+    one. Reddens if ``resume_now`` stops confirming the latch.
+    """
+    from src.api.pause import resume_now
+    from src.curator import clock as clockmod
+    from src.curator.pause import RESUME_PENDING_KEY
+    from src.db.settings_store import get_setting
+
+    db = await _mkdb(tmp_path, continuity=False)
+    try:
+        # Continuity was established at IDLE_MINUTES=30 but the service now runs with
+        # 60 (`_settings()`): a §7 break, and one with no pause anywhere near it.
+        await _establish_continuity(db, idle_minutes=30)
+        await _seed_rule(db, "grafana.lc", "prox")
+        ext = Ext(db)
+        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
+        await ext.add_instance("prox", tabs=[])
+        ext.responder = lambda i, c, p: (
+            {"ok": True, "result": {"tabId": ext.next_open_id(), "windowId": 1}}
+            if c == protocol.CMD_OPEN_TAB else {"ok": True, "result": {}}
+        )
+
+        # The break arms the latch: the plan is shown, nothing is executed.
+        armed = await ext.run_pass()
+        assert armed["status"] == "resume_pending"
+        assert armed["plan"]["relocations"] == 1
+        assert await _rows(db, "SELECT COUNT(*) FROM actions") == [(0,)]
+        assert await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
+
+        # The button. DELETE /api/pause and the MCP `resume` tool both come through here.
+        out = await ext.with_driver(resume_now(ext.as_app()))
+
+        # A REAL pass ran — not another `resume_pending` deferral…
+        assert out["pass"]["status"] == "ok", out["pass"]
+        # …and it actually did the work the plan promised.
+        assert await _rows(
+            db, "SELECT instance_from, instance_to, status FROM actions WHERE kind='relocate'"
+        ) == [("main", "prox", "done")]
+        assert await _rows(db, "SELECT COUNT(*) FROM passes") == [(1,)]
+
+        # The latch is gone and the fingerprint was refreshed to the RUNNING config —
+        # the two halves of "the state has an exit". Without the refresh the next tick
+        # would re-arm on the same stale fingerprint and the loop would never end.
+        assert not await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
+        stored = await db.read(clockmod.read_stored_fingerprint)
+        assert stored["idle_minutes"] == 60
+
+        # And the next scheduled pass is an ordinary one.
+        assert (await ext.run_pass())["status"] == "ok"
     finally:
         await db.close()
 

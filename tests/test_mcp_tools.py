@@ -418,6 +418,47 @@ async def test_mcp_resume_runs_a_pass_like_the_http_twin(tmp_path):
     ) == (1,)
 
 
+async def test_mcp_resume_escapes_a_continuity_break_latch(tmp_path):
+    """§7/§11 parity, the other half: the agent's resume must be able to LEAVE
+    ``resume_pending``, not only lift a pause.
+
+    The tool is the same door as ``DELETE /api/pause`` (both run
+    :func:`src.api.pause.resume_now`), and the latch is armed by a CONTINUITY BREAK as
+    well as by an expired pause. On a break there is nothing to clear but the stale
+    fingerprint, which only a real pass refreshes — the pass the latch blocks. An agent
+    that hit that state had no verb that could leave it: the MCP ``run_pass`` tool takes
+    only ``dry_run``, so ``resume`` is its ONLY exit. Reddens if the tool grows a private
+    resume path, or if ``resume_now`` stops confirming the latch: the answer is another
+    ``resume_pending`` and the curator stays latched forever.
+    """
+    from src.curator import clock as clockmod
+
+    db = await _make_db(tmp_path)
+    app = _app(db)
+    # A fleet row (a pass stores a fingerprint only when it saw a fleet, §7) plus a
+    # fingerprint taken at a DIFFERENT IDLE_MINUTES than the running config: a §7
+    # continuity break with no pause anywhere near it.
+    await db.write(lambda c: c.execute(
+        "INSERT INTO instances (id, status, connected, conn_epoch) "
+        "VALUES ('main', 'active', 0, 0)"))
+    fp = await db.read(lambda c: clockmod.current_fingerprint(
+        c, idle_minutes=30, main_instance_id="main"))
+    await db.write(lambda c: clockmod.store_fingerprint(c, fp))
+
+    # The scheduled pass defers behind a click and arms the latch.
+    assert (await tools.run_pass(app))["status"] == "resume_pending"
+    assert (await tools.list_instances(app))["resume_pending"] is True
+
+    out = await tools.resume(app)
+    assert out["ok"] is True
+    # A REAL pass ran (nothing is connected → no_ready_instances), the latch is gone and
+    # the fingerprint now matches the running config, so the next tick stays quiet.
+    assert out["pass"]["status"] == "no_ready_instances", out["pass"]
+    assert (await tools.list_instances(app))["resume_pending"] is False
+    assert (await db.read(clockmod.read_stored_fingerprint))["idle_minutes"] == 60
+    assert (await tools.run_pass(app))["status"] == "no_ready_instances"
+
+
 async def test_list_instances_exposes_resume_pending(tmp_path):
     """§7 verbatim: «`resume_pending` виден в `StateResponse` и в `list_instances`».
 
