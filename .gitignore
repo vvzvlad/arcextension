@@ -27,3 +27,6 @@ startpage/dist/
 # A stray instance.json is dev cruft under enrollment (config is entered per profile in
 # the extension UI, §13) — never commit one.
 extension/instance.json
+
+# Built extension bundle (make bundle OUT=dist) — a build artifact, not source
+dist/

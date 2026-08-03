@@ -243,9 +243,9 @@ once, on `/admin`, during a short window. Themed browser instances are built wit
 **instance generator** — a two-step, token-free flow (`make bundle` then `make instance`,
 see `tools/README.md`):
 
-- `make bundle OUT=~/dist` builds the **one** universal bundle the whole fleet loads. No
+- `make bundle OUT=dist` builds the **one** universal bundle the whole fleet loads. No
   key, no other variable: it is a copy of `extension/` and nothing is stamped into it.
-- `make instance INSTANCE_ID=… BUNDLE_DIR=~/dist OUT=…` wraps that shared bundle in a
+- `make instance INSTANCE_ID=… BUNDLE_DIR=dist OUT=…` wraps that shared bundle in a
   per-instance `.app` (own profile, `.app`, launcher). It writes **no** extension copy and
   **no** `instance.json` — the launcher's `--load-extension` points at the shared bundle.
 - **Cloning a `.app` does not add an instance** — a clone mints a new `install_uuid` in

@@ -104,10 +104,10 @@ fencing-epoch аренда и перечитывание `user_version` внут
 Папка расширения одна на весь парк — инстанс добавляется не копированием, а
 enrollment'ом:
 
-1. `make bundle OUT=~/dist` — один раз на парк: общая папка расширения для всех
+1. `make bundle OUT=dist` — один раз на парк: общая папка расширения для всех
    инстансов. Больше ничего не требуется — ключей нет, id расширения не пинится и
    нигде не используется: ни `/ext`, ни CORS `/api/*` origin не проверяют.
-2. `make instance INSTANCE_ID=… BUNDLE_DIR=~/dist OUT=~/instances [TITLE="…"]` —
+2. `make instance INSTANCE_ID=… BUNDLE_DIR=dist OUT=~/Applications [TITLE="…"]` —
    `.app` со своим профилем. Копия расширения не создаётся, лаунчер
    `--load-extension` смотрит в общую папку. Клон `.app` инстанса не добавляет: у
    свежего профиля свой `install_uuid`, он проходит enrollment отдельно.

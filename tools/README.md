@@ -35,17 +35,17 @@ the CLI (`tools/generate_instance.py`).
 
 ```bash
 # 1. Build the shared universal bundle ONCE.
-make bundle OUT=~/arcextension-dist
+make bundle OUT=dist
 #   …or the CLI directly:
-.venv/bin/python -m tools.generate_instance bundle --out ~/arcextension-dist
+.venv/bin/python -m tools.generate_instance bundle --out dist
 
 # 2. Wrap it in per-instance .apps. The launcher loads the SHARED bundle — no copy.
-make instance INSTANCE_ID=main BUNDLE_DIR=~/arcextension-dist \
-    OUT=~/arcextension-instances TITLE="Curator Main"
+make instance INSTANCE_ID=main BUNDLE_DIR=dist \
+    OUT=~/Applications TITLE="Curator Main"
 #   …or the CLI directly (more options: --icon, --brave-binary, --overwrite):
 .venv/bin/python -m tools.generate_instance generate \
-    --instance-id main --bundle-dir ~/arcextension-dist \
-    --out ~/arcextension-instances --title "Curator Main"
+    --instance-id main --bundle-dir dist \
+    --out ~/Applications --title "Curator Main"
 ```
 
 Neither step prints an extension id, because nothing consumes one. All instances load
