@@ -9,7 +9,8 @@
   resolution is NOT cached).
 * :func:`require_metrics_token` — the SEPARATE Bearer ``METRICS_TOKEN`` check for
   ``/metrics`` only (§12: the scrape credential lives in git plaintext, so it must
-  never be able to touch anything but ``/metrics``; it must NOT accept ``EXT_TOKEN``).
+  never be able to touch anything but ``/metrics``; it must NOT accept ``ADMIN_TOKEN``
+  or a per-instance secret).
 * :func:`require_operational` — 503 while the DB is in degraded mode (a migration
   failure means the schema cannot be trusted for authoritative writes). ``/healthz``
   deliberately does NOT call it: liveness must stay green so an orchestrator keeps
@@ -196,9 +197,9 @@ def require_same_origin(request: Request) -> None:
 def require_metrics_token(request: Request) -> None:
     """Enforce ``Authorization: Bearer <METRICS_TOKEN>`` for ``/metrics``; 401 otherwise.
 
-    A SEPARATE token from ``EXT_TOKEN`` (§12): the scrape credential lives in git
-    plaintext, so it must open ``/metrics`` and nothing else. Compared ONLY against
-    ``metrics_token``, so a valid ``EXT_TOKEN`` is rejected here.
+    A SEPARATE token (§12): the scrape credential lives in git plaintext, so it must
+    open ``/metrics`` and nothing else. Compared ONLY against ``metrics_token``, so a
+    valid ``ADMIN_TOKEN`` (or a per-instance secret) is rejected here.
     """
     if not _bearer_ok(request, request.app.state.settings.metrics_token):
         auth_rejections.incr("metrics_token")

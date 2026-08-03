@@ -63,30 +63,28 @@ startpage: ## Build the startpage, run the §10 build gates, then the vitest sui
 	cd startpage && npm test
 
 # --- Instance generator (§13) ------------------------------------------------
-# Generate a themed Brave instance (own --user-data-dir, extension copy,
-# instance.json, .app). The token is a SECRET — pass it via the EXT_TOKEN env,
-# never on the command line. Note the assignment goes BEFORE `make`: written after
-# it, `EXT_TOKEN=…` is a make argument and lands in argv (visible in `ps`, recorded
-# in shell history) instead of the environment. See tools/README.md for the manual
-# acceptance list.
-#   EXT_TOKEN=… make instance INSTANCE_ID=main SERVICE_URL=wss://host \
-#                 OUT=~/instances TITLE="Curator Main"
-.PHONY: instance
-instance: install ## Generate an instance (vars: INSTANCE_ID SERVICE_URL OUT [TITLE]; env EXT_TOKEN)
-	$(PY) -m tools.generate_instance generate \
-		--instance-id "$(INSTANCE_ID)" --service-url "$(SERVICE_URL)" --out "$(OUT)" \
-		$(if $(TITLE),--title "$(TITLE)",)
+# Under enrollment (§7/§13) the build is a TWO-step flow and neither step carries a
+# token or a service address — both are entered per profile in the extension's
+# enrollment settings UI. See tools/README.md for the manual acceptance list.
+#
+# 1) Build the ONE universal, key-pinned bundle the whole fleet loads. Pass a stable
+#    --key-file for a reproducible chrome-extension:// id across rebuilds.
+#      make bundle OUT=~/dist [KEY_FILE=~/signing_key.pem]
+.PHONY: bundle
+bundle: install ## Build the shared universal bundle (vars: OUT [KEY_FILE])
+	$(PY) -m tools.generate_instance bundle \
+		--out "$(OUT)" \
+		$(if $(KEY_FILE),--key-file "$(KEY_FILE)",)
 
-# Re-stamp EVERY instance under OUT (the §13 rotation path): rotate EXT_TOKEN AND
-# refresh each copy's extension code from this repo's extension/. Both halves matter
-# — the bundle is duplicated per instance and protocolVersion is compared by exact
-# equality (§6), so rotating without carrying the code would reject every instance on
-# hello after a PROTOCOL_VERSION bump. Restart the browsers afterwards so the SW
-# re-reads instance.json. EXT_TOKEN goes BEFORE `make` (see the note above).
-#   EXT_TOKEN=… make restamp OUT=~/instances
-.PHONY: restamp
-restamp: install ## Rotate EXT_TOKEN + refresh code across ALL instances under OUT (env EXT_TOKEN)
-	$(PY) -m tools.generate_instance restamp --out "$(OUT)"
+# 2) Wrap that shared bundle in a per-instance .app + empty profile. NO extension copy
+#    and NO instance.json are written — the launcher's --load-extension points at the
+#    shared BUNDLE_DIR, so every instance loads the same dir (one id/origin).
+#      make instance INSTANCE_ID=main BUNDLE_DIR=~/dist OUT=~/instances [TITLE="Curator Main"]
+.PHONY: instance
+instance: install ## Generate an instance .app (vars: INSTANCE_ID BUNDLE_DIR OUT [TITLE])
+	$(PY) -m tools.generate_instance generate \
+		--instance-id "$(INSTANCE_ID)" --bundle-dir "$(BUNDLE_DIR)" --out "$(OUT)" \
+		$(if $(TITLE),--title "$(TITLE)",)
 
 # --- Housekeeping ------------------------------------------------------------
 .PHONY: clean

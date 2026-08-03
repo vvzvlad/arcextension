@@ -43,10 +43,11 @@ services:
       # (deploy/DEPLOY.md §8), the curator only fingerprints its contents.
       - curator_restore_marker:/app/restore:ro
     environment:
-      # EXT_TOKEN opens /ext, /api/* and /mcp; METRICS_TOKEN is read-only for
-      # /metrics; ADMIN_TOKEN opens /admin (enrollment, §13). All three are REQUIRED —
-      # an empty value fails startup (§4). ADMIN_TOKEN must DIFFER from METRICS_TOKEN.
-      EXT_TOKEN: XXX
+      # Under enrollment (§13) there is NO shared /ext token: METRICS_TOKEN is read-only
+      # for /metrics; ADMIN_TOKEN opens /admin (enrollment), /api/* (human/agent caller)
+      # and /mcp. Both are REQUIRED — an empty value fails startup (§4). ADMIN_TOKEN must
+      # DIFFER from METRICS_TOKEN. Instances authenticate by a per-install secret entered
+      # during enrollment, not by any value set here.
       METRICS_TOKEN: YYY
       ADMIN_TOKEN: ZZZ
       # Backups live on the separate curator_backups volume above, NOT under

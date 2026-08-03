@@ -3,7 +3,8 @@
 The startpage fetches /api/* cross-origin with an Authorization Bearer header, which
 forces a CORS preflight. These tests pin the allow-list behaviour end-to-end through
 the real ``create_app`` middleware stack (Starlette ``TestClient``), and the two
-acceptance auth gates (/metrics needs METRICS_TOKEN, /api/* needs EXT_TOKEN).
+acceptance auth gates (/metrics needs METRICS_TOKEN, /api/* needs ADMIN_TOKEN or an
+active-instance secret — never METRICS_TOKEN).
 
 Each test reddens if its guard is removed: dropping the CORSMiddleware drops the
 Access-Control-Allow-Origin echo (test 1), and widening allow_origins to '*' or a
@@ -17,7 +18,6 @@ from starlette.testclient import TestClient
 
 from src.app import create_app
 
-EXT_TOKEN = "test-ext-token"
 ADMIN_TOKEN = "test-admin-token"
 METRICS_TOKEN = "test-metrics-token"
 GOOD_ORIGIN = "chrome-extension://abc"
@@ -145,16 +145,16 @@ def test_metrics_requires_metrics_token(tmp_path):
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         assert client.get("/metrics").status_code == 401
-        # EXT_TOKEN must NOT open /metrics (§12: separate read-only credential).
+        # ADMIN_TOKEN must NOT open /metrics (§12: separate read-only credential).
         assert client.get(
-            "/metrics", headers={"Authorization": f"Bearer {EXT_TOKEN}"}
+            "/metrics", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
         ).status_code == 401
         assert client.get(
             "/metrics", headers={"Authorization": f"Bearer {METRICS_TOKEN}"}
         ).status_code == 200
 
 
-def test_api_requires_ext_token(tmp_path):
+def test_api_rejects_unauthenticated_and_metrics_token(tmp_path):
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         # read
@@ -163,7 +163,8 @@ def test_api_requires_ext_token(tmp_path):
         assert client.post(
             "/api/focus", json={"instance": "i1", "tabId": 1}
         ).status_code == 401
-        # METRICS_TOKEN must NOT open /api/* (only EXT_TOKEN does, §12).
+        # METRICS_TOKEN must NOT open /api/* (§12: it opens /metrics only; /api/* takes
+        # ADMIN_TOKEN or an active-instance secretHash, §13).
         assert client.get(
             "/api/state", headers={"Authorization": f"Bearer {METRICS_TOKEN}"}
         ).status_code == 401

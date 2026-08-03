@@ -1,6 +1,7 @@
 """The MCP mount (§11): the app BOOTS with /mcp wired in (no "Task group is not
 initialized"), the endpoint is reachable at /mcp (NOT /mcp/mcp), and it is behind the
-ADMIN_TOKEN Bearer (issue #35 §4: the agent equals the human — ADMIN_TOKEN, not EXT_TOKEN).
+ADMIN_TOKEN Bearer (issue #35 §4: the agent equals the human — ADMIN_TOKEN, not a
+per-instance secret or any other token).
 
 These redden if the §11 mount trap is reintroduced:
 * remove ``async with mcp.session_manager.run()`` from the lifespan -> the initialize
@@ -18,7 +19,7 @@ from starlette.testclient import TestClient
 from src.app import create_app
 
 ADMIN_TOKEN = "test-admin-token"
-EXT_TOKEN = "test-ext-token"  # NO LONGER opens /mcp (issue #35 §4) — see the reject test.
+METRICS_TOKEN = "test-metrics-token"  # a valid OTHER-service token — must NOT open /mcp.
 _ACCEPT = "application/json, text/event-stream"
 
 
@@ -88,9 +89,9 @@ def test_mcp_requires_bearer(tmp_path):
     with TestClient(app) as client:
         assert client.post("/mcp", json=_init_body(), headers=_headers(token=None)).status_code == 401
         assert client.post("/mcp", json=_init_body(), headers=_headers(token="wrong")).status_code == 401
-        # issue #35 §4: EXT_TOKEN NO LONGER opens /mcp (only ADMIN_TOKEN does).
+        # issue #35 §4: only ADMIN_TOKEN opens /mcp — a valid METRICS_TOKEN must not.
         assert client.post(
-            "/mcp", json=_init_body(), headers=_headers(token=EXT_TOKEN)
+            "/mcp", json=_init_body(), headers=_headers(token=METRICS_TOKEN)
         ).status_code == 401
 
 

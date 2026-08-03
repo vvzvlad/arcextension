@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Thin CLI entry point for the instance generator (§13).
 
-Usage lives in the subcommands; see ``tools/README.md``. Run via ``make instance``
-/ ``make restamp`` or directly with the project ``.venv`` python.
+Usage lives in the subcommands (``bundle``, ``generate``); see ``tools/README.md``.
+Run via ``make bundle`` / ``make instance`` or directly with the project ``.venv``
+python.
 """
 
 import sys

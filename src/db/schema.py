@@ -180,7 +180,7 @@ _V1_STATEMENTS: list[str] = [
 ]
 
 # --- Version 2: enrollment (§1 of issue #35) --------------------------------
-# Enrollment replaces the shared EXT_TOKEN: an instance says hello with an
+# Enrollment replaces the former shared /ext token: an instance says hello with an
 # install_uuid + a per-install secret, lands in enroll_requests, and an operator
 # approves it into instances during a short enrollment window. This step only adds
 # the STORAGE (tables + columns + the guarding index) and migrates existing rows —

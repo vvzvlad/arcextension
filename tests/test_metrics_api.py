@@ -1,6 +1,6 @@
 """GET /metrics — the Prometheus exposition (§12).
 
-Covers: the separate METRICS_TOKEN guard (EXT_TOKEN rejected), every §12 metric
+Covers: the separate METRICS_TOKEN guard (a non-metrics bearer rejected), every §12 metric
 present from the first scrape, pass facts read from `passes` (incl. the green-and-dead
 last_pass_ok=0), the two acceptance scenarios (hour-long pause suppresses overdue +
 snapshot_age so NO alert can fire; a crash-loop trips overdue computed from `passes`
@@ -23,7 +23,7 @@ from starlette.testclient import TestClient
 
 from src.app import create_app
 
-EXT_TOKEN = "test-ext-token"
+ADMIN_TOKEN = "test-admin-token"
 METRICS_TOKEN = "test-metrics-token"
 MAUTH = {"Authorization": f"Bearer {METRICS_TOKEN}"}
 
@@ -151,16 +151,17 @@ def _scrape(client):
 
 
 # --- auth -------------------------------------------------------------------
-def test_metrics_requires_metrics_token_and_rejects_ext_token(tmp_path):
+def test_metrics_requires_metrics_token_and_rejects_other_tokens(tmp_path):
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         assert client.get("/metrics").status_code == 401
         assert client.get(
             "/metrics", headers={"Authorization": "Bearer nope"}
         ).status_code == 401
-        # EXT_TOKEN must NOT open /metrics (§12: the scrape credential is separate).
+        # A non-metrics bearer must NOT open /metrics (§12: the scrape credential is
+        # separate — ADMIN_TOKEN opens /admin, /api/* and /mcp, never /metrics).
         assert client.get(
-            "/metrics", headers={"Authorization": f"Bearer {EXT_TOKEN}"}
+            "/metrics", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
         ).status_code == 401
         r = client.get("/metrics", headers=MAUTH)
         assert r.status_code == 200
