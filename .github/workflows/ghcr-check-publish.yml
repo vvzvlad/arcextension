@@ -129,7 +129,8 @@ jobs:
 
     - name: Compute image tags
       id: tags
-      # main -> :latest + :<sha> (watchtower deploys :latest); develop -> :develop only
+      # develop -> :develop, and that is the tag watchtower deploys today.
+      # main -> :latest + :<sha> is reserved for releases; the branch does not exist yet.
       run: |
         if [ "${{ github.ref_name }}" = "main" ]; then
           echo "tags=ghcr.io/${{ github.repository }}:latest ghcr.io/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"

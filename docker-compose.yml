@@ -23,7 +23,11 @@ networks:
 
 services:
   curator:
-    image: ghcr.io/vvzvlad/arcextension:latest
+    # `:develop` is the deployed tag — CI publishes it on every push to `develop`,
+    # and the watchtower label below auto-updates the container from it. `main` is
+    # reserved for releases (`:latest` + `:<sha>`) but does not exist yet, so
+    # pinning `:latest` here would resolve to an image that was never published.
+    image: ghcr.io/vvzvlad/arcextension:develop
     container_name: curator
     restart: always
     # The app runs as non-root user `app` (uid 1000): the entrypoint starts as
