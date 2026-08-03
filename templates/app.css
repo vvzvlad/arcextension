@@ -1,0 +1,74 @@
+/* Curator admin console styling. Loaded via <link> under style-src 'self' (no inline). */
+:root {
+  color-scheme: light dark;
+  --line: #cccccc;
+  --muted: #666666;
+  --danger: #b00020;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  margin: 0;
+  padding: 1rem 1.25rem 3rem;
+  line-height: 1.4;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+h1 { font-size: 1.3rem; margin: 0; }
+h2 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+
+section { max-width: 70rem; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+th { color: var(--muted); font-weight: 600; }
+
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+button {
+  font: inherit;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+
+.actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+
+input[type="text"] { font: inherit; padding: 0.25rem 0.4rem; min-width: 8rem; }
+
+.error {
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.75rem;
+}
+
+.muted { color: var(--muted); }

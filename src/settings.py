@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     # surface). Also equals the window's own MAX (ENROLL_WINDOW_MAX_MIN=60), so a request
     # cannot expire under even a maximally-armed window.
     enroll_request_ttl_min: int = 60
+    # Lifetime of an /admin HTML-console browser SESSION (§13, issue #36). The login cookie
+    # carries a random id (never the ADMIN_TOKEN); this is how long that id stays valid in
+    # the in-memory session store before a re-login is required. Enforced SERVER-side (the
+    # cookie Max-Age is only a browser hint), and a rotated ADMIN_TOKEN invalidates every
+    # session immediately regardless of this. 720 minutes = 12h: an unhurried operator
+    # workday, bounded so a walked-away session does not stay open indefinitely.
+    admin_session_ttl_min: int = 720
     # Ceiling on simultaneously-open /ext sockets that have been accepted but have not
     # yet completed a hello/enroll (§2). Refused BEFORE accept() (a handshake rejection,
     # no TLS session), so a flood of opened-but-silent sockets cannot exhaust memory or

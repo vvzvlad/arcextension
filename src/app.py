@@ -30,6 +30,16 @@ from src.api.admin import (
     reject,
     revoke as admin_revoke,
 )
+from src.api.admin_page import (
+    AdminSecurityHeadersMiddleware,
+    admin_page,
+    app_css,
+    app_js,
+    login_js,
+    login_page,
+    login_submit,
+    logout_submit,
+)
 from src.api.cors import CountingCORSMiddleware, cors_kwargs
 from src.api.exemptions import create_exemption, delete_exemption, list_exemptions
 from src.api.guards import require_operational
@@ -234,6 +244,18 @@ def create_app(settings) -> Starlette:
         # instances and opens/reads/closes the enrollment window. JSON only — the HTML
         # console (#36) renders this API. Reads are allowed in degraded mode; the mutating
         # verbs (approve/reject/revoke/window arm+close) answer 503 while degraded.
+        # /admin HTML console (§13, issue #36) — the presentation layer over the JSON API
+        # above. Serving is by EXPLICIT handlers (never StaticFiles) so every HTML/asset
+        # response can carry the CSP header. GET /admin is auth-gated (cookie OR Bearer);
+        # the login form + .js/.css assets are public and hold no secrets. Login mints a
+        # random-id cookie session (in-memory); logout drops it.
+        Route("/admin", admin_page, methods=["GET"]),
+        Route("/admin/login", login_page, methods=["GET"]),
+        Route("/admin/login", login_submit, methods=["POST"]),
+        Route("/admin/logout", logout_submit, methods=["POST"]),
+        Route("/admin/app.js", app_js, methods=["GET"]),
+        Route("/admin/app.css", app_css, methods=["GET"]),
+        Route("/admin/login.js", login_js, methods=["GET"]),
         Route("/admin/enroll/requests", list_enroll_requests, methods=["GET"]),
         Route("/admin/enroll/approve", approve, methods=["POST"]),
         Route("/admin/enroll/reject", reject, methods=["POST"]),
@@ -259,7 +281,11 @@ def create_app(settings) -> Starlette:
     middleware = [
         Middleware(
             CountingCORSMiddleware, **cors_kwargs(settings.ext_allowed_origins)
-        )
+        ),
+        # Stamp X-Content-Type-Options: nosniff on every /admin response (HTML/asset AND the
+        # #35 JSON API that serves untrusted suggested_title/origin verbatim). Header-only,
+        # so it never alters a #35 JSON body/status (§13, issue #36).
+        Middleware(AdminSecurityHeadersMiddleware),
     ]
     app = Starlette(
         routes=routes,
