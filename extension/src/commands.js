@@ -31,12 +31,14 @@ import {
   CMD_NAVIGATE_TAB,
   CMD_MERGE_WINDOWS,
   CMD_EXECUTE_JS,
+  CMD_MOVE_TAB,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
   ERR_NO_WINDOW,
   ERR_JS_DISABLED,
   ERR_BUSY_DRAGGING,
+  ERR_PINNED_CROSS_WINDOW,
   ERR_INTERNAL,
 } from "./constants.js";
 
@@ -112,6 +114,8 @@ export async function dispatchCommand(frame, ctx = {}) {
         return await navigateTab(params);
       case CMD_MERGE_WINDOWS:
         return await mergeWindows(params, nowFn, map);
+      case CMD_MOVE_TAB:
+        return await moveTab(params, nowFn, map);
       case CMD_EXECUTE_JS:
         return await executeJs(params);
       default:
@@ -489,6 +493,95 @@ async function mergeWindows(params, nowFn, map) {
     return fail(ERR_INTERNAL, msg);
   }
   return ok({ merged: toMove.length });
+}
+
+// move_tab {tabId, windowId, index?}. Move ONE tab to a window and position inside
+// THIS browser. Cross-INSTANCE relocation is the open+close pair of §7 and works
+// only because the browsers are separate processes; between the windows of one
+// browser there was no verb at all, though `chrome.tabs.move` has driven
+// merge_windows all along. `index` defaults to -1, chrome's own "append to the end".
+//
+// §9's PINNED rule applies verbatim and is the reason this refusal has a code of its
+// own. A cross-window `tabs.move` silently resets `pinned` (undocumented Chromium;
+// an intra-window move keeps it), and a lost turn between the move and re-pinning
+// destroys the owner's only "do not touch by hand" shield. merge_windows answers
+// that by SKIPPING pinned tabs — it moves a set, and the skip is visible in the
+// `merged` count it returns. A one-tab verb has no such room: skipping silently and
+// answering ok would tell the agent the tab moved when it did not. So the whole
+// command refuses with `pinned_cross_window` and moves nothing, which the agent can
+// tell apart from a generic failure and act on (unpin by hand, or reorder the tab
+// inside its own window instead).
+//
+// INSIDE one window a pinned tab moves freely: `pinned` survives the move, so there
+// is no shield to lose and nothing to protect against.
+async function moveTab(params, nowFn, map) {
+  const tabId = params.tabId;
+  const targetWindowId = params.windowId;
+  if (!Number.isInteger(targetWindowId)) {
+    return fail(ERR_PRECONDITION_FAILED, "move_tab requires an integer windowId");
+  }
+  // The position is optional; -1 is chrome.tabs.move's own "append to the end".
+  // Anything below that is rejected HERE rather than left to throw as `internal`.
+  const index = params.index === undefined || params.index === null ? -1 : params.index;
+  if (!Number.isInteger(index) || index < -1) {
+    return fail(ERR_PRECONDITION_FAILED, "move_tab index must be an integer >= -1");
+  }
+
+  // Never assume the tab is still there: the agent decided on a mirror that is
+  // minutes old and the human may have closed the tab since.
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${tabId}`);
+  }
+
+  // The SAME eligibility predicate merge_windows applies to its target (§9): a
+  // popup / devtools / app window and a fullscreen showcase are not places to drop a
+  // tab into. Read LIVE, for merge_windows' reason — by command time the named
+  // window may be closed or have become a popup. `no_window` is in the service's
+  // _CLIENT_ERRORS set (src/api/instances.py), i.e. "your picture is stale, refetch".
+  const windows = await chrome.windows.getAll();
+  const target = windows.find((w) => w.id === targetWindowId);
+  if (!isMergeableWindow(target)) {
+    return fail(ERR_NO_WINDOW, `no eligible target window: ${targetWindowId}`);
+  }
+
+  const crossWindow = tab.windowId !== targetWindowId;
+  if (crossWindow && tab.pinned) {
+    return fail(
+      ERR_PINNED_CROSS_WINDOW,
+      "a pinned tab is never moved across windows (§9) — unpin it, or move it inside its own window",
+    );
+  }
+
+  // Both windows get reshuffled by the move (the source activates a neighbour, the
+  // target re-activates), so BOTH are marked before it and the mark is AWAITED —
+  // exactly as close_tab and merge_windows do. Without it the agent's move reads as
+  // "the human touched this tab" and resets the idle clock it was moved by.
+  const marked = [...new Set([tab.windowId, targetWindowId])].filter(
+    (id) => id !== undefined && id !== null,
+  );
+  await map.markCuratorCause(marked, nowFn());
+  try {
+    await chrome.tabs.move(tabId, { windowId: targetWindowId, index });
+  } catch (e) {
+    // The move failed => undo the mark so a later REAL activation still counts.
+    await map.clearCuratorCause(marked);
+    const msg = String((e && e.message) || e);
+    // Chromium refuses tab edits mid-drag — transient busy, not a failure (§9).
+    if (/drag/i.test(msg)) {
+      return fail(ERR_BUSY_DRAGGING, msg);
+    }
+    // The tab was closed in the gap between the `get` above and the move; Chromium
+    // answers "No tab with id: N". That is the vanished tab, not an internal fault,
+    // and the caller reads the same code it would have got a millisecond earlier.
+    if (/no tab with id|no such tab/i.test(msg)) {
+      return fail(ERR_NO_SUCH_TAB, msg);
+    }
+    return fail(ERR_INTERNAL, msg);
+  }
+  return ok({ tabId, windowId: targetWindowId, index });
 }
 
 // execute_js {code, tabId?, world?}. Gated on the options checkbox in

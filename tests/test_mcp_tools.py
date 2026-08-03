@@ -243,6 +243,78 @@ async def test_close_and_focus_send_commands(tmp_path):
     assert f2["command"] == protocol.CMD_FOCUS_TAB and f2["params"] == {"tabId": 4}
 
 
+# --- move_tab (§6/§9) --------------------------------------------------------
+async def test_move_tab_sends_the_command_and_omits_an_absent_index(tmp_path):
+    # The verb that closes §11's gap: relocation BETWEEN instances is the §7 open+close
+    # pair (it works only because the browsers are separate processes), and between the
+    # windows of ONE browser the agent had nothing at all.
+    #
+    # An absent index must be ABSENT from the frame, not sent as null or as a
+    # server-invented -1: the extension owns the default ("append to the end"), and one
+    # default living in two places is how the two halves drift.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+
+    out, frame = await _run_with_response(
+        lambda: tools.move_tab(app, instance="main", tab_id=7, window_id=3, auth_ctx="s"),
+        cs, ws, {"tabId": 7, "windowId": 3, "index": -1},
+    )
+    assert frame["command"] == protocol.CMD_MOVE_TAB
+    assert frame["params"] == {"tabId": 7, "windowId": 3}  # no `index` key at all
+    assert out["ok"] is True and out["result"]["windowId"] == 3
+
+    # An EXPLICIT index is passed through untouched, including 0.
+    _, frame2 = await _run_with_response(
+        lambda: tools.move_tab(app, instance="main", tab_id=7, window_id=3, index=0),
+        cs, ws, {"tabId": 7, "windowId": 3, "index": 0},
+    )
+    assert frame2["params"] == {"tabId": 7, "windowId": 3, "index": 0}
+
+
+async def test_move_tab_surfaces_the_pinned_refusal_as_its_own_code(tmp_path):
+    # §9: a pinned tab never crosses a window boundary. The refusal must reach the agent
+    # as a MACHINE-readable code it can act on (unpin, or move inside the window), not as
+    # a generic failure — so the extension's `pinned_cross_window` travels verbatim
+    # through CommandError into the ToolError the MCP wrapper renders as
+    # {"ok": false, "error": "pinned_cross_window"}.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+
+    task = asyncio.create_task(
+        tools.move_tab(app, instance="main", tab_id=7, window_id=3, auth_ctx="s")
+    )
+    for _ in range(400):
+        if ws.sent:
+            break
+        await asyncio.sleep(0.005)
+    assert ws.sent, "move_tab never sent a command frame"
+    resolve_response(cs, {
+        "type": "response", "id": ws.sent[-1]["id"], "ok": False,
+        "error": {"code": protocol.ERR_PINNED_CROSS_WINDOW, "message": "pinned"},
+    })
+    with pytest.raises(tools.ToolError) as ei:
+        await task
+    assert ei.value.code == protocol.ERR_PINNED_CROSS_WINDOW
+
+
+async def test_move_tab_is_refused_while_paused_and_sends_nothing(tmp_path):
+    # A move is automation like every other mutating verb (§7/§12), and the MCP door has
+    # no `force`: an agent is not a human at the keyboard.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app, minutes=30)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.move_tab(app, instance="main", tab_id=7, window_id=3)
+    assert ei.value.code == "paused"
+    assert ws.sent == []
+
+
 # --- execute_js: audited (§12) + kill-switch --------------------------------
 async def test_execute_js_audited_with_mcp_session_as_auth_ctx(tmp_path):
     db = await _make_db(tmp_path)

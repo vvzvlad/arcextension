@@ -301,6 +301,38 @@ async def focus_tab(app, *, instance: str, tab_id: int,
     return {"ok": True, "result": result}
 
 
+async def move_tab(app, *, instance: str, tab_id: int, window_id: int,
+                   index: int | None = None, auth_ctx: str | None = None) -> dict:
+    """Move one tab to a window/position INSIDE one browser (§6/§9).
+
+    The gap this fills: relocation BETWEEN instances is the §7 open+close pair, which
+    only works because the browsers are separate processes. Between the windows of one
+    browser the fleet had no verb at all — the agent could open, close, focus and
+    navigate a tab, and fold every window into one, but not put a single tab where it
+    belongs.
+
+    ``index`` is optional and omitted from the frame when absent, so the extension's
+    own default (-1 = append to the end) is the ONE definition of "no position given".
+
+    The extension owns the guards, as it does for every command: the target window
+    must pass §9's mergeable predicate (``no_window`` otherwise) and a PINNED tab is
+    never moved across a window boundary (``pinned_cross_window``, nothing moved) —
+    both surface here as a :class:`ToolError` carrying that code, which is exactly
+    what makes the pinned refusal actionable rather than a generic failure.
+
+    No ``actions`` row: this follows its siblings ``open_tab`` / ``close_tab`` /
+    ``focus_tab``, which journal nothing from the MCP door either. (``merge_windows``
+    does, because §9 requires the manual merge to be recorded and it shares that
+    writer with the HTTP button.)
+    """
+    await _ensure_not_paused(app)
+    params: dict = {"tabId": tab_id, "windowId": window_id}
+    if index is not None:
+        params["index"] = index
+    result = await _command(app, instance, protocol.CMD_MOVE_TAB, params, auth_ctx=auth_ctx)
+    return {"ok": True, "result": result}
+
+
 async def merge_windows(app, *, instance: str, params: dict | None = None,
                         auth_ctx: str | None = None) -> dict:
     """Fold an instance's windows into one (§9). Delegates to the SHARED core in

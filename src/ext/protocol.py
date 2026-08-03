@@ -47,6 +47,10 @@ CMD_FOCUS_TAB = "focus_tab"
 CMD_NAVIGATE_TAB = "navigate_tab"
 CMD_MERGE_WINDOWS = "merge_windows"
 CMD_EXECUTE_JS = "execute_js"
+# Move ONE tab to a window/position inside a SINGLE browser. Relocation BETWEEN
+# instances is the open+close pair of §7, which works only because the browsers are
+# separate processes; between the windows of one browser there was no verb at all.
+CMD_MOVE_TAB = "move_tab"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side
@@ -57,6 +61,11 @@ ERR_NO_SUCH_TAB = "no_such_tab"
 ERR_NO_WINDOW = "no_window"
 ERR_JS_DISABLED = "js_disabled"
 ERR_BUSY_DRAGGING = "busy_dragging"
+# ``move_tab`` refused: the tab is PINNED and the move would cross a window boundary
+# (§9 — a cross-window ``tabs.move`` silently drops ``pinned``). Its own code so the
+# caller can tell the owner's "do not touch by hand" shield apart from every other
+# precondition without parsing a message.
+ERR_PINNED_CROSS_WINDOW = "pinned_cross_window"
 ERR_INTERNAL = "internal"
 # Service-side only: no live socket for the instance, and the local send/wait
 # timed out before any `response` arrived.

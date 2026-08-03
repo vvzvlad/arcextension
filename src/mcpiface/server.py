@@ -163,6 +163,21 @@ def build_mcp(app_ref) -> MCPServer:
         ))
 
     @mcp.tool()
+    async def move_tab(
+        instance: str, tab_id: int, window_id: int, index: int | None = None
+    ) -> dict:
+        """Move a tab to a window/position inside one browser; omit index for the end.
+
+        Refuses with ``pinned_cross_window`` when the tab is pinned and the move would
+        leave its window (§9), and with ``no_window`` when the target is not a normal,
+        non-fullscreen window.
+        """
+        return await _guarded(tools.move_tab(
+            _host(), instance=instance, tab_id=tab_id, window_id=window_id,
+            index=index, auth_ctx=current_mcp_session(),
+        ))
+
+    @mcp.tool()
     async def merge_windows(instance: str, params: dict | None = None) -> dict:
         """Merge windows in an instance (§9)."""
         return await _guarded(tools.merge_windows(

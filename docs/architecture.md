@@ -1099,7 +1099,8 @@ worker умирает через 30 с и внутренний таймер не
 
 `command {id, sessionId, command, params}` → `response {id, ok, result|error}`,
 где `error = {code, message}`. Коды: `stale_session`, `precondition_failed`,
-`no_such_tab`, `no_window`, `js_disabled`, `busy_dragging`, `internal`.
+`no_such_tab`, `no_window`, `js_disabled`, `busy_dragging`, `pinned_cross_window`,
+`internal`.
 
 | Команда | Параметры | Результат |
 |---|---|---|
@@ -1109,7 +1110,26 @@ worker умирает через 30 с и внутренний таймер не
 | `focus_tab` | `{tabId}` | `{ok}` |
 | `navigate_tab` | `{tabId, url}` | `{ok}` |
 | `merge_windows` | `{windowIds?, targetWindowId?}` | `{merged: n}` — пустой объект только для ручной кнопки (§9) |
+| `move_tab` | `{tabId, windowId, index?}` | `{tabId, windowId, index}` / `pinned_cross_window` / `no_window` |
 | `execute_js` | `{code, tabId?, world?}` | `{results}` / `js_disabled` |
+
+**`move_tab` — переселение внутри одного браузера.** Между инстансами вкладку
+переселяет пара «`open_tab` в целевом + `close_tab` в исходном» (§7), и это работает
+только потому, что браузеры — разные процессы. Между окнами ОДНОГО браузера у агента
+не было ничего, хотя `chrome.tabs.move` живёт здесь с самого `merge_windows`.
+`index` необязателен: без него `-1`, то есть в конец.
+
+Правило §9 о закреплённых применяется дословно, но отказом, а не пропуском.
+Кросс-оконный `tabs.move` молча сбрасывает `pinned`, поэтому закреплённую вкладку через
+границу окна не двигает никто; `merge_windows` может пропустить её молча — он двигает
+МНОЖЕСТВО, и пропуск виден в `merged`. У команды на одну вкладку такого места нет:
+промолчать и ответить `ok` значит сказать агенту, что вкладка переехала. Поэтому вся
+команда отказывает кодом `pinned_cross_window` и не двигает ничего — агент отличает
+«сработал щит „руками не трогать“» от общей ошибки и может снять закрепление или
+двигать вкладку внутри её окна. Внутри одного окна `pinned` переживает перенос, и
+закреплённая вкладка двигается свободно. Целевое окно проверяется тем же предикатом
+пригодности, что и цель слияния (обычное, не fullscreen), — сваливать вкладки в
+devtools-окно незачем.
 
 **Волатильные гарды перепроверяются на краю, а не только по снимку.**
 `expect = {url, notAudible, notPinned, minIdleMs}`; перед `tabs.remove` расширение
@@ -2312,8 +2332,16 @@ mcp.session_manager.run():` в lifespan плюс собственный `Route` 
 
 **Разделения на чтение и запись нет** (стр. 15в). Инструменты: `list_instances`,
 `list_tabs`, `get_rules`, `list_actions`, `upsert_rule`, `delete_rule`, `open_tab`,
-`close_tab`, `focus_tab`, `relocate_tab`, `reset_singleton`, `merge_windows`,
-`execute_js`, `pause`, `resume`, `run_pass {dry_run?}`.
+`close_tab`, `focus_tab`, `relocate_tab`, `move_tab`, `reset_singleton`,
+`merge_windows`, `execute_js`, `pause`, `resume`, `run_pass {dry_run?}`.
+
+`relocate_tab` и `move_tab` — разные глаголы и не заменяют друг друга: первый переселяет
+вкладку МЕЖДУ инстансами парой «открыть копию + закрыть оригинал» (§7, фаза B закрывает
+исходник под полными гардами), второй двигает вкладку внутри ОДНОГО браузера через
+`chrome.tabs.move` (§6). HTTP-близнеца у `move_tab` нет намеренно: `/api/focus` и
+`/api/instances/:id/merge_windows` существуют потому, что их дёргает кнопка на
+стартпейдже, а раскладку окон человек в браузере двигает мышью — эндпоинт без вызывающей
+стороны был бы поверхностью без пользователя.
 
 `upsert_rule` подчиняется тому же правилу подтверждения, что и HTTP: возвращает
 impact и требует эхо `confirm_impact`. Иначе из трёх заявленных защит (§7) на пути

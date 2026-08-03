@@ -140,6 +140,11 @@ export const CMD_FOCUS_TAB = "focus_tab";
 export const CMD_NAVIGATE_TAB = "navigate_tab";
 export const CMD_MERGE_WINDOWS = "merge_windows";
 export const CMD_EXECUTE_JS = "execute_js";
+// Move ONE tab to a window/position inside THIS browser. Relocation BETWEEN
+// browsers is an open+close pair (§7) — that works only because the instances are
+// separate processes; between the windows of one instance there was nothing at
+// all, though `chrome.tabs.move` has been in use here since merge_windows.
+export const CMD_MOVE_TAB = "move_tab";
 
 // --- Command error codes (§6) -----------------------------------------------
 // The `error.code` a failing `response` carries. Mirrors the ERR_* strings in
@@ -150,4 +155,10 @@ export const ERR_NO_SUCH_TAB = "no_such_tab";
 export const ERR_NO_WINDOW = "no_window";
 export const ERR_JS_DISABLED = "js_disabled";
 export const ERR_BUSY_DRAGGING = "busy_dragging";
+// move_tab refused because the tab is PINNED and the move would cross a window
+// boundary (§9). Its own code rather than `precondition_failed`: the agent must be
+// able to tell "the owner's do-not-touch shield stopped me, unpin it or move it
+// inside its own window" apart from every other precondition, and act on it
+// without parsing a message string.
+export const ERR_PINNED_CROSS_WINDOW = "pinned_cross_window";
 export const ERR_INTERNAL = "internal";

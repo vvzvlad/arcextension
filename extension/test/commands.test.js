@@ -10,6 +10,7 @@ import {
   CMD_NAVIGATE_TAB,
   CMD_MERGE_WINDOWS,
   CMD_EXECUTE_JS,
+  CMD_MOVE_TAB,
 } from "../src/constants.js";
 
 const NOW = 1_000_000_000;
@@ -48,6 +49,7 @@ describe("stale_session rejects every verb without executing", () => {
     [CMD_FOCUS_TAB, { tabId: 1 }],
     [CMD_NAVIGATE_TAB, { tabId: 1, url: "https://x/" }],
     [CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }],
+    [CMD_MOVE_TAB, { tabId: 1, windowId: 2 }],
     [CMD_EXECUTE_JS, { code: "1", tabId: 1 }],
   ];
 
@@ -846,6 +848,237 @@ describe("merge_windows", () => {
     expect(res.error.code).toBe("busy_dragging");
     expect(map.markCuratorCause).toHaveBeenCalled();
     expect(map.clearCuratorCause).toHaveBeenCalled(); // rolled back
+  });
+});
+
+// --- move_tab ---------------------------------------------------------------
+describe("move_tab", () => {
+  // Two normal windows; tab 100 lives in window 1, window 2 already holds two tabs.
+  function chromeTwoNormalWindows(over = {}) {
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", pinned: false },
+        { id: 200, windowId: 2, url: "https://b/", pinned: false },
+        { id: 201, windowId: 2, url: "https://c/", pinned: false },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 2, type: "normal", state: "normal" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+      ...over,
+    });
+  }
+
+  function tabById(id) {
+    return chrome.__state.tabs.find((t) => t.id === id);
+  }
+
+  it("moves a tab to ANOTHER window and marks BOTH windows as curator-caused", async () => {
+    // The whole point of the verb: inside one browser there was no way to relocate a
+    // tab (cross-instance relocation is open+close, which needs two processes).
+    chromeTwoNormalWindows();
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ tabId: 100, windowId: 2, index: -1 });
+    expect(move).toHaveBeenCalledWith(100, { windowId: 2, index: -1 });
+    expect(tabById(100).windowId).toBe(2); // it really moved
+
+    // Both the source and the target are reshuffled by the move, so both are marked
+    // BEFORE it — without this the agent's move reads as "the human touched this tab"
+    // and resets the very idle clock the tab was moved by (§5/§6).
+    expect(map.markCuratorCause).toHaveBeenCalledTimes(1);
+    const [marked, when] = map.markCuratorCause.mock.calls[0];
+    expect([...marked].sort()).toEqual([1, 2]);
+    expect(when).toBe(NOW);
+    expect(map.clearCuratorCause).not.toHaveBeenCalled(); // nothing to roll back
+  });
+
+  it("moves a tab WITHIN its own window; only that window is marked", async () => {
+    chromeTwoNormalWindows();
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 200, windowId: 2, index: 0 }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ tabId: 200, windowId: 2, index: 0 });
+    expect(move).toHaveBeenCalledWith(200, { windowId: 2, index: 0 });
+    expect(map.markCuratorCause.mock.calls[0][0]).toEqual([2]); // deduped to one window
+  });
+
+  it("index defaults to -1 (the end) and an EXPLICIT index is passed through", async () => {
+    chromeTwoNormalWindows();
+    const move = vi.spyOn(chrome.tabs, "move");
+    await dispatchCommand(frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }), ctx());
+    expect(move.mock.calls[0][1]).toEqual({ windowId: 2, index: -1 });
+
+    chromeTwoNormalWindows();
+    const move2 = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2, index: 1 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(move2.mock.calls[0][1]).toEqual({ windowId: 2, index: 1 });
+  });
+
+  it("a PINNED tab across windows is REFUSED: nothing moves, it stays pinned (§9)", async () => {
+    // §9's rule, verbatim: a cross-window tabs.move silently drops `pinned`, and the
+    // lost turn between the move and re-pinning destroys the owner's only "do not
+    // touch by hand" shield. merge_windows can skip such a tab silently because it
+    // moves a SET and the skip shows up in `merged`; a one-tab verb cannot — answering
+    // ok while doing nothing would tell the agent the tab moved. Hence a code of its
+    // own, and no side effects at all.
+    chromeTwoNormalWindows();
+    chrome.__state.tabs.find((t) => t.id === 100).pinned = true;
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }),
+      ctx({ map }),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "pinned_cross_window", message: expect.any(String) },
+    });
+    expect(move).not.toHaveBeenCalled();
+    expect(map.markCuratorCause).not.toHaveBeenCalled(); // no mark to roll back either
+    // The tab is exactly where it was, and still shielded.
+    expect(tabById(100).windowId).toBe(1);
+    expect(tabById(100).pinned).toBe(true);
+  });
+
+  it("a PINNED tab moves freely INSIDE its window and keeps `pinned` (§9)", async () => {
+    // The other half of the same rule: an intra-window move preserves `pinned`, so
+    // there is no shield to lose and nothing to refuse. Widen the refusal to every
+    // move and this reddens.
+    chromeTwoNormalWindows();
+    chrome.__state.tabs.find((t) => t.id === 200).pinned = true;
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 200, windowId: 2, index: 0 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(move).toHaveBeenCalledWith(200, { windowId: 2, index: 0 });
+    expect(tabById(200).pinned).toBe(true);
+    expect(tabById(200).windowId).toBe(2);
+  });
+
+  it("an INELIGIBLE target window (popup / devtools) is refused with no_window (§9)", async () => {
+    // The SAME predicate merge_windows uses for its target: there is no reason to let
+    // an agent dump tabs into a devtools or popup window.
+    chromeTwoNormalWindows({
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 2, type: "popup", state: "normal" },
+      ],
+    });
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }), ctx());
+    expect(res.error.code).toBe("no_window");
+    expect(move).not.toHaveBeenCalled();
+    expect(tabById(100).windowId).toBe(1);
+  });
+
+  it("a FULLSCREEN target window is refused too (§9's showcase)", async () => {
+    chromeTwoNormalWindows({
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 2, type: "normal", state: "fullscreen" },
+      ],
+    });
+    const res = await dispatchCommand(frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }), ctx());
+    expect(res.error.code).toBe("no_window");
+  });
+
+  it("a target window that CLOSED since the agent looked answers no_window, not internal", async () => {
+    // `no_window` is in the service's _CLIENT_ERRORS set => "your picture is stale,
+    // refetch", where `internal` would be a 502 and nothing would re-read.
+    chromeTwoNormalWindows();
+    const res = await dispatchCommand(frame(CMD_MOVE_TAB, { tabId: 100, windowId: 42 }), ctx());
+    expect(res.error.code).toBe("no_window");
+  });
+
+  it("a VANISHED tab answers no_such_tab, and never touches the activity map", async () => {
+    // Between the agent's decision and this command the human may simply have closed
+    // the tab. That must be a clear answer, not a throw that becomes `internal`.
+    chromeTwoNormalWindows();
+    const move = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 999, windowId: 2 }),
+      ctx({ map }),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "no_such_tab", message: expect.any(String) },
+    });
+    expect(move).not.toHaveBeenCalled();
+    expect(map.markCuratorCause).not.toHaveBeenCalled();
+  });
+
+  it("a tab that vanishes BETWEEN the get and the move is still no_such_tab", async () => {
+    // The narrower race: it existed when we looked and is gone when Chromium executes.
+    // Chromium says "No tab with id: N" — that is the vanished tab, not a fault.
+    chromeTwoNormalWindows();
+    chrome.__state.moveError = "No tab with id: 100.";
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }),
+      ctx({ map }),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+    expect(map.clearCuratorCause).toHaveBeenCalled(); // the mark is rolled back
+  });
+
+  it("busy_dragging while the human holds a tab; curatorCause cleared", async () => {
+    chromeTwoNormalWindows();
+    chrome.__state.moveError = "Tabs cannot be edited right now (user may be dragging a tab).";
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }),
+      ctx({ map }),
+    );
+    expect(res.error.code).toBe("busy_dragging");
+    expect(map.markCuratorCause).toHaveBeenCalled();
+    expect(map.clearCuratorCause).toHaveBeenCalled();
+  });
+
+  it("any other move failure is `internal`, with the mark rolled back", async () => {
+    chromeTwoNormalWindows();
+    chrome.__state.moveError = "something else went wrong";
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: 2 }),
+      ctx({ map }),
+    );
+    expect(res.error.code).toBe("internal");
+    expect(map.clearCuratorCause).toHaveBeenCalled();
+  });
+
+  it("a missing/garbled windowId or index is refused at the edge, before any read", async () => {
+    for (const params of [
+      { tabId: 100 }, // no target window at all
+      { tabId: 100, windowId: "2" }, // a string id would silently never match
+      { tabId: 100, windowId: 2, index: -2 }, // below chrome's own -1 floor
+      { tabId: 100, windowId: 2, index: 1.5 },
+      { tabId: 100, windowId: 2, index: "0" },
+    ]) {
+      chromeTwoNormalWindows();
+      const move = vi.spyOn(chrome.tabs, "move");
+      const res = await dispatchCommand(frame(CMD_MOVE_TAB, params), ctx());
+      expect(res.ok, JSON.stringify(params)).toBe(false);
+      expect(res.error.code, JSON.stringify(params)).toBe("precondition_failed");
+      expect(move).not.toHaveBeenCalled();
+    }
   });
 });
 
