@@ -168,31 +168,40 @@ def test_version_ahead_is_degraded(tmp_path):
         conn.close()
 
 
-# --- Version 2: enrollment schema (§13) -------------------------------------
+# --- Version 2/3: the enrollment schema as it stands today ------------------
 def test_migrate_creates_enrollment_schema(tmp_path):
-    # After a full migrate the enrollment step-2 objects exist and the version is 2.
+    # After a full migrate the surviving enrollment objects exist and the version tracks
+    # MAX_VERSION.
     db = str(tmp_path / "curator.db")
     backups = str(tmp_path / "backups")
     conn = _open(db)
     try:
         result = migrate(conn, db, backups)
         assert result.ok and not result.degraded
-        # PRAGMA user_version tracks MAX_VERSION. NOT compared against a literal 2: the
+        # PRAGMA user_version tracks MAX_VERSION. NOT compared against a literal: the
         # enrollment step's version is an implementation detail that moves the moment a
-        # step 3 is appended, and a hardcoded number here would redden a change that is
+        # step is appended, and a hardcoded number here would redden a change that is
         # correct — the very hardcoding issue #35 asked to remove (it survived one round in
-        # this same assertion). What this test is ABOUT is the enrollment objects below.
+        # this same assertion). What this test is ABOUT is the objects below.
         assert _version(conn) == MAX_VERSION
 
         tables = _tables(conn)
-        assert {"enroll_requests", "admin_audit"} <= tables
+        assert "admin_audit" in tables
+        # Step 3 dropped the pending-request storage: enrolment is one step (§6), so there
+        # is no list to hold. Asserted rather than merely not-mentioned, because a table
+        # left standing is an invitation to wire the second step back in.
+        assert "enroll_requests" not in tables
 
-        # The new instances columns.
+        # The instances columns step 2 added...
         assert {
             "status", "secret_hash", "install_uuid", "enrolled_at", "revoked_at"
         } <= _columns(conn, "instances")
+        # ...and the one step 3 removed: the id IS the name now (§6).
+        assert "title" not in _columns(conn, "instances")
 
-        # The UNIQUE index guards secret_hash (unique flag == 1).
+        # The UNIQUE index guards secret_hash (unique flag == 1). It must SURVIVE the
+        # column drop — SQLite rebuilds the table under ALTER TABLE ... DROP COLUMN, and an
+        # index lost there would silently allow two instances to share one credential.
         assert _index_list(conn, "instances").get("instances_secret_hash") == 1
         # The admin_audit(ts) lookup index exists.
         assert "admin_audit_ts" in _index_list(conn, "admin_audit")
@@ -202,7 +211,7 @@ def test_migrate_creates_enrollment_schema(tmp_path):
 
 def test_pre_migration_instance_becomes_revoked(tmp_path):
     # A row that existed before enrollment (secret_hash IS NULL) is migrated to
-    # 'revoked' — after the upgrade even MAIN needs explicit re-approval.
+    # 'revoked' — after the upgrade even MAIN needs an explicit re-enrolment.
     db = str(tmp_path / "curator.db")
     backups = str(tmp_path / "backups")
     conn = _open(db)
@@ -210,7 +219,7 @@ def test_pre_migration_instance_becomes_revoked(tmp_path):
         _migrate_to_v1_only(conn, db, backups)
         conn.execute("INSERT INTO instances (id, title) VALUES ('main', 'Main')")
 
-        result = migrate(conn, db, backups)  # applies step 2
+        result = migrate(conn, db, backups)  # applies steps 2 and 3
         assert result.ok and _version(conn) == MAX_VERSION
 
         row = conn.execute(
@@ -218,6 +227,58 @@ def test_pre_migration_instance_becomes_revoked(tmp_path):
         ).fetchone()
         assert row[0] == "revoked"
         assert row[1] is None
+    finally:
+        conn.close()
+
+
+def test_step3_keeps_existing_instances_and_drops_only_title(tmp_path):
+    """The upgrade on a NON-EMPTY database: rows survive, ``title`` goes, the table goes.
+
+    ``ALTER TABLE ... DROP COLUMN`` rebuilds the table, which is exactly when data is
+    quietly lost — so this seeds a v2 database that looks like a live install (two
+    instances, one of them enrolled with a secret, plus pending enroll_requests) and pins
+    what must be true afterwards. Reddens if step 3 is implemented as a recreate that
+    forgets to copy rows across.
+    """
+    db = str(tmp_path / "curator.db")
+    backups = str(tmp_path / "backups")
+    conn = _open(db)
+    try:
+        # Bring the DB to version 2 only (the pre-simplification schema).
+        migrate(conn, db, backups, steps=STEPS[:2], max_version=2)
+        assert _version(conn) == 2
+        conn.execute(
+            "INSERT INTO instances (id, title, status, secret_hash, install_uuid, "
+            "conn_epoch, allow_execute_js) VALUES "
+            "('main', 'Curator Main', 'active', 'hash-main', 'uuid-main', 7, 1)"
+        )
+        conn.execute(
+            "INSERT INTO instances (id, title, status) VALUES ('prox', 'Prox', 'revoked')"
+        )
+        conn.execute(
+            "INSERT INTO enroll_requests (install_uuid, origin, suggested_title, "
+            "protocol_version, secret_hash, first_seen_at, last_seen_at) "
+            "VALUES ('uuid-waiting', 'chrome-extension://x', 'Waiting', 1, 'h', 1, 1)"
+        )
+        conn.commit()
+
+        result = migrate(conn, db, backups)  # applies step 3
+        assert result.ok and not result.degraded
+        assert _version(conn) == MAX_VERSION
+
+        # Every instance survived, with every OTHER column intact.
+        rows = conn.execute(
+            "SELECT id, status, secret_hash, install_uuid, conn_epoch, allow_execute_js "
+            "FROM instances ORDER BY id"
+        ).fetchall()
+        assert rows == [
+            ("main", "active", "hash-main", "uuid-main", 7, 1),
+            ("prox", "revoked", None, None, 0, 0),
+        ]
+        assert "title" not in _columns(conn, "instances")
+        assert "enroll_requests" not in _tables(conn)
+        # The credential guard survived the table rebuild.
+        assert _index_list(conn, "instances").get("instances_secret_hash") == 1
     finally:
         conn.close()
 
@@ -254,18 +315,21 @@ def test_multiple_null_secret_hash_rows_coexist_but_dupes_collide(tmp_path):
         conn.close()
 
 
-def test_v1_to_v2_is_idempotent_on_rerun(tmp_path):
-    # Rolling redeploy: a DB brought from v1 to v2 must re-run migrate as a no-op.
+def test_v1_to_latest_is_idempotent_on_rerun(tmp_path):
+    # Rolling redeploy: a DB brought from v1 to the head must re-run migrate as a no-op.
+    # This is where a NON-idempotent step 3 would show up as a crash-loop: `DROP TABLE`
+    # and `DROP COLUMN` both fail hard on a second application, and the version guard
+    # inside the transaction is the only thing that stops them running twice.
     db = str(tmp_path / "curator.db")
     backups = str(tmp_path / "backups")
     conn = _open(db)
     try:
         _migrate_to_v1_only(conn, db, backups)
-        r2 = migrate(conn, db, backups)  # v1 -> v2
+        r2 = migrate(conn, db, backups)  # v1 -> head
         assert r2.ok and _version(conn) == MAX_VERSION
-        r3 = migrate(conn, db, backups)  # v2 -> v2, pure no-op
+        r3 = migrate(conn, db, backups)  # head -> head, pure no-op
         assert r3.ok and not r3.degraded and _version(conn) == MAX_VERSION
-        assert {"enroll_requests", "admin_audit"} <= _tables(conn)
+        assert "admin_audit" in _tables(conn)
     finally:
         conn.close()
 

@@ -11,12 +11,6 @@ from src.ext.protocol import heartbeat_step
 from src.ext.snapshot import apply_snapshot
 
 
-# The pending-request TTL these tests hand to `upsert_enroll_request_capped`. Wide enough
-# that every row in the tests below is LIVE, so the TTL branch only fires where a test
-# deliberately reaches past it (see the expired-row test).
-_TTL_MS = 60 * 60_000
-
-
 async def _make_db(tmp_path):
     db = Database(str(tmp_path / "curator.db"), str(tmp_path / "backups"))
     await db.open()
@@ -38,7 +32,7 @@ async def _register(db, instance_id, session_id, now):
         )
     )
     return await db.write(
-        lambda c: queries.hello_upsert(c, instance_id, session_id, "t", False, now)
+        lambda c: queries.hello_upsert(c, instance_id, session_id, False, now)
     )
 
 
@@ -402,7 +396,7 @@ async def test_hello_upsert_is_update_only_and_returns_none_for_missing_row(tmp_
     db = await _make_db(tmp_path)
     try:
         epoch = await db.write(
-            lambda c: queries.hello_upsert(c, "ghost", "s", "t", False, 1)
+            lambda c: queries.hello_upsert(c, "ghost", "s", False, 1)
         )
         assert epoch is None
         count = await db.read(
@@ -425,7 +419,7 @@ async def test_hello_upsert_ignores_a_revoked_row(tmp_path):
             )
         )
         epoch = await db.write(
-            lambda c: queries.hello_upsert(c, "r", "s", "t", False, 1)
+            lambda c: queries.hello_upsert(c, "r", "s", False, 1)
         )
         assert epoch is None
         row = await db.read(
@@ -494,214 +488,127 @@ async def test_resolve_secret_db_leak_resistance(tmp_path):
         await db.close()
 
 
-async def test_upsert_enroll_request_does_not_bump_first_seen_at(tmp_path):
-    # first_seen_at is frozen across repeats (so the TTL is reachable); last_seen_at /
-    # title / origin refresh to the latest. secret_hash is frozen TOO — see
-    # test_pending_request_credential_is_frozen_against_substitution for why.
+# --- enroll_instance: the write that REPLACED the operator approval ----------
+async def test_enroll_instance_creates_an_active_row(tmp_path):
+    """A brand-new id INSERTs an ACTIVE row carrying the presented secret + install_uuid.
+
+    This is the whole of enrolment now: the /ext channel calls this the moment a valid code
+    reaches an open window (§6). Reddens if the row lands in any status but 'active' —
+    which would leave a browser that just enrolled unable to hello (`_HELLO_UPSERT` guards
+    on ``status='active'``) with nothing to fix it, since there is no approve endpoint.
+    """
     db = await _make_db(tmp_path)
     try:
-        await db.write(
-            lambda c: queries.upsert_enroll_request(
-                c, "u1", "o1", "T1", 1, "h1", now=100
-            )
-        )
-        await db.write(
-            lambda c: queries.upsert_enroll_request(
-                c, "u1", "o2", "T2", 1, "h2", now=200
-            )
-        )
+        assert await db.write(
+            lambda c: queries.enroll_instance(
+                c, instance_id="laptop", secret_hash="h1", install_uuid="u1", now=100)
+        ) == queries.ENROLL_OK
         row = await db.read(
             lambda c: c.execute(
-                "SELECT first_seen_at, last_seen_at, suggested_title, secret_hash, origin "
-                "FROM enroll_requests WHERE install_uuid='u1'"
+                "SELECT status, secret_hash, install_uuid, enrolled_at "
+                "FROM instances WHERE id='laptop'"
             ).fetchone()
         )
-        assert row == (100, 200, "T2", "h1", "o2")
-        count = await db.read(
-            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
-        )
-        assert count == 1
+        assert row == ("active", "h1", "u1", 100)
+        # And the credential works immediately — no second step in between.
+        assert await db.read(
+            lambda c: c.execute(
+                "SELECT id, status FROM instances WHERE secret_hash='h1'"
+            ).fetchone()
+        ) == ("laptop", "active")
     finally:
         await db.close()
 
 
-async def test_pending_request_credential_is_frozen_against_substitution(tmp_path):
-    """THE TOCTOU on the pending list: the operator must approve the credential they SAW.
+async def test_enroll_instance_refuses_a_live_id_and_leaves_it_untouched(tmp_path):
+    """The ONE objection the removed approval step answered: an id already held by an
+    ACTIVE instance is refused, and that instance is not disturbed.
 
-    Attack shape: the row is keyed on ``install_uuid``, and the enroll gate only requires
-    the (shared, short-lived) window code — so anyone who knows a victim's install_uuid and
-    the current code could re-file that request with THEIR secret. Every operator-visible
-    field (origin, suggested_title, protocol_version, the first-8 uuid) can be left
-    identical, so the console row does not change at all and the click enrolls the
-    attacker's credential under the victim's identity.
-
-    The fix is that the stored credential is immutable for the life of the row: a repeat
-    with a DIFFERENT hash writes nothing at all — not the hash, and not last_seen_at, so
-    the stale row still ages out on its original schedule and the honest client's next
-    attempt is accepted. Reddens if ``secret_hash = excluded.secret_hash`` returns to the
-    ON CONFLICT clause, or if the mismatch stops being reported to the caller.
+    Reddens if the ``WHERE instances.status != 'active'`` guard is dropped — the upsert
+    would then overwrite a live browser's credential with the newcomer's, silently
+    evicting it from the fleet. That is the failure mode the manual approval prevented,
+    and it is the reason this refusal is loud rather than a merge.
     """
     db = await _make_db(tmp_path)
     try:
+        await db.write(
+            lambda c: queries.enroll_instance(
+                c, instance_id="main", secret_hash="old", install_uuid="u-old", now=100)
+        )
         assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "victim", "o", "Laptop", 1, "victim-hash", 100, 8, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
-
-        # The substitution attempt: same uuid, same visible fields, different secret.
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "victim", "o", "Laptop", 1, "attacker-hash", 200, 8, _TTL_MS)
-        ) == queries.ENROLL_SECRET_MISMATCH
+            lambda c: queries.enroll_instance(
+                c, instance_id="main", secret_hash="new", install_uuid="u-new", now=200)
+        ) == queries.ENROLL_ID_TAKEN
         assert await db.read(
             lambda c: c.execute(
-                "SELECT secret_hash, last_seen_at FROM enroll_requests "
-                "WHERE install_uuid='victim'"
+                "SELECT secret_hash, install_uuid, enrolled_at FROM instances WHERE id='main'"
             ).fetchone()
-        ) == ("victim-hash", 100)
-
-        # The honest repeat (the client re-sends the secret it persisted) still refreshes
-        # everything it is allowed to refresh — the freeze is not a freeze of the row.
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "victim", "o2", "Renamed", 1, "victim-hash", 300, 8, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
+        ) == ("old", "u-old", 100)
+        # Exactly one row, and the newcomer's secret resolves to nothing.
         assert await db.read(
-            lambda c: c.execute(
-                "SELECT last_seen_at, suggested_title, origin FROM enroll_requests "
-                "WHERE install_uuid='victim'"
-            ).fetchone()
-        ) == (300, "Renamed", "o2")
-
-        # And once the row is gone (operator rejected it, or the TTL sweep took it), the
-        # new secret enrolls normally — the freeze self-heals, it does not brick a uuid.
-        await db.write(lambda c: queries.reject_enroll_request(c, "victim"))
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "victim", "o", "Laptop", 1, "fresh-hash", 400, 8, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
-    finally:
-        await db.close()
-
-
-async def test_expired_pending_row_does_not_freeze_the_credential(tmp_path):
-    """The credential freeze must follow the SAME TTL both read surfaces apply.
-
-    `list_pending_enroll_requests` and `get_enroll_request` filter on
-    ``first_seen_at >= now - ttl_ms``; the physical sweep only catches up within a tick.
-    A row inside that gap is invisible in /admin and unapprovable — yet the freeze used to
-    consult it anyway and answer ``secret_conflict`` to a legitimate re-registration,
-    leaving the operator with nothing to reject and the client with no way through. An
-    expired row must therefore read as ABSENT: replaced outright, new secret, new
-    first_seen_at. Reddens if the TTL filter is dropped from the lookup, or if the replace
-    degrades to the plain UPSERT (which leaves secret_hash and first_seen_at alone).
-    """
-    db = await _make_db(tmp_path)
-    try:
-        t0 = 1_000_000
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "u1", "o", "Laptop", 1, "old-hash", t0, 8, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
-
-        # Exactly ON the cutoff the row is still LIVE (the readers compare with `>=`), so
-        # the freeze is untouched for rows an operator can still act on.
-        live = t0 + _TTL_MS
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "u1", "o", "Laptop", 1, "new-hash", live, 8, _TTL_MS)
-        ) == queries.ENROLL_SECRET_MISMATCH
-
-        # One ms past it the row is expired — gone for every reader — so the new secret
-        # goes in and the row restarts its TTL from this request.
-        past = t0 + _TTL_MS + 1
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "u1", "o2", "Renamed", 1, "new-hash", past, 8, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
-        assert await db.read(
-            lambda c: c.execute(
-                "SELECT secret_hash, first_seen_at, last_seen_at, suggested_title "
-                "FROM enroll_requests WHERE install_uuid='u1'"
-            ).fetchone()
-        ) == ("new-hash", past, past, "Renamed")
-        # Exactly one row — the expired one was replaced, not duplicated.
-        assert await db.read(
-            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
+            lambda c: c.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
         ) == 1
+        assert await db.read(
+            lambda c: c.execute(
+                "SELECT 1 FROM instances WHERE secret_hash='new'"
+            ).fetchone()
+        ) is None
     finally:
         await db.close()
 
 
-async def test_capacity_count_is_not_ttl_filtered(tmp_path):
-    """The ceiling counts ROWS, expired or not — deliberately stricter than the readers.
+async def test_enroll_instance_reclaims_a_revoked_id(tmp_path):
+    """A REVOKED id can be taken again — the restore path for a revoked MAIN.
 
-    The anti-flood bound exists to keep the table (and the operator's list) from growing
-    without bound; a row that is expired but not yet swept is still a row. TTL-filtering
-    this count would let a flood hold `max_pending` live rows AND an unbounded tail of
-    expired ones between sweeps. The refusal it produces is self-clearing — the sweeper
-    runs every TICK_MS — unlike the credential freeze above. Reddens if a `WHERE
-    first_seen_at >= ?` is added to the COUNT.
+    Migration 2 retires every pre-enrolment row, so this reactivation is the only way MAIN
+    ever curates again; it used to be the ``_APPROVE_UPSERT`` an operator triggered, and
+    the semantics are carried over verbatim. Reddens if the guard is tightened to refuse
+    any existing id (MAIN would be permanently unrecoverable).
     """
     db = await _make_db(tmp_path)
     try:
-        t0 = 1_000_000
-        for uuid, h in (("u1", "h1"), ("u2", "h2")):
-            assert await db.write(
-                lambda c, u=uuid, hh=h: queries.upsert_enroll_request_capped(
-                    c, u, None, None, 1, hh, t0, 2, _TTL_MS)
-            ) == queries.ENROLL_ACCEPTED
-        # Both rows are now EXPIRED, and a NEW uuid is still refused: the count saw them.
-        past = t0 + _TTL_MS + 1
+        await db.write(
+            lambda c: queries.enroll_instance(
+                c, instance_id="main", secret_hash="old", install_uuid="u-old", now=100)
+        )
+        await db.write(
+            lambda c: c.execute("UPDATE instances SET status='revoked' WHERE id='main'")
+        )
         assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(
-                c, "u3", None, None, 1, "h3", past, 2, _TTL_MS)
-        ) == queries.ENROLL_AT_CAPACITY
+            lambda c: queries.enroll_instance(
+                c, instance_id="main", secret_hash="new", install_uuid="u-new", now=200)
+        ) == queries.ENROLL_OK
         assert await db.read(
-            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
-        ) == 2
+            lambda c: c.execute(
+                "SELECT status, secret_hash, install_uuid, enrolled_at "
+                "FROM instances WHERE id='main'"
+            ).fetchone()
+        ) == ("active", "new", "u-new", 200)
     finally:
         await db.close()
 
 
-async def test_upsert_enroll_request_capped_enforces_capacity_atomically(tmp_path):
-    # The capacity gate must be authoritative under one transaction: a NEW install_uuid is
-    # rejected once the list is at max_pending, but an EXISTING one is always accepted (an
-    # update, not a new row — so a full list can still refresh last_seen_at under TTL).
-    # This is now the ONLY capacity gate: the channel's advisory pre-count was removed (it
-    # was a second unauthenticated DB read per socket and could never be authoritative).
+async def test_enroll_instance_reports_a_secret_already_enrolled(tmp_path):
+    """A secret already carried by ANOTHER instance is refused, not raised.
+
+    Unreachable for an honest client (32 fresh random bytes per install), but the
+    ``UNIQUE(secret_hash)`` index is real and the channel has to answer the frame either
+    way — an escaping ``IntegrityError`` would close the socket with no verdict, leaving
+    the browser retrying forever with no reason on screen. Reddens if the except clause is
+    removed.
+    """
     db = await _make_db(tmp_path)
     try:
-        # Fill to a max_pending of 2.
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, None, 1, "h1", 100, 2, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u2", None, None, 1, "h2", 100, 2, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
-        # A third, NEW uuid at capacity is refused and writes nothing.
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u3", None, None, 1, "h3", 100, 2, _TTL_MS)
-        ) == queries.ENROLL_AT_CAPACITY
-        assert await db.read(
-            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
-        ) == 2
-        assert await db.read(
-            lambda c: c.execute("SELECT 1 FROM enroll_requests WHERE install_uuid='u3'").fetchone()
-        ) is None
-        # An EXISTING uuid at capacity is still accepted (refresh), count unchanged.
-        assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, "T1b", 1, "h1", 300, 2, _TTL_MS)
-        ) == queries.ENROLL_ACCEPTED
-        row = await db.read(
-            lambda c: c.execute(
-                "SELECT last_seen_at, suggested_title FROM enroll_requests "
-                "WHERE install_uuid='u1'"
-            ).fetchone()
+        await db.write(
+            lambda c: queries.enroll_instance(
+                c, instance_id="a", secret_hash="shared", install_uuid="ua", now=100)
         )
-        assert row == (300, "T1b")
+        assert await db.write(
+            lambda c: queries.enroll_instance(
+                c, instance_id="b", secret_hash="shared", install_uuid="ub", now=200)
+        ) == queries.ENROLL_SECRET_TAKEN
         assert await db.read(
-            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
-        ) == 2
+            lambda c: c.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+        ) == 1
     finally:
         await db.close()

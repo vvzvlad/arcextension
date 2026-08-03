@@ -46,7 +46,6 @@ def _hello(instance_id="i1", session="sess-1", **over):
         "instanceId": instance_id,
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",
-        "title": "Themed",
         "sessionId": session,
         "allowExecuteJs": False,
     }
@@ -135,8 +134,7 @@ def test_revoked_instance_and_its_tabs_leave_the_state_mirror(tmp_path):
 
     The tabs go with it: nothing ever deletes a revoked instance's tabs (``apply_snapshot``
     is their only writer and it needs a live socket), so leaving them behind would render a
-    phantom group labelled with a bare instance id — the title lived on the instance row
-    that just disappeared. Reddens if either filter is dropped.
+    phantom group whose "jump" can only fail. Reddens if either filter is dropped.
     """
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
@@ -211,8 +209,9 @@ def test_state_returns_mirror_shape(tmp_path):
             # The instance is present with the §10 fields.
             inst = {i["id"]: i for i in body["instances"]}["i1"]
             assert inst["connected"] is True
+            # No `title`: the id IS the name (§6) and the column is gone (migration 3).
             assert set(inst.keys()) == {
-                "id", "title", "connected", "snapshot_at", "last_seen_at",
+                "id", "connected", "snapshot_at", "last_seen_at",
                 "reject_reason", "reject_at", "focused_window_id",
             }
             # The tab from the snapshot is mirrored with the §10 tab fields.

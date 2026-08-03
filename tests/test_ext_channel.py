@@ -3,14 +3,15 @@
 These drive the real endpoint under the ENROLLMENT contract (issue #35):
 
 * a hello authenticates by a per-install SECRET — the client sends the RAW ``secret``
-  over TLS, the server hashes it (sha256) and resolves that to an APPROVED
+  over TLS, the server hashes it (sha256) and resolves that to an enrolled
   (``status='active'``) instances row and takes the server-assigned id from that row.
   There is no shared token and no trusted self-reported instanceId. A test therefore
-  ``approve_instance(...)`` (what Task E's operator approval does) before it can drive the
+  ``approve_instance(...)`` (what a successful enrol creates) before it can drive the
   hello path.
-* a not-yet-approved client opens with an ``enroll_request`` carrying the window
-  ``code``; the server records the request and answers ``enroll_pending`` — it never
-  creates an instances row.
+* a not-yet-enrolled client opens with an ``enroll_request`` carrying the window ``code``
+  AND the ``instanceId`` it wants; an open window with the right code IS the permission,
+  so the server creates the ACTIVE row on the spot and answers
+  ``enroll_accepted{instanceId}``. Every refusal creates nothing.
 
 Heartbeat is parked far away by default so no ping steals a synchronous frame; the
 two-miss decision is covered as a pure function in test_ext_snapshot.py.
@@ -43,7 +44,6 @@ def _hello(instance_id="i1", **over):
         "secret": secret_for(instance_id),
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",
-        "title": "Themed",
         "sessionId": "sess-1",
         "allowExecuteJs": False,
     }
@@ -57,8 +57,9 @@ def _enroll(**over):
         "protocolVersion": 1,
         "installUuid": "install-1",
         "secret": "a" * 64,
-        "origin": "chrome-extension://abc",
-        "title": "My laptop",
+        # The name the operator typed in the extension. It becomes the instance id
+        # verbatim (§6) — there is no separate display title on the wire anymore.
+        "instanceId": "my-laptop",
     }
     msg.update(over)
     return msg
@@ -69,6 +70,15 @@ def _db_row(db_path, sql, params=()):
     try:
         conn.execute("PRAGMA busy_timeout = 5000")
         return conn.execute(sql, params).fetchone()
+    finally:
+        conn.close()
+
+
+def _all_rows(db_path, sql, params=()):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn.execute(sql, params).fetchall()
     finally:
         conn.close()
 
@@ -392,10 +402,10 @@ def test_degraded_ext_rejected_no_bump_no_registry(tmp_path):
         assert client.app.state.ext_registry.get("i1") is None
 
 
-# --- enrollment: gates before any row is written ----------------------------
-def test_enroll_request_without_code_at_open_window_writes_no_row(tmp_path):
-    # Acceptance 2: a request WITHOUT a code at an OPEN window is refused (bad_code) and
-    # writes NO enroll_requests row (a missing code reads as code_ok=False).
+# --- enrollment: the window IS the permission (§6) ---------------------------
+def test_enroll_request_without_code_at_open_window_creates_nothing(tmp_path):
+    # A request WITHOUT a code at an OPEN window is refused (bad_code) and creates NO
+    # instance (a missing code reads as code_ok=False).
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
@@ -404,11 +414,13 @@ def test_enroll_request_without_code_at_open_window_writes_no_row(tmp_path):
             ws.send_json(_enroll())  # no "code"
             frame = _recv(ws)
             assert frame == {"type": "enroll_rejected", "reason": "bad_code"}
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
 def test_enroll_request_valid_code_closed_window_rejected(tmp_path):
-    # Acceptance 3: a request WITH a code but a CLOSED window is refused (closed), 0 rows.
+    # A request WITH a code but a CLOSED window is refused (closed) and creates nothing.
+    # This is the WHOLE gate now — there is no operator approval behind it — so the
+    # closed-window branch is load-bearing rather than a first line of defence.
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     # window NOT armed => closed
@@ -417,77 +429,141 @@ def test_enroll_request_valid_code_closed_window_rejected(tmp_path):
             ws.send_json(_enroll(code="ABC123"))
             frame = _recv(ws)
             assert frame == {"type": "enroll_rejected", "reason": "closed"}
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
-def test_enroll_request_valid_code_open_window_pending_and_no_first_seen_bump(tmp_path):
-    # Acceptance 2 (accept half): a valid code at an open window => enroll_pending + one
-    # row; a REPEAT enroll_request refreshes last_seen_at but NOT first_seen_at (so the
-    # request can still age out against its original first_seen_at, issue §1).
+def test_enroll_request_valid_code_open_window_creates_an_active_instance(tmp_path):
+    """The headline: a valid code at an open window enrols IMMEDIATELY.
+
+    One frame in, `enroll_accepted{instanceId}` out, and an ACTIVE row with the client's
+    secret_hash — no pending row, no operator step, and the very next hello with the same
+    secret authenticates. Reddens if the handler goes back to recording a request instead
+    of creating the instance (the hello below would be refused ``unknown_instance``).
+    """
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         code = _arm_window(db_path)
         with client.websocket_connect("/ext") as ws:
-            ws.send_json(_enroll(code=code, title="First"))
-            assert _recv(ws) == {"type": "enroll_pending"}
-        row1 = _wait_until(
+            ws.send_json(_enroll(code=code))
+            assert _recv(ws) == {"type": "enroll_accepted", "instanceId": "my-laptop"}
+        row = _wait_until(
             lambda: _db_row(
                 db_path,
-                "SELECT first_seen_at, last_seen_at, suggested_title, secret_hash, "
-                "protocol_version FROM enroll_requests WHERE install_uuid='install-1'",
+                "SELECT status, secret_hash, install_uuid FROM instances "
+                "WHERE id='my-laptop'",
             )
         )
-        assert row1 is not None
-        first_seen, last_seen1, title1, sh1, pv = row1
-        assert title1 == "First"
         # The server hashed the raw wire secret on receipt: the stored secret_hash is
         # sha256(raw), never the raw value itself (option A — only the hash is persisted).
-        assert sh1 == queries.sha256_hex("a" * 64)
-        assert pv == 1
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (1,)
+        assert row == ("active", queries.sha256_hex("a" * 64), "install-1")
+        # The enrolment is audited as the security trail of "a browser joined" — the row
+        # an operator's Approve click used to write.
+        assert _db_row(
+            db_path,
+            "SELECT action, initiator, instance_id FROM admin_audit WHERE action='enroll'",
+        ) == ("enroll", "system", "my-laptop")
 
-        time.sleep(0.02)  # ensure a later wall-clock for last_seen_at
+        # And it can hello straight away with that same secret: no second step in between.
         with client.websocket_connect("/ext") as ws2:
-            ws2.send_json(_enroll(code=code, title="Second"))
-            assert _recv(ws2) == {"type": "enroll_pending"}
-        row2 = _wait_until(
-            lambda: (
-                lambda r: r if r and r[2] == "Second" else None
-            )(
-                _db_row(
-                    db_path,
-                    "SELECT first_seen_at, last_seen_at, suggested_title "
-                    "FROM enroll_requests WHERE install_uuid='install-1'",
-                )
-            )
-        )
-        first_seen2, last_seen2, title2 = row2
-        # Still one row; first_seen_at is FROZEN; last_seen_at and title were refreshed.
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (1,)
-        assert first_seen2 == first_seen
-        assert last_seen2 >= last_seen1
-        assert title2 == "Second"
+            ws2.send_json(_hello(secret="a" * 64))
+            ack = _recv(ws2)
+            assert ack["ok"] is True and ack["instanceId"] == "my-laptop"
+            _recv(ws2)  # snapshot_request
 
 
-def test_enroll_request_at_capacity_rejected_no_row(tmp_path):
-    # The capacity gate refuses an enroll_request once the pending list is at the ceiling
-    # and writes no NEW row. enroll_max_pending=0 makes the ceiling bite immediately.
-    app = create_app(_settings(tmp_path, enroll_max_pending=0))
+def test_enroll_request_for_a_live_id_is_refused_and_does_not_disturb_it(tmp_path):
+    """A name already held by an ACTIVE instance is refused LOUDLY — the one collision the
+    removed approval step really guarded against.
+
+    Both halves matter: the newcomer gets ``id_taken`` (so its operator can see why in the
+    extension settings — the only place a refusal is visible now), and the incumbent's
+    credential is untouched, so it is not silently evicted from the fleet. Reddens if the
+    upsert's ``WHERE status != 'active'`` guard is dropped.
+    """
+    app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        approve_instance(db_path, "my-laptop")  # already live, with its own secret
         code = _arm_window(db_path)
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_enroll(code=code))
-            assert _recv(ws) == {"type": "enroll_rejected", "reason": "capacity"}
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
+            assert _recv(ws) == {"type": "enroll_rejected", "reason": "id_taken"}
+        # The incumbent keeps ITS secret; the newcomer's is nowhere.
+        assert _db_row(
+            db_path, "SELECT secret_hash FROM instances WHERE id='my-laptop'"
+        ) != (queries.sha256_hex("a" * 64),)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (1,)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM admin_audit WHERE action='enroll'") \
+            == (0,)
+
+
+def test_enroll_request_reclaims_a_revoked_id(tmp_path):
+    """A REVOKED id may be taken again — the restore path for a revoked MAIN.
+
+    Migration 2 leaves every pre-enrolment row revoked, so without this MAIN could never
+    curate again. Reddens if the collision gate is tightened to refuse any EXISTING id.
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        approve_instance(db_path, "my-laptop", status="revoked")
+        code = _arm_window(db_path)
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_enroll(code=code))
+            assert _recv(ws) == {"type": "enroll_accepted", "instanceId": "my-laptop"}
+        assert _wait_until(
+            lambda: _db_row(
+                db_path,
+                "SELECT status, secret_hash FROM instances WHERE id='my-laptop'",
+            ),
+        ) == ("active", queries.sha256_hex("a" * 64))
+
+
+def test_enroll_request_with_an_unusable_id_is_refused_under_its_own_reason(tmp_path):
+    """A name outside [A-Za-z0-9._-]{1,64} is ``bad_id``, not the generic ``protocol``.
+
+    The id becomes the row's PRIMARY KEY and travels into URLs, metric labels and the
+    console. The refusal has its OWN reason because the operator typed the value and has
+    to be told WHICH field to fix — the extension prints the reason verbatim. Reddens if
+    the check is folded into the structural protocol reject (the settings page would then
+    say "protocol mismatch" over a name with a space in it).
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        code = _arm_window(db_path)
+        for bad in ("has space", "x" * 65, "bad/slash", "", None, 42):
+            with client.websocket_connect("/ext") as ws:
+                ws.send_json(_enroll(code=code, instanceId=bad))
+                assert _recv(ws) == {
+                    "type": "enroll_rejected", "reason": "bad_id"}, repr(bad)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
+
+
+def test_enroll_bad_code_is_decided_before_the_id_is_looked_at(tmp_path):
+    """Order: a WRONG CODE wins over an unusable id.
+
+    The code gate must not become an oracle. If ``bad_id`` were decided first, an
+    unauthenticated peer could distinguish "my code is wrong" from "my code is right but
+    the name is bad" by varying the name — i.e. probe the window code with a frame that is
+    deliberately malformed. Reddens if the id check moves ahead of
+    ``enroll_reject_reason``.
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _arm_window(db_path)
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_enroll(code="WRONGC", instanceId="has space"))
+            assert _recv(ws) == {"type": "enroll_rejected", "reason": "bad_code"}
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
 def test_enroll_request_overlength_uuid_or_secret_rejected_no_row(tmp_path):
-    # §36: install_uuid (PK) and the raw secret (which becomes the secret_hash credential)
-    # go into the operator-facing pending list, so an overlength value is refused as a
-    # malformed frame and writes NO row (they are NOT truncated — that would corrupt a
-    # key/credential).
+    # §36: install_uuid and the raw secret (which becomes the secret_hash credential) land
+    # in the DB, so an overlength value is refused as a malformed frame and creates NOTHING
+    # (they are NOT truncated — that would corrupt a key/credential).
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
@@ -496,11 +572,11 @@ def test_enroll_request_overlength_uuid_or_secret_rejected_no_row(tmp_path):
             with client.websocket_connect("/ext") as ws:
                 ws.send_json(_enroll(code=code, **over))
                 assert _recv(ws) == {"type": "enroll_rejected", "reason": "protocol"}
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
 def test_enroll_request_wrong_protocol_rejected(tmp_path):
-    # Protocol version gates FIRST, before window/code/capacity (order in §2).
+    # Protocol version gates FIRST, before window/code/id (order in §6).
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
@@ -508,42 +584,34 @@ def test_enroll_request_wrong_protocol_rejected(tmp_path):
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_enroll(code=code, protocolVersion=2))
             assert _recv(ws) == {"type": "enroll_rejected", "reason": "protocol"}
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
-def test_enroll_repeat_with_a_different_secret_is_refused(tmp_path):
-    """Through the socket: the pending credential cannot be swapped out from under the
-    operator (the DB-level guard is pinned in test_ext_snapshot).
+def test_two_enrolments_of_one_name_resolve_to_one_active_row(tmp_path):
+    """Two browsers asking for the same name: one is enrolled, the other refused.
 
-    The client is told ``secret_conflict`` rather than being answered ``enroll_pending``:
-    silently queueing it would leave the client waiting on the approval of a secret it does
-    not hold, which is indistinguishable (from the client's side) from an operator who has
-    not got round to it. Reddens if the channel maps the mismatch to ``enroll_pending`` or
-    lets the write refresh the hash.
+    The collision is decided INSIDE the write transaction, which is what makes this
+    deterministic rather than last-write-wins. Reddens if the check is moved to a pre-read
+    in its own transaction — both would then see "free" and the second would clobber the
+    first's credential.
     """
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         code = _arm_window(db_path)
         with client.websocket_connect("/ext") as ws:
-            ws.send_json(_enroll(code=code, secret="a" * 64))
-            assert _recv(ws) == {"type": "enroll_pending"}
-        stored = _wait_until(
-            lambda: _db_row(
-                db_path,
-                "SELECT secret_hash FROM enroll_requests WHERE install_uuid='install-1'",
-            )
+            ws.send_json(_enroll(code=code, installUuid="install-1", secret="a" * 64))
+            assert _recv(ws) == {"type": "enroll_accepted", "instanceId": "my-laptop"}
+        _wait_until(
+            lambda: _db_row(db_path, "SELECT 1 FROM instances WHERE id='my-laptop'")
         )
-        assert stored == (queries.sha256_hex("a" * 64),)
-
-        # Same install_uuid, same visible fields, DIFFERENT secret -> refused, row intact.
         with client.websocket_connect("/ext") as ws2:
-            ws2.send_json(_enroll(code=code, secret="b" * 64))
-            assert _recv(ws2) == {"type": "enroll_rejected", "reason": "secret_conflict"}
+            ws2.send_json(_enroll(code=code, installUuid="install-2", secret="b" * 64))
+            assert _recv(ws2) == {"type": "enroll_rejected", "reason": "id_taken"}
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (1,)
         assert _db_row(
-            db_path, "SELECT secret_hash FROM enroll_requests WHERE install_uuid='install-1'"
-        ) == (queries.sha256_hex("a" * 64),)
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (1,)
+            db_path, "SELECT install_uuid FROM instances WHERE id='my-laptop'"
+        ) == ("install-1",)
 
 
 def test_enroll_wrong_protocol_version_touches_no_database(tmp_path):
@@ -601,39 +669,34 @@ def test_enroll_non_ascii_code_is_rejected_cleanly(tmp_path):
         with client.websocket_connect("/ext") as ws:
             ws.send_json(_enroll(code="Ж" * 6))
             assert _recv(ws) == {"type": "enroll_rejected", "reason": "bad_code"}
-        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
 # --- hello field hygiene (§36 symmetry with the enroll path) -----------------
-def test_hello_title_is_clamped_and_a_non_string_title_is_not_stored(tmp_path):
-    """An approved instance must not be able to overwrite its clamped enrolled name with a
-    megabyte, nor to crash the write with a non-string.
+def test_hello_cannot_rename_an_instance(tmp_path):
+    """A hello carries no name, and a client that sends one changes nothing.
 
-    ``title`` travels from here into /admin/instances, /api/state and the operator console.
-    The enroll path has always clamped its ``suggested_title`` to 200 chars; the hello path
-    took the value straight off the frame, so one hello could replace a carefully clamped
-    name with 10 MB of anything — and a list/dict title reached sqlite3 as a bind parameter
-    and raised an unhandled ``InterfaceError`` inside a write whose only guard is a
-    ``finally``. Reddens if the ``_clamp`` is dropped from the hello path.
+    ``title`` used to travel on this frame into /admin/instances, /api/state and the
+    console, so it had to be clamped and type-checked. The id IS the name now (§6): it is
+    assigned once at enrolment and a hello has no field that can move it. Reddens if a
+    display name is reintroduced on the authenticated path — an enrolled instance would
+    once again be able to redecorate every operator surface, and the megabyte/non-string
+    hazards would come back with it.
     """
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         approve_instance(db_path, "i1")
+        # A hello that hopefully carries a name the server does not read.
         with client.websocket_connect("/ext") as ws:
-            ws.send_json(_hello(title="T" * 10_000))
-            assert _recv(ws)["ok"] is True
+            ws.send_json(_hello(title="T" * 10_000, instanceId="somethingelse"))
+            ack = _recv(ws)
+            assert ack["ok"] is True and ack["instanceId"] == "i1"
             _recv(ws)  # snapshot_request
-        title = _db_row(db_path, "SELECT title FROM instances WHERE id='i1'")[0]
-        assert len(title) == 200 and set(title) == {"T"}
-
-        # A structurally wrong title is stored as NULL — the hello still succeeds (the
-        # frame is otherwise valid) and nothing raises.
-        with client.websocket_connect("/ext") as ws2:
-            ws2.send_json(_hello(title=["not", "a", "string"]))
-            assert _recv(ws2)["ok"] is True
-            _recv(ws2)
-        assert _db_row(db_path, "SELECT title FROM instances WHERE id='i1'") == (None,)
+        # The id is unchanged and there is no column for the name to have landed in.
+        assert _db_row(db_path, "SELECT id FROM instances") == ("i1",)
+        cols = {r[1] for r in _all_rows(db_path, "PRAGMA table_info(instances)")}
+        assert "title" not in cols
 
 
 def test_hello_with_an_unusable_session_id_is_a_protocol_reject(tmp_path):

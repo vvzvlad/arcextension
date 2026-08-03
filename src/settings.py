@@ -60,30 +60,15 @@ class Settings(BaseSettings):
     # window (arm_enroll_window silently floors it to 1) and a value above the clamp would
     # be silently reduced — both are config that does not mean what it says.
     enroll_window_min: int = Field(default=10, ge=1, le=ENROLL_WINDOW_MAX_MIN)
-    # Ceiling on the number of PENDING enroll_requests (§2). A not-yet-approved client's
-    # enroll_request is refused with enroll_rejected{reason:capacity} once the pending
-    # list is at this size, so a flood of anonymous enroll_requests cannot grow the
-    # operator-facing list without bound. 64 is generous for a human-scale fleet while
-    # still bounding the pre-auth list.
-    # ge=1: 0 is not "no ceiling", it is "no enrollment at all" — every enroll_request
-    # refused with {reason:capacity} and no way to add a browser, with nothing in the logs
-    # naming the cause. A knob that disables a subsystem must not be reachable by a typo.
-    enroll_max_pending: int = Field(default=64, ge=1)
-    # Lifetime of a PENDING enroll_request (§13, acceptance 12). A request is filtered out
-    # of GET /admin/enroll/requests once its FROZEN first_seen_at is older than this, and a
-    # frequent sweep (TICK_MS, ~60s) physically deletes it — so a stale/abandoned request
-    # self-clears within TTL+~60s instead of lingering in the operator list forever. 60
-    # minutes is chosen as: (a) comfortably LONGER than the enrollment window
-    # (ENROLL_WINDOW_MIN, 10 min) so an operator who opens a window always has a live
-    # request to approve — an approvable request must outlast the window, which is now a
-    # HARD requirement (an approve is gated on the window being open) and is validated
-    # below rather than merely intended; (b) long enough
-    # that a human noticing the request and approving it is unhurried; yet (c) bounded, so a
-    # copied/abandoned install's request does not sit in the pre-auth list indefinitely
-    # (the same self-clearing discipline the pending-cap and window give the pre-auth
-    # surface). Also equals the window's own MAX (ENROLL_WINDOW_MAX_MIN=60), so a request
-    # cannot expire under even a maximally-armed window.
-    enroll_request_ttl_min: int = Field(default=60, ge=1)
+    # ENROLL_MAX_PENDING and ENROLL_REQUEST_TTL_MIN are GONE, together with the
+    # `enroll_requests` table they governed. Enrolment is one step now (§6): an
+    # enroll_request with a valid code into an open window creates the active instance
+    # immediately, so there is no pending list to cap and no stale row to age out. Their
+    # cross-validator (TTL >= ENROLL_WINDOW_MIN, which existed because an approve was gated
+    # on the window still being open) went with them: nothing outlives the frame anymore.
+    # Both are read from `.env` as `extra="ignore"` leftovers without error, which is the
+    # right behaviour for a knob that stopped meaning anything.
+    #
     # Lifetime of an /admin HTML-console browser SESSION (§13, issue #36). The login cookie
     # carries a random id (never the ADMIN_TOKEN); this is how long that id stays valid in
     # the in-memory session store before a re-login is required. Enforced SERVER-side (the
@@ -124,26 +109,6 @@ class Settings(BaseSettings):
     backup_dir: str = "data/backups"
     host: str = "0.0.0.0"
     port: int = 8000
-
-    @field_validator("enroll_request_ttl_min")
-    @classmethod
-    def _ttl_must_outlast_the_window(cls, v: int, info) -> int:
-        # An approve is gated on the enrollment WINDOW being open (src.api.admin.approve),
-        # so a request must stay approvable for at least as long as one armed window lasts.
-        # With TTL < ENROLL_WINDOW_MIN a request filed at the start of a window expires
-        # BEFORE the window closes and the operator's approve answers 404 — the request is
-        # still in front of them in the console, because both surfaces apply the same
-        # read-time TTL filter and the list simply stops showing it a moment later.
-        # ``enroll_window_min`` is declared first, so it is already validated in info.data;
-        # if it failed its own validation it is absent and there is nothing to compare to.
-        window = info.data.get("enroll_window_min")
-        if window is not None and v < window:
-            raise ValueError(
-                f"must be >= ENROLL_WINDOW_MIN ({window}): an approve is only accepted "
-                "while the enrollment window is open, so a pending request has to outlast "
-                "the window it was filed in"
-            )
-        return v
 
     @field_validator("metrics_token", "admin_token")
     @classmethod

@@ -856,39 +856,59 @@ describe("enroll status banner (§7)", () => {
     expect(store.enrollStatus.value.label).toMatch(/wss:\/\//);
   });
 
-  it("shows 'ожидает одобрения' from the SW enrollState (pending)", async () => {
-    const env = makeChrome({
-      tabs: [],
-      messages: {
-        get_identity: { instanceId: "me" },
-        get_connection_state: { enrollState: "pending", hasAddress: true },
-      },
-    });
-    const store = storeWith(env, makeFetch({}).fetchFn);
-    await store.init();
-    expect(store.enrollStatus.value.label).toBe("ожидает одобрения");
+  it("shows 'не зарегистрирован' — there is no 'ожидает одобрения' state left", async () => {
+    // Enrolment is one step (§6): an enroll_request is accepted or refused on the spot, so
+    // a browser is either enrolled or it is not. The SW no longer reports `pending`; if an
+    // old worker still does, the banner must not invent a waiting state for it.
+    for (const enrollState of ["needs-enroll", "pending"]) {
+      const env = makeChrome({
+        tabs: [],
+        messages: {
+          get_identity: { instanceId: "me" },
+          get_connection_state: { enrollState, hasAddress: true },
+        },
+      });
+      const store = storeWith(env, makeFetch({}).fetchFn);
+      await store.init();
+      const label = store.enrollStatus.value && store.enrollStatus.value.label;
+      expect(label == null || !label.includes("ожидает")).toBe(true);
+    }
   });
 
-  it("a pending request the server rejected shows WHY, not an eternal 'ожидает одобрения'", async () => {
-    const env = makeChrome({
-      tabs: [],
-      messages: {
-        get_identity: { instanceId: "me" },
-        get_connection_state: { enrollState: "pending", hasAddress: true, enrollReject: "bad_code" },
-      },
-    });
-    const store = storeWith(env, makeFetch({}).fetchFn);
-    await store.init();
-    expect(store.enrollStatus.value.label).toBe("заявка отклонена: bad_code");
+  it("a refused enrolment shows WHY, in words, not the wire constant", async () => {
+    // This banner and the extension settings are the ONLY places a human sees a refusal:
+    // /admin has no list of refused attempts anymore. So it has to say what to change.
+    const cases = [
+      ["id_taken", "имя уже занято"],
+      ["bad_id", "имя не подходит"],
+      ["bad_code", "неверный код"],
+      ["closed", "окно регистрации закрыто"],
+      ["brand_new", "brand_new"], // an unlisted reason is shown raw, never swallowed
+    ];
+    for (const [reason, expected] of cases) {
+      const env = makeChrome({
+        tabs: [],
+        messages: {
+          get_identity: { instanceId: "me" },
+          get_connection_state: {
+            enrollState: "needs-enroll", hasAddress: true, enrollReject: reason,
+          },
+        },
+      });
+      const store = storeWith(env, makeFetch({}).fetchFn);
+      await store.init();
+      expect(store.enrollStatus.value.state).toBe("needs-enroll");
+      expect(store.enrollStatus.value.label).toContain("не зарегистрирован");
+      expect(store.enrollStatus.value.label).toContain(expected);
+    }
   });
 
   it("a QUARANTINED instance whose re-registration was rejected shows why, and that a new code is needed", async () => {
-    // getEnrollState resolves `quarantined` before `pending` (the old secret is still
-    // active), so this instance NEVER reports `pending` — a reject shown only under
-    // `pending` is invisible exactly here. And here there is no self-healing: the terminal
-    // reject wiped the staged code, so the probe stops asking and the banner would sit on
-    // "требуется повторная регистрация" while the operator waits for an approval that no
-    // request exists for.
+    // getEnrollState resolves `quarantined` before needs-enroll (the old secret is still
+    // active), so this instance NEVER reports needs-enroll — a reject shown only there is
+    // invisible exactly here. And here there is no self-healing: the terminal reject wiped
+    // the staged code, so the probe stops asking and the banner would sit on
+    // "требуется повторная регистрация" over an attempt that already came back refused.
     const env = makeChrome({
       tabs: [],
       messages: {
@@ -903,8 +923,8 @@ describe("enroll status banner (§7)", () => {
     const store = storeWith(env, makeFetch({}).fetchFn);
     await store.init();
     expect(store.enrollStatus.value.state).toBe("quarantined");
-    expect(store.enrollStatus.value.label).toContain("заявка отклонена: bad_code");
-    expect(store.enrollStatus.value.label).toContain("новый код");
+    expect(store.enrollStatus.value.label).toContain("повторная регистрация отклонена");
+    expect(store.enrollStatus.value.label).toContain("неверный код");
   });
 
   it("shows 'отозван' from the SW enrollState (revoked)", async () => {

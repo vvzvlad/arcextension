@@ -43,6 +43,18 @@ const ADDRESS_ERROR_LABELS = {
 };
 const ADDRESS_ERROR_FALLBACK = "адрес отклонён — нужен wss://хост";
 
+// The `enroll_rejected` reasons (src/ext/protocol.py), in the language of this page. Same
+// discipline as the address labels: the SERVICE decides, this only names the verdict. An
+// unlisted reason falls through to the raw string rather than being swallowed — a new
+// refusal reason must be readable before it is pretty.
+const ENROLL_REJECT_LABELS = {
+  id_taken: "имя уже занято другим активным браузером",
+  bad_id: "имя не подходит: 1-64 символа из A-Z a-z 0-9 . _ -",
+  bad_code: "неверный код регистрации",
+  closed: "окно регистрации закрыто",
+  protocol: "версия протокола не совпала",
+};
+
 export function createStore(deps = {}) {
   const chromeApi = deps.chromeApi || (typeof chrome !== "undefined" ? chrome : undefined);
   const fetchFn = deps.fetchFn || (typeof fetch !== "undefined" ? fetch.bind(globalThis) : undefined);
@@ -60,7 +72,7 @@ export function createStore(deps = {}) {
   const search = ref("");
   const fallbackMessage = ref("");
   // Enrollment (§7): the SW's durable-fact state + whether an address is configured.
-  // The status bar shows "ожидает одобрения" / "отозван" / "адрес не настроен" from
+  // The status bar shows "не зарегистрирован" / "отозван" / "адрес не настроен" from
   // these; connectivity itself stays with /api/state (offline/instances).
   const enrollState = ref("needs-enroll");
   const hasAddress = ref(false);
@@ -68,8 +80,11 @@ export function createStore(deps = {}) {
   // (ws:// on loopback aside), because the raw instance secret rides that connection.
   // Without this the banner would say "адрес не настроен" over a filled-in field.
   const addressError = ref(null);
-  // The last enroll_rejected reason (bad_code/closed/capacity/…), so a pending banner
-  // shows WHY instead of an eternal "ожидает одобрения" (§7).
+  // The last enroll_rejected reason (bad_code/closed/id_taken/bad_id/…), so the banner
+  // says WHY the browser is not enrolled (§7). There is no "ожидает одобрения" state to
+  // be stuck in anymore — an enroll_request is answered on the spot (§6) — so a browser
+  // that is not enrolled either never tried or was refused, and the reason is the whole
+  // news. It is also the only place a human sees it: /admin lists no refused attempts.
   const enrollReject = ref(null);
 
   // --- the clock (§10) ------------------------------------------------------
@@ -197,7 +212,7 @@ export function createStore(deps = {}) {
   // The GROUPED TAB LISTS — deliberately free of the ticking clock. This computed is
   // the expensive one (§10 promises hundreds of rows, and every invalidation makes Vue
   // re-diff the whole v-for), so it must depend only on data that actually changes:
-  // the tabs, the search string, the instance titles, offline. `serverNow()` reads
+  // the tabs, the search string, the instance list, offline. `serverNow()` reads
   // `clockTick`, so folding the status label in here rebuilt the entire foreign list
   // once a second.
   const foreignTabGroups = computed(() => {
@@ -213,7 +228,7 @@ export function createStore(deps = {}) {
       const meta = metaById.get(instanceId) || { id: instanceId };
       groups.push({
         instanceId,
-        title: meta.title || instanceId,
+        title: instanceId, // the id IS the name (§6): there is no separate title
         meta,
         // Offline: a jump to a foreign tab is inactive, and the group is labelled
         // "кэш от <время>" (§10).
@@ -237,7 +252,7 @@ export function createStore(deps = {}) {
   const statusRows = computed(() =>
     instances.value.map((i) => ({
       id: i.id,
-      title: i.title || i.id,
+      title: i.id, // the id IS the name (§6)
       status: instanceStatus(i, serverNow(), staleMs),
     })),
   );
@@ -260,28 +275,34 @@ export function createStore(deps = {}) {
       return { state: "no-address", label: "адрес не настроен" };
     }
     switch (enrollState.value) {
-      case "pending":
-        return enrollReject.value
-          ? { state: "pending", label: "заявка отклонена: " + enrollReject.value }
-          : { state: "pending", label: "ожидает одобрения" };
       case "revoked":
         return { state: "revoked", label: "отозван" };
       case "quarantined":
-        // The reject has to be surfaced HERE too, not only under `pending`: getEnrollState
-        // resolves `quarantined` BEFORE `pending`, so a quarantined instance (it still holds
-        // a valid old secret) never reports `pending` and its rejected re-registration would
-        // show nothing at all. And this is the path with no self-healing — a terminal reject
-        // (bad_code / closed) wipes the staged code, so the probe goes quiet and only a fresh
-        // code from the operator moves it. The label says that instead of leaving the banner
-        // on "требуется повторная регистрация" over an attempt that already failed.
+        // The reject is surfaced HERE too, not only under needs-enroll: getEnrollState
+        // resolves `quarantined` ahead of everything but `revoked`, so a quarantined
+        // instance (it still holds a valid old secret) never reports needs-enroll and its
+        // refused re-registration would show nothing at all. And this is the path with no
+        // self-healing — a terminal reject wipes the staged code, so the probe goes quiet
+        // and only the operator moves it. The label says that instead of leaving the
+        // banner on "требуется повторная регистрация" over an attempt that already failed.
         return enrollReject.value
           ? {
               state: "quarantined",
-              label: "заявка отклонена: " + enrollReject.value + " — введите новый код регистрации",
+              label:
+                "повторная регистрация отклонена: " +
+                (ENROLL_REJECT_LABELS[enrollReject.value] || enrollReject.value),
             }
           : { state: "quarantined", label: "неизвестный инстанс — требуется повторная регистрация" };
       case "needs-enroll":
-        return { state: "needs-enroll", label: "не зарегистрирован" };
+        // Not enrolled. WHY, when we know: a refusal is the only signal a human gets.
+        return enrollReject.value
+          ? {
+              state: "needs-enroll",
+              label:
+                "не зарегистрирован — " +
+                (ENROLL_REJECT_LABELS[enrollReject.value] || enrollReject.value),
+            }
+          : { state: "needs-enroll", label: "не зарегистрирован" };
       default:
         return null; // approved / unknown → the normal status rows speak
     }
@@ -295,7 +316,7 @@ export function createStore(deps = {}) {
     if (ident && ident.instanceId) ownInstanceId.value = ident.instanceId;
 
     // Enroll state + address presence from the SW (durable facts, §7). Read first so
-    // the status bar can show "адрес не настроен" / "ожидает одобрения" on the very
+    // the status bar can show "адрес не настроен" / "не зарегистрирован" on the very
     // first paint even before any /api/state round-trip (acc 13).
     const cs = await getConnectionState(chromeApi);
     if (cs) {

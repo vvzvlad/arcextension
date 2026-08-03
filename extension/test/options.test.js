@@ -4,6 +4,8 @@ import {
   enrollLabel,
   init,
   installUuidPrefix,
+  instanceNameError,
+  instanceNameErrorText,
   normalizeServiceAddress as optionsNormalizeServiceAddress,
   serviceAddressError as optionsServiceAddressError,
 } from "../pages/options.js";
@@ -15,11 +17,12 @@ import { INSTALL_UUID_PREFIX_LEN } from "../src/constants.js";
 
 const UUID = "d01784bd-a594-4766-a521-b52c4e71c010";
 
-describe("installUuidPrefix (§7 — operator identifies their own request)", () => {
+describe("installUuidPrefix (§7 — this install's identity, for the operator to quote)", () => {
   it("shows enough of installUuid to tell two installs apart, '—' when absent", () => {
-    // The /admin list prints the SAME prefix (templates/app.js) — that is the only way to
-    // compare them. 8 chars was too few: same person, same browser name, same fleet-wide
-    // origin, so the prefix is the ONLY discriminator and it decides who gets a credential.
+    // It used to be compared char-for-char against a row in the /admin pending list; that
+    // list is gone (§6), so this is now a diagnostic rather than a decision input. The
+    // length is kept: two browsers of one person still have to be distinguishable in a
+    // support conversation, and 8 hex chars collide too easily for that.
     expect(installUuidPrefix(UUID)).toBe("d01784bd-a594-4766");
     expect(installUuidPrefix(UUID)).toHaveLength(INSTALL_UUID_PREFIX_LEN);
     expect(installUuidPrefix("")).toBe("—");
@@ -135,35 +138,74 @@ describe("normalizeServiceAddress", () => {
 });
 
 describe("enrollLabel", () => {
-  it("maps each enroll state to a human label", () => {
-    expect(enrollLabel("pending")).toBe("ожидает одобрения");
+  it("maps each enroll state to a human label — and has no 'waiting' state left", () => {
     expect(enrollLabel("revoked")).toBe("отозван");
-    expect(enrollLabel("approved")).toBe("одобрен");
+    expect(enrollLabel("approved")).toBe("активен");
     expect(enrollLabel("needs-enroll")).toBe("не зарегистрирован");
     expect(enrollLabel(null)).toBe("не зарегистрирован");
+    // `pending` is GONE (§6): an enroll_request is answered on the spot, so there is no
+    // "ожидает одобрения" for a browser to be stuck in. Reddens if the label is
+    // reintroduced — it would be shown over a state nothing can ever leave.
+    expect(enrollLabel("pending")).toBe("не зарегистрирован");
+    for (const state of ["approved", "revoked", "needs-enroll", "quarantined", null]) {
+      expect(enrollLabel(state)).not.toContain("ожидает");
+    }
   });
 
-  it("surfaces an enroll_rejected reason instead of an eternal 'waiting' (§7)", () => {
-    // A pending request the server rejected must say WHY, not "ожидает одобрения".
-    expect(enrollLabel("pending", "bad_code")).toBe("заявка отклонена: bad_code");
-    expect(enrollLabel("needs-enroll", "closed")).toBe("заявка отклонена: closed");
-    // An approved instance ignores a stale reject.
-    expect(enrollLabel("approved", "bad_code")).toBe("одобрен");
+  it("surfaces the refusal reason — the only place a human ever sees it", () => {
+    // There is no pending list in /admin anymore, so a refused enrolment leaves NO trace a
+    // human can look at except this label (and a /metrics counter). It must therefore say
+    // what to change, not print the wire constant.
+    expect(enrollLabel("needs-enroll", "id_taken")).toContain("имя уже занято");
+    expect(enrollLabel("needs-enroll", "bad_id")).toContain("имя не подходит");
+    expect(enrollLabel("needs-enroll", "bad_code")).toContain("неверный код");
+    expect(enrollLabel("needs-enroll", "closed")).toContain("окно регистрации закрыто");
+    expect(enrollLabel(null, "closed")).toContain("окно регистрации закрыто");
+    // Still not enrolled, and it says so before the reason.
+    expect(enrollLabel("needs-enroll", "id_taken")).toContain("не зарегистрирован");
+    // An unknown reason is shown raw rather than swallowed.
+    expect(enrollLabel("needs-enroll", "brand_new")).toContain("brand_new");
+    // An enrolled instance ignores a stale reject.
+    expect(enrollLabel("approved", "bad_code")).toBe("активен");
   });
 
   it("surfaces the reason on the QUARANTINE path, which cannot recover by itself", () => {
     // The regression this pins: a quarantined instance keeps a valid old secret, so
-    // getEnrollState answers `quarantined` and never `pending` — gate the reject on
-    // pending-only and the operator who typed a wrong code sees the same
+    // getEnrollState answers `quarantined` and never needs-enroll — gate the reject on
+    // needs-enroll only and the operator who typed a wrong code sees the same
     // "требуется повторная регистрация" as before submitting, forever. The staged code was
-    // wiped with the reject, so the probe will not retry and only a new code moves this.
+    // wiped with the reject, so the probe will not retry and only the operator moves this.
     const label = enrollLabel("quarantined", "bad_code");
-    expect(label).toContain("заявка отклонена: bad_code");
-    expect(label).toContain("новый код");
+    expect(label).toContain("повторная регистрация отклонена");
+    expect(label).toContain("неверный код");
     // Without a reject the plain quarantine label is untouched.
     expect(enrollLabel("quarantined")).toBe(
       "неизвестный инстанс — требуется повторная регистрация",
     );
+  });
+});
+
+describe("instanceNameError (the name IS the instance id, §6)", () => {
+  it("accepts exactly what the service accepts, and refuses the rest locally", () => {
+    // The service enforces src/ext/protocol.py INSTANCE_ID_RE and answers
+    // enroll_rejected{bad_id}; this check exists so a bad name is refused BEFORE the
+    // one-shot window code is spent on a certain refusal. Same table both sides.
+    for (const good of ["main", "a", "A".repeat(64), "work-laptop", "Prox.2", "x_y-z.1"]) {
+      expect(instanceNameError(good)).toBe(null);
+      expect(instanceNameError("  " + good + "  ")).toBe(null); // trimmed like the field
+    }
+    for (const bad of ["A".repeat(65), "has space", "имя", "a/b", "a:b"]) {
+      expect(instanceNameError(bad)).toBe("charset");
+    }
+    for (const empty of ["", "   ", null, undefined]) {
+      expect(instanceNameError(empty)).toBe("empty");
+    }
+  });
+
+  it("explains the refusal in terms of what to type", () => {
+    expect(instanceNameErrorText("charset")).toMatch(/A-Z a-z 0-9/);
+    expect(instanceNameErrorText("charset")).toMatch(/no spaces/i);
+    expect(instanceNameErrorText("empty")).toMatch(/name/i);
   });
 });
 
@@ -240,12 +282,78 @@ describe("options init (§7)", () => {
     // The operator types the address + the window code and presses submit → the code
     // feeds the enroll_request via the SW message (and both are persisted).
     doc.els["service-address"].value = "wss://curator.example";
+    doc.els["browser-name"].value = "work-laptop";
     doc.els["enroll-code"].value = "WIN-CODE";
     await doc.els["submit-enroll"]._handlers.click();
     const submit = sent.find((m) => m.type === "submit_enrollment");
     expect(submit).toEqual({ type: "submit_enrollment", code: "WIN-CODE" });
     expect(stored.enrollCode).toBe("WIN-CODE");
     expect(stored.serviceAddress).toBe("wss://curator.example");
+    // The name rides to the SW through storage, not through the message.
+    expect(stored.browserName).toBe("work-laptop");
+  });
+
+  it("refuses to submit a name that cannot be an instance id (no message sent)", async () => {
+    // The name goes on the wire as `instanceId` and the service refuses it with bad_id —
+    // burning the one-shot window code for nothing. The field may hold an unsaved value
+    // the change handler already rejected, so submit re-checks it.
+    const doc = fakeDoc(IDS);
+    const { chromeApi, sent, stored } = fakeChrome();
+    await init(doc, chromeApi);
+    sent.length = 0;
+    doc.els["service-address"].value = "wss://curator.example";
+    doc.els["browser-name"].value = "Bob's Chrome";
+    doc.els["enroll-code"].value = "WIN-CODE";
+    await doc.els["submit-enroll"]._handlers.click();
+    expect(sent.find((m) => m.type === "submit_enrollment")).toBeUndefined();
+    expect(doc.els.status.textContent).toMatch(/A-Z a-z 0-9/);
+    expect(stored.enrollCode).toBeUndefined(); // the code is not spent
+  });
+
+  it("does NOT store a name that cannot be an instance id, and says why", async () => {
+    const doc = fakeDoc(IDS);
+    const { chromeApi, stored } = fakeChrome();
+    await init(doc, chromeApi);
+
+    doc.els["browser-name"].value = "Bob's Chrome";
+    await doc.els["browser-name"]._handlers.change();
+    expect(stored.browserName).toBeUndefined(); // never persisted
+    expect(doc.els.status.textContent).toMatch(/no spaces/i);
+
+    doc.els["browser-name"].value = "  bobs-chrome  ";
+    await doc.els["browser-name"]._handlers.change();
+    expect(stored.browserName).toBe("bobs-chrome"); // trimmed and saved
+    expect(doc.els.status.textContent).toBe("Browser name saved");
+  });
+
+  it("repaints the state when the SW records a verdict (storage.onChanged)", async () => {
+    // The verdict lands on the SOCKET, in a worker that is not this page: submit returns
+    // before it arrives. Without this watcher the refusal reason — the ONLY thing a human
+    // ever sees about a refused enrolment — would need a page reload to appear.
+    const doc = fakeDoc(IDS);
+    const listeners = [];
+    const { chromeApi } = fakeChrome({}, { enrollState: "needs-enroll" });
+    chromeApi.storage.onChanged = { addListener: (fn) => listeners.push(fn) };
+    let state = { enrollState: "needs-enroll" };
+    chromeApi.runtime.sendMessage = async (msg) =>
+      msg.type === "get_connection_state" ? state : { ok: true };
+
+    await init(doc, chromeApi);
+    expect(doc.els["enroll-state"].textContent).toBe("не зарегистрирован");
+    expect(listeners).toHaveLength(1);
+
+    // The SW writes the refusal into the durable enroll facts.
+    state = { enrollState: "needs-enroll", enrollReject: "id_taken" };
+    await listeners[0]({ enrollState: {} }, "local");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(doc.els["enroll-state"].textContent).toContain("имя уже занято");
+
+    // An unrelated key (or a different area) does not repaint.
+    state = { enrollState: "approved" };
+    await listeners[0]({ somethingElse: {} }, "local");
+    await listeners[0]({ enrollState: {} }, "sync");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(doc.els["enroll-state"].textContent).toContain("имя уже занято");
   });
 
   it("refuses to submit an empty code (no message sent)", async () => {
@@ -334,6 +442,7 @@ describe("options: the service address is validated before it is stored (§7)", 
     await init(doc, chromeApi);
 
     doc.els["service-address"].value = "curator.nebula.lc";
+    doc.els["browser-name"].value = "work-laptop";
     doc.els["enroll-code"].value = "WIN-CODE";
     await doc.els["submit-enroll"]._handlers.click();
 

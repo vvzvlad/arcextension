@@ -308,7 +308,7 @@ def test_every_enrollment_signal_has_an_alert_rule():
 
 # Reason labels that deliberately have NO rule. The default is the other way round — a
 # reason label needs an alert unless it is listed here WITH a reason — because the
-# thing this guards against is exactly what happened to `enroll_secret_conflict`: a new
+# thing this guards against is exactly what happened to the retired `enroll_secret_conflict`: a new
 # refusal reason was added, exported, and the hand-written needle list said nothing.
 #
 # Each entry is excluded because a rule on it would be noise, not because nobody got to
@@ -321,6 +321,17 @@ def test_every_enrollment_signal_has_an_alert_rule():
 #     page on ordinary operation.
 #   * `enroll_closed` — likewise normal: any client that reconnects outside an open window
 #     gets it, which is most of the time on a healthy install.
+#   * `enroll_bad_id` — the proposed instance id is outside [A-Za-z0-9._-]{1,64}. The
+#     extension validates the SAME expression in its options page before it sends, and
+#     refuses to save or submit a name that fails, so an honest client cannot produce this
+#     label at all; reaching it means a hand-made frame or a stale bundle. And it has no
+#     operational consequence to alert on: nothing was created, nobody else was denied
+#     anything, and the one person affected is looking straight at the reason — the
+#     extension shows it verbatim in the settings page they just typed the name into.
+#     Its sibling `enroll_id_taken` DOES get a rule (curator-enroll-id-taken, threshold 0)
+#     precisely because it lacks all three of those: it can happen to a correct client, it
+#     leaves that browser unable to enrol, and — with the pending list gone — the counter
+#     is the only trace an operator can find.
 #   * `auth` — documented in `hello_reject_reason` as a last-line guard the channel is
 #     supposed to have already handled with a more specific reason. It is a belt-and-
 #     suspenders branch, not an operational signal.
@@ -368,6 +379,7 @@ _REASONS_WITHOUT_A_RULE = frozenset({
     "revoked",
     "unknown_instance",
     "enroll_closed",
+    "enroll_bad_id",
     "enroll_protocol",
     "admin_session",
     "api_token",
@@ -779,19 +791,21 @@ def test_the_label_scan_sees_writers_outside_the_protocol_module():
     assert {"cors_preflight", "admin_bad_token", "mcp_token"} <= labels
     # And the protocol-derived half is still there — the scan ADDED writers, it did not
     # replace the dynamic channel sites.
-    assert {"enroll_secret_conflict", "unknown_instance"} <= labels
+    assert {"enroll_id_taken", "unknown_instance"} <= labels
 
 
-def test_secret_conflict_rule_fires_on_a_single_occurrence():
-    """A credential-substitution attempt is not a fat-finger, so its threshold is 0.
+def test_id_taken_rule_fires_on_a_single_occurrence():
+    """A name collision at enrolment is not a fat-finger to smooth over, so threshold 0.
 
-    `secret_conflict` means the window was open and the code was right, but the secret
-    differed from the one frozen on the pending row — a healthy client always re-registers
-    with the same durable secret, so this does not happen by accident. Reddens if the rule
-    is given a brute-force-style threshold that would sit silent through a successful
-    single-shot substitution."""
-    rule = next(r for r in _rules() if r["alert"] == "curator-enroll-secret-conflict")
-    assert 'curator_auth_rejections_total{reason="enroll_secret_conflict"}' in rule["expr"]
+    `id_taken` means the window was open, the code was right, and the peer asked for the id
+    of a LIVE instance. Two readings, both worth one page: the operator named a new browser
+    after an existing one (that browser is now stuck un-enrolled), or somebody aimed at an
+    existing identity. Neither is background noise — enrolments are rare and deliberate —
+    and since the approval step went away there is no pending list in /admin where a
+    refused attempt could be seen instead. Reddens if the rule is given a brute-force-style
+    threshold that would sit silent through a single collision."""
+    rule = next(r for r in _rules() if r["alert"] == "curator-enroll-id-taken")
+    assert 'curator_auth_rejections_total{reason="enroll_id_taken"}' in rule["expr"]
     assert "increase(" in rule["expr"]
     assert rule["expr"].strip().endswith("> 0")
 

@@ -1,28 +1,28 @@
-"""``/admin/*`` enrollment JSON API (issue #35 Task E) — the operator control surface.
+"""``/admin/*`` — the operator control surface that is LEFT after enrolment lost its
+second step (§6, §13).
 
-Pins the acceptance rows the /admin JSON slice owns:
+What this file no longer covers, and why: there is no ``/admin/enroll/approve``,
+``/admin/enroll/reject`` or ``/admin/enroll/requests``. A browser enrols itself over /ext
+by presenting a valid window code and the id it wants, so there is no pending row to list,
+approve or reject, and no TTL to sweep. Those frames are tested in
+``tests/test_ext_channel.py`` and the SQL that writes them in ``tests/test_revoke.py``
+(``enroll_instance``).
 
-* (4)  approve → an active instances row with the request's secret_hash + the assigned
-       id, the request row deleted, and ``resolve_secret`` now returning it active (a
-       subsequent secret-hello would authenticate).
+What remains here:
+
 * (6)  every /admin endpoint rejects an INSTANCE secret with 401; ADMIN_TOKEN → 200.
 * (9)  revoking MAIN without a matching replacement → 409; with ``replacement==MAIN`` →
-       200; and approve RE-ACTIVATES the revoked MAIN (the round-trip).
-* (11) two approves of one request resolve to exactly one 200 + one 409, leaving exactly
-       one active instance / one secret; both 409 mechanisms (already-active WHERE guard
-       and UNIQUE(secret_hash)) are exercised.
-* (12) a request older than TTL is not returned by GET, and
-       ``delete_expired_enroll_requests`` physically removes it; the sweep wiring runs it
-       within TTL+TICK.
-* revoke-404, approve-already-active-409, and admin_audit rows for approve/reject/revoke.
+       200 — and the id it frees can be taken again (the restore path, asserted at the
+       query layer since the operator no longer performs it).
+* the enrollment window: arm → read (with the live code) → close, each audited.
+* degraded gating: mutating verbs 503, reads still available.
+* the instances list: all statuses, and a revoked row never reads as connected.
 
 Each test is written to REDDEN on the specific mutation it guards (noted inline).
 """
 
-import asyncio
 import sqlite3
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from conftest import (
     admin_headers,
@@ -33,30 +33,12 @@ from conftest import (
 )
 from starlette.testclient import TestClient
 
-from src.db.access import Database
-from src.db.queries import ApproveConflict, approve_enroll_request, sha256_hex
+from src.db.queries import ENROLL_OK, enroll_instance
 
 
 # --- low-level DB helpers ----------------------------------------------------
 def _now() -> int:
     return int(time.time() * 1000)
-
-
-def _seed_request(db_path, install_uuid, *, secret_hash, first_seen_at=None,
-                  origin="chrome-extension://abc", title="T", proto=1):
-    fs = first_seen_at if first_seen_at is not None else _now()
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("PRAGMA busy_timeout = 5000")
-        conn.execute(
-            "INSERT INTO enroll_requests (install_uuid, origin, suggested_title, "
-            "protocol_version, secret_hash, first_seen_at, last_seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (install_uuid, origin, title, proto, secret_hash, fs, fs),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _seed_instance(db_path, iid, *, status, secret_hash=None, install_uuid=None):
@@ -82,27 +64,6 @@ def _q(db_path, sql, params=()):
         conn.close()
 
 
-def _arm_window(db_path, *, minutes=10, now=None):
-    """Open the enrollment window directly in the DB (what the operator's
-    ``POST /admin/enroll/window`` does) and return its code.
-
-    Approve is GATED on an open window (issue #35 §13 / src.curator.enroll's contract), so
-    every approve test has to stage one — the operator flow is open-window → hand out the
-    code → the client enrolls → approve, all inside the window.
-    """
-    from src.curator.enroll import arm_enroll_window
-
-    now = _now() if now is None else now
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("PRAGMA busy_timeout = 5000")
-        state = arm_enroll_window(conn, now=now, minutes=minutes)
-        conn.commit()
-        return state.code
-    finally:
-        conn.close()
-
-
 # --- (6) admin-only auth -----------------------------------------------------
 def test_every_admin_endpoint_rejects_instance_and_anon(tmp_path):
     """Acc 6: an INSTANCE secret (and no token) is 401 on EVERY /admin route; ADMIN_TOKEN
@@ -118,9 +79,6 @@ def test_every_admin_endpoint_rejects_instance_and_anon(tmp_path):
         inst = instance_headers(secret_for("inst"))
 
         endpoints = [
-            ("GET", "/admin/enroll/requests"),
-            ("POST", "/admin/enroll/approve"),
-            ("POST", "/admin/enroll/reject"),
             ("GET", "/admin/instances"),
             ("POST", "/admin/instances/inst/revoke"),
             ("POST", "/admin/enroll/window"),
@@ -134,319 +92,30 @@ def test_every_admin_endpoint_rejects_instance_and_anon(tmp_path):
             assert r_anon.status_code == 401, f"{method} {path} anon -> {r_anon.status_code}"
 
         # ADMIN_TOKEN passes the gate on the read endpoints (200).
-        assert client.get("/admin/enroll/requests", headers=admin_headers()).status_code == 200
         assert client.get("/admin/instances", headers=admin_headers()).status_code == 200
         assert client.get("/admin/enroll/window", headers=admin_headers()).status_code == 200
 
 
-# --- (4) approve activates the row with the request's secret -----------------
-def test_approve_activates_instance_with_request_secret_and_consumes_request(tmp_path):
-    """Acc 4: approve creates an ACTIVE instances row carrying the REQUEST's secret_hash
-    under the operator-assigned id, deletes the request, and resolve_secret then returns
-    it active (a later secret-hello would authenticate). An admin_audit 'approve' row is
-    written. Reddens if approve stops copying secret_hash, stops deleting the request, or
-    leaves status != 'active'."""
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    # The request stores sha256(raw); approve copies THAT onto the instance, and a later
-    # hello presenting the RAW secret resolves it (option A — server hashes on receipt).
-    raw = "secret-A"
-    sh = sha256_hex(raw)
-    with TestClient(app) as client:
-        _arm_window(db_path)
-        _seed_request(db_path, "uuid-A", secret_hash=sh, title="Home")
-        resp = client.post(
-            "/admin/enroll/approve", headers=admin_headers(),
-            json={"install_uuid": "uuid-A", "instance_id": "laptop"},
-        )
-        assert resp.status_code == 200
-        assert resp.json() == {"instance_id": "laptop", "status": "active"}
+def test_the_approval_endpoints_are_gone(tmp_path):
+    """The retired routes must 404, not linger as a second way in.
 
-        rows = _q(db_path, "SELECT status, secret_hash, install_uuid, title, enrolled_at "
-                           "FROM instances WHERE id='laptop'")
-        assert len(rows) == 1
-        status, secret_hash, install_uuid, title, enrolled_at = rows[0]
-        assert status == "active" and secret_hash == sh
-        assert install_uuid == "uuid-A" and title == "Home" and enrolled_at is not None
-        # The request was consumed.
-        assert _q(db_path, "SELECT 1 FROM enroll_requests WHERE install_uuid='uuid-A'") == []
-        # resolve_secret now returns it active — a secret-hello presenting the RAW secret
-        # would authenticate (the server hashes it back to the stored sh).
-        assert asyncio.run(_resolve(db_path, raw)) == ("laptop", "active")
-        # admin_audit recorded the approve.
-        audit = _q(db_path, "SELECT action, install_uuid, instance_id, initiator "
-                            "FROM admin_audit WHERE action='approve'")
-        assert audit == [("approve", "uuid-A", "laptop", "admin")]
-
-
-async def _resolve(db_path, raw_secret):
-    from src.db.queries import resolve_secret
-    db = Database(db_path, str(db_path) + ".bk")
-    # Reuse the existing DB file; open() runs migrations (idempotent) on it.
-    await db.open()
-    try:
-        return await db.read(lambda c: resolve_secret(c, raw_secret))
-    finally:
-        await db.close()
-
-
-def test_approve_uses_body_title_over_suggested(tmp_path):
-    """The body ``title`` overrides the client's suggested_title; absent, the suggested
-    title is used. Reddens if the endpoint ignores the body title."""
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _arm_window(db_path)
-        _seed_request(db_path, "uuid-T", secret_hash="h-T", title="suggested")
-        client.post("/admin/enroll/approve", headers=admin_headers(),
-                    json={"install_uuid": "uuid-T", "instance_id": "i-T", "title": "chosen"})
-        assert _q(db_path, "SELECT title FROM instances WHERE id='i-T'") == [("chosen",)]
-
-
-def test_approve_refused_while_the_window_is_closed(tmp_path):
-    """The gate ``src.curator.enroll``'s docstring and the DEPLOY runbook have always
-    claimed and the code did not have: approval is accepted ONLY while the enrollment
-    window is open.
-
-    The concrete hole: with the shipping ``ENROLL_WINDOW_MIN=10`` /
-    ``ENROLL_REQUEST_TTL_MIN=60`` a request stayed approvable for 50 minutes after the
-    window closed — "at an arbitrary later time", which is exactly what the short window
-    exists to prevent. Reddens if the window read is dropped from ``approve``: the closed
-    -window POST would create the instance.
+    A route left mounted over a handler nobody maintains is exactly how the two-step flow
+    would come back by accident — and, worse, an ``/admin/enroll/approve`` that still
+    answered would be an ADMIN-authenticated way to mint an instance outside the window
+    gate. Reddens if any of them is re-registered.
     """
     app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
-        _seed_request(db_path, "uuid-W", secret_hash="h-W")
-
-        # No window armed at all → refused, and NOTHING was written.
-        closed = client.post("/admin/enroll/approve", headers=admin_headers(),
-                             json={"install_uuid": "uuid-W", "instance_id": "lap"})
-        assert closed.status_code == 409
-        assert _q(db_path, "SELECT COUNT(*) FROM instances") == [(0,)]
-        # The request survives — a closed window is a "not now", not a rejection.
-        assert _q(db_path, "SELECT 1 FROM enroll_requests WHERE install_uuid='uuid-W'") == [(1,)]
-
-        # An EXPIRED window is closed too (the deadline row lingers after natural expiry;
-        # read_enroll_window compares it against now). Reddens if the gate tests for the
-        # ROW's presence instead of the window's state.
-        _arm_window(db_path, minutes=10, now=_now() - 11 * 60_000)
-        expired = client.post("/admin/enroll/approve", headers=admin_headers(),
-                              json={"install_uuid": "uuid-W", "instance_id": "lap"})
-        assert expired.status_code == 409
-        assert _q(db_path, "SELECT COUNT(*) FROM instances") == [(0,)]
-
-        # Open one and the very same call succeeds (non-vacuity: the window is the only
-        # thing that changed).
-        _arm_window(db_path)
-        ok = client.post("/admin/enroll/approve", headers=admin_headers(),
-                         json={"install_uuid": "uuid-W", "instance_id": "lap"})
-        assert ok.status_code == 200
-        assert _q(db_path, "SELECT status FROM instances WHERE id='lap'") == [("active",)]
+        for method, path in [
+            ("GET", "/admin/enroll/requests"),
+            ("POST", "/admin/enroll/approve"),
+            ("POST", "/admin/enroll/reject"),
+        ]:
+            resp = client.request(method, path, headers=admin_headers(), json={})
+            assert resp.status_code == 404, f"{method} {path} -> {resp.status_code}"
 
 
-def test_reject_and_revoke_are_not_window_gated(tmp_path):
-    """Only APPROVE is gated. Reject (drop a pending request) and revoke (retire an
-    instance) must stay available with the window shut — they only ever REMOVE access, and
-    gating them would mean an operator who wants to kill a credential first has to open the
-    enrollment surface. Reddens if the gate is copied onto the destructive verbs."""
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _seed_request(db_path, "uuid-R", secret_hash="h-R")
-        _seed_instance(db_path, "gone", status="active", secret_hash="s-gone")
-        # No window armed anywhere in this test.
-        assert client.post("/admin/enroll/reject", headers=admin_headers(),
-                           json={"install_uuid": "uuid-R"}).status_code == 200
-        assert client.post("/admin/instances/gone/revoke", headers=admin_headers(),
-                           json={}).status_code == 200
-
-
-def test_admin_api_field_names_are_snake_case(tmp_path):
-    """The /admin JSON contract is snake_case, in BOTH directions — pinned so the drift
-    between code and prose cannot come back silently.
-
-    This service has exactly two naming conventions and they are per-SURFACE, not per-file:
-    the ``/ext`` WIRE protocol is camelCase (``installUuid``, ``sessionId``,
-    ``protocolVersion``), and every JSON API body/response is snake_case — ``/api/rules``
-    has taken ``instance_id`` since long before enrollment, the shipped console
-    (``templates/app.js``) posts ``install_uuid``/``instance_id``, and these very responses
-    return ``install_uuid``/``first_seen_at`` straight from the columns. Reddens if a
-    handler starts accepting camelCase (or answering in it).
-    """
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _arm_window(db_path)
-        _seed_request(db_path, "uuid-N", secret_hash="h-N")
-
-        listed = client.get("/admin/enroll/requests", headers=admin_headers()).json()
-        row = listed["requests"][0]
-        for field in ("install_uuid", "install_uuid_short", "suggested_title",
-                      "protocol_version", "first_seen_at", "last_seen_at", "id_exists"):
-            assert field in row, field
-        assert not any(k in row for k in ("installUuid", "protocolVersion", "firstSeenAt"))
-
-        # camelCase in the REQUEST body is not silently accepted: install_uuid is missing,
-        # so the handler answers 400 rather than enrolling something it guessed.
-        camel = client.post("/admin/enroll/approve", headers=admin_headers(),
-                            json={"installUuid": "uuid-N", "instanceId": "lap"})
-        assert camel.status_code == 400
-        assert _q(db_path, "SELECT COUNT(*) FROM instances") == [(0,)]
-
-        # snake_case works, and the response answers in snake_case too.
-        ok = client.post("/admin/enroll/approve", headers=admin_headers(),
-                         json={"install_uuid": "uuid-N", "instance_id": "lap"})
-        assert ok.status_code == 200 and "instance_id" in ok.json()
-
-        instances = client.get("/admin/instances", headers=admin_headers()).json()
-        for field in ("id", "status", "connected", "last_seen_at", "enrolled_at",
-                      "revoked_at"):
-            assert field in instances["instances"][0], field
-
-
-def test_approve_missing_request_is_404(tmp_path):
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _arm_window(db_path)
-        resp = client.post("/admin/enroll/approve", headers=admin_headers(),
-                           json={"install_uuid": "ghost", "instance_id": "x"})
-        assert resp.status_code == 404
-
-
-# --- (11) two approves -> one 200 one 409, one active row / one secret --------
-def test_two_approves_of_one_request_resolve_to_200_and_409(tmp_path):
-    """Acc 11: given the request's secret captured once (both racing handlers read it
-    before either write commits), two approves to the SAME id resolve to exactly one 200
-    and one 409 via the ``WHERE status != 'active'`` guard, leaving ONE active row and ONE
-    secret. Reddens if that WHERE guard is dropped (the second approve would overwrite and
-    return 200 → two 'successes')."""
-    db_path = str(tmp_path / "curator.db")
-
-    async def _run():
-        db = Database(db_path, str(tmp_path / "bk"))
-        await db.open()
-        try:
-            # Seed the request; capture its secret once (as both handlers' read would).
-            await db.write(lambda c: c.execute(
-                "INSERT INTO enroll_requests (install_uuid, protocol_version, secret_hash, "
-                "first_seen_at, last_seen_at) VALUES ('u', 1, 'sekret', 1, 1)"))
-            outcomes = []
-            for _ in range(2):
-                try:
-                    await db.write(lambda c: approve_enroll_request(
-                        c, instance_id="one", secret_hash="sekret",
-                        install_uuid="u", title=None, now=_now()))
-                    outcomes.append(200)
-                except ApproveConflict:
-                    outcomes.append(409)
-                except sqlite3.IntegrityError:
-                    outcomes.append(409)
-            return outcomes, await db.read(lambda c: c.execute(
-                "SELECT COUNT(*) FROM instances WHERE status='active'").fetchone()[0]), \
-                await db.read(lambda c: c.execute(
-                "SELECT COUNT(*) FROM instances WHERE secret_hash='sekret'").fetchone()[0])
-        finally:
-            await db.close()
-
-    outcomes, active_count, secret_count = asyncio.run(_run())
-    assert sorted(outcomes) == [200, 409]
-    assert active_count == 1 and secret_count == 1
-
-
-def test_two_approves_to_different_ids_collide_on_unique_secret(tmp_path):
-    """Acc 11, the OTHER 409 mechanism: two approves of one request to DIFFERENT ids —
-    the second hits ``UNIQUE(secret_hash)`` (a second active instance carrying the same
-    secret) and raises IntegrityError → 409. Reddens if the unique index is dropped (both
-    would succeed, two actives share one secret)."""
-    db_path = str(tmp_path / "curator.db")
-
-    async def _run():
-        db = Database(db_path, str(tmp_path / "bk"))
-        await db.open()
-        try:
-            await db.write(lambda c: c.execute(
-                "INSERT INTO enroll_requests (install_uuid, protocol_version, secret_hash, "
-                "first_seen_at, last_seen_at) VALUES ('u', 1, 'sekret', 1, 1)"))
-            await db.write(lambda c: approve_enroll_request(
-                c, instance_id="idA", secret_hash="sekret", install_uuid="u",
-                title=None, now=_now()))
-            raised = None
-            try:
-                await db.write(lambda c: approve_enroll_request(
-                    c, instance_id="idB", secret_hash="sekret", install_uuid="u",
-                    title=None, now=_now()))
-            except sqlite3.IntegrityError as e:
-                raised = e
-            n = await db.read(lambda c: c.execute(
-                "SELECT COUNT(*) FROM instances WHERE secret_hash='sekret'").fetchone()[0])
-            return raised, n
-        finally:
-            await db.close()
-
-    raised, n = asyncio.run(_run())
-    assert raised is not None
-    assert n == 1
-
-
-def test_approve_already_active_id_is_409(tmp_path):
-    """A brand-new request whose operator-assigned id is ALREADY an active instance → 409
-    (ApproveConflict), and that live instance is untouched. Reddens if the already-active
-    guard is removed (the live instance would be overwritten with the new secret)."""
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _arm_window(db_path)
-        _seed_instance(db_path, "taken", status="active", secret_hash="old-secret",
-                       install_uuid="old-uuid")
-        _seed_request(db_path, "new-uuid", secret_hash="new-secret")
-        resp = client.post("/admin/enroll/approve", headers=admin_headers(),
-                           json={"install_uuid": "new-uuid", "instance_id": "taken"})
-        assert resp.status_code == 409
-        # The live instance kept its OWN secret; the request survives for a retry.
-        assert _q(db_path, "SELECT secret_hash FROM instances WHERE id='taken'") == [("old-secret",)]
-        assert _q(db_path, "SELECT 1 FROM enroll_requests WHERE install_uuid='new-uuid'") == [(1,)]
-
-
-def test_approve_new_id_with_secret_of_active_instance_is_409_over_http(tmp_path):
-    """acc-11 second mechanism, THROUGH the HTTP handler: approving a NEW id whose request
-    carries a secret already held by an active instance → 409 via UNIQUE(secret_hash).
-    Reddens if the handler's `except sqlite3.IntegrityError -> 409` branch is removed (the
-    endpoint would 500 instead) — the DB-level tests do not cover this HTTP mapping."""
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _arm_window(db_path)
-        _seed_instance(db_path, "live", status="active", secret_hash="dup-secret",
-                       install_uuid="live-uuid")
-        _seed_request(db_path, "new-uuid", secret_hash="dup-secret")
-        resp = client.post("/admin/enroll/approve", headers=admin_headers(),
-                           json={"install_uuid": "new-uuid", "instance_id": "fresh-id"})
-        assert resp.status_code == 409
-        assert "secret is already enrolled" in resp.text  # string detail → PlainTextResponse
-        # No second row created; the request survives for a retry.
-        assert _q(db_path, "SELECT COUNT(*) FROM instances WHERE secret_hash='dup-secret'") == [(1,)]
-        assert _q(db_path, "SELECT 1 FROM instances WHERE id='fresh-id'") == []
-        assert _q(db_path, "SELECT 1 FROM enroll_requests WHERE install_uuid='new-uuid'") == [(1,)]
-
-
-def test_approve_rejects_malformed_instance_id_400(tmp_path):
-    """The operator-assigned instance_id (row PRIMARY KEY) is bounded charset/length;
-    a space / overlong value → 400, no row written. Reddens if the _INSTANCE_ID_RE guard
-    is removed."""
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _arm_window(db_path)
-        _seed_request(db_path, "u1", secret_hash="s1")
-        for bad in ("has space", "x" * 65, "bad/slash"):
-            resp = client.post("/admin/enroll/approve", headers=admin_headers(),
-                               json={"install_uuid": "u1", "instance_id": bad})
-            assert resp.status_code == 400, bad
-        assert _q(db_path, "SELECT COUNT(*) FROM instances") == [(0,)]
-
-
+# --- the instances list ------------------------------------------------------
 def test_list_instances_reports_revoked_as_not_connected(tmp_path):
     """A revoked row leaves the stale `connected` column set (teardown is async); the
     operator console must still show it disconnected. Reddens if the status gate on
@@ -468,13 +137,36 @@ def test_list_instances_reports_revoked_as_not_connected(tmp_path):
         assert row["status"] == "revoked" and row["connected"] is False
 
 
-# --- (9) revoke MAIN round-trip + re-approve restores it ---------------------
-def test_revoke_main_409_without_replacement_then_reapprove_restores(tmp_path):
-    """Acc 9: revoking MAIN without ``replacement==MAIN`` → 409; WITH it → 200; then an
-    approve RE-ACTIVATES the revoked MAIN (the only restore path — Task D leaves MAIN
-    revoked). Reddens if RevokeMainRefused stops mapping to 409, or if approve's
-    ON CONFLICT reactivation (WHERE status!='active') is broken (the revoked MAIN could
-    not be restored)."""
+def test_list_instances_shows_all_statuses_and_no_title(tmp_path):
+    """Every status is listed — and the row carries NO ``title`` field.
+
+    The id IS the name (§6): the column is dropped in migration 3 and the console prints
+    the id. Reddens if a ``title`` key is reintroduced into the JSON, which is how a
+    half-removed field starts being re-populated by the next writer.
+    """
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "a", status="active", secret_hash="sa")
+        _seed_instance(db_path, "b", status="revoked", secret_hash="sb")
+        got = client.get("/admin/instances", headers=admin_headers()).json()["instances"]
+        by_id = {i["id"]: i["status"] for i in got}
+        assert by_id == {"a": "active", "b": "revoked"}
+        for row in got:
+            assert "title" not in row
+
+
+# --- (9) revoke MAIN round-trip + the restore path ---------------------------
+def test_revoke_main_409_without_replacement_then_the_id_can_be_retaken(tmp_path):
+    """Acc 9: revoking MAIN without ``replacement==MAIN`` → 409; WITH it → 200.
+
+    Then the RESTORE: the freed id is taken again by an enrolment, which is the only way
+    back for a revoked MAIN (migration 2 leaves every pre-enrolment row revoked). That
+    half is asserted at the query layer because no operator action performs it anymore —
+    the browser re-enrols itself through /ext. Reddens if ``RevokeMainRefused`` stops
+    mapping to 409, or if ``enroll_instance``'s reactivation (``WHERE status!='active'``)
+    breaks — the revoked MAIN could then never come back.
+    """
     app = create_app_for(tmp_path, main_instance_id="main")
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
@@ -492,14 +184,19 @@ def test_revoke_main_409_without_replacement_then_reapprove_restores(tmp_path):
         assert ok.status_code == 200 and ok.json() == {"instance_id": "main", "status": "revoked"}
         assert _q(db_path, "SELECT status FROM instances WHERE id='main'") == [("revoked",)]
 
-        # Re-approve restores MAIN to active with a fresh secret (the reactivation path).
-        _arm_window(db_path)
-        _seed_request(db_path, "main-uuid", secret_hash="main-new")
-        restore = client.post("/admin/enroll/approve", headers=admin_headers(),
-                              json={"install_uuid": "main-uuid", "instance_id": "main"})
-        assert restore.status_code == 200
-        assert _q(db_path, "SELECT status, secret_hash FROM instances WHERE id='main'") \
-            == [("active", "main-new")]
+    # The restore: a fresh enrolment reclaims the revoked id with a NEW secret.
+    conn = sqlite3.connect(db_path)
+    try:
+        outcome = enroll_instance(
+            conn, instance_id="main", secret_hash="main-new",
+            install_uuid="main-uuid", now=_now(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert outcome == ENROLL_OK
+    assert _q(db_path, "SELECT status, secret_hash FROM instances WHERE id='main'") \
+        == [("active", "main-new")]
 
 
 def test_revoke_nonexistent_is_404(tmp_path):
@@ -543,134 +240,16 @@ def test_revoke_writes_audit_and_closes_socket(tmp_path):
         assert audit == [("revoke", "gone", "admin")]
 
 
-# --- reject: idempotent + audited -------------------------------------------
-def test_reject_deletes_request_and_audits_idempotently(tmp_path):
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _seed_request(db_path, "uuid-R", secret_hash="h-R")
-        r1 = client.post("/admin/enroll/reject", headers=admin_headers(),
-                         json={"install_uuid": "uuid-R"})
-        assert r1.status_code == 200 and r1.json()["deleted"] is True
-        assert _q(db_path, "SELECT 1 FROM enroll_requests WHERE install_uuid='uuid-R'") == []
-        # Idempotent: a second reject is still 200, deleted=False.
-        r2 = client.post("/admin/enroll/reject", headers=admin_headers(),
-                         json={"install_uuid": "uuid-R"})
-        assert r2.status_code == 200 and r2.json()["deleted"] is False
-        assert _q(db_path, "SELECT COUNT(*) FROM admin_audit WHERE action='reject'") == [(2,)]
-
-
-# --- (12) TTL: read filter + physical delete + sweep wiring ------------------
-def test_ttl_read_filter_hides_expired_but_keeps_row(tmp_path):
-    """Acc 12 part 1: the read-time filter (``list_pending_enroll_requests``) never returns
-    a request whose frozen first_seen_at is older than the TTL, while the row is STILL
-    PHYSICALLY PRESENT (read filter and physical delete are independent). Tested against
-    the DB directly so the live background sweep cannot race the physical-presence check.
-    Reddens if the read drops the ``first_seen_at >= now-ttl`` filter (the stale request
-    would appear) — and separately proves the row is only hidden, not yet deleted."""
-    from src.db.queries import list_pending_enroll_requests
-
-    db_path = str(tmp_path / "curator.db")
-
-    async def _run():
-        db = Database(db_path, str(tmp_path / "bk"))
-        await db.open()
-        try:
-            now = _now()
-            _seed_request(db_path, "freshie", secret_hash="h1", first_seen_at=now)
-            _seed_request(db_path, "staleee", secret_hash="h2",
-                          first_seen_at=now - 61 * 60_000)  # 61 min old > 60 min TTL
-            rows = await db.read(lambda c: list_pending_enroll_requests(
-                c, now=now, ttl_ms=60 * 60_000))
-            physical = await db.read(lambda c: c.execute(
-                "SELECT COUNT(*) FROM enroll_requests").fetchone()[0])
-            return rows, physical
-        finally:
-            await db.close()
-
-    rows, physical = asyncio.run(_run())
-    assert {r["install_uuid"] for r in rows} == {"freshie"}
-    assert physical == 2  # only filtered at read time, not deleted
-    assert rows[0]["install_uuid_short"] == "freshie"[:8]
-
-
-def test_delete_expired_enroll_requests_physical_removal(tmp_path):
-    """Acc 12 part 2: the pure ``delete_expired_enroll_requests(conn, cutoff)`` removes
-    rows with first_seen_at < cutoff and KEEPS newer ones. Reddens if the boundary flips
-    (it would delete the fresh row or keep the stale one)."""
-    from src.db.queries import list_pending_enroll_requests
-    from src.db.retention import delete_expired_enroll_requests, enroll_request_cutoff_ms
-
-    db_path = str(tmp_path / "curator.db")
-
-    async def _run():
-        db = Database(db_path, str(tmp_path / "bk"))
-        await db.open()
-        try:
-            now = _now()
-            _seed_request(db_path, "fresh", secret_hash="h1", first_seen_at=now)
-            _seed_request(db_path, "stale", secret_hash="h2", first_seen_at=now - 61 * 60_000)
-            cutoff = enroll_request_cutoff_ms(now, 60)
-            deleted = await db.write(lambda c: delete_expired_enroll_requests(c, cutoff))
-            remaining = await db.read(
-                lambda c: [r["install_uuid"]
-                           for r in list_pending_enroll_requests(c, now=now, ttl_ms=60 * 60_000)])
-            all_rows = await db.read(
-                lambda c: [r[0] for r in c.execute(
-                    "SELECT install_uuid FROM enroll_requests").fetchall()])
-            return deleted, remaining, all_rows
-        finally:
-            await db.close()
-
-    deleted, remaining, all_rows = asyncio.run(_run())
-    assert deleted == 1
-    assert remaining == ["fresh"] and all_rows == ["fresh"]
-
-
-def test_sweep_loop_deletes_within_ttl_plus_tick(tmp_path):
-    """Acc 12 part 3: the wired ``enroll_request_sweep_loop`` physically deletes an expired
-    request on its next tick — proving the sweep is the mechanism that bounds physical
-    removal at TTL+TICK. Driven with a tiny interval so the test is fast. Reddens if the
-    loop stops calling delete_expired_enroll_requests."""
-    from src.db.retention import enroll_request_sweep_loop
-
-    db_path = str(tmp_path / "curator.db")
-
-    async def _run():
-        db = Database(db_path, str(tmp_path / "bk"))
-        await db.open()
-        try:
-            now = _now()
-            _seed_request(db_path, "stale", secret_hash="h", first_seen_at=now - 61 * 60_000)
-            _seed_request(db_path, "fresh", secret_hash="h2", first_seen_at=now)
-            # ttl_min=60, interval_ms tiny (clamped to 1s min inside; use the clamp).
-            task = asyncio.create_task(enroll_request_sweep_loop(db, 60, 1))
-            # Wait for the stale row to disappear (bounded).
-            deadline = asyncio.get_event_loop().time() + 5
-            while asyncio.get_event_loop().time() < deadline:
-                rows = await db.read(lambda c: c.execute(
-                    "SELECT install_uuid FROM enroll_requests ORDER BY install_uuid").fetchall())
-                if [r[0] for r in rows] == ["fresh"]:
-                    break
-                await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            return [r[0] for r in await db.read(lambda c: c.execute(
-                "SELECT install_uuid FROM enroll_requests ORDER BY install_uuid").fetchall())]
-        finally:
-            await db.close()
-
-    assert asyncio.run(_run()) == ["fresh"]
-
-
 # --- window endpoints + degraded gating -------------------------------------
 def test_window_open_read_close_and_audit(tmp_path):
     """Arm → GET reports open with the code → DELETE closes it; window_open/window_close
     audit rows are written. Reddens if the code is not returned while open, or the audit
-    is dropped."""
+    is dropped.
+
+    The window carries MORE weight than it used to: it is now the WHOLE permission to
+    enrol, not merely the interval an approval had to fall inside. Arming it is therefore
+    the operator's one deliberate act, and `window_open` is the audit row that records it.
+    """
     app = create_app_for(tmp_path, enroll_window_min=10)
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
@@ -697,30 +276,13 @@ def test_writes_503_in_degraded_reads_ok(tmp_path):
     with TestClient(app) as client:
         client.app.state.degraded = True
         # reads OK
-        assert client.get("/admin/enroll/requests", headers=admin_headers()).status_code == 200
         assert client.get("/admin/instances", headers=admin_headers()).status_code == 200
         assert client.get("/admin/enroll/window", headers=admin_headers()).status_code == 200
         # writes 503
-        assert client.post("/admin/enroll/approve", headers=admin_headers(),
-                           json={"install_uuid": "u", "instance_id": "i"}).status_code == 503
-        assert client.post("/admin/enroll/reject", headers=admin_headers(),
-                           json={"install_uuid": "u"}).status_code == 503
         assert client.post("/admin/instances/x/revoke", headers=admin_headers(),
                            json={}).status_code == 503
         assert client.post("/admin/enroll/window", headers=admin_headers()).status_code == 503
         assert client.delete("/admin/enroll/window", headers=admin_headers()).status_code == 503
-
-
-def test_list_instances_shows_all_statuses(tmp_path):
-    app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    with TestClient(app) as client:
-        _seed_instance(db_path, "a", status="active", secret_hash="sa")
-        _seed_instance(db_path, "b", status="revoked", secret_hash="sb")
-        _seed_instance(db_path, "c", status="pending", secret_hash="sc")
-        got = client.get("/admin/instances", headers=admin_headers()).json()["instances"]
-        by_id = {i["id"]: i["status"] for i in got}
-        assert by_id == {"a": "active", "b": "revoked", "c": "pending"}
 
 
 # --- app factory helper ------------------------------------------------------

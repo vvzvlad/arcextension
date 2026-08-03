@@ -78,14 +78,17 @@ class AdminSecurityHeadersMiddleware:
     ``X-Frame-Options``) stay on the HTML/asset responses themselves, where framing is the
     threat.
 
-    * ``nosniff`` — the JSON API serves UNTRUSTED ``suggested_title`` / ``origin``
-      verbatim; a browser MIME-sniffing that body into active HTML must not be possible.
+    * ``nosniff`` — a browser MIME-sniffing a JSON body into active HTML must not be
+      possible. The bodies carry no free-text client input anymore (the pending list that
+      served ``suggested_title`` / ``origin`` verbatim is gone, and an instance id is
+      charset-bounded before the row exists), but the header stays: it is what keeps the
+      NEXT field from being the hole, and it costs nothing.
     * ``no-store`` — ``/admin`` is entirely secrets: ``GET /admin/enroll/window`` returns
-      the LIVE window code, the request list carries pending credentials' metadata, and
-      the console page is only meaningful to an authenticated operator. None of it carried
-      any cache directive, so the default heuristics let a browser (or any intermediary)
-      write the live code to the disk cache, where it outlives both the window and the
-      session. ``no-store`` is the only directive that forbids writing it down at all —
+      the LIVE window code, which is now the WHOLE permission to enrol, and the console
+      page is only meaningful to an authenticated operator. None of it carried any cache
+      directive, so the default heuristics let a browser (or any intermediary) write the
+      live code to the disk cache, where it outlives both the window and the session.
+      ``no-store`` is the only directive that forbids writing it down at all —
       ``no-cache`` still permits a stored copy.
     """
 

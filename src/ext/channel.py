@@ -90,47 +90,34 @@ def first_frame_timeout_s(silent_count: int, preauth_max: int) -> float:
         return _FIRST_FRAME_TIMEOUT_UNDER_PRESSURE_S
     return _FIRST_FRAME_TIMEOUT_S
 
-# Client-proposed strings recorded verbatim from an enroll_request are length-clamped
-# before they touch the DB (§36): a hostile peer must not stash megabytes in the
-# operator-facing pending list.
-_MAX_SUGGESTED_TITLE = 200
-_MAX_ORIGIN = 300
-# install_uuid (the enroll_requests PRIMARY KEY) and the raw secret (which the server
-# hashes into the NOT-NULL secret_hash credential) are the LARGEST unbounded fields a
-# hostile peer with a valid window code could stash in the operator-facing pending list
-# (§36), so they get their own ceilings. Unlike title/origin they are NOT truncated —
-# truncating a key or a credential silently corrupts identity — an overlength value is a
-# malformed frame (REJECT_PROTOCOL). A real raw secret is 64 hex chars (32 bytes), a real
-# UUID 36; the cap stays generous.
+# install_uuid (recorded on the instances row) and the raw secret (which the server hashes
+# into the NOT-NULL secret_hash credential) are the LARGEST unbounded fields a hostile peer
+# with a valid window code could push into the DB (§36), so they get their own ceilings.
+# They are NOT truncated — truncating a key or a credential silently corrupts identity — an
+# overlength value is a malformed frame (REJECT_PROTOCOL). A real raw secret is 64 hex chars
+# (32 bytes), a real UUID 36; the cap stays generous. The proposed ``instanceId`` needs no
+# ceiling of its own: ``protocol.INSTANCE_ID_RE`` already bounds it to 64 chars of a fixed
+# charset, and unlike these two it is refused with its own reason (``bad_id``) because the
+# operator has to be told which field to fix.
 _MAX_INSTALL_UUID = 200
 _MAX_SECRET = 128
-# The same ceilings on the HELLO path. A hello is authenticated, but "authenticated" only
-# means the peer holds an approved secret — it does not make the rest of the frame trusted,
-# and every value below lands in the DB and then in an operator-facing surface (§36):
-#   * ``title`` is display text, so it is CLAMPED exactly like ``suggested_title`` — an
-#     approved instance must not be able to replace its carefully-clamped enrolled name
-#     with a multi-megabyte string that then travels into /admin, /api/state and the
-#     console. A non-str title becomes NULL instead of reaching sqlite3 as a list/dict,
-#     which raised an unhandled InterfaceError inside a write whose only guard is a
-#     `finally`.
-#   * ``sessionId`` is IDENTITY, not display text: the mirror compares it verbatim against
-#     the value later reported in snapshots, and a relocation stays live only while both
-#     endpoints' sessions still match. Truncating it would silently corrupt those
-#     comparisons, so an oversized/non-str session id is a malformed frame
-#     (REJECT_PROTOCOL) — the same rule install_uuid / secret already follow.
-_MAX_TITLE = 200
+# The same ceiling on the HELLO path. A hello is authenticated, but "authenticated" only
+# means the peer holds an enrolled secret — it does not make the rest of the frame trusted,
+# and ``sessionId`` lands in the DB and from there on operator-facing surfaces (§36).
+# ``sessionId`` is IDENTITY, not display text: the mirror compares it verbatim against the
+# value later reported in snapshots, and a relocation stays live only while both endpoints'
+# sessions still match. Truncating it would silently corrupt those comparisons, so an
+# oversized/non-str session id is a malformed frame (REJECT_PROTOCOL) — the same rule
+# install_uuid / secret already follow.
+#
+# There used to be a ``title`` clamp beside it, for the display name a hello carried. The
+# name is the id now (§6), the id is assigned once at enrolment and a hello cannot change
+# it, so there is no client-supplied display text on this path left to clamp.
 _MAX_SESSION_ID = 200
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _clamp(value: Any, limit: int) -> str | None:
-    """Coerce a client-supplied string to at most ``limit`` chars; non-str -> None."""
-    if not isinstance(value, str):
-        return None
-    return value[:limit]
 
 
 def _count_rejection(app) -> None:
@@ -218,8 +205,8 @@ async def ext_channel(websocket: WebSocket) -> None:
 
         mtype = first.get("type") if isinstance(first, dict) else None
         if mtype == protocol.TYPE_ENROLL_REQUEST:
-            # A not-yet-approved client. Record (or refuse) the request and close; the
-            # socket is NOT kept — approval is async ("удерживать сокет не нужно").
+            # A not-yet-enrolled client. Enrol (or refuse) it and close; the socket is NOT
+            # kept — the client reconnects with a hello once it holds an id.
             await _handle_enroll(websocket, app, settings, first)
             return
         if mtype != protocol.TYPE_HELLO:
@@ -275,13 +262,18 @@ async def ext_channel(websocket: WebSocket) -> None:
 async def _handle_enroll(
     websocket: WebSocket, app, settings, msg: dict[str, Any]
 ) -> None:
-    """Gate + record a not-yet-approved client's enroll_request (§2).
+    """Gate + ENROL a not-yet-enrolled client's enroll_request (§6).
 
-    Checks protocol/window/code via the pure :func:`protocol.enroll_reject_reason` and —
-    only if all gates pass — writes ONE ``enroll_requests`` row and replies
-    ``enroll_pending``. On any gate failure it sends ``enroll_rejected{reason}`` and writes
-    NO row (issue acceptance 2/3). The socket is always closed afterwards: approval is
-    asynchronous, so the socket is never kept.
+    **The open window IS the permission.** Checks protocol/window/code via the pure
+    :func:`protocol.enroll_reject_reason` and — only if all gates pass — creates the ACTIVE
+    ``instances`` row there and then, under the ``instanceId`` the operator typed into the
+    extension, and replies ``enroll_accepted{instanceId}``. There is no second step and no
+    return to the console: the window with its short-lived code already answered "who may
+    connect", and approval existed only to assign the id, which the browser now brings.
+
+    On any gate failure it sends ``enroll_rejected{reason}`` and creates NOTHING. The
+    socket is always closed afterwards; the client learns it is enrolled from THIS frame
+    and opens a fresh socket with a hello.
 
     **DB reads are rationed against the credential check.** This handler runs on a
     completely UNAUTHENTICATED socket, and every ``Database.read`` opens a fresh sqlite
@@ -291,28 +283,27 @@ async def _handle_enroll(
 
     * the ``protocolVersion`` gate — the one check that needs no DB at all — runs FIRST,
       so a wrong-version flood costs zero connections;
-    * the window/code check needs exactly ONE read, and there is no second one: the
-      capacity pre-count was pure duplication, because
-      :func:`queries.upsert_enroll_request_capped` re-counts inside the write transaction
-      and is the authoritative gate anyway (a pre-read in its own transaction could never
-      be more than advisory).
+    * the window/code check needs exactly ONE read, and there is no second one: the id
+      collision is decided inside the write transaction by :func:`queries.enroll_instance`,
+      which is the authoritative gate anyway (a pre-read in its own transaction could never
+      be more than advisory against two browsers racing on one name).
     """
     db = app.state.db
     now = _now_ms()
     # Cheapest gate first, with NO DB touch. The pure helper below re-checks it and owns the
-    # CONFIG-shaped head of the order (§2: protocol → window → code); this only
+    # CONFIG-shaped head of the order (§6: protocol → window → code); this only
     # short-circuits its DB-free first step so a wrong-version peer never reaches the pool.
-    # The full order of record continues HERE, and only here: after the helper comes the
-    # structural check on installUuid/secret, and then capacity + the frozen-secret
-    # conflict, both decided inside the write transaction below rather than ahead of it.
+    # The full order of record continues HERE, and only here: after the helper come the
+    # structural check on installUuid/secret and the id charset check, and then the id
+    # collision, decided inside the write transaction below rather than ahead of it.
     if msg.get("protocolVersion") != settings.protocol_version:
         await _reject_enroll(websocket, app, protocol.REJECT_PROTOCOL)
         return
 
     window = await db.read(lambda c: read_enroll_window(c, now=now))
     window_open = window.open
-    # A missing/blank/mismatched code => code_ok False (acceptance 2: an enroll_request
-    # WITHOUT a code at an open window must write NO row). The window must also be open
+    # A missing/blank/mismatched code => code_ok False (an enroll_request WITHOUT a code at
+    # an open window must create NOTHING). The window must also be open
     # for a code to be valid at all. Compared in CONSTANT TIME: the window code is a short
     # secret typed by the operator, and a plain `==` leaks its prefix through timing to the
     # very unauthenticated peer this gate exists to stop. Both sides are encoded (errors
@@ -328,17 +319,18 @@ async def _handle_enroll(
             code.encode("utf-8", "ignore"), window.code.encode("utf-8", "ignore")
         )
     )
-    # Capacity is decided authoritatively inside the write below, so nothing to pre-read —
-    # and the helper no longer takes a capacity flag at all (it used to, and the only
-    # caller pinned it to True, which made the branch dead and the docstring wrong).
+    # The id collision is decided authoritatively inside the write below, so nothing to
+    # pre-read — and the helper no longer takes a capacity flag at all (it used to, and the
+    # only caller pinned it to True, which made the branch dead and the docstring wrong).
     reason = protocol.enroll_reject_reason(
         msg, settings.protocol_version, window_open, code_ok
     )
+    instance_id = msg.get("instanceId")
     if reason is None:
         # Structural check AFTER the code gate (so a wrong code never reveals whether the
         # frame was well-formed, and no row is written for a bad code): a row needs a
-        # non-blank install_uuid (its PRIMARY KEY) and a non-blank raw secret (which we
-        # hash into the NOT-NULL secret_hash below).
+        # non-blank install_uuid and a non-blank raw secret (which we hash into the
+        # NOT-NULL secret_hash below).
         install_uuid = msg.get("installUuid")
         raw_secret = msg.get("secret")
         if (
@@ -349,46 +341,60 @@ async def _handle_enroll(
             or not raw_secret.strip()
             or len(raw_secret) > _MAX_SECRET
         ):
-            # Missing/blank OR overlength (§36: no megabytes in the operator-facing list).
+            # Missing/blank OR overlength (§36: no megabytes reachable from an anon frame).
             reason = protocol.REJECT_PROTOCOL
+        elif not protocol.instance_id_ok(instance_id):
+            # The proposed id becomes the row's PRIMARY KEY. Refused under its OWN reason,
+            # not the generic protocol one: the operator typed this value and has to be
+            # told which field to fix, and the extension shows the reason verbatim.
+            reason = protocol.ENROLL_BAD_ID
 
     if reason is not None:
         await _reject_enroll(websocket, app, reason)
         return
 
-    origin = _clamp(msg.get("origin"), _MAX_ORIGIN)
-    suggested_title = _clamp(msg.get("title"), _MAX_SUGGESTED_TITLE)
-    # Hash the raw secret on receipt: only the sha256 is ever stored (option A). The
-    # /admin approve later copies this same secret_hash onto the instance row.
+    # Hash the raw secret on receipt: only the sha256 is ever stored (option A).
     secret_hash = queries.sha256_hex(raw_secret)
-    # THE capacity gate (count + write under one transaction, so racing enrolls cannot
-    # overshoot enroll_max_pending) and the frozen-credential gate, both authoritative.
-    outcome = await db.write(
-        lambda c: queries.upsert_enroll_request_capped(
+
+    def _txn(c) -> str:
+        # THE collision gate: create-or-reactivate under ONE transaction, so two browsers
+        # racing on one name resolve to exactly one active row. The audit row commits with
+        # it — a refused enrolment must leave no trail of a browser that did not join, and
+        # a successful one must never be missing from the security trail.
+        outcome = queries.enroll_instance(
             c,
-            install_uuid,
-            origin,
-            suggested_title,
-            settings.protocol_version,
-            secret_hash,
-            now,
-            settings.enroll_max_pending,
-            settings.enroll_request_ttl_min * 60_000,
+            instance_id=instance_id,
+            secret_hash=secret_hash,
+            install_uuid=install_uuid,
+            now=now,
         )
-    )
-    if outcome == queries.ENROLL_AT_CAPACITY:
-        await _reject_enroll(websocket, app, protocol.ENROLL_CAPACITY)
+        if outcome == queries.ENROLL_OK:
+            # `initiator='system'`: nobody clicked. The operator's act was opening the
+            # window (audited as `window_open`); this row is the browser that walked in.
+            queries.insert_admin_audit(
+                c,
+                now=now,
+                action="enroll",
+                initiator="system",
+                install_uuid=install_uuid,
+                instance_id=instance_id,
+            )
+        return outcome
+
+    outcome = await db.write(_txn)
+    if outcome != queries.ENROLL_OK:
+        # ENROLL_ID_TAKEN (the name belongs to a live instance) and ENROLL_SECRET_TAKEN (a
+        # different live id already carries this secret — unreachable for an honest client,
+        # whose secret is 32 fresh random bytes) are the same answer to the peer: the
+        # identity you asked for is not available. Counted under one label so the alert
+        # on it means one thing.
+        await _reject_enroll(websocket, app, protocol.ENROLL_ID_TAKEN)
         return
-    if outcome == queries.ENROLL_SECRET_MISMATCH:
-        # A pending request for this install_uuid already carries a DIFFERENT secret; the
-        # stored credential is frozen at creation (queries._UPSERT_ENROLL_REQUEST), so this
-        # one is refused rather than silently queued behind a credential the client does
-        # not hold. Counted under its own reason so a burst — the shape a substitution
-        # attempt makes — is visible in /metrics.
-        await _reject_enroll(websocket, app, protocol.ENROLL_SECRET_CONFLICT)
-        return
+    logger.info("enrolled instance {} (install {})", instance_id, install_uuid[:18])
     try:
-        await websocket.send_json({"type": protocol.TYPE_ENROLL_PENDING})
+        await websocket.send_json(
+            {"type": protocol.TYPE_ENROLL_ACCEPTED, "instanceId": instance_id}
+        )
         await websocket.close()
     except Exception:  # noqa: BLE001 - peer may already be gone
         pass
@@ -463,16 +469,15 @@ async def _handle_hello(
 
     # Field hygiene BEFORE the registry lock, symmetric with the enroll path (which does
     # the same structural checks in this module rather than in the pure validator): an
-    # authenticated peer is not a trusted peer, and both values below go straight into the
-    # DB and from there to operator-facing surfaces. See _MAX_TITLE / _MAX_SESSION_ID for
-    # why one is clamped and the other refused.
+    # authenticated peer is not a trusted peer, and the value below goes straight into the
+    # DB and from there to operator-facing surfaces. See _MAX_SESSION_ID for why an
+    # oversized session id is refused rather than truncated.
     session_id = msg.get("sessionId")
     if session_id is not None and (
         not isinstance(session_id, str) or len(session_id) > _MAX_SESSION_ID
     ):
         await _reject(websocket, app, instance_id, protocol.REJECT_PROTOCOL)
         return None
-    title = _clamp(msg.get("title"), _MAX_TITLE)
 
     install_uuid = msg.get("installUuid") or ""
     registry: Registry = app.state.ext_registry
@@ -511,7 +516,7 @@ async def _handle_hello(
         allow_execute_js = bool(msg.get("allowExecuteJs"))
         new_epoch = await db.write(
             lambda c: queries.hello_upsert(
-                c, instance_id, session_id, title, allow_execute_js, now
+                c, instance_id, session_id, allow_execute_js, now
             )
         )
         if new_epoch is None:

@@ -53,7 +53,7 @@ export const INSTALL_UUID_KEY = "installUuid"; // chrome.storage.local — survi
 // credential). Absence of this key is the "needs-enroll" fact. When a quarantined instance
 // re-enrolls, the
 // FRESH secret is generated under INSTANCE_SECRET_PENDING_KEY and promoted over the
-// old one ONLY after the server approves it (unknown_instance never wipes — see
+// old one ONLY after the server accepts it (unknown_instance never wipes — see
 // connection.js), which is why the two keys are distinct.
 export const INSTANCE_SECRET_KEY = "instanceSecret"; // storage.local — the active secret (hex)
 export const INSTANCE_SECRET_PENDING_KEY = "instanceSecretPending"; // storage.local — re-enroll secret
@@ -62,36 +62,51 @@ export const INSTANCE_SECRET_PENDING_KEY = "instanceSecretPending"; // storage.l
 // rule target + filter own tabs even while the MV3 worker is cold.
 export const INSTANCE_ID_KEY = "instanceId"; // storage.local — server-assigned id
 // Operator-entered settings that USED to live in instance.json. The address and the
-// browser name are per-profile now (a universal build has no generator to stamp them),
+// instance NAME are per-profile now (a universal build has no generator to stamp them),
 // and the shared token is gone entirely (§7). The enroll CODE is the ~10-min window
-// code the operator reads off /admin and types once to submit an enrollment.
+// code the operator reads off /admin and types once to enrol.
 export const SERVICE_ADDRESS_KEY = "serviceAddress"; // storage.local — wss/ws service URL
-export const BROWSER_NAME_KEY = "browserName"; // storage.local — suggested_title source
+// The name this browser asks to be known by — and that is the WHOLE of it: the service
+// has no separate display title anymore, so this value becomes the `instances` PRIMARY
+// KEY verbatim on a successful enrol. Hence the charset below rather than free text: the
+// id travels into URLs, metric labels and the operator console.
+export const INSTANCE_NAME_KEY = "browserName"; // storage.local — the proposed instance_id
+// The charset/length the service enforces (src/ext/protocol.py INSTANCE_ID_RE). Checked
+// in the options page BEFORE sending so the refusal is immediate and local; the service
+// re-checks it and answers `enroll_rejected{reason:"bad_id"}` for a client that skipped
+// its own gate. Duplicated deliberately (the options page is loaded raw under the
+// extension_pages CSP and imports nothing) — test/options.test.js runs both over the
+// same table so they cannot drift.
+export const INSTANCE_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 export const ENROLL_CODE_KEY = "enrollCode"; // storage.local — the window code (transient input)
 
-// There is deliberately no re-registration INTERVAL here. A server-CONFIRMED enroll
-// request (an `enroll_pending` frame was seen) is never re-sent on a timer: the staged
-// code belongs to ONE window and `arm_enroll_window` (src/curator/enroll.py) mints a
-// fresh code on every open, so a resend after the window closed can only draw
-// enroll_rejected{closed} — which clears the code and durably paints "заявка отклонена"
-// over a request that is still approvable. Recovery from the service's TTL sweep is an
-// operator step (open a new window, type the new code), not a client retry.
+// There is deliberately no re-registration INTERVAL here, and no re-registration STATE
+// either. An enroll_request is answered on the spot — `enroll_accepted` or
+// `enroll_rejected` — so there is no window in which the client believes a request is
+// waiting somewhere. It re-sends only while it still has a staged code and is not yet
+// enrolled, which the alarm already covers; recovery from a closed window is an operator
+// step (open a new one, type the new code), not a client retry.
 
-// How many chars of installUuid identify an instance to the operator (§7). NOT 8: the
-// operator matches the value shown on the options page against a row in /admin, and 8
-// hex chars of two same-named browsers collide often enough to approve the WRONG one.
-// The /admin page must render the SAME prefix length or the two cannot be compared.
+// How many chars of installUuid identify an instance to the operator (§7). Shown on the
+// options page as the durable identity of THIS install — the /admin console no longer
+// prints it (there is no request list to match against), so this is a diagnostic the
+// operator can quote, not a value to compare screen-to-screen.
 export const INSTALL_UUID_PREFIX_LEN = 18;
 // Durable enrollment facts, the SINGLE source getEnrollState reads (the in-memory
 // helloAcked is useless at page open — the worker is cold). Shape:
 //   { requestPending: bool, approved: bool, quarantined: bool, lastVerdict: str|null }
 export const ENROLL_STATE_KEY = "enrollState"; // storage.local — durable enroll facts
 
-// The five enroll states getEnrollState resolves to (§7). Only these are authoritative
+// The four enroll states getEnrollState resolves to (§7). Only these are authoritative
 // from the SW branch; actual connectivity stays with /api/state on the startpage.
-export const ENROLL_NEEDS = "needs-enroll"; // no secret yet
-export const ENROLL_PENDING = "pending"; // request submitted, awaiting approval
-export const ENROLL_APPROVED = "approved"; // a hello has succeeded at least once
+//
+// There is NO `pending` state. It meant "the service holds our request, an operator has
+// yet to click Approve", and that step is gone: an enroll_request is accepted or refused
+// on the spot, so the transition is needs-enroll → approved with nothing in between. A
+// refusal leaves the state at needs-enroll and surfaces its REASON instead — which is the
+// honest report, where "ожидает одобрения" over a refused attempt was not.
+export const ENROLL_NEEDS = "needs-enroll"; // no secret yet, or the last attempt was refused
+export const ENROLL_APPROVED = "approved"; // enrolled: the service assigned this id
 export const ENROLL_REVOKED = "revoked"; // server said `revoked` — secret wiped
 export const ENROLL_QUARANTINED = "quarantined"; // server said `unknown_instance` post-approval
 

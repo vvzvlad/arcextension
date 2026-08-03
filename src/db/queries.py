@@ -120,20 +120,20 @@ def instance_status(conn: sqlite3.Connection, instance_id: str) -> str | None:
     return None if row is None else row[0]
 
 
-# hello success: bump an ALREADY-APPROVED instance row and return the NEW conn_epoch.
-# UPDATE-only (§3, issue #35): under enrollment a hello NEVER creates a row — the row
-# is created by an operator approval (Task E) with status='active' and a secret_hash;
-# an anon who only knows the public PROTOCOL_VERSION must not be able to conjure an
-# `instances` row. A reconnect does conn_epoch+1, sets connected=1 and clears the reject
-# fields. The ``AND status='active'`` guard means a hello for a revoked/pending/absent id
-# matches nothing (the channel resolves the secret first, but the row can vanish or be
-# revoked between resolve and this write — the None-guard below handles that race).
+# hello success: bump an ALREADY-ENROLLED instance row and return the NEW conn_epoch.
+# UPDATE-only (§3): a hello NEVER creates a row — the row is created by :func:`enroll_instance`
+# from an enroll_request that carried a valid code into an OPEN window, with
+# status='active' and a secret_hash; an anon who only knows the public PROTOCOL_VERSION
+# must not be able to conjure an `instances` row. A reconnect does conn_epoch+1, sets
+# connected=1 and clears the reject fields. The ``AND status='active'`` guard means a hello
+# for a revoked/absent id matches nothing (the channel resolves the secret first, but the
+# row can vanish or be revoked between resolve and this write — the None-guard below
+# handles that race).
 _HELLO_UPSERT = """
 UPDATE instances SET
     conn_epoch = conn_epoch + 1,
     connected = 1,
     session_id = ?,
-    title = ?,
     allow_execute_js = ?,
     last_seen_at = ?,
     reject_reason = NULL,
@@ -146,7 +146,6 @@ def hello_upsert(
     conn: sqlite3.Connection,
     instance_id: str,
     session_id: str | None,
-    title: str | None,
     allow_execute_js: bool,
     now: int,
 ) -> int | None:
@@ -161,7 +160,7 @@ def hello_upsert(
     """
     conn.execute(
         _HELLO_UPSERT,
-        (session_id, title, 1 if allow_execute_js else 0, now, instance_id),
+        (session_id, 1 if allow_execute_js else 0, now, instance_id),
     )
     row = conn.execute(
         "SELECT conn_epoch FROM instances WHERE id = ? AND status = 'active'",
@@ -213,152 +212,6 @@ def resolve_secret(
     return (row[0], row[1])
 
 
-# Record (or refresh) a pending enrollment request. Keyed by install_uuid so a repeat
-# hello UPSERTs the same row instead of piling up. TWO columns are DELIBERATELY NOT
-# updated on conflict:
-#
-# * ``first_seen_at`` (issue §1) — a request that keeps re-arriving must still age out
-#   against its ORIGINAL first_seen_at, otherwise the TTL is never reached and a stale
-#   request lives forever.
-# * ``secret_hash`` — the CREDENTIAL the operator approves. Refreshing it on conflict made
-#   the pending list a TOCTOU surface: anyone who knows a victim's ``install_uuid`` and the
-#   current window code could re-submit the same request with THEIR secret, leaving every
-#   operator-visible field (origin, suggested_title, protocol_version, the first-8 uuid)
-#   untouched — so the operator would click Approve on the row they inspected and enroll the
-#   ATTACKER's credential under the victim's identity. The credential is now frozen at the
-#   value the row was CREATED with; a client that genuinely needs to enroll a different
-#   secret must first have the pending request rejected (or let it age out under TTL), which
-#   is a deliberate operator act. A repeat from the honest client carries the SAME secret it
-#   persisted, so nothing changes for it.
-#
-# Everything else (last_seen_at, the client-proposed title, protocol_version, origin) is
-# refreshed to the latest request.
-_UPSERT_ENROLL_REQUEST = """
-INSERT INTO enroll_requests
-    (install_uuid, origin, suggested_title, protocol_version, secret_hash,
-     first_seen_at, last_seen_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(install_uuid) DO UPDATE SET
-    last_seen_at = excluded.last_seen_at,
-    suggested_title = excluded.suggested_title,
-    protocol_version = excluded.protocol_version,
-    origin = excluded.origin
-"""
-
-# Outcomes of :func:`upsert_enroll_request_capped`. Strings rather than a bool because the
-# caller maps each onto a DIFFERENT client-facing verdict, and a bool cannot carry three.
-ENROLL_ACCEPTED = "accepted"
-ENROLL_AT_CAPACITY = "capacity"
-ENROLL_SECRET_MISMATCH = "secret_conflict"
-
-
-def upsert_enroll_request(
-    conn: sqlite3.Connection,
-    install_uuid: str,
-    origin: str | None,
-    suggested_title: str | None,
-    protocol_version: int,
-    secret_hash: str,
-    now: int,
-) -> None:
-    """Insert-or-refresh the pending enroll request for ``install_uuid`` (see SQL).
-
-    The uncapped form, kept for direct callers/tests. Like the capped one it never
-    overwrites a stored ``secret_hash`` (see the SQL comment) — the INSERT branch is the
-    only way a credential enters the row.
-    """
-    conn.execute(
-        _UPSERT_ENROLL_REQUEST,
-        (install_uuid, origin, suggested_title, protocol_version, secret_hash, now, now),
-    )
-
-
-def upsert_enroll_request_capped(
-    conn: sqlite3.Connection,
-    install_uuid: str,
-    origin: str | None,
-    suggested_title: str | None,
-    protocol_version: int,
-    secret_hash: str,
-    now: int,
-    max_pending: int,
-    ttl_ms: int,
-) -> str:
-    """Capacity-check + upsert atomically in ONE write transaction; return the outcome.
-
-    Returns one of :data:`ENROLL_ACCEPTED`, :data:`ENROLL_AT_CAPACITY`,
-    :data:`ENROLL_SECRET_MISMATCH`.
-
-    The capacity count and the write run under the SAME ``Database.write`` BEGIN, so the
-    ceiling is authoritative even when N enroll_requests race (each in its own connection):
-    this is the ONLY capacity gate — the channel deliberately does no advisory pre-count,
-    which would be a second unauthenticated DB read per socket.
-
-    An install_uuid that ALREADY has a LIVE row is an UPDATE (refresh), never a new row, so
-    it is always accepted regardless of capacity — else a full list could not even refresh
-    ``last_seen_at`` and a pending request would age out under TTL. A genuinely NEW
-    install_uuid is written only when ``count < max_pending``.
-
-    A repeat whose ``secret_hash`` DIFFERS from the stored one writes NOTHING and returns
-    :data:`ENROLL_SECRET_MISMATCH`: the credential is frozen at creation (see the SQL
-    comment above), and silently answering ``enroll_pending`` would leave the client waiting
-    on the approval of a secret it does not hold. Refusing instead keeps ``last_seen_at``
-    frozen too, so the stale row ages out on schedule and the client's next retry is
-    accepted — the state self-heals within the TTL without an operator, and immediately if
-    the operator rejects the stale request.
-
-    **The frozen-credential rule applies to LIVE rows only, hence ``ttl_ms``.** A row is
-    pending for the reader exactly while ``first_seen_at >= now - ttl_ms`` — that is the
-    filter BOTH read surfaces apply (:func:`list_pending_enroll_requests`,
-    :func:`get_enroll_request`) — and the physical sweep only catches up within a tick. In
-    the gap between the two, an expired row is invisible AND unapprovable, so freezing the
-    credential against it refused a legitimate re-registration with ``secret_conflict``
-    while the operator's list had nothing to reject: an un-fixable state, for a row that
-    was already logically gone. An expired row is therefore treated as ABSENT — deleted and
-    re-INSERTed with the new credential and a fresh ``first_seen_at``, which the plain
-    UPSERT could not do (its DO UPDATE deliberately leaves both columns alone).
-
-    The capacity ``COUNT(*)`` is deliberately NOT TTL-filtered, and the expired row is
-    counted before it is deleted. The ceiling is an anti-flood bound on ROWS, and rows
-    expired-but-not-yet-swept are real rows; counting them is the stricter reading and the
-    one §2 documents. The refusal it can produce is self-clearing — the sweeper runs every
-    ``TICK_MS`` — whereas the secret freeze above was not.
-    """
-    row = conn.execute(
-        "SELECT secret_hash, first_seen_at FROM enroll_requests WHERE install_uuid = ?",
-        (install_uuid,),
-    ).fetchone()
-    expired = row is not None and row[1] < now - ttl_ms
-    if row is None or expired:
-        # No LIVE row for this install_uuid: this write adds one to the operator's list, so
-        # it must pass the ceiling. Counted BEFORE the delete below — every row still in the
-        # table counts, TTL or not (docstring).
-        n = conn.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
-        if n >= max_pending:
-            return ENROLL_AT_CAPACITY
-        if expired:
-            # Clear the tombstone so the UPSERT takes its INSERT branch and the row comes
-            # back with THIS request's secret_hash and a fresh first_seen_at.
-            conn.execute(
-                "DELETE FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
-            )
-    elif row[0] != secret_hash:
-        return ENROLL_SECRET_MISMATCH
-    conn.execute(
-        _UPSERT_ENROLL_REQUEST,
-        (install_uuid, origin, suggested_title, protocol_version, secret_hash, now, now),
-    )
-    return ENROLL_ACCEPTED
-
-
-# NOTE: there is deliberately no `count_enroll_requests` helper any more. It existed to
-# feed an ADVISORY pre-count in the /ext enroll handler — a second sqlite connection taken
-# from the shared pool on a fully UNAUTHENTICATED socket, before the window code had been
-# checked, whose answer ``upsert_enroll_request_capped`` then recomputed inside the write
-# anyway. Keeping a helper whose docstring calls it "the capacity gate" is an invitation to
-# wire that read back in; the gate is the transaction.
-
-
 def count_active_instances(conn: sqlite3.Connection) -> int:
     """Number of approved (active) instances. Exposed for completeness / later use."""
     row = conn.execute(
@@ -367,174 +220,76 @@ def count_active_instances(conn: sqlite3.Connection) -> int:
     return int(row[0])
 
 
-# --- /admin enrollment API helpers (Task E) ---------------------------------
-# The read/approve/reject/list SQL the /admin JSON endpoints run. Kept HERE next to
-# the other enroll_requests helpers (upsert / count) so all the enrollment SQL lives in
-# one mutation-testable place — the endpoints never inline SQL of their own.
-
-
-class ApproveConflict(Exception):
-    """An approve that must answer HTTP 409 (issue #35 acceptance 11).
-
-    Raised when the target id is ALREADY active — a re-approve of a live id, detected by
-    the ``WHERE instances.status != 'active'`` guard matching zero rows. The OTHER 409
-    path — a second active instance carrying the SAME ``secret_hash`` — surfaces as a raw
-    ``sqlite3.IntegrityError`` from the ``UNIQUE(secret_hash)`` index (§1); the handler
-    maps BOTH to 409. Together they make two racing approves resolve to exactly one 200
-    and one 409, with exactly one active row / one secret left in the DB.
-    """
-
-
-# Read-time listing of PENDING enroll requests, already TTL-filtered (acceptance 12). A
-# row whose FROZEN ``first_seen_at`` is older than the cutoff is never returned — the
-# physical DELETE (delete_expired_enroll_requests) then removes it within TTL+tick. The
-# EXISTS sub-select is the ``id_exists`` hint: whether an ``instances`` row already
-# carries this request's ``install_uuid`` — i.e. this install was enrolled before (a
-# revoked/pending re-enrol), so the operator can reuse the same id (the re-approve /
-# MAIN-restore path). It is a UI hint only; approval never depends on it.
-_LIST_PENDING_ENROLL_REQUESTS = """
-SELECT
-    e.install_uuid,
-    e.origin,
-    e.suggested_title,
-    e.protocol_version,
-    e.first_seen_at,
-    e.last_seen_at,
-    EXISTS(SELECT 1 FROM instances i WHERE i.install_uuid = e.install_uuid) AS id_exists
-FROM enroll_requests e
-WHERE e.first_seen_at >= ?
-ORDER BY e.first_seen_at ASC
-"""
-
-
-def list_pending_enroll_requests(
-    conn: sqlite3.Connection, *, now: int, ttl_ms: int
-) -> list[dict]:
-    """Return the pending enroll requests not past TTL, newest-first-frozen order.
-
-    ``cutoff = now - ttl_ms``: a request whose ``first_seen_at`` is strictly OLDER than
-    the cutoff is filtered out at read time (never returned after TTL, acceptance 12).
-    ``install_uuid_short`` is the first 8 chars for a compact display; ``origin`` /
-    ``suggested_title`` are UNTRUSTED (length already clamped server-side in slice B) and
-    returned VERBATIM — the JSON API never HTML-encodes; the #36 page uses ``textContent``.
-    """
-    cutoff = now - ttl_ms
-    rows = conn.execute(_LIST_PENDING_ENROLL_REQUESTS, (cutoff,)).fetchall()
-    out: list[dict] = []
-    for (install_uuid, origin, suggested_title, proto, first_seen_at,
-         last_seen_at, id_exists) in rows:
-        out.append({
-            "install_uuid": install_uuid,
-            "install_uuid_short": (install_uuid or "")[:8],
-            "origin": origin,
-            "suggested_title": suggested_title,
-            "protocol_version": proto,
-            "first_seen_at": first_seen_at,
-            "last_seen_at": last_seen_at,
-            "id_exists": bool(id_exists),
-        })
-    return out
-
-
-def get_enroll_request(
-    conn: sqlite3.Connection, install_uuid: str, *, now: int, ttl_ms: int
-) -> dict | None:
-    """Return one pending, NOT-expired enroll request by ``install_uuid`` (or ``None``).
-
-    The approve handler reads this FIRST (own read txn) to 404 an absent/expired request
-    and to capture the ``secret_hash`` it will enroll. Reading it out of band is what
-    lets two racing approves BOTH hold the secret and so collide on the write (the
-    ``UNIQUE(secret_hash)`` / already-active guards) rather than one silently 404-ing.
-    Applies the SAME ``first_seen_at >= now - ttl_ms`` filter as the list (an expired
-    request is not approvable, matching the read-time TTL of acceptance 12).
-    """
-    cutoff = now - ttl_ms
-    row = conn.execute(
-        "SELECT install_uuid, secret_hash, suggested_title, first_seen_at "
-        "FROM enroll_requests WHERE install_uuid = ? AND first_seen_at >= ?",
-        (install_uuid, cutoff),
-    ).fetchone()
-    if row is None:
-        return None
-    return {
-        "install_uuid": row[0],
-        "secret_hash": row[1],
-        "suggested_title": row[2],
-        "first_seen_at": row[3],
-    }
-
-
-# Create-or-REACTIVATE the operator-assigned instance row in ONE statement (§1, acc 11).
-# A brand-new id INSERTs; an EXISTING revoked/pending id is UPDATEd back to 'active' —
-# this is the ONLY path that restores a revoked MAIN (Task D leaves MAIN revoked). The
-# ``WHERE instances.status != 'active'`` guard makes re-approving an ALREADY-active id a
-# no-op (rowcount 0 → ApproveConflict → 409), so an approve never silently overwrites a
-# live instance. ``conn_epoch`` / ``connected`` are LEFT untouched on the update path so
+# --- enrolment: the open window IS the permission (§6) -----------------------
+# Create-or-REACTIVATE the instance row the enroll_request asked for, in ONE statement.
+# A brand-new id INSERTs; an EXISTING revoked id is UPDATEd back to 'active' — that is the
+# ONLY path that restores a revoked MAIN (migration 2 retires every pre-enrolment row).
+# The ``WHERE instances.status != 'active'`` guard makes an enrolment onto an ALREADY-active
+# id a no-op (rowcount 0 → ENROLL_ID_TAKEN → the refusal the client shows), so an enrolment
+# never silently overwrites a live instance — the ONE objection the retired approval step
+# actually answered. ``conn_epoch`` / ``connected`` are LEFT untouched on the update path so
 # a reactivation does not disturb a socket that somehow still holds the id.
-_APPROVE_UPSERT = """
-INSERT INTO instances (id, status, secret_hash, install_uuid, enrolled_at, title)
-VALUES (?, 'active', ?, ?, ?, ?)
+#
+# This is verbatim the semantics of the removed ``_APPROVE_UPSERT``; only the actor changed
+# (the channel, inside the open window, instead of an /admin call afterwards) and the
+# ``title`` column it also wrote is gone.
+_ENROLL_UPSERT = """
+INSERT INTO instances (id, status, secret_hash, install_uuid, enrolled_at)
+VALUES (?, 'active', ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     status = 'active',
     secret_hash = excluded.secret_hash,
     install_uuid = excluded.install_uuid,
-    enrolled_at = excluded.enrolled_at,
-    title = excluded.title
+    enrolled_at = excluded.enrolled_at
 WHERE instances.status != 'active'
 """
 
+# Outcomes of :func:`enroll_instance`. Strings rather than a bool because the caller maps
+# each onto a different client-facing verdict.
+ENROLL_OK = "ok"
+ENROLL_ID_TAKEN = "id_taken"
+ENROLL_SECRET_TAKEN = "secret_taken"
 
-def approve_enroll_request(
+
+def enroll_instance(
     conn: sqlite3.Connection,
     *,
     instance_id: str,
     secret_hash: str,
     install_uuid: str,
-    title: str | None,
     now: int,
-) -> None:
-    """Enroll ``instance_id`` from a captured ``secret_hash`` in ONE write txn (acc 11).
+) -> str:
+    """Enrol ``instance_id`` with ``secret_hash`` in ONE write txn; return the outcome.
 
-    Runs :data:`_APPROVE_UPSERT` then, on success, DELETEs the consumed enroll_request
-    (idempotent — the loser of a race deletes an already-gone row). Two 409 guards:
+    Returns :data:`ENROLL_OK`, :data:`ENROLL_ID_TAKEN` (the id belongs to a LIVE instance)
+    or :data:`ENROLL_SECRET_TAKEN` (a DIFFERENT active id already carries this secret — the
+    ``UNIQUE(secret_hash)`` index of §1, caught here rather than let out as a raw
+    ``IntegrityError``, because the channel has to answer a frame either way).
 
-    * ``rowcount == 0`` ⇒ the id was already active (the ``WHERE status != 'active'``
-      guard matched nothing) ⇒ :class:`ApproveConflict`;
-    * a ``UNIQUE(secret_hash)`` collision (a DIFFERENT active id already carries this
-      secret) raises ``sqlite3.IntegrityError`` straight out of ``conn.execute`` — the
-      write txn rolls back, so no partial row and the request stays for a retry.
+    Both guards are decided INSIDE the caller's ``Database.write`` transaction, which is
+    what makes two browsers racing on the same name resolve to exactly one active row: a
+    pre-read in its own transaction could never be authoritative.
 
-    The whole body is one synchronous ``fn(conn)`` (Фаза 2 contract): the caller runs it
-    under ``Database.write`` so the upsert and the delete commit together or not at all.
+    ``ENROLL_SECRET_TAKEN`` is not reachable by an honest client — a secret is 32 random
+    bytes generated per install — so it has no reason string of its own on the wire; the
+    channel maps it onto the same ``id_taken`` refusal, since from the peer's side the
+    identity it asked for is likewise unavailable.
     """
-    cur = conn.execute(
-        _APPROVE_UPSERT, (instance_id, secret_hash, install_uuid, now, title)
-    )
-    if cur.rowcount == 0:
-        # The id exists and is already 'active' — a re-approve of a live instance. Refuse
-        # rather than clobber it; the request is left in place (not consumed).
-        raise ApproveConflict(
-            f"instance {instance_id!r} is already active; refusing to overwrite"
+    try:
+        cur = conn.execute(
+            _ENROLL_UPSERT, (instance_id, secret_hash, install_uuid, now)
         )
-    conn.execute(
-        "DELETE FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
-    )
-
-
-def reject_enroll_request(conn: sqlite3.Connection, install_uuid: str) -> bool:
-    """Delete the pending enroll request for ``install_uuid``; return whether a row went.
-
-    Idempotent: rejecting an already-gone request removes nothing and returns ``False``
-    (the handler still answers 200 — the desired end state, request absent, holds).
-    """
-    cur = conn.execute(
-        "DELETE FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
-    )
-    return cur.rowcount > 0
+    except sqlite3.IntegrityError:
+        # UNIQUE(secret_hash): another active instance already carries this secret.
+        return ENROLL_SECRET_TAKEN
+    if cur.rowcount == 0:
+        # The id exists and is already 'active' — refuse rather than clobber it.
+        return ENROLL_ID_TAKEN
+    return ENROLL_OK
 
 
 _LIST_INSTANCES = """
-SELECT id, title, status, connected, last_seen_at, enrolled_at, revoked_at
+SELECT id, status, connected, last_seen_at, enrolled_at, revoked_at
 FROM instances
 ORDER BY id
 """
@@ -543,23 +298,23 @@ ORDER BY id
 def list_instances(conn: sqlite3.Connection) -> list[dict]:
     """Return EVERY instance (all statuses) for the operator console.
 
-    Unlike the curator's ``status='active'`` reads, this lists revoked/pending rows too
-    so the operator can see a revoked MAIN awaiting re-approval or a stuck pending id.
+    Unlike the curator's ``status='active'`` reads, this lists revoked rows too so the
+    operator can see a revoked MAIN awaiting re-enrolment or a retired browser. There is
+    no separate display name: the id IS the name (§6).
     """
     rows = conn.execute(_LIST_INSTANCES).fetchall()
     return [
         {
             "id": r[0],
-            "title": r[1],
-            "status": r[2],
+            "status": r[1],
             # revoke clears status/session but leaves the `connected` column to the
             # channel's async socket teardown (not guaranteed if there is no live socket),
-            # so report `connected` only for an ACTIVE row — a revoked/pending instance is
+            # so report `connected` only for an ACTIVE row — a revoked instance is
             # never "connected" for the operator console, whatever the stale flag says.
-            "connected": bool(r[3]) and r[2] == "active",
-            "last_seen_at": r[4],
-            "enrolled_at": r[5],
-            "revoked_at": r[6],
+            "connected": bool(r[2]) and r[1] == "active",
+            "last_seen_at": r[3],
+            "enrolled_at": r[4],
+            "revoked_at": r[5],
         }
         for r in rows
     ]

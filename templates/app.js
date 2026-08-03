@@ -1,16 +1,18 @@
 // Curator admin console logic. Served from /admin/app.js under script-src 'self' (there is
-// NO inline script). It renders the #35 /admin JSON API through same-origin fetch.
+// NO inline script). It renders the /admin JSON API through same-origin fetch.
 //
-// SECURITY (issue #36 acc 6): suggested_title and origin are UNAUTHENTICATED input. They are
-// ONLY ever written with element.textContent — this file assigns raw markup to no element —
-// so a value like `<img src=x onerror=alert(1)>` renders as literal text, never as markup.
+// There is no pending-requests section anymore. Enrolment is one step (§6): a browser that
+// submits the window code enrols itself under the id typed in its own settings, so there is
+// nothing here to approve and no list of waiting rows. A REFUSED attempt is therefore not
+// visible here either — it is reported in that browser's settings and counted in /metrics
+// (`curator-enroll-id-taken` alerts on the collision case). That is the accepted cost of
+// dropping the second step.
+//
+// SECURITY (issue #36 acc 6): every value rendered here is written with element.textContent
+// — this file assigns raw markup to no element — so a value like `<img src=x onerror=…>`
+// renders as literal text, never as markup. That still matters for the id column: an id is
+// bounded to [A-Za-z0-9._-] server-side, but the rule is enforced there, not here.
 "use strict";
-
-// How many chars of install_uuid this page prints. KEEP IN SYNC with the extension's
-// INSTALL_UUID_PREFIX_LEN (extension/src/constants.js, mirrored in pages/options.js):
-// the operator's job is to compare the string shown on an extension's options page with
-// a row here, and two different prefix lengths cannot be compared at a glance.
-const INSTALL_UUID_PREFIX_LEN = 18;
 
 // --- small DOM helpers (textContent only) ------------------------------------
 function el(tag, text) {
@@ -37,10 +39,10 @@ function clearError() {
 // credentials:'same-origin' sends the session cookie; the browser adds Origin +
 // Sec-Fetch-Site on mutating requests, which the server's CSRF gate checks (acc 3).
 // Builds the Error a failed response is reported with — used by BOTH wrappers below, so a
-// read (apiGet) shows the operator the same words a write (apiSend) does. The three
-// render* calls all go through apiGet, so leaving it on a bare status meant a degraded
-// service printed "/admin/enroll/requests -> 503" and threw away the sentence the server
-// had already written.
+// read (apiGet) shows the operator the same words a write (apiSend) does. Both render*
+// calls go through apiGet, so leaving it on a bare status meant a degraded
+// service printed "/admin/instances -> 503" and threw away the sentence the server had
+// already written.
 //
 // The Error carries `.status`: a caller that must react to a SPECIFIC status (the 409 the
 // MAIN-revoke guard answers with) cannot parse it back out of the message.
@@ -49,10 +51,8 @@ function clearError() {
 // (src/app.py) renders a dict `detail` as JSON and every OTHER `detail` — i.e. nearly all
 // of them — as plain text. Reading only `res.json().error` meant every carefully worded
 // string detail was swallowed by the failed parse and the operator was shown a bare
-// status code. /admin/enroll/approve alone answers 409 with THREE different meanings
-// (window closed / instance id already active / secret already enrolled), and the closed
-// one even spells out the fix ("open it (POST /admin/enroll/window) and approve within
-// it"); a lone "-> 409" tells the operator none of that.
+// status code. The MAIN-revoke 409 spells out what revoking MAIN does and does not do; a
+// lone "-> 409" tells the operator none of that.
 const ERROR_DETAIL_MAX = 300; // one-line error box: enough for a sentence, not a page
 
 async function responseError(method, path, res) {
@@ -128,71 +128,6 @@ async function renderWindow() {
   }
 }
 
-// --- pending enroll requests -------------------------------------------------
-async function renderRequests() {
-  const body = document.getElementById("requests-body");
-  const empty = document.getElementById("requests-empty");
-  const data = await apiGet("/admin/enroll/requests");
-  body.textContent = "";
-  const rows = data.requests || [];
-  empty.hidden = rows.length > 0;
-  for (const r of rows) {
-    const tr = el("tr");
-    // NOT `install_uuid_short` (the server's first-8). The operator's only way to tell
-    // their own request from someone else's is to compare this string with the one the
-    // extension's options page shows — and the other two columns do not help: the origin
-    // is uniform fleet-wide and two browsers of the same person carry the same suggested
-    // title. 8 hex chars collide too easily for a decision that grants a credential, so
-    // both places print the same INSTALL_UUID_PREFIX_LEN chars of the same value, and the
-    // full uuid is on the cell as a tooltip. (A property assignment, not markup — the
-    // textContent-only contract for untrusted fields is untouched.)
-    const uuidCell = el("td", (r.install_uuid || "").slice(0, INSTALL_UUID_PREFIX_LEN));
-    uuidCell.title = r.install_uuid || "";
-    tr.appendChild(uuidCell);
-    tr.appendChild(el("td", r.suggested_title));    // UNTRUSTED -> textContent
-    tr.appendChild(el("td", r.origin));             // UNTRUSTED -> textContent
-    tr.appendChild(el("td", r.protocol_version));
-    tr.appendChild(el("td", r.id_exists ? "yes" : "no"));
-
-    // approve-as input (operator types the instance_id to assign)
-    const idCell = el("td");
-    const idInput = el("input");
-    idInput.type = "text";
-    idInput.placeholder = "instance_id";
-    idCell.appendChild(idInput);
-    tr.appendChild(idCell);
-
-    // approve / reject buttons
-    const actionCell = el("td");
-    const approveBtn = el("button", "Approve");
-    approveBtn.type = "button";
-    approveBtn.addEventListener("click", async () => {
-      try {
-        clearError();
-        await apiSend("POST", "/admin/enroll/approve", {
-          install_uuid: r.install_uuid,
-          instance_id: idInput.value.trim(),
-        });
-        await refresh();
-      } catch (e) { showError(e.message); }
-    });
-    const rejectBtn = el("button", "Reject");
-    rejectBtn.type = "button";
-    rejectBtn.addEventListener("click", async () => {
-      try {
-        clearError();
-        await apiSend("POST", "/admin/enroll/reject", { install_uuid: r.install_uuid });
-        await refresh();
-      } catch (e) { showError(e.message); }
-    });
-    actionCell.appendChild(approveBtn);
-    actionCell.appendChild(rejectBtn);
-    tr.appendChild(actionCell);
-
-    body.appendChild(tr);
-  }
-}
-
 // --- instances ---------------------------------------------------------------
 async function renderInstances() {
   const body = document.getElementById("instances-body");
@@ -203,8 +138,7 @@ async function renderInstances() {
   empty.hidden = rows.length > 0;
   for (const inst of rows) {
     const tr = el("tr");
-    tr.appendChild(el("td", inst.id));
-    tr.appendChild(el("td", inst.title));            // operator/suggested title -> textContent
+    tr.appendChild(el("td", inst.id));               // the id IS the name (§6)
     tr.appendChild(el("td", inst.status));
     tr.appendChild(el("td", inst.connected ? "yes" : "no"));
 
@@ -253,7 +187,7 @@ async function renderInstances() {
 }
 
 async function refresh() {
-  await Promise.all([renderWindow(), renderRequests(), renderInstances()]);
+  await Promise.all([renderWindow(), renderInstances()]);
 }
 
 // --- wiring ------------------------------------------------------------------

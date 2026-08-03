@@ -8,12 +8,12 @@ a websocket. Each branch and the ordering between branches is asserted.
 from src.ext import protocol
 from src.ext.protocol import (
     ENROLL_BAD_CODE,
-    ENROLL_CAPACITY,
     ENROLL_CLOSED,
     REJECT_AUTH,
     REJECT_PROTOCOL,
     enroll_reject_reason,
     hello_reject_reason,
+    instance_id_ok,
 )
 
 
@@ -49,13 +49,13 @@ def test_hello_no_token_field_consulted():
 
 # --- enroll_reject_reason: each branch + the load-bearing order --------------
 # The helper owns the CONFIG-shaped gates ONLY (protocol -> window -> code). Capacity used
-# to be a fifth parameter here; it moved into the write transaction
-# (queries.upsert_enroll_request_capped) so it could be authoritative against racing
-# enrolls, after which the only caller pinned `has_capacity=True` and the branch became
-# unreachable — a dead argument whose docstring still promised capacity was checked before
-# any row was written. `None` from this helper therefore means "the config gates passed",
-# not "the request is accepted"; the channel still has the structural check and the
-# in-transaction capacity/secret-conflict gates ahead of it.
+# to be a fifth parameter here; it moved into the write transaction, after which the only
+# caller pinned `has_capacity=True` and the branch became unreachable — a dead argument
+# whose docstring still promised capacity was checked before any row was written. The
+# pending list it capped is gone entirely now (enrolment is one step, §6). `None` from this
+# helper therefore means "the config gates passed", not "the request is accepted"; the
+# channel still has the structural check, the id charset check and the in-transaction
+# collision gate ahead of it.
 def test_enroll_all_ok_returns_none():
     assert enroll_reject_reason({"protocolVersion": 1}, 1, True, True) is None
 
@@ -85,28 +85,62 @@ def test_enroll_bad_code_is_the_last_gate_here():
 
 
 def test_enroll_reject_reason_takes_no_capacity_argument():
-    """The capacity gate is the write transaction's, and the signature must say so.
+    """The pending-list gates are gone with the list; the signature must say so.
 
-    Reddens if a ``has_capacity`` parameter is reintroduced — which is how the previous
+    Reddens if a ``has_capacity`` parameter is reintroduced — which is how an earlier
     version lied: the flag existed, the caller hardcoded it True, and a reader of the pure
-    helper concluded the ceiling was enforced before any row was written.
+    helper concluded the ceiling was enforced before any row was written. There is no
+    ceiling now, and no pending row for one to bound.
     """
     import inspect
 
     params = list(inspect.signature(enroll_reject_reason).parameters)
     assert params == ["msg", "protocol_version", "window_open", "code_ok"]
-    # The constant survives — the CHANNEL returns it from the transaction's outcome.
-    assert protocol.ENROLL_CAPACITY == "capacity"
+    # The retired constants must not creep back: a reason with no producer is a metric
+    # label the alert guard would have to excuse forever.
+    assert not hasattr(protocol, "ENROLL_CAPACITY")
+    assert not hasattr(protocol, "ENROLL_SECRET_CONFLICT")
 
 
 def test_enroll_reason_constants_are_stable_strings():
-    # The metric labels / wire strings must not drift (issue §37 alerts on bad_code).
-    assert (protocol.ENROLL_CLOSED, protocol.ENROLL_BAD_CODE, protocol.ENROLL_CAPACITY) == (
-        "closed",
-        "bad_code",
-        "capacity",
-    )
-    assert protocol.TYPE_ENROLL_PENDING == "enroll_pending"
+    # The metric labels / wire strings must not drift (§12 alerts on bad_code and id_taken).
+    assert (
+        protocol.ENROLL_CLOSED,
+        protocol.ENROLL_BAD_CODE,
+        protocol.ENROLL_ID_TAKEN,
+        protocol.ENROLL_BAD_ID,
+    ) == ("closed", "bad_code", "id_taken", "bad_id")
+    # `enroll_pending` is GONE, not renamed: a client that still waits for it would wait
+    # forever instead of noticing it is already enrolled.
+    assert not hasattr(protocol, "TYPE_ENROLL_PENDING")
+    assert protocol.TYPE_ENROLL_ACCEPTED == "enroll_accepted"
     assert protocol.TYPE_ENROLL_REJECTED == "enroll_rejected"
     assert protocol.REJECT_REVOKED == "revoked"
     assert protocol.REJECT_UNKNOWN == "unknown_instance"
+
+
+# --- instance_id_ok: the charset that becomes a PRIMARY KEY ------------------
+def test_instance_id_charset_and_length():
+    """The id the browser proposes becomes the row's PRIMARY KEY and travels into URLs,
+    metric labels and the console, so the accepted set is exactly [A-Za-z0-9._-]{1,64}.
+
+    This expression used to live in src/api/admin.py, applied to an id an OPERATOR typed
+    into the console. It moved here because the id now arrives on an UNAUTHENTICATED /ext
+    frame — the extension checks the same expression locally first, but that check is on
+    the peer's side of the wire and cannot be the gate.
+    """
+    for good in ("main", "a", "A" * 64, "work-laptop", "Prox.2", "x_y-z.1"):
+        assert instance_id_ok(good), good
+    for bad in (
+        "",              # blank
+        "A" * 65,        # one over the ceiling
+        "has space",     # the operator's most likely mistake
+        "имя",           # non-ASCII
+        "a/b",           # a path separator in something that lands in URLs
+        "a:b",
+        "a\nb",
+        None,            # a missing field
+        123,             # a non-str
+        ["main"],
+    ):
+        assert not instance_id_ok(bad), repr(bad)

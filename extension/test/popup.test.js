@@ -54,12 +54,14 @@ describe("buildRule", () => {
 
 describe("instanceChoices", () => {
   it("keeps the server order and marks the browser the popup runs in", () => {
+    // The label is the bare id: the id IS the name (§6), so the old "Title (id)" pairing
+    // has nothing left to pair. A stray `title` on the server row must not resurrect it.
     const choices = instanceChoices(
-      [{ id: "main", title: "Curator Main" }, { id: "prox", title: "Prox" }],
+      [{ id: "main", title: "Curator Main" }, { id: "prox" }],
       "prox",
     );
     expect(choices.map((c) => c.id)).toEqual(["main", "prox"]);
-    expect(choices[0].label).toBe("Curator Main (main)");
+    expect(choices[0].label).toBe("main");
     expect(choices[1].label).toContain("this browser");
   });
 
@@ -68,7 +70,7 @@ describe("instanceChoices", () => {
     // is what the popup did unconditionally before the target became pickable, so it
     // must never become unreachable — otherwise a copy whose row is not active yet
     // cannot file the rule it was opened for at all.
-    const choices = instanceChoices([{ id: "main", title: "Main" }], "prox");
+    const choices = instanceChoices([{ id: "main" }], "prox");
     expect(choices[0].id).toBe("prox");
     expect(choices.map((c) => c.id)).toEqual(["prox", "main"]);
     expect(instanceChoices([], "prox").map((c) => c.id)).toEqual(["prox"]);
@@ -322,8 +324,8 @@ describe("init: build -> preview -> save", () => {
     const stateCall = calls.find((c) => c.url.endsWith("/api/state"));
     expect(stateCall.opts.headers.Authorization).toBe("Bearer the-secret");
     expect(doc.els.target.children.map((o) => o.value)).toEqual(["main", "prox"]);
-    // Titles are SERVER strings: textContent, never innerHTML.
-    expect(doc.els.target.children[0].textContent).toBe("Main (main)");
+    // Ids are SERVER strings: textContent, never innerHTML.
+    expect(doc.els.target.children[0].textContent).toBe("main");
     expect(doc.els.target.value).toBe("prox"); // the current instance stays the default
   });
 

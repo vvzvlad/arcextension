@@ -36,20 +36,17 @@ def _tc(app) -> TestClient:
     return TestClient(app, base_url="https://testserver")
 
 
-# --- low-level seed of a pending enroll request ------------------------------
-def _seed_request(db_path, install_uuid, *, secret_hash, title="T",
-                  origin="chrome-extension://abc", proto=1):
+# --- low-level seed of an instances row --------------------------------------
+# The mutating verb these tests exercise is `revoke`; there is no approve/reject pair
+# anymore (§6), so an instance is what has to exist for a mutation to land on.
+def _seed_instance(db_path, iid, *, status="active", secret_hash=None):
     import sqlite3
-    import time
-    now = int(time.time() * 1000)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute(
-            "INSERT INTO enroll_requests (install_uuid, origin, suggested_title, "
-            "protocol_version, secret_hash, first_seen_at, last_seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (install_uuid, origin, title, proto, secret_hash, now, now),
+            "INSERT INTO instances (id, status, secret_hash, connected) VALUES (?, ?, ?, 0)",
+            (iid, status, secret_hash),
         )
         conn.commit()
     finally:
@@ -105,27 +102,27 @@ def test_csrf_cookie_mutation_blocked_cross_origin_bearer_allowed(tmp_path):
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with _tc(app) as client:
-        _seed_request(db_path, "u-csrf", secret_hash=secret_hash_for("csrf"))
+        _seed_instance(db_path, "victim", secret_hash=secret_hash_for("victim"))
         _login(client)
 
         foreign = {"Origin": "https://evil.example.com"}
         # (a) cookie + FOREIGN Origin -> 403 even though the request is otherwise valid.
-        r = client.post("/admin/enroll/reject", json={"install_uuid": "u-csrf"},
-                        headers=foreign)
+        r = client.post("/admin/instances/victim/revoke", json={}, headers=foreign)
         assert r.status_code == 403
 
         # (b) cookie + Sec-Fetch-Site:same-origin (foreign Origin present) -> allowed:
         # the unforgeable fetch-metadata header takes precedence over the Origin fallback.
-        r = client.post("/admin/enroll/reject", json={"install_uuid": "u-csrf"},
+        r = client.post("/admin/instances/victim/revoke", json={},
                         headers={**foreign, "Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
 
         # (c) Bearer + FOREIGN Origin, NO cookie -> Bearer skips CSRF; reaches handler.
-        r = client.post("/admin/enroll/reject", json={"install_uuid": "u-none"},
+        # 404 (no such instance) is the proof it REACHED the handler rather than the gate.
+        r = client.post("/admin/instances/ghost/revoke", json={},
                         headers={**admin_headers(), **foreign},
                         cookies={})
         assert r.status_code != 403
-        assert r.status_code == 200  # reject is idempotent -> reaches the handler
+        assert r.status_code == 404
 
 
 def test_csrf_same_site_neighbor_refused(tmp_path):
@@ -171,18 +168,23 @@ def test_logout_revokes_session_server_side(tmp_path):
         assert r.status_code == 401
 
 
-# --- (6) XSS payload rendered as text, not markup ----------------------------
-def test_xss_payload_served_verbatim_and_page_uses_textcontent(tmp_path):
-    """Acc 6. Reddens if the JSON API HTML-encodes/strips the payload (breaking the text
-    contract), or if the page JS is switched to innerHTML for untrusted fields."""
+# --- (6) the console renders as text, not markup -----------------------------
+def test_page_uses_textcontent_and_no_unbounded_client_string_reaches_it(tmp_path):
+    """Acc 6, in the shape the console has now.
+
+    The payload half of this test is gone WITH ITS SOURCE. The console used to print two
+    client-supplied strings verbatim — ``suggested_title`` and ``origin`` off a pending
+    enroll_request — so an unauthenticated peer could put ``<img src=x onerror=…>`` in
+    front of the operator, and the whole defence was the page's textContent discipline.
+    There is no pending list anymore (§6) and no free-text field behind it: the only
+    client-influenced value the console prints is the instance id, which the service
+    refuses unless it matches ``[A-Za-z0-9._-]{1,64}`` before the row is ever created.
+
+    The textContent contract is still pinned, because it is what keeps the NEXT field from
+    being a hole. Reddens if the page JS is switched to innerHTML anywhere.
+    """
     app = create_app_for(tmp_path)
-    db_path = str(tmp_path / "curator.db")
-    payload = "<img src=x onerror=alert(1)>"
     with _tc(app) as client:
-        _seed_request(db_path, "u-xss", secret_hash=secret_hash_for("xss"), title=payload)
-        rows = client.get("/admin/enroll/requests", headers=admin_headers()).json()["requests"]
-        assert any(r["suggested_title"] == payload for r in rows)  # verbatim, not encoded
-        # The rendering contract lives in the SHIPPED page JS: textContent, never innerHTML.
         served = client.get("/admin/app.js").text
         assert "textContent" in served
         assert "innerHTML" not in served
@@ -195,13 +197,12 @@ def test_error_detail_reaches_the_console_not_just_the_status(tmp_path):
     ``_http_exception`` (src/app.py) renders a dict ``detail`` as JSON and every other
     ``detail`` as PLAIN TEXT. The console's ``apiSend`` used to read only
     ``res.json().error``, so every string detail was lost to the failed parse and the
-    operator saw a bare "POST /admin/enroll/approve -> 409" — while approve alone answers
-    409 with three different meanings (window closed / id already active / secret already
-    enrolled) and the closed one spells out the fix.
+    operator saw a bare "-> 409" — while the MAIN-revoke refusal spells out both what
+    revoking MAIN does and what it does NOT do (it cannot hand MAIN to another instance).
 
     ``apiGet`` had the same hole for longer: it threw ``path + " -> " + res.status`` and
-    ALL THREE ``render*`` calls go through it, so a degraded service showed
-    "/admin/enroll/requests -> 503" instead of the sentence the server sent. The extraction
+    every ``render*`` call goes through it, so a degraded service showed
+    "/admin/instances -> 503" instead of the sentence the server sent. The extraction
     therefore lives in ONE helper both wrappers call — the thing this test pins, because a
     second copy is exactly how the two paths drifted apart the first time.
 
@@ -215,14 +216,13 @@ def test_error_detail_reaches_the_console_not_just_the_status(tmp_path):
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with _tc(app) as client:
-        _seed_request(db_path, "u-detail", secret_hash=secret_hash_for("detail"))
-        # No window armed → the 409 whose detail tells the operator what to do.
-        r = client.post("/admin/enroll/approve", headers=admin_headers(),
-                        json={"install_uuid": "u-detail", "instance_id": "lap"})
+        _seed_instance(db_path, "main", secret_hash=secret_hash_for("main"))
+        # Revoking MAIN without the repeated id → the 409 whose detail names the guard.
+        r = client.post("/admin/instances/main/revoke", headers=admin_headers(), json={})
         assert r.status_code == 409
         assert "text/plain" in r.headers["content-type"]  # NOT JSON: no `error` field
-        assert "the enrollment window is closed" in r.text
-        assert "POST /admin/enroll/window" in r.text
+        assert "replacement" in r.text
+        assert "MAIN_INSTANCE_ID" in r.text
 
         # The shipped console reads the body as TEXT and only then tries to parse it as
         # JSON — the order matters, res.json() consumes the body on a failed parse.
@@ -264,7 +264,7 @@ def test_bearer_opens_admin_and_beats_cookie(tmp_path):
     with _tc(app) as client:
         # Bearer with NO cookie opens the console page and every JSON read.
         assert client.get("/admin", headers=admin_headers(), cookies={}).status_code == 200
-        for path in ("/admin/enroll/requests", "/admin/instances", "/admin/enroll/window"):
+        for path in ("/admin/instances", "/admin/enroll/window"):
             assert client.get(path, headers=admin_headers(), cookies={}).status_code == 200
 
         # Now a cookie ALSO exists; a Bearer request with a foreign Origin must still take the
@@ -284,8 +284,7 @@ def test_degraded_reads_serve_writes_503(tmp_path):
         client.app.state.degraded = True
         assert client.get("/admin", headers=admin_headers()).status_code == 200
         assert client.get("/admin/instances", headers=admin_headers()).status_code == 200
-        r = client.post("/admin/enroll/approve", headers=admin_headers(),
-                        json={"install_uuid": "u", "instance_id": "i"})
+        r = client.post("/admin/instances/anything/revoke", headers=admin_headers(), json={})
         assert r.status_code == 503
 
 
@@ -540,7 +539,6 @@ def test_admin_responses_are_never_cached(tmp_path):
         for resp in (
             client.get("/admin", headers=admin_headers()),
             client.get("/admin/instances", headers=admin_headers()),
-            client.get("/admin/enroll/requests", headers=admin_headers()),
             client.get("/admin/login"),
             client.get("/admin/app.js"),
             client.get("/admin/app.css"),
@@ -572,9 +570,10 @@ def test_admin_html_and_assets_carry_frame_defenses(tmp_path):
 
 
 def test_admin_json_carries_nosniff(tmp_path):
-    """Every /admin JSON response carries X-Content-Type-Options: nosniff (untrusted
-    suggested_title/origin are served verbatim). Reddens if the header middleware stops
-    covering the JSON API — without changing the JSON body."""
+    """Every /admin JSON response carries X-Content-Type-Options: nosniff. Reddens if the
+    header middleware stops covering the JSON API — without changing the JSON body. The
+    bodies no longer carry free-text client input, but the header is what keeps the next
+    field added to them from being a MIME-sniffing hole."""
     app = create_app_for(tmp_path)
     with _tc(app) as client:
         r = client.get("/admin/instances", headers=admin_headers())

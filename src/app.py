@@ -21,13 +21,10 @@ from starlette.routing import Route, WebSocketRoute
 
 from src.api.actions import list_actions
 from src.api.admin import (
-    approve,
     close_enroll_window_endpoint,
     get_enroll_window,
-    list_enroll_requests,
     list_instances as admin_list_instances,
     open_enroll_window,
-    reject,
     revoke as admin_revoke,
 )
 from src.api.admin_page import (
@@ -64,7 +61,7 @@ from src.curator import runner
 from src.curator.clock import ClockGuard
 from src.db.access import Database
 from src.db.backup import nightly_backup_loop
-from src.db.retention import enroll_request_sweep_loop, retention_loop
+from src.db.retention import retention_loop
 from src.ext.channel import ext_channel
 from src.ext.registry import Registry
 from src.mcpiface.server import build_mcp, mcp_route
@@ -164,17 +161,10 @@ def create_app(settings) -> Starlette:
             background_tasks.append(
                 asyncio.create_task(_curator_driver(app, db, settings))
             )
-            # Frequent enroll_requests sweep (§35 acceptance 12): physically delete a
-            # request within TTL+~60s of its frozen first_seen_at. SEPARATE from the 24h
-            # retention loop AND from the curator driver (which ticks at PASS_INTERVAL_MIN,
-            # 5 min — too coarse for TTL+60s); this loop wakes every TICK_MS (~60s).
-            background_tasks.append(
-                asyncio.create_task(
-                    enroll_request_sweep_loop(
-                        db, settings.enroll_request_ttl_min, settings.tick_ms
-                    )
-                )
-            )
+            # (There used to be a third loop here: a TICK_MS sweep that physically deleted
+            # expired `enroll_requests`. Enrolment is one step now — a request never
+            # becomes a row that could go stale — so the table, its TTL and the sweep are
+            # all gone, §6.)
         else:
             logger.warning(
                 "degraded mode: nightly backup and retention loops not started"
@@ -245,11 +235,12 @@ def create_app(settings) -> Starlette:
         # an immediate pass). Both are exceptions to the pause gate (resume verbs).
         Route("/api/pause", pause_endpoint, methods=["POST"]),
         Route("/api/pause", resume_endpoint, methods=["DELETE"]),
-        # Enrollment JSON API (§13, issue #35). ADMIN-only (ADMIN_TOKEN / MCP): the
-        # operator lists/approves/rejects pending enroll requests, lists/revokes
-        # instances and opens/reads/closes the enrollment window. JSON only — the HTML
-        # console (#36) renders this API. Reads are allowed in degraded mode; the mutating
-        # verbs (approve/reject/revoke/window arm+close) answer 503 while degraded.
+        # Enrollment JSON API (§13). ADMIN-only (ADMIN_TOKEN / MCP): the operator opens /
+        # reads / closes the enrollment window and lists/revokes instances. There is no
+        # approve/reject pair and no pending list — an enroll_request with a valid code
+        # into an open window enrols itself over /ext (§6). JSON only — the HTML console
+        # (#36) renders this API. Reads are allowed in degraded mode; the mutating verbs
+        # (revoke / window arm+close) answer 503 while degraded.
         # /admin HTML console (§13, issue #36) — the presentation layer over the JSON API
         # above. Serving is by EXPLICIT handlers (never StaticFiles) so every HTML/asset
         # response can carry the CSP header. GET /admin is auth-gated (cookie OR Bearer);
@@ -262,9 +253,6 @@ def create_app(settings) -> Starlette:
         Route("/admin/app.js", app_js, methods=["GET"]),
         Route("/admin/app.css", app_css, methods=["GET"]),
         Route("/admin/login.js", login_js, methods=["GET"]),
-        Route("/admin/enroll/requests", list_enroll_requests, methods=["GET"]),
-        Route("/admin/enroll/approve", approve, methods=["POST"]),
-        Route("/admin/enroll/reject", reject, methods=["POST"]),
         Route("/admin/enroll/window", open_enroll_window, methods=["POST"]),
         Route("/admin/enroll/window", get_enroll_window, methods=["GET"]),
         Route("/admin/enroll/window", close_enroll_window_endpoint, methods=["DELETE"]),
@@ -287,9 +275,8 @@ def create_app(settings) -> Starlette:
     # unaffected either way.
     middleware = [
         Middleware(CountingCORSMiddleware, **cors_kwargs()),
-        # Stamp X-Content-Type-Options: nosniff on every /admin response (HTML/asset AND the
-        # #35 JSON API that serves untrusted suggested_title/origin verbatim). Header-only,
-        # so it never alters a #35 JSON body/status (§13, issue #36).
+        # Stamp X-Content-Type-Options: nosniff on every /admin response (HTML/asset AND
+        # the JSON API). Header-only, so it never alters a JSON body/status (§13, #36).
         Middleware(AdminSecurityHeadersMiddleware),
     ]
     app = Starlette(

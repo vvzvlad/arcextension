@@ -57,9 +57,7 @@ _DEFAULTS: dict = {
     "restore_marker_path": "",
     "log_level": "INFO",
     "enroll_window_min": 10,
-    "enroll_max_pending": 64,
     "enroll_preauth_max": 128,
-    "enroll_request_ttl_min": 60,
     "admin_session_ttl_min": 720,
 }
 
@@ -144,9 +142,10 @@ def secret_hash_for(instance_id: str) -> str:
 def approve_instance(db_path, instance_id, *, status="active", secret_hash=None):
     """Insert (or update) an ``instances`` row so a secret-hello authenticates.
 
-    Mimics the operator approval of Task E: a row with a human-assigned ``id``, a
-    ``secret_hash`` and ``status`` (default 'active'). ``conn_epoch`` starts at 0 and the
-    first hello bumps it to 1 via the UPDATE-only upsert.
+    Mimics what a successful ``enroll_request`` creates (src.db.queries.enroll_instance):
+    a row whose ``id`` is the name the browser asked for, plus a ``secret_hash`` and a
+    ``status`` (default 'active'). ``conn_epoch`` starts at 0 and the first hello bumps it
+    to 1 via the UPDATE-only upsert.
     """
     sh = secret_hash if secret_hash is not None else secret_hash_for(instance_id)
     conn = sqlite3.connect(str(db_path))

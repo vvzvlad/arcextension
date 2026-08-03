@@ -1,10 +1,10 @@
 """Enrollment window — arm / read / close, stored in the ``settings`` TABLE (§13).
 
-Enrollment replaces the former shared /ext token: an instance says hello with an
-``install_uuid`` + a per-install secret and waits in ``enroll_requests`` until an
-operator approves it. Approval is only accepted while the enrollment WINDOW is open —
-a short, operator-opened interval so a stolen hello cannot be approved at an arbitrary
-later time.
+Enrollment replaces the former shared /ext token: an instance enrols by presenting an
+``install_uuid``, a per-install secret and the id it wants, and it is admitted ONLY while
+the enrollment WINDOW is open — a short, operator-opened interval, so an enrol attempt at
+an arbitrary later time is refused. The window IS the permission: there is no second
+approval step (§6), which is exactly why the window has to be short and its code fresh.
 
 The window is modelled exactly like ``pause_until`` in :mod:`src.curator.pause`: a
 deadline stored in the ``settings`` key/value table and compared against ``now`` AT

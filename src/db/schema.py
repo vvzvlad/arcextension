@@ -236,11 +236,36 @@ _V2_STATEMENTS: list[str] = [
     "UPDATE instances SET status='revoked' WHERE secret_hash IS NULL",
 ]
 
+# --- Version 3: enrollment without approval (§6) -----------------------------
+# The two-step enrollment is gone. The WINDOW is the permission: an enroll_request that
+# carries the right code into an open window creates the ACTIVE instance immediately,
+# under the id the human typed in the extension settings. So the whole pending-request
+# storage goes with it, and with it the client-proposed name:
+#
+# * ``enroll_requests`` — nothing writes or reads it anymore. The channel enrolls straight
+#   into ``instances``; there is no operator list to hold, no TTL to sweep, no capacity
+#   to cap. Dropping the TABLE (rather than leaving it orphaned) is what makes the
+#   simplification real: a leftover table is an invitation to wire the second step back.
+# * ``instances.title`` — the browser proposed a display name AND the operator separately
+#   assigned an id, with no rename anywhere in the product to justify the split. One name
+#   per system now: the id IS the name, and every surface that printed ``title`` prints
+#   the id.
+#
+# ``ALTER TABLE ... DROP COLUMN`` needs SQLite >= 3.35 (measured: 3.46.1 in the shipping
+# python:3.11-slim image, 3.53.3 on the dev machine) and refuses a column that is indexed
+# or referenced by a view/trigger — ``title`` is plain, so this is a single statement
+# rather than the twelve-column table rebuild the older recipe would need.
+_V3_STATEMENTS: list[str] = [
+    "DROP TABLE enroll_requests",
+    "ALTER TABLE instances DROP COLUMN title",
+]
+
 # Ordered list of steps. Append new steps with the next target_version and bump
 # MAX_VERSION; never edit a shipped step (a migrated DB has already run it).
 STEPS: list[tuple[int, list[str]]] = [
     (1, _V1_STATEMENTS),
     (2, _V2_STATEMENTS),
+    (3, _V3_STATEMENTS),
 ]
 
 MAX_VERSION: int = max(target for target, _ in STEPS)

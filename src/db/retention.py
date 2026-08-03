@@ -64,21 +64,6 @@ def delete_old_js_audit(conn: sqlite3.Connection, cutoff: int) -> int:
     return cur.rowcount
 
 
-def delete_expired_enroll_requests(conn: sqlite3.Connection, cutoff: int) -> int:
-    """Physically delete enroll_requests with ``first_seen_at < cutoff``; return the count.
-
-    Pure ``fn(conn)`` mirroring :func:`delete_old_actions` (issue #35 acceptance 12). The
-    cutoff is ``now - ENROLL_REQUEST_TTL_MIN`` in ms — the SAME boundary the read-time
-    filter in ``list_pending_enroll_requests`` uses (it KEEPS ``first_seen_at >= cutoff``,
-    this DELETES ``first_seen_at < cutoff``), so a request stops being returned and is then
-    physically removed at the same TTL. ``first_seen_at`` is frozen on repeat hellos
-    (slice B), so the TTL is actually reachable. Run by the frequent sweep below, NOT the
-    24h retention pass — TTL+60s is far finer than a day.
-    """
-    cur = conn.execute("DELETE FROM enroll_requests WHERE first_seen_at < ?", (cutoff,))
-    return cur.rowcount
-
-
 @dataclass(frozen=True)
 class RetentionResult:
     actions_deleted: int
@@ -138,39 +123,3 @@ async def retention_loop(
         except Exception as exc:  # noqa: BLE001 - never let the schedule die
             logger.error("retention run failed: {}", exc)
         await asyncio.sleep(_RETENTION_INTERVAL_S)
-
-
-def enroll_request_cutoff_ms(now_ms: int, ttl_min: int) -> int:
-    """The ``first_seen_at`` boundary: requests strictly older than this are expired.
-
-    Minutes (not days): the enroll_request TTL is a small operator-scale horizon, so the
-    boundary is ``now - ttl_min*60_000`` rather than reusing the day-based ``cutoff_ms``.
-    """
-    return now_ms - ttl_min * 60_000
-
-
-async def enroll_request_sweep_loop(db, ttl_min: int, interval_ms: int) -> None:
-    """Frequent sweep that physically deletes expired enroll_requests (acceptance 12).
-
-    SEPARATE from :func:`retention_loop` on purpose. Acceptance 12 requires a request to
-    be GONE from disk within ``TTL + 60s``; the 24h retention pass is orders of magnitude
-    too coarse, and the curator pass driver ticks at ``PASS_INTERVAL_MIN`` (5 min by
-    default) — also too coarse. So this dedicated loop wakes every ``TICK_MS`` (~60s): a
-    request that crossed its TTL is removed on the next tick, i.e. at most ``TTL + TICK_MS``
-    (~TTL+60s) after ``first_seen_at``. A failed sweep is logged and the schedule
-    continues (a broken sweep must never kill the process). The deletion logic under test
-    is :func:`delete_expired_enroll_requests`; this loop is intentionally trivial.
-    """
-    interval_s = max(interval_ms, 1_000) / 1000
-    while True:
-        try:
-            now_ms = int(time.time() * 1000)
-            cutoff = enroll_request_cutoff_ms(now_ms, ttl_min)
-            deleted = await db.write(
-                lambda c: delete_expired_enroll_requests(c, cutoff)
-            )
-            if deleted:
-                logger.info("enroll sweep: deleted {} expired enroll_requests", deleted)
-        except Exception as exc:  # noqa: BLE001 - never let the schedule die
-            logger.error("enroll sweep failed: {}", exc)
-        await asyncio.sleep(interval_s)

@@ -10,18 +10,24 @@ tested without a socket or a wall clock.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # --- Message types (the `type` field of every frame) ------------------------
 TYPE_HELLO = "hello"
 TYPE_HELLO_ACK = "hello_ack"
-# Enrollment handshake (§2, issue #35). A not-yet-approved instance opens with an
-# `enroll_request` (carrying the window `code`); the service records the request and
-# answers `enroll_pending` (approval is async — no response is sent on approval, the
-# client learns via a successful `hello` on its next alarm). A gated request is refused
-# with `enroll_rejected{reason}`.
+# Enrollment handshake (§6). A not-yet-enrolled instance opens with an `enroll_request`
+# carrying the window `code` and the `instanceId` its operator typed; the OPEN WINDOW is
+# the permission, so the service creates the ACTIVE row there and then and answers
+# `enroll_accepted{instanceId}`. A gated request is refused with
+# `enroll_rejected{reason}` and creates nothing.
+#
+# There is no `enroll_pending` anymore, and the frame is gone rather than kept as a
+# no-op: it was the client's evidence that a request existed in a list awaiting a
+# separate operator approval, and that list no longer exists. A client that still waits
+# for it would wait forever instead of noticing it is already enrolled.
 TYPE_ENROLL_REQUEST = "enroll_request"
-TYPE_ENROLL_PENDING = "enroll_pending"
+TYPE_ENROLL_ACCEPTED = "enroll_accepted"
 TYPE_ENROLL_REJECTED = "enroll_rejected"
 TYPE_SNAPSHOT_REQUEST = "snapshot_request"
 TYPE_SNAPSHOT = "snapshot"
@@ -64,11 +70,13 @@ REJECT_PROTOCOL = "protocol"
 REJECT_AUTH = "auth"
 REJECT_INSTANCE = "instance"
 REJECT_DUPLICATE = "duplicate_instance"
-# There is no `origin` verdict anymore. The hello frame still CARRIES an origin, but the
-# service now ignores it entirely — it is neither compared nor stored. The check was
+# There is no `origin` verdict anymore, and no `origin` anywhere. The check was
 # self-reported by the very client it was meant to vet, and the EXT_ALLOWED_ORIGINS
-# allow-list behind it is gone (see src/api/cors.py). The ENROLL path still records its
-# frame's origin, because there it is operator-facing evidence at approval time, not a gate.
+# allow-list behind it is gone (see src/api/cors.py). The hello frame still CARRIES an
+# origin and the service ignores it entirely — neither compared nor stored. The ENROLL
+# path used to RECORD its frame's origin, as operator-facing evidence at approval time;
+# with approval gone there is no reader for it, so the enroll_request no longer carries
+# one either (a field nobody reads is how a contract drifts).
 # hello verdicts the client acts on (§7): the secret matched a REVOKED row, or matched
 # no active/pending row at all (unknown — e.g. never approved, or deleted). The client
 # distinguishes these to decide whether to re-enroll (unknown) or stop (revoked).
@@ -76,19 +84,32 @@ REJECT_REVOKED = "revoked"
 REJECT_UNKNOWN = "unknown_instance"
 
 # --- Enroll reject reasons (`reason` of an `enroll_rejected` frame) ----------
-# The enrollment window is closed, the supplied window `code` was wrong/blank, or the
-# pending-request list is at its ceiling. A protocolVersion mismatch reuses
-# ``REJECT_PROTOCOL`` (same string as the hello path).
+# The enrollment window is closed, or the supplied window `code` was wrong/blank. A
+# protocolVersion mismatch reuses ``REJECT_PROTOCOL`` (same string as the hello path).
 ENROLL_CLOSED = "closed"
 ENROLL_BAD_CODE = "bad_code"
-ENROLL_CAPACITY = "capacity"
-# A pending request for this install_uuid already exists carrying a DIFFERENT secret. The
-# stored credential is frozen at creation (see ``queries._UPSERT_ENROLL_REQUEST``), so this
-# request is refused rather than silently answered ``enroll_pending`` — the client would
-# otherwise wait for the approval of a secret it does not hold. TRANSIENT for the client:
-# it keeps retrying, and the stale row either ages out under TTL or is rejected by the
-# operator, after which the retry is accepted.
-ENROLL_SECRET_CONFLICT = "secret_conflict"
+# The proposed `instanceId` is already carried by an ACTIVE instance. This is the ONE
+# objection the removed approval step really answered — a name collision — and it is
+# refused loudly rather than turned into a manual step on every ordinary enrolment. An
+# EXISTING-BUT-REVOKED id is NOT this: taking it back is the restore path for a revoked
+# MAIN and is accepted (see ``queries.enroll_instance``).
+ENROLL_ID_TAKEN = "id_taken"
+# The proposed `instanceId` is outside the charset/length the row's PRIMARY KEY accepts
+# (:data:`INSTANCE_ID_RE`). The extension validates the same expression before it sends,
+# so reaching this means a client that skipped its own field check.
+ENROLL_BAD_ID = "bad_id"
+
+# The charset/length an instance id must satisfy — it becomes the ``instances`` PRIMARY
+# KEY and travels into URLs, metric labels and the console, so a pasted or fat-fingered
+# value must not become a permanent key. Lives HERE, in the pure module, because the
+# enrollment gate that applies it is now the /ext channel; it used to live in
+# src/api/admin.py next to the operator-assigned id of the retired approve endpoint.
+INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def instance_id_ok(value: Any) -> bool:
+    """Whether ``value`` is a usable instance id (a str matching :data:`INSTANCE_ID_RE`)."""
+    return isinstance(value, str) and bool(INSTANCE_ID_RE.match(value))
 
 # Two consecutive heartbeat misses close the socket (§6).
 MAX_HEARTBEAT_MISSES = 2
@@ -166,16 +187,19 @@ def enroll_reject_reason(
     * not ``code_ok``          -> ``ENROLL_BAD_CODE``
     * otherwise                -> ``None`` (this helper accepts; see below)
 
-    ``None`` is NOT "the request is accepted" — it is "the config gates passed". Two more
-    gates run afterwards in :mod:`src.ext.channel`, and they are not here because they
-    cannot be pure:
+    ``None`` is NOT "the request is accepted" — it is "the config gates passed". Three
+    more gates run afterwards in :mod:`src.ext.channel`, and they are not here because
+    they cannot be pure:
 
     1. the STRUCTURAL check (non-blank, non-oversized ``installUuid``/``secret``), done
        after the code gate so a wrong code never reveals whether the frame was well-formed;
-    2. capacity AND the frozen-secret conflict, decided INSIDE the write transaction by
-       :func:`src.db.queries.upsert_enroll_request_capped` — ``ENROLL_CAPACITY`` and
-       ``ENROLL_SECRET_CONFLICT`` are returned by the channel from that transaction's
-       outcome.
+    2. the id CHARSET check (:func:`instance_id_ok`) → ``ENROLL_BAD_ID``, which is pure but
+       lives with the structural checks so the whole "is this frame usable" step is in one
+       place and refuses before any write;
+    3. the id COLLISION, decided INSIDE the write transaction by
+       :func:`src.db.queries.enroll_instance` — ``ENROLL_ID_TAKEN`` is returned by the
+       channel from that transaction's outcome, because a pre-read in its own transaction
+       could never be authoritative against two browsers enrolling the same name at once.
 
     This function used to take a ``has_capacity`` flag and own ``ENROLL_CAPACITY``, and its
     docstring claimed every gate ran "BEFORE the channel writes any ``enroll_requests``
@@ -183,7 +207,8 @@ def enroll_reject_reason(
     pre-read in its own transaction could never be authoritative against racing enrolls):
     the only caller passed ``has_capacity=True`` unconditionally, so the branch was dead
     code and the documented order was the opposite of the real one. The parameter is gone
-    rather than left as a trap for the next reader.
+    rather than left as a trap for the next reader — and with the pending list itself, so
+    is the capacity ceiling.
     """
     if msg.get("protocolVersion") != protocol_version:
         return REJECT_PROTOCOL

@@ -1,9 +1,17 @@
 """``/admin/*`` — the JSON enrollment API an operator (or the MCP agent) drives (§13).
 
-This is the JSON control surface of enrollment: list/approve/reject pending requests,
-list/revoke instances, and open/read/close the enrollment window. The HTML console that
-renders it is a SEPARATE issue (#36) — this module serves JSON ONLY (no templates, no
-StaticFiles).
+This is the JSON control surface of enrollment: list/revoke instances, and open/read/close
+the enrollment window. The HTML console that renders it is a SEPARATE issue (#36) — this
+module serves JSON ONLY (no templates, no StaticFiles).
+
+There is deliberately NO approve/reject pair and no pending-request list. Enrolment is
+one step: an ``enroll_request`` carrying a valid code into an OPEN window creates the
+active instance in :mod:`src.ext.channel`, under the id its operator typed. The window is
+the permission; approval existed only to assign an id the browser now brings, and the one
+objection it really answered — a name collision — is refused loudly at the /ext frame
+instead of costing a manual step on every ordinary enrolment. What is left here is what
+the console still needs: arming the window (which mints the code), reading it, closing it
+early, and the fleet list with revocation.
 
 Auth (issue #35 §4). ``/admin`` is ADMIN-only: :func:`require_admin` runs the shared
 ``require_api_caller`` and then rejects an INSTANCE caller with 401 (acceptance 6). The
@@ -12,17 +20,13 @@ first. MUTATING endpoints additionally call ``require_operational`` (503 while t
 degraded — a migration failure means authoritative writes cannot be trusted); READ
 endpoints do NOT, so the operator can still inspect the fleet in degraded mode.
 
-All SQL lives in :mod:`src.db.queries` / :mod:`src.curator.enroll` / :mod:`src.db.retention`
-(slices A/B/D) — the handlers only orchestrate reads/writes and map outcomes to HTTP.
-``origin`` / ``suggested_title`` are UNTRUSTED (length already clamped server-side in
-slice B) and returned VERBATIM: the JSON API never HTML-encodes; the #36 page textContent-s
-them.
+All SQL lives in :mod:`src.db.queries` / :mod:`src.curator.enroll` — the handlers only
+orchestrate reads/writes and map outcomes to HTTP.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 import time
 
@@ -42,12 +46,8 @@ from src.api.guards import (
 )
 from src.curator.enroll import arm_enroll_window, close_enroll_window, read_enroll_window
 from src.db import queries
-from src.db.queries import ApproveConflict, revoke_instance
+from src.db.queries import revoke_instance
 from src.db.queries import RevokeMainRefused
-
-
-# A bounded charset/length for the operator-assigned instance_id (the row PRIMARY KEY).
-_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def _now_ms() -> int:
@@ -98,176 +98,12 @@ async def require_admin(request: Request) -> Caller:
     raise HTTPException(status_code=401, detail="admin authentication required")
 
 
-def _ttl_ms(request: Request) -> int:
-    """The enroll_request TTL in ms (ENROLL_REQUEST_TTL_MIN), the read-time cutoff base."""
-    return request.app.state.settings.enroll_request_ttl_min * 60_000
-
-
-# --- pending enroll requests -------------------------------------------------
-async def list_enroll_requests(request: Request) -> JSONResponse:
-    """``GET /admin/enroll/requests`` — the pending, NOT-expired requests (acc 12).
-
-    Read-only, so it is allowed in degraded mode. The TTL filter is applied at read time
-    (a request past ``ENROLL_REQUEST_TTL_MIN`` is never returned), independent of the
-    physical sweep that later deletes it.
-    """
-    await require_admin(request)
-    now = _now_ms()
-    rows = await request.app.state.db.read(
-        lambda c: queries.list_pending_enroll_requests(c, now=now, ttl_ms=_ttl_ms(request))
-    )
-    return JSONResponse({"requests": rows})
-
-
-def _require_str(body: dict, field: str) -> str:
-    value = body.get(field)
-    if not isinstance(value, str) or not value:
-        raise HTTPException(status_code=400, detail=f"{field} is required")
-    return value
-
-
-async def approve(request: Request) -> JSONResponse:
-    """``POST /admin/enroll/approve`` — enroll a pending request (§1, acceptance 4/11).
-
-    Body ``{install_uuid, instance_id, [title]}`` — snake_case, like every other JSON body
-    and response field in this service (``/api/rules`` has always taken ``instance_id``).
-    The operator assigns ``instance_id`` (stable across re-issue, §1). Flow:
-
-    0. The enrollment WINDOW must be OPEN → 409 otherwise. This is the gate
-       :mod:`src.curator.enroll` and deploy/DEPLOY.md have always described («approval is
-       only accepted while the window is open — a short, operator-opened interval so a
-       stolen hello cannot be approved at an arbitrary later time») and that the code did
-       not implement: with ``ENROLL_WINDOW_MIN=10`` and ``ENROLL_REQUEST_TTL_MIN=60`` a
-       request could be approved 50 minutes after the window closed, which is precisely
-       the "at an arbitrary later time" the design excludes. The window is what BOUNDS the
-       approval surface in time; the code only bounds who may file a request.
-       The gate also changes what ``ENROLL_REQUEST_TTL_MIN`` is FOR: it no longer bounds
-       "how long an approval remains possible" (the window does that now) but "does a
-       request outlive the window it was filed in". :mod:`src.settings` enforces exactly
-       that relation — ``ENROLL_REQUEST_TTL_MIN >= ENROLL_WINDOW_MIN`` — because below it a
-       request filed at the start of a window expires before the window closes and the
-       approve 404s on the row still in front of the operator.
-    1. READ the pending request (own read txn) → 404 if absent/expired, and capture its
-       ``secret_hash``. Reading it out of band is what lets two racing approves BOTH hold
-       the secret so the write-side guards (not a 404) decide the loser.
-    2. ONE write txn: create-or-reactivate the ``instances`` row + delete the consumed
-       request + write the ``admin_audit`` row — all committed together. The two 409
-       guards: an already-active id (``ApproveConflict``) and a ``UNIQUE(secret_hash)``
-       collision (``sqlite3.IntegrityError``). Exactly one of two racing approves commits.
-
-    Approval sends NOTHING to the extension — it learns via a successful secret-hello on
-    its next alarm (acceptance 4). Returns ``{instance_id, status:'active'}``.
-    """
-    await require_admin(request)
-    require_operational(request)
-    body = await read_force_body(request)
-    install_uuid = _require_str(body, "install_uuid")
-    instance_id = _require_str(body, "instance_id")
-    # instance_id becomes the row's PRIMARY KEY; the operator is trusted, but a bounded
-    # charset/length keeps a fat-fingered or pasted value from becoming a permanent key.
-    if not _INSTANCE_ID_RE.match(instance_id):
-        raise HTTPException(
-            status_code=400,
-            detail="instance_id must be 1-64 chars of [A-Za-z0-9._-]",
-        )
-    title = body.get("title")
-    if title is not None and not isinstance(title, str):
-        raise HTTPException(status_code=400, detail="title must be a string")
-
-    now = _now_ms()
-    db = request.app.state.db
-    # (0) The window gate, BEFORE the request lookup: a closed window is a flat refusal
-    # that must not double as an oracle for which install_uuids are pending.
-    window = await db.read(lambda c: read_enroll_window(c, now=now))
-    if not window.open:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "the enrollment window is closed; open it "
-                "(POST /admin/enroll/window) and approve within it"
-            ),
-        )
-    req = await db.read(
-        lambda c: queries.get_enroll_request(
-            c, install_uuid, now=now, ttl_ms=_ttl_ms(request)
-        )
-    )
-    if req is None:
-        raise HTTPException(
-            status_code=404, detail="no pending enroll request for that install_uuid"
-        )
-    # Body title wins; otherwise the client's suggested title (untrusted, already clamped).
-    final_title = title if title is not None else req["suggested_title"]
-    secret_hash = req["secret_hash"]
-
-    def _txn(c: sqlite3.Connection) -> None:
-        # Upsert (create-or-reactivate) + delete request + audit, atomically. A conflict
-        # rolls the WHOLE txn back — no partial row, no audit for a failed approve, and the
-        # request survives for a retry.
-        queries.approve_enroll_request(
-            c,
-            instance_id=instance_id,
-            secret_hash=secret_hash,
-            install_uuid=install_uuid,
-            title=final_title,
-            now=now,
-        )
-        queries.insert_admin_audit(
-            c,
-            now=now,
-            action="approve",
-            initiator="admin",
-            install_uuid=install_uuid,
-            instance_id=instance_id,
-            detail=json.dumps({"title": final_title}),
-        )
-
-    try:
-        await db.write(_txn)
-    except ApproveConflict:
-        raise HTTPException(status_code=409, detail="instance id is already active")
-    except sqlite3.IntegrityError:
-        # UNIQUE(secret_hash): another active instance already carries this secret — the
-        # concurrency loser (a DIFFERENT id, same request).
-        raise HTTPException(status_code=409, detail="secret is already enrolled")
-    return JSONResponse({"instance_id": instance_id, "status": "active"})
-
-
-async def reject(request: Request) -> JSONResponse:
-    """``POST /admin/enroll/reject`` — delete a pending request. Body ``{install_uuid}``.
-
-    Idempotent: a 200 even when the request is already gone (the desired end state —
-    request absent — already holds). The reject is always audited, with a ``deleted`` flag
-    recording whether a row was actually present.
-    """
-    await require_admin(request)
-    require_operational(request)
-    body = await read_force_body(request)
-    install_uuid = _require_str(body, "install_uuid")
-    now = _now_ms()
-
-    def _txn(c: sqlite3.Connection) -> bool:
-        deleted = queries.reject_enroll_request(c, install_uuid)
-        queries.insert_admin_audit(
-            c,
-            now=now,
-            action="reject",
-            initiator="admin",
-            install_uuid=install_uuid,
-            detail=json.dumps({"deleted": deleted}),
-        )
-        return deleted
-
-    deleted = await request.app.state.db.write(_txn)
-    return JSONResponse({"install_uuid": install_uuid, "rejected": True, "deleted": deleted})
-
-
 # --- instances ---------------------------------------------------------------
 async def list_instances(request: Request) -> JSONResponse:
     """``GET /admin/instances`` — every instance, all statuses (read-only, degraded-ok).
 
-    Unlike the curator's active-only reads, this shows revoked/pending rows too so the
-    operator can see a revoked MAIN awaiting re-approval or a stuck pending id.
+    Unlike the curator's active-only reads, this shows revoked rows too so the operator
+    can see a revoked MAIN awaiting re-enrolment or a retired browser.
     """
     await require_admin(request)
     rows = await request.app.state.db.read(queries.list_instances)

@@ -77,58 +77,40 @@ tests:
         alertname: curator-enroll-window-held-open
         exp_alerts: []
 
-  # --- curator-enroll-secret-conflict: fires on a SINGLE occurrence --------------
+  # --- curator-enroll-id-taken: fires on a SINGLE occurrence --------------------
   - interval: 1m
-    name: one secret-substitution attempt pages
+    name: one taken-name enrolment attempt pages
     input_series:
-      - series: 'curator_auth_rejections_total{reason="enroll_secret_conflict"}'
-        # ONE refusal, ever. A healthy client always re-registers with the same durable
-        # secret, so this cannot happen by accident — hence the >0 threshold, unlike the
-        # brute-force rules. Reddens if the rule is given a >5-style threshold.
+      - series: 'curator_auth_rejections_total{reason="enroll_id_taken"}'
+        # ONE refusal, ever. The peer held a valid code for an open window and asked for a
+        # LIVE instance's name: either the operator collided two browsers (and the new one
+        # cannot enrol, with nothing in the console to show it) or somebody aimed at an
+        # existing identity. Hence >0, unlike the brute-force rules. Reddens if the rule is
+        # given a >5-style threshold.
         values: '0 0 0 1 1 1 1 1 1 1 1 1'
     alert_rule_test:
       - eval_time: 11m
-        alertname: curator-enroll-secret-conflict
+        alertname: curator-enroll-id-taken
         exp_alerts:
           - exp_labels:
               severity: warning
-              reason: enroll_secret_conflict
+              reason: enroll_id_taken
             exp_annotations:
-              summary: "An enroll_request tried to replace the frozen secret of a pending install_uuid (credential-substitution attempt, §6)."
+              summary: "An enroll_request asked for the id of a live instance and was refused — that browser cannot enrol under this name, and nothing else records the attempt (§6)."
 
-  # --- curator-enroll-secret-conflict: QUIET when nothing conflicts --------------
+  # --- curator-enroll-id-taken: QUIET when no name collides ---------------------
   - interval: 1m
-    name: no secret conflicts is quiet
+    name: no name collisions is quiet
     input_series:
       # A flat series (the shape a healthy install keeps once one old refusal is behind
       # it): increase() over the window is 0, so the >0 threshold stays silent. Without
       # this the rule would page forever on a single historical counter value.
-      - series: 'curator_auth_rejections_total{reason="enroll_secret_conflict"}'
+      - series: 'curator_auth_rejections_total{reason="enroll_id_taken"}'
         values: '1+0x11'
     alert_rule_test:
       - eval_time: 11m
-        alertname: curator-enroll-secret-conflict
+        alertname: curator-enroll-id-taken
         exp_alerts: []
-
-  # --- curator-enroll-pending-capacity: fires at the pending ceiling -------------
-  - interval: 1m
-    name: pending-list capacity refusals fire
-    input_series:
-      # Enrollments turned away at ENROLL_MAX_PENDING. Distinct from the /ext pre-auth
-      # ceiling below: that one is {reason="capacity"}, this one {reason="enroll_capacity"},
-      # and a rule matching the wrong label would be silent at the moment new browsers
-      # cannot enroll at all.
-      - series: 'curator_auth_rejections_total{reason="enroll_capacity"}'
-        values: '0+4x12'
-    alert_rule_test:
-      - eval_time: 11m
-        alertname: curator-enroll-pending-capacity
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              reason: enroll_capacity
-            exp_annotations:
-              summary: "Enrollments are being refused at the pending-request ceiling (ENROLL_MAX_PENDING) — a new browser cannot enroll (§6)."
 
   # --- curator-admin-token-bruteforce: fires on repeated failed logins -----------
   - interval: 1m

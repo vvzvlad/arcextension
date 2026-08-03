@@ -277,11 +277,14 @@ describe("enrollment message channel (§7)", () => {
     expect(st.hasAddress).toBe(true);
   });
 
-  it("get_identity returns the server-assigned id from storage, not instance.json", async () => {
-    await loadServiceWorker({ seedLocal: { instanceId: "srv-9", browserName: "Lab" } });
+  it("get_identity returns the server-assigned id from storage, and nothing else", async () => {
+    // No `title` companion: the id IS the name (§6). The locally-typed name is what this
+    // browser WANTS to be called and is deliberately not reported as identity — nothing
+    // has agreed to it until an enrolment succeeds, at which point it IS the id.
+    await loadServiceWorker({ seedLocal: { instanceId: "srv-9", browserName: "lab" } });
     const id = await ask({ type: "get_identity" });
     expect(id.instanceId).toBe("srv-9");
-    expect(id.title).toBe("Lab");
+    expect(id.title).toBeUndefined();
   });
 
   it("submit_enrollment marks the request pending and acks ok", async () => {

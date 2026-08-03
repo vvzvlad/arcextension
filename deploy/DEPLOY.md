@@ -238,8 +238,8 @@ reach a published image.
 ## 7. Instances & enrollment (§13)
 
 Under enrollment there is **no shared token to distribute or rotate**. Each instance
-authenticates with a **per-install secret** it generates itself; the operator approves it
-once, on `/admin`, during a short window. Themed browser instances are built with the
+authenticates with a **per-install secret** it generates itself; the operator's whole part
+is opening a short window on `/admin` and handing over its code. Themed browser instances are built with the
 **instance generator** — a two-step, token-free flow (`make bundle` then `make instance`,
 see `tools/README.md`):
 
@@ -254,107 +254,84 @@ see `tools/README.md`):
 
 ### Adding a browser (the enrollment procedure)
 
-An operator adds an instance by pairing it during a short, deliberately-opened window:
+An operator adds an instance by opening a short window and handing over its code. **The
+open window is the whole permission** — there is no approval step, and nothing to come
+back to the console for.
 
-1. **Open a window.** On `/admin`, open an enrollment window (`ENROLL_WINDOW_MIN`,
+1. **Name the browser.** In the new instance's extension settings, enter the service
+   address and the **browser name**. That name becomes the instance's `instance_id`
+   verbatim, so it must be 1-64 characters of `A-Za-z0-9._-` (no spaces) and must not
+   already belong to a live instance. The settings page refuses anything else before it
+   sends, and tells you what to type instead.
+2. **Open a window.** On `/admin`, open an enrollment window (`ENROLL_WINDOW_MIN`,
    default 10 min). `/admin` shows a short **enrollment code** for the open window.
-2. **Take the code into the extension.** In the new instance's extension settings, enter
-   the service address and the enrollment code, and submit — the extension sends its
-   `install_uuid` + a freshly generated per-install secret and lands in the pending list.
-   The settings page shows that install's own `install_uuid` prefix — note it, it is what
-   you match against the console row in the next step.
-3. **Approve it on `/admin`, while the window is still open.** Approve the pending request
-   (give it its `instanceId`). Approval binds the secret's hash to that row; from then on
-   the instance's `hello` (and its `/api/*` calls) authenticate by that secret.
+3. **Take the code into the extension and submit.** The extension sends its
+   `install_uuid`, a freshly generated per-install secret and the name from step 1. If the
+   window is open and the code is right, the instance is created **active** on the spot and
+   the extension's status line flips from «не зарегистрирован» to «активен». From then on
+   its `hello` (and its `/api/*` calls) authenticate by that secret.
+4. **Close the window** (`DELETE /admin/enroll/window`, or the button) when you are done.
+   Leaving it open leaves the door open — `curator-enroll-window-held-open` fires after
+   65 minutes precisely because of that.
 
-> **Three independent time bounds. Two of them must hold at the moment you click Approve.**
+> **Why there is no Approve button anymore.** The window with its one-shot code already
+> answers "who may connect"; approval existed only to assign the `instance_id`, and the
+> browser now brings it. The single real objection — two browsers claiming one name — is
+> refused loudly (`id_taken`) instead of costing a manual step on every ordinary addition.
 >
-> - The **window** bounds *approval*. `approve` re-reads the window and answers **409**
->   when it is closed — so a stolen hello cannot be approved at an arbitrary later time.
->   The check runs *before* the request lookup, so a closed window is a flat refusal and
->   never doubles as an oracle for which `install_uuid`s are pending.
-> - The **code** bounds *who may file a request*: a request is only accepted while a
->   window is open and only with that window's own code, otherwise the service answers
->   `enroll_rejected{closed|bad_code}` and writes **no** row. This is what keeps unknown
->   clients out of the pending list.
-> - **`ENROLL_REQUEST_TTL_MIN`** (60 min) bounds how long a filed request survives at all.
->   The service refuses to start unless `ENROLL_REQUEST_TTL_MIN >= ENROLL_WINDOW_MIN`, so
->   a request always outlasts the window it was filed in — otherwise one filed at the start
->   of a window would expire before that window closed, and `approve` would 404 on a row
->   still visible in front of you.
->
-> **Practical consequence: a closed window does not just make you hurry — it makes
-> `approve` fail.** On a 409 saying the window is closed, open a new one
-> (`POST /admin/enroll/window`) and approve inside it. As long as the request is still
-> within its TTL it is still in the list, so nothing has to happen at the browser: the new
-> window's code exists to *file* requests, and this one is already filed.
->
-> **Reject what you do not recognise, promptly.** How you tell your own request from
-> someone else's is the **18-character `install_uuid` prefix** (`xxxxxxxx-xxxx-xxxx`):
-> the extension's settings page and the `/admin` console print the same 18 characters of
-> the same value, so you compare them literally, and the full uuid is on the console cell
-> as a tooltip if you want to check every character. Nothing else in the row identifies
-> anybody — every instance in the fleet shares one `chrome-extension://` origin by
-> construction, and two browsers belonging to the same person carry the same suggested
-> title. `POST /admin/enroll/reject` clears a row you did not expect; do not leave it
-> sitting in the list on the theory that the window has closed, because the row outlives
-> the window and the next window you open is an approval opportunity for it too.
+> **What you give up, and where to look instead.** A REFUSED attempt no longer appears in
+> any console list. Its reason is shown in the settings page of the browser that was
+> refused — that is the place to look — and the fact is counted in
+> `curator_auth_rejections_total{reason="enroll_*"}`. The name collision has its own alert,
+> `curator-enroll-id-taken`, with a threshold of 0 (deploy/alerts.yml), so the one refusal
+> that means "a browser cannot join and nobody would otherwise notice" still pages.
 
-### When you cannot approve (window closed, TTL expired, or you rejected the request)
+### When enrolment is refused
 
-- **Window closed, request still within its TTL** — the request survives, but `approve`
-  answers **409**. Open a new window on `/admin` and approve inside it. The operator does
-  **not** have to touch the browser: the request is already filed, and the new window's
-  code only matters for filing.
-- **Request past `ENROLL_REQUEST_TTL_MIN`** — it stops being returned by
-  `GET /admin/enroll/requests` at read time and is physically swept within about one
-  `TICK_MS` (60 s) after that; `approve` answers **404**. Re-submitting is then
-  **mandatory, not an option** — there is nothing left to approve.
-- **The extension re-files the request on its own, but only while it still holds a code.**
-  A pending instance re-sends its `enroll_request` when it has never seen an
-  `enroll_pending` at all, or when the last confirmation is more than 5 minutes old — so a
-  request swept under TTL comes back by itself *if* the staged window code is still valid.
-  It is not: a code belongs to one window, and the re-file lands after the window closed,
-  which draws `enroll_rejected{closed}` and clears the code. That is the designed outcome —
-  it converts a silent wait into a visible "re-stage the code" — but it does mean the
-  instance stops on its own and waits for you.
-- **The recovery is therefore at the browser, not at `/admin`:** open a **new** window on
-  `/admin` (a new window always mints a **new** code — a previous window's code never
-  carries over), then in the instance's extension settings enter that new code and press
-  submit again. The instance reuses the **same** secret it already generated, so approving
-  the new request enrolls the same credential; what expired was the request, not the
-  secret. Approve it **promptly** this time — the request only outlives its window by
-  `ENROLL_REQUEST_TTL_MIN`.
-- **Tell "waiting" from "wrong code" without guessing:** the extension surfaces the last
-  `enroll_rejected` reason in its settings UI. An instance stuck on `bad_code` or `closed`
-  needs the procedure above; `capacity` means the pending list is full (clear it with
-  `reject`); `secret_conflict` means a pending request already exists for that
-  `install_uuid` carrying a **different** secret — reject the stale row on `/admin` (or let
-  it age out) and the retry is accepted, because the approved credential is deliberately
-  frozen at the value the request was created with. An instance showing no reason at all is
-  genuinely waiting for you.
+The extension shows the reason in its settings; each maps to one action:
+
+- **`имя уже занято` (`id_taken`)** — a LIVE instance already has that name. Pick another
+  name in the extension settings, or revoke the old instance on `/admin` first if it is
+  the one being replaced. A **revoked** name is free to reuse: re-enrolling under it
+  reactivates that row, which is exactly how a revoked MAIN comes back.
+- **`имя не подходит` (`bad_id`)** — the name is outside `A-Za-z0-9._-` or longer than 64.
+  Fix it in the settings. (The extension normally refuses to send such a name at all, so
+  seeing this means an old build.)
+- **`неверный код регистрации` (`bad_code`)** — the code was wrong or belongs to an older
+  window. Open a new window on `/admin` (each open mints a **new** code) and type that one.
+- **`окно регистрации закрыто` (`closed`)** — same fix: open a window, then submit.
+- **`версия протокола не совпала` (`protocol`)** — the extension and the service disagree
+  on `PROTOCOL_VERSION`. Update one of them; the extension keeps the staged code and
+  retries by itself.
+
+A refusal for a wrong code, a closed window or a bad name is **terminal for that attempt**:
+the extension clears the staged code and stops retrying until a human acts. That is
+deliberate — it stops a browser from hammering a service that can only refuse it — but it
+means recovery always starts at the browser, not at `/admin`.
 
 ### Revoking a browser
 
 On `/admin`, **revoke** the instance. Revocation flips its row out of `active` at once
 (the resolution is never cached, §12), so the next `hello` and every `/api/*` call from
 that secret are rejected immediately — a lost or decommissioned laptop is cut off without
-touching any other instance. To bring it back, enroll it again (open a window, re-submit,
-approve).
+touching any other instance. To bring it back, enroll it again (open a window, type the
+code in the browser) — under the SAME name if you want the same identity back: a revoked
+row is reactivated rather than refused.
 
 > **Release note — MAIN must re-enroll after migration.** The former shared /ext token
 > is **gone**. After upgrading into the enrollment release, **every** existing instance —
 > including `MAIN_INSTANCE_ID` — must re-enroll: migration step 2 runs
 > `UPDATE instances SET status='revoked' WHERE secret_hash IS NULL`, and before enrollment
 > *no* row had a `secret_hash`, so **every** row goes to `revoked`. Nothing authenticates
-> until an operator opens a window and approves each one, and the stock branch stays
-> disabled until MAIN has been re-approved. Approving MAIN reuses its existing id: the
-> approve upsert reactivates an existing `revoked` row rather than creating a second one,
-> so quarantines, exemptions and rules that reference `main` are not orphaned.
+> until each one re-enrols through an open window, and the stock branch stays disabled
+> until MAIN has. Re-enrolling MAIN under its EXISTING id is what restores it: the enrol
+> upsert reactivates a `revoked` row rather than creating a second one, so quarantines,
+> exemptions and rules that reference `main` are not orphaned. Type `main` (or whatever
+> `MAIN_INSTANCE_ID` is set to) as the browser name in that instance's extension settings.
 >
 > **What the alert does.** `curator_main_instance_never_seen` reads **1** while MAIN is
 > un-enrolled, so `curator-main-instance-never-seen` fires ~15 min after the upgrade and
-> is your reminder; it clears once MAIN is approved and reconnects.
+> is your reminder; it clears once MAIN has re-enrolled and reconnected.
 >
 > That is true because the gauge keys on MAIN's **`status`** as well as its `last_seen_at`
 > — and the distinction matters on an upgrade. The migration touches neither `last_seen_at`

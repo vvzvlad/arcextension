@@ -268,40 +268,33 @@ groups:
         annotations:
           summary: "Repeated bad enrollment codes (brute-force on the enrollment window, §6)."
 
-      # A pending enroll_request for an install_uuid arrived carrying a DIFFERENT secret
-      # than the one already frozen on that row (src/db/queries `_UPSERT_ENROLL_REQUEST`
-      # freezes the credential at creation). That is precisely the shape of an attempt to
-      # slip a foreign credential in under somebody else's install_uuid and have the
-      # operator approve it: the code is right, the window is open, only the secret has
-      # changed. THRESHOLD 0, not 5 — unlike a bad code, this cannot happen by accident on
-      # a healthy install (a client re-registers with the SAME durable secret), so a single
-      # occurrence is already the whole signal, and increase() over 10m keeps a burst from
-      # one attacker collapsing into one page per scrape. Like every reason series it
-      # exists only once the refusal has been seen, so a healthy install stays silent.
-      - alert: curator-enroll-secret-conflict
-        # [A]: increase(curator_auth_rejections_total{reason="enroll_secret_conflict"}[10m])
+      # An enroll_request asked for the id of an ALREADY-ACTIVE instance (§6). This is the
+      # ONE objection the removed approval step really answered — a name collision — and
+      # since there is no pending list anymore, this counter and the refusal shown in that
+      # browser's own settings are the ONLY traces the attempt ever happened: `_reject_enroll`
+      # creates nothing by construction, so there is no row, no reject_reason and no console
+      # entry for an operator to find.
+      #
+      # THRESHOLD 0, not 5, and it inherits that from the retired
+      # `curator-enroll-secret-conflict`: the peer already held a valid code for an OPEN
+      # window, so this is not a stranger guessing — it is either the operator naming a new
+      # browser after a live one (and that browser is now stuck, unable to enrol, with
+      # nothing in the console to show it) or an attempt to graft onto a live identity.
+      # Neither is background noise on a healthy install, where enrolments are rare and
+      # deliberate. increase() over 10m keeps a burst from one source collapsing into one
+      # page per scrape, and the series exists only once the refusal has been seen, so a
+      # healthy install stays silent.
+      #
+      # `bad_id` — a name outside [A-Za-z0-9._-]{1,64} — deliberately has NO rule: see
+      # `_REASONS_WITHOUT_A_RULE` in tests/test_deploy_alerts.py for the argument.
+      - alert: curator-enroll-id-taken
+        # [A]: increase(curator_auth_rejections_total{reason="enroll_id_taken"}[10m])
         # [C]: A > 0
-        expr: increase(curator_auth_rejections_total{reason="enroll_secret_conflict"}[10m]) > 0
+        expr: increase(curator_auth_rejections_total{reason="enroll_id_taken"}[10m]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "An enroll_request tried to replace the frozen secret of a pending install_uuid (credential-substitution attempt, §6)."
-
-      # The PENDING-request ceiling is refusing enrollments — ENROLL_MAX_PENDING (64), the
-      # anti-flood bound on the operator-facing list. Twin of the pre-auth rule above and
-      # for the same reason: `_reject_enroll` writes NO row by construction, so this
-      # counter is the ONLY trace that a browser was turned away. At 64 a human-scale fleet
-      # never reaches it, so sustained refusals mean either a flood of anonymous requests
-      # or a list nobody is draining — and in both cases a legitimate new browser cannot
-      # enroll at all until a human looks.
-      - alert: curator-enroll-pending-capacity
-        # [A]: increase(curator_auth_rejections_total{reason="enroll_capacity"}[10m])
-        # [C]: A > 5
-        expr: increase(curator_auth_rejections_total{reason="enroll_capacity"}[10m]) > 5
-        labels:
-          severity: warning
-        annotations:
-          summary: "Enrollments are being refused at the pending-request ceiling (ENROLL_MAX_PENDING) — a new browser cannot enroll (§6)."
+          summary: "An enroll_request asked for the id of a live instance and was refused — that browser cannot enrol under this name, and nothing else records the attempt (§6)."
 
       # /api/* CORS is cutting the startpage off — the §12 «бесшумный отказ», and the ONE
       # shape of it that no other signal reports.

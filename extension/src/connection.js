@@ -68,11 +68,10 @@ import {
   INSTANCE_SECRET_PENDING_KEY,
   INSTANCE_ID_KEY,
   SERVICE_ADDRESS_KEY,
-  BROWSER_NAME_KEY,
+  INSTANCE_NAME_KEY,
   ENROLL_CODE_KEY,
   ENROLL_STATE_KEY,
   ENROLL_NEEDS,
-  ENROLL_PENDING,
   ENROLL_APPROVED,
   ENROLL_REVOKED,
   ENROLL_QUARANTINED,
@@ -90,15 +89,18 @@ function bytesToHex(bytes) {
 }
 
 // The durable enroll facts, with defaults for a never-touched profile.
+//   requestPending: an enrolment was submitted and has not been ACCEPTED yet. It is not a
+//     "waiting for an operator" flag anymore — there is nobody to wait for (§6) — only
+//     "keep sending the enroll_request while a code is staged", which matters because the
+//     MV3 worker can die between the operator's click and the socket opening.
 //   quarantineProbe: a DURABLE 0/1/2 cursor cycling the quarantine opening frame across
 //     cold-worker reconnects (0=enroll_request(pending), 1=hello(old), 2=hello(pending));
 //     an in-memory cursor would reset to the same phase on every ~30 s worker death.
-//   enrollReject: the last enroll_rejected reason (bad_code/closed/capacity/…), surfaced
-//     via get_connection_state so the UI shows it instead of an eternal "waiting".
-//   requestRegisteredAt: when the service last CONFIRMED it holds our enroll request (an
-//     `enroll_pending` frame), or null. "We sent one" and "the service has one" are
-//     different facts — only the second is durable evidence — and _sendOpening
-//     re-registers off exactly this timestamp.
+//   enrollReject: the last enroll_rejected reason (bad_code/closed/id_taken/bad_id/…),
+//     surfaced via get_connection_state so the UI shows WHY instead of nothing.
+// (`requestRegisteredAt` is gone with the `enroll_pending` frame: it timestamped the
+// service's confirmation that it held a request awaiting approval, and no such state
+// exists — the very next frame is the verdict.)
 const DEFAULT_ENROLL_FACTS = {
   requestPending: false,
   approved: false,
@@ -106,7 +108,6 @@ const DEFAULT_ENROLL_FACTS = {
   lastVerdict: null,
   quarantineProbe: 0,
   enrollReject: null,
-  requestRegisteredAt: null,
 };
 
 // installUuid lives in chrome.storage.local (in the profile, NOT copied with the
@@ -290,7 +291,12 @@ export class Connection {
   }
 
   // Compute the enroll state from DURABLE facts only (§7). Order is load-bearing:
-  // revoked (secret already wiped) → quarantined → approved → pending → needs-enroll.
+  // revoked (secret already wiped) → quarantined → approved → needs-enroll.
+  //
+  // There is no intermediate state between needs-enroll and approved: an enroll_request is
+  // answered on the spot, so a browser is either enrolled or not. A generated-but-not-yet
+  // -accepted secret used to read "pending"; it now reads needs-enroll, which is the truth
+  // — the service has no row for it — and the last refusal REASON is reported alongside.
   async getEnrollState() {
     const facts = await this._loadEnrollFacts();
     const hasActive = !!(await this._readSecretHex(INSTANCE_SECRET_KEY));
@@ -300,8 +306,6 @@ export class Connection {
     }
     if (facts.quarantined && hasActive) return ENROLL_QUARANTINED;
     if (facts.approved && hasActive) return ENROLL_APPROVED;
-    if (facts.requestPending && (hasActive || hasPending)) return ENROLL_PENDING;
-    if (hasActive || hasPending) return ENROLL_PENDING; // secret but no verdict yet
     return ENROLL_NEEDS;
   }
 
@@ -342,14 +346,15 @@ export class Connection {
   // Operator action (from the settings UI via the SW message channel): submit an
   // enrollment with the window `code`. Persists the code (so a cold worker / the
   // quarantine probe can reconstitute it), generates the secret to enroll, marks the
-  // request pending (durable), and forces an immediate reconnect so the enroll_request
-  // goes out now. Approval is learned LATER by a successful hello (acc 5).
+  // attempt pending (durable), and forces an immediate reconnect so the enroll_request
+  // goes out now. The VERDICT arrives on that same socket — `enroll_accepted` (enrolled,
+  // with the assigned id) or `enroll_rejected{reason}` — so there is no waiting state to
+  // report and nothing to poll for.
   //
-  // This call is NOT the moment the request reaches the service: the forced reconnect
-  // can fail outright (service down, address refused) and the worker can die before the
-  // socket opens. `requestRegisteredAt` is therefore reset to null and set ONLY by an
-  // `enroll_pending` frame — until then _sendOpening keeps re-sending the request, so the
-  // "pending" the UI shows is never a claim about a request nobody ever received.
+  // This call is NOT the moment the request reaches the service: the forced reconnect can
+  // fail outright (service down, address refused) and the worker can die before the socket
+  // opens. `requestPending` therefore stays set until an ACCEPT clears it, and _sendOpening
+  // re-sends the request on every reconnect while a code is staged.
   async submitEnrollment(code) {
     await this.init();
     // No USABLE address (never set, or refused by the TLS gate) => there is nothing to
@@ -382,7 +387,6 @@ export class Connection {
       }
       await this._saveEnrollFacts({
         requestPending: true,
-        requestRegisteredAt: null,
         approved: false,
         lastVerdict: null,
         enrollReject: null,
@@ -526,36 +530,28 @@ export class Connection {
       return;
     }
 
-    // INITIAL enrollment awaiting approval. The DEFAULT opening frame is `hello` — that is
-    // how approval is learned, and a cold worker must not re-register on every reconnect
-    // (acc 5). The request is re-sent in exactly ONE case: `requestRegisteredAt === null`,
-    // i.e. no `enroll_pending` was ever seen, so the service was NEVER confirmed to hold
-    // the request. Either the forced reconnect at submit never opened (service down /
-    // address refused) or the worker died before the frame went out. The UI already says
-    // "ожидает одобрения" while /admin has nothing at all; this is what closes that gap.
+    // INITIAL enrolment. While an attempt is staged and not yet accepted, the opening
+    // frame IS the enroll_request: it is answered immediately, so re-sending it costs one
+    // frame and is the only way a submit whose socket never opened (service down, worker
+    // died before onopen) ever reaches the service. Nothing here polls — a code and an
+    // un-accepted attempt are the whole condition.
     //
-    // There is deliberately NO age-based re-registration. A staged code belongs to ONE
-    // window: `arm_enroll_window` (src/curator/enroll.py) mints a FRESH code on every
-    // open, so once that window closes the staged code is dead for good and no amount of
-    // re-sending can revive the request — the reply is enroll_rejected{closed}, which
-    // clears the code and durably marks the enrollment "rejected" on every surface while
-    // the request may still be perfectly approvable in /admin. An age-based resend could
-    // therefore only ever destroy the very state it claimed to protect. Recovery from a
-    // TTL-swept request is by design a manual step: the operator opens a new window and
+    // A staged code belongs to ONE window: `arm_enroll_window` (src/curator/enroll.py)
+    // mints a FRESH code on every open, so once that window closes the code is dead and
+    // the reply is enroll_rejected{closed} — which clears the code (below) and stops the
+    // resend. Recovery is by design a manual step: the operator opens a new window and
     // types the new code on the options page.
     if (facts.requestPending && !facts.approved && !facts.quarantined) {
       const code = await this._readSetting(ENROLL_CODE_KEY);
-      // "never confirmed" is the absence of a numeric timestamp — a missing key and a
-      // garbage stored value both mean the same thing as an explicit null.
-      const neverConfirmed = typeof facts.requestRegisteredAt !== "number";
-      if (code && neverConfirmed) {
+      if (code) {
         await this._sendEnrollRequest(INSTANCE_SECRET_KEY, code);
         return;
       }
     }
 
-    // Everything else (a confirmed request awaiting approval, quarantine with no staged
-    // re-enroll, …): hello with the active secret to learn/keep approval.
+    // Everything else (an enrolled instance, quarantine with no staged re-enroll, an
+    // attempt whose code was cleared by a terminal refusal, …): hello with the active
+    // secret to establish/keep the connection.
     await this._sendHello(INSTANCE_SECRET_KEY);
   }
 
@@ -565,24 +561,24 @@ export class Connection {
     );
   }
 
-  // The browser name the operator set (→ suggested_title); a bundle title is a
-  // fallback so the /admin column has a source (§7).
-  async _suggestedTitle() {
-    const setting = await this._readSetting(BROWSER_NAME_KEY);
+  // The name this browser asks to be known by — and, on a successful enrol, IS known by:
+  // the service takes it verbatim as the `instances` PRIMARY KEY (§6). A bundle
+  // instance.json `title` stays a bootstrap fallback so a stamped build still has a
+  // source, but it is subject to the same charset the service enforces.
+  async _instanceName() {
+    const setting = await this._readSetting(INSTANCE_NAME_KEY);
     return setting || (this.config && this.config.title) || undefined;
   }
 
-  // enroll_request (§2) for the secret under `secretKey`: {type, protocolVersion,
-  // installUuid, code, secret, title}. Option A: the RAW secret hex goes on the wire (over
-  // TLS) and the SERVER hashes it into the stored secret_hash.
+  // enroll_request (§6) for the secret under `secretKey`: {type, protocolVersion,
+  // installUuid, code, secret, instanceId}. Option A: the RAW secret hex goes on the wire
+  // (over TLS) and the SERVER hashes it into the stored secret_hash.
   //
-  // The browser name field is `title`, ONE name, not two. This frame used to carry both
-  // `title` and `suggestedTitle` "to be safe", which is how a contract drifts: the server
-  // reads `title` (src/ext/channel.py `_handle_enroll` → the `suggested_title` COLUMN), so
-  // a client that sent only the other spelling silently landed a NULL name in the operator
-  // console — the failure was invisible on both sides because the redundant field kept it
-  // working. `title` is the surviving name: it is what the wire already carries in `hello`
-  // and what the service reads today. `suggested_title` stays the DB/JSON column name.
+  // The name field is `instanceId` — ONE name for one thing. It used to be `title`, a
+  // display name the operator then had to pair with an id typed in the console; there was
+  // no rename anywhere in the product to pay for that split, so the two collapsed into the
+  // id (§6). The frame no longer carries `origin` either: its only reader was the pending
+  // row an operator inspected before approving, and both are gone.
   async _sendEnrollRequest(secretKey, code) {
     const secret = await this._readSecretHex(secretKey);
     this._send({
@@ -591,8 +587,7 @@ export class Connection {
       installUuid: this.installUuid,
       code,
       secret,
-      title: await this._suggestedTitle(),
-      origin: await this._origin(),
+      instanceId: await this._instanceName(),
     });
   }
 
@@ -600,9 +595,10 @@ export class Connection {
   // GONE and the client no longer self-reports a trusted `instanceId` — the server
   // hashes the RAW secret and resolves the id from it (slice B / option A).
   // `_lastHelloWasPending` records WHICH secret this hello carried so _onApproved knows
-  // whether a subsequent ok:true means "the re-enrolled secret was approved" (promote) or
+  // whether a subsequent ok:true means "the re-enrolled secret was accepted" (promote) or
   // "the old secret recovered" (discard the moot re-enroll). A hello with no secret is a
-  // no-op (nothing to say).
+  // no-op (nothing to say). The frame no longer carries a `title`: the id IS the name and
+  // the service assigned it at enrolment — a hello cannot change it (§6).
   async _sendHello(secretKey = INSTANCE_SECRET_KEY) {
     const secret = await this._readSecretHex(secretKey);
     if (!secret) return; // needs-enroll: no secret to authenticate with
@@ -613,7 +609,6 @@ export class Connection {
       secret,
       installUuid: this.installUuid,
       origin: await this._origin(),
-      title: await this._suggestedTitle(),
       sessionId: this.sessionId,
       // The AUTHORITATIVE execute_js state is the options checkbox in
       // storage.local (§12) — a copied bundle sets its own checkbox. Report it.
@@ -636,16 +631,18 @@ export class Connection {
     }
   }
 
-  // A successful hello means the secret THIS hello carried is active (§7). Record the
-  // durable approved fact + the server-assigned id, and resolve any pending re-enroll:
-  //   * the PENDING secret was the one approved (_lastHelloWasPending) → PROMOTE it and
+  // The instance is enrolled and the secret in play is active (§7) — reached from a
+  // successful hello_ack AND from `enroll_accepted`, which is the FIRST evidence a fresh
+  // enrolment landed. Record the durable approved fact + the server-assigned id, and
+  // resolve any pending re-enroll:
+  //   * the PENDING secret was the one accepted (`promotePending`) → PROMOTE it and
   //     retire the old one (this overwrite IS the wipe — and only now, never eagerly);
   //   * the OLD secret succeeded (a transient `unknown` healed server-side) → the
   //     parallel re-enroll is moot: DISCARD the pending secret, keep the old one.
-  async _onApproved(instanceId) {
+  async _onApproved(instanceId, promotePending = this._lastHelloWasPending) {
     const pending = await this._readSecretHex(INSTANCE_SECRET_PENDING_KEY);
     if (pending) {
-      if (this._lastHelloWasPending) {
+      if (promotePending) {
         await this.env.storageLocalSet({ [INSTANCE_SECRET_KEY]: pending });
       }
       // Either way the pending slot is cleared: promoted into active, or dropped as moot.
@@ -657,7 +654,6 @@ export class Connection {
     await this._saveEnrollFacts({
       approved: true,
       requestPending: false,
-      requestRegisteredAt: null,
       quarantined: false,
       lastVerdict: null,
       quarantineProbe: 0,
@@ -682,7 +678,6 @@ export class Connection {
       await this._saveEnrollFacts({
         approved: false,
         requestPending: false,
-        requestRegisteredAt: null,
         quarantined: false,
         lastVerdict: VERDICT_REVOKED,
       });
@@ -690,9 +685,10 @@ export class Connection {
     }
     if (code === VERDICT_UNKNOWN) {
       const facts = await this._loadEnrollFacts();
-      // Not yet approved => `unknown` just means "approval hasn't happened". This is the
-      // normal pending path (an enroll_request sits in enroll_requests, not instances,
-      // so resolve_secret returns nothing). Keep waiting; the alarm retries hello.
+      // Never enrolled => `unknown` just means this secret was never accepted (a submit
+      // whose enroll_request has not landed yet, or a refused one). Nothing to quarantine;
+      // the alarm keeps trying, and _sendOpening re-sends the enroll_request while a code
+      // is staged.
       if (!facts.approved) return;
       // A PREVIOUSLY-APPROVED instance suddenly unknown => quarantine WITHOUT wiping.
       await this._quarantine();
@@ -775,45 +771,57 @@ export class Connection {
         }
         await this._persistConnectionState();
         return msg;
-      case "enroll_pending":
-        // The service CONFIRMED it holds our request; approval is async and the alarm
-        // keeps retrying hello to learn it (acc 5). Two durable consequences:
-        //   * timestamp the confirmation — this frame is the ONLY evidence the request
-        //     actually exists server-side, and _sendOpening re-registers off exactly this
-        //     timestamp (a submit that never reached the wire leaves it null);
-        //   * clear a stale enrollReject. A transient refusal (capacity / protocol) keeps
-        //     the code and gets retried; once THIS frame arrives the request is in the
-        //     operator's list, and leaving "заявка отклонена" on screen over a request
-        //     that is visibly there sends the operator hunting a problem that is fixed.
-        this.env.log("enroll pending");
+      case "enroll_accepted":
+        // ENROLLED, right now — the window with a valid code was the whole permission
+        // (§6), so this frame carries the assigned id and there is nothing further to
+        // wait for. It replaced `enroll_pending`, which only ever meant "an operator has
+        // yet to look at this".
+        //
+        // `promotePending: true` is passed explicitly rather than reusing
+        // `_lastHelloWasPending`: this frame answers an enroll_request, not a hello, and
+        // an enroll_request during quarantine carries the PENDING secret — that is the
+        // secret just accepted, so it is the one to promote. Reading the hello flag here
+        // would leave the freshly enrolled secret in the pending slot and keep the retired
+        // one active.
+        this.env.log("enrolled as", msg.instanceId);
+        this.helloAcked = false; // an enrol is not a connection; the hello below makes one
         this.rejectReason = null;
-        await this._saveEnrollFacts({
-          requestPending: true,
-          requestRegisteredAt: this.env.now(),
-          enrollReject: null,
-        });
+        await this._onApproved(msg.instanceId, true);
         await this._persistConnectionState();
+        // The service closes this socket right after the frame. Reconnect NOW so the hello
+        // goes out in THIS live worker rather than waiting up to 60 s for the alarm — the
+        // same reason submit and the quarantine verdict force a reconnect.
+        await this._forceReconnect();
         return msg;
       case "enroll_rejected": {
-        // Surface the reason (closed / bad_code / capacity / protocol) so the operator
-        // can react. The reason is persisted in the DURABLE facts so get_connection_state
-        // (read by a COLD worker at page open) shows it instead of an eternal "waiting".
+        // Surface the reason (closed / bad_code / id_taken / bad_id / protocol) so the
+        // operator can react. It is persisted in the DURABLE facts so get_connection_state
+        // (read by a COLD worker at page open) shows WHY — this is now the ONLY place a
+        // refusal is visible to a human, since there is no pending list in /admin for a
+        // refused attempt to sit in.
         const reason = (msg && msg.reason) || "rejected";
         this.rejectReason = "enroll_" + reason;
         this.env.log("enroll rejected:", reason);
-        // A refused request was NOT recorded server-side (every reject path in
-        // `_handle_enroll` returns before the upsert), so drop the registration
-        // timestamp: that returns the client to "never confirmed", which is exactly the
-        // condition the next opening frame re-sends a transiently refused request under.
-        await this._saveEnrollFacts({ enrollReject: reason, requestRegisteredAt: null });
-        // TERMINAL reasons (src/ext/protocol.py ENROLL_BAD_CODE / ENROLL_CLOSED): the
-        // staged code is dead for good — a wrong/expired code, or a closed window. Clear
-        // it so the quarantine probe STOPS re-sending enroll_request(pending, staleCode)
-        // — which would otherwise draw enroll_rejected forever — and falls back to the
-        // hello phases (old for transient recovery, pending for a later approval) until
-        // the operator submits a fresh code. Transient reasons (capacity / protocol) keep
-        // the code so a retry can still land.
-        if (reason === "bad_code" || reason === "closed") {
+        // A refused request created NOTHING server-side (every reject path in
+        // `_handle_enroll` returns before the write), so the attempt stays pending here
+        // and the next opening frame re-sends it — unless its reason is terminal, below.
+        await this._saveEnrollFacts({ enrollReject: reason });
+        // TERMINAL reasons: nothing this client can retry will change the answer, so the
+        // staged code is cleared and the resend STOPS until a human acts.
+        //   * bad_code / closed (src/ext/protocol.py ENROLL_BAD_CODE / ENROLL_CLOSED) — a
+        //     wrong or expired code, or a closed window: the code is dead for good, since
+        //     every window mints a fresh one.
+        //   * id_taken / bad_id — the code may well still be live, but the NAME is the
+        //     problem, and re-sending the same frame draws the same refusal forever. The
+        //     operator has to change the name in these settings and submit again (which
+        //     re-stages the code from the still-filled field).
+        // Retrying anything else (protocol skew) keeps the code so a retry can land.
+        if (
+          reason === "bad_code" ||
+          reason === "closed" ||
+          reason === "id_taken" ||
+          reason === "bad_id"
+        ) {
           await this.env.storageLocalRemove(ENROLL_CODE_KEY);
         }
         await this._persistConnectionState();

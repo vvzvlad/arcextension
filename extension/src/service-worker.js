@@ -23,7 +23,6 @@ import {
   RECONNECT_ALARM,
   TICK_ALARM,
   INSTANCE_ID_KEY,
-  BROWSER_NAME_KEY,
 } from "./constants.js";
 
 const now = () => Date.now();
@@ -161,25 +160,21 @@ flushQueue(quickLinksEnv()).catch((e) =>
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message !== "object") return false;
   if (message.type === "get_identity") {
-    // Identity moved off instance.json (§7): the id is SERVER-assigned (learned from a
-    // successful hello_ack, stored durably) and the title is the operator's browser
-    // name. Both are read from storage.local so a cold worker still answers.
+    // Identity moved off instance.json (§7): the id is SERVER-assigned — learned from
+    // `enroll_accepted` (and re-confirmed by every hello_ack) and stored durably, so a
+    // cold worker still answers. There is no separate `title`: the id IS the name (§6),
+    // which is why the enrolled id is the only thing reported here. Until this browser
+    // enrols, the locally-typed name is what it WANTS to be called; it is deliberately
+    // not returned as an identity, because nothing has agreed to it yet.
     connection
       .init()
       .then(async () => {
         const idGot = await chrome.storage.local.get(INSTANCE_ID_KEY);
-        const nameGot = await chrome.storage.local.get(BROWSER_NAME_KEY);
-        sendResponse({
-          instanceId: (idGot && idGot[INSTANCE_ID_KEY]) || null,
-          title:
-            (nameGot && nameGot[BROWSER_NAME_KEY]) ||
-            (connection.config && connection.config.title) ||
-            null,
-        });
+        sendResponse({ instanceId: (idGot && idGot[INSTANCE_ID_KEY]) || null });
       })
       .catch((e) => {
         console.error("[ext] get_identity failed:", e);
-        sendResponse({ instanceId: null, title: null });
+        sendResponse({ instanceId: null });
       });
     return true; // async response
   }

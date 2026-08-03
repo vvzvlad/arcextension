@@ -117,17 +117,18 @@ export async function fetchInstances(fetchFn, base, token) {
   return body.instances;
 }
 
-export function optionLabel(id, title, currentId) {
-  let label = title && title !== id ? title + " (" + id + ")" : id;
-  if (id === currentId) label += " — this browser";
-  return label;
+// The label for one browser in the <select>. It used to pair a display title with the id
+// ("Prox (prox)"); there is no separate title anymore — the id IS the name (§6) — so the
+// id stands alone and the only decoration left is marking which row is us.
+export function optionLabel(id, currentId) {
+  return id === currentId ? id + " — this browser" : id;
 }
 
 // The <select> options, ALWAYS containing the browser this popup runs in.
-// /api/state lists only ACTIVE instances (src/db/state.py), so a copy that is enrolled
-// but not yet approved is not in it — and neither is anything at all when the call
-// fails. Since targeting THIS browser is what the popup used to do unconditionally, it
-// must never become unreachable: it is added back at the top when the list omits it.
+// /api/state lists only ACTIVE instances (src/db/state.py), so a revoked copy is not in
+// it — and neither is anything at all when the call fails. Since targeting THIS browser
+// is what the popup used to do unconditionally, it must never become unreachable: it is
+// added back at the top when the list omits it.
 export function instanceChoices(instances, currentId) {
   const out = [];
   const seen = new Set();
@@ -135,10 +136,10 @@ export function instanceChoices(instances, currentId) {
     const id = inst && typeof inst.id === "string" ? inst.id : null;
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, label: optionLabel(id, inst.title, currentId) });
+    out.push({ id, label: optionLabel(id, currentId) });
   }
   if (!seen.has(currentId)) {
-    out.unshift({ id: currentId, label: optionLabel(currentId, null, currentId) });
+    out.unshift({ id: currentId, label: optionLabel(currentId, currentId) });
   }
   return out;
 }
@@ -354,7 +355,7 @@ function renderChoices(doc, select, choices, selectedId) {
   for (const choice of choices) {
     const opt = doc.createElement("option");
     opt.value = choice.id;
-    // An instance title is SERVER data: textContent, never innerHTML.
+    // An instance id is SERVER data: textContent, never innerHTML.
     opt.textContent = choice.label;
     select.appendChild(opt);
   }

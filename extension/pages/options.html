@@ -8,14 +8,15 @@
   <body>
     <!--
       Options page (§7, §12). It carries the enrollment settings — the service
-      address, the browser name (→ suggested_title), the ~10-min window code the
-      operator reads off /admin, and a submit-enrollment action — plus an installUuid
-      prefix so the operator can identify THEIR request in the /admin list (origin is
-      uniform fleet-wide, and the list prints the SAME prefix length so the two can be
-      compared char for char). The execute_js opt-in checkbox (§12) is the
-      "stop" button for the most dangerous operation. All settings live in
-      chrome.storage.local (per-profile; NEVER in the bundle) — the shared token is
-      gone. The script is external (options.js) because the extension_pages CSP is
+      address, the NAME this browser enrols under (which becomes its instance id, so it
+      is validated here against the same charset the service enforces), the ~10-min
+      window code the operator reads off /admin, and a submit-enrollment action — plus
+      an installUuid prefix as a diagnostic. Enrolment is ONE step: submitting a valid
+      code into an open window enrols this browser immediately, and a refusal shows its
+      reason right here (this is the only place a human sees it). The execute_js opt-in
+      checkbox (§12) is the "stop" button for the most dangerous operation. All settings
+      live in chrome.storage.local (per-profile; NEVER in the bundle) — the shared token
+      is gone. The script is external (options.js) because the extension_pages CSP is
       `script-src 'self'`.
     -->
     <main style="max-width: 34rem; font: 14px system-ui, sans-serif">
@@ -24,9 +25,9 @@
       <section>
         <h2 style="font-size: 1rem">Enrollment (§7)</h2>
         <p>
-          This instance identity:
+          This install's identity:
           <code id="install-uuid" data-role="install-uuid">…</code>
-          — quote it to the operator to find your request in the admin list.
+          — quote it when reporting a problem with this copy.
         </p>
         <p>
           Status: <strong id="enroll-state" data-role="enroll-state">…</strong>
@@ -57,9 +58,16 @@
         </p>
         <p>
           <label>
-            Browser name (shown to the operator as the suggested title)<br />
+            Browser name — this becomes the instance id<br />
             <input type="text" id="browser-name" data-role="browser-name" size="40" />
           </label>
+          <br />
+          <small>
+            1–64 characters of <code>A–Z a–z 0–9 . _ -</code> — no spaces. This is the
+            name the service knows this browser by: it appears in the admin console, in
+            curation rules and in metrics. It must not be taken by another live browser;
+            a name freed by revoking a browser can be reused.
+          </small>
         </p>
         <p>
           <label>

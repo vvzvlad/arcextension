@@ -18,7 +18,6 @@ from src.curator.pause import RESUME_PENDING_KEY, read_pause_until
 # from §10's StateResponse.
 _INSTANCE_COLUMNS = (
     "id",
-    "title",
     "connected",
     "snapshot_at",
     "last_seen_at",
@@ -66,7 +65,6 @@ def _read_instances(conn: sqlite3.Connection) -> list[dict]:
     return [
         {
             "id": r["id"],
-            "title": r["title"],
             "connected": bool(r["connected"]),
             "snapshot_at": r["snapshot_at"],
             "last_seen_at": r["last_seen_at"],
@@ -82,9 +80,8 @@ def _read_tabs(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
     # Tabs follow their instance through the SAME filter. Nothing ever deletes a revoked
     # instance's tabs (``apply_snapshot`` is the only writer and it needs a live socket),
-    # so leaving them in would render a phantom group on the startpage — labelled with a
-    # bare instance id, since the instance row that carried its title is gone — full of
-    # tabs whose "jump" can only fail. One rule, applied to the whole StateResponse.
+    # so leaving them in would render a phantom group on the startpage — full of tabs
+    # whose "jump" can only fail. One rule, applied to the whole StateResponse.
     rows = conn.execute(
         "SELECT " + ", ".join(_TAB_COLUMNS) + " FROM tabs "
         "WHERE instance_id IN (SELECT id FROM instances WHERE status = 'active') "

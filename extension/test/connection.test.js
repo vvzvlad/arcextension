@@ -292,12 +292,12 @@ describe("secret (§7, option A: raw secret on the wire)", () => {
   });
 });
 
-describe("enroll_request frame (§2/§7)", () => {
-  it("sends enroll_request{code, secret, installUuid, title} — NOT a hello", async () => {
-    // Keep the seeded secret but make the state not-approved, and stage a browser name.
+describe("enroll_request frame (§6/§7)", () => {
+  it("sends enroll_request{code, secret, installUuid, instanceId} — NOT a hello", async () => {
+    // Keep the seeded secret but make the state not-enrolled, and stage a name.
     await chrome.storage.local.set({
       enrollState: { requestPending: false, approved: false, quarantined: false, lastVerdict: null },
-      browserName: "Bob's Chrome",
+      browserName: "bobs-chrome",
     });
     const conn = makeConnection();
     await conn.submitEnrollment("WIN-CODE");
@@ -312,53 +312,86 @@ describe("enroll_request frame (§2/§7)", () => {
       code: "WIN-CODE",
       secret: SECRET_HEX,
       installUuid: conn.installUuid,
-      title: "Bob's Chrome", // ONE name for the browser name — the one the server reads
+      // ONE name for one thing: the field IS the instance id the service will assign
+      // (§6). It used to be `title`, a display name paired with an id the operator typed
+      // separately into the console — two names for a browser that is never renamed.
+      instanceId: "bobs-chrome",
     });
-    // The frame used to carry `suggestedTitle` as well "to be safe". Two spellings of one
-    // field is how the name silently drifted: only `title` is consumed
-    // (src/ext/channel.py `_handle_enroll`), so the redundant one hid the fact that the
-    // other spelling lands a NULL title in the operator console.
+    // Neither the old display-name spellings nor `origin` ride along. The frame used to
+    // carry `title` AND `suggestedTitle` "to be safe", and an `origin` whose only reader
+    // was the pending row an operator inspected before approving. All three are gone: a
+    // field nobody reads is how a contract drifts.
+    expect(req.title).toBeUndefined();
     expect(req.suggestedTitle).toBeUndefined();
+    expect(req.origin).toBeUndefined();
     expect(ws.sent.find((m) => m.type === "hello")).toBeUndefined();
   });
 
-  it("after a pending submit a FRESH worker sends HELLO (not enroll_request) to learn approval (acc 5)", async () => {
-    // Durable: secret + requestPending, and the service CONFIRMED the request just now
-    // (an enroll_pending frame). A cold worker must then learn approval by hello, not
-    // re-register on every reconnect.
+  it("enroll_accepted enrols on the spot: id stored, approved, code cleared", async () => {
+    // The headline of the one-step flow. There is no `enroll_pending` and no waiting: the
+    // very frame that answers the request says the browser is IN, with the id it asked
+    // for. Reddens if the client goes back to treating the answer as "recorded, awaiting
+    // an operator" — the state would sit at needs-enroll over a live instance.
     await chrome.storage.local.set({
-      enrollCode: "WIN-CODE",
-      enrollState: {
-        requestPending: true,
-        approved: false,
-        quarantined: false,
-        lastVerdict: null,
-        requestRegisteredAt: Date.now(),
-      },
+      enrollState: { requestPending: false, approved: false, quarantined: false, lastVerdict: null },
+      browserName: "bobs-chrome",
     });
-    const conn = makeConnection(); // cold worker
-    await conn.ensureSocket();
-    const ws = conn.ws;
-    ws._open();
+    const conn = makeConnection();
+    await conn.submitEnrollment("WIN-CODE");
+    conn.ws._open();
     await flush();
-    expect(ws.sent.find((m) => m.type === "hello")).toBeDefined();
-    expect(ws.sent.find((m) => m.type === "enroll_request")).toBeUndefined();
+    expect(conn.ws.sent.find((m) => m.type === "enroll_request")).toBeDefined();
+
+    conn.ws._serverSend({ type: "enroll_accepted", instanceId: "bobs-chrome" });
+    await flush();
+
+    expect(await conn.getEnrollState()).toBe("approved");
+    expect((await chrome.storage.local.get("instanceId")).instanceId).toBe("bobs-chrome");
+    // The one-shot window code has served its purpose and must not linger.
+    expect((await chrome.storage.local.get("enrollCode")).enrollCode).toBeUndefined();
+    const facts = (await chrome.storage.local.get("enrollState")).enrollState;
+    expect(facts.approved).toBe(true);
+    expect(facts.requestPending).toBe(false);
+    // A COLD worker over the same storage reads the same verdict.
+    expect(await makeConnection().getEnrollState()).toBe("approved");
   });
 
-  // --- the request must EXIST server-side, not merely have been submitted -------
-  it("re-sends the request when no enroll_pending ever confirmed it (submit with no open socket)", async () => {
+  it("there is no intermediate 'pending' state between not-enrolled and active", async () => {
+    // A submitted-but-unanswered attempt reads needs-enroll, which is the truth: the
+    // service holds nothing for it. The old `pending` meant "an operator has yet to look
+    // at your request", and there is nobody to look. Reddens if the state is reintroduced
+    // — every surface would again show "ожидает одобрения" over a request that either
+    // never arrived or was refused.
+    await chrome.storage.local.set({
+      enrollState: { requestPending: false, approved: false, quarantined: false, lastVerdict: null },
+      browserName: "bobs-chrome",
+    });
+    const conn = makeConnection();
+    await conn.submitEnrollment("WIN-CODE");
+    conn.ws._open();
+    await flush();
+    expect(await conn.getEnrollState()).toBe("needs-enroll");
+    expect((await conn.getConnectionState()).enrollState).toBe("needs-enroll");
+  });
+
+  it("re-sends the request on every reconnect until it is accepted (submit with no open socket)", async () => {
     // The operator pressed submit while the service was down: the forced reconnect never
-    // opened, so the enroll_request never went out — yet the UI already says "ожидает
-    // одобрения" and /admin has nothing at all. The next opening frame must be the
+    // opened, so the enroll_request never went out. The next opening frame must be the
     // enroll_request, not a hello that can only ever answer `unknown_instance`.
+    //
+    // The old client re-sent only while `requestRegisteredAt === null`, because a
+    // confirmed request was waiting in an operator's list and re-registering it was
+    // pointless churn. Nothing waits anywhere now, so the condition collapses to "a code
+    // is staged and we are not enrolled", and the resend costs exactly one frame that is
+    // answered immediately.
     await chrome.storage.local.set({
       enrollCode: "WIN-CODE",
+      browserName: "bobs-chrome",
       enrollState: {
         requestPending: true,
         approved: false,
         quarantined: false,
         lastVerdict: null,
-        requestRegisteredAt: null, // never confirmed
       },
     });
     const conn = makeConnection();
@@ -371,21 +404,18 @@ describe("enroll_request frame (§2/§7)", () => {
     expect(conn.ws.sent.find((m) => m.type === "hello")).toBeUndefined();
   });
 
-  it("NEVER re-registers a confirmed request, however old the confirmation is", async () => {
-    // There is no age-based re-registration, on purpose. The staged code belongs to ONE
-    // window (arm_enroll_window mints a fresh code on every open), so a resend after the
-    // window closed draws enroll_rejected{closed} — which CLEARS the code and durably
-    // marks the enrollment rejected, over a request that is still approvable in /admin.
-    // That would break the very case ("operator came back an hour later") it claimed to
-    // fix, so a confirmed request stays on `hello` no matter how stale the confirmation.
+  it("stops re-sending once the code is gone, and hellos instead", async () => {
+    // A terminal refusal clears the staged code (below); after that the opening frame
+    // falls back to hello, so a browser whose enrolment was refused does not hammer the
+    // service with a frame that can only be refused again.
     await chrome.storage.local.set({
-      enrollCode: "WIN-CODE",
+      browserName: "bobs-chrome",
       enrollState: {
         requestPending: true,
         approved: false,
         quarantined: false,
         lastVerdict: null,
-        requestRegisteredAt: Date.now() - 24 * 60 * 60000, // a day old
+        enrollReject: "id_taken",
       },
     });
     const conn = makeConnection();
@@ -396,62 +426,57 @@ describe("enroll_request frame (§2/§7)", () => {
     expect(conn.ws.sent.find((m) => m.type === "hello")).toBeDefined();
   });
 
-  it("enroll_pending timestamps the request AND clears a stale reject (transient capacity)", async () => {
-    // capacity/protocol are TRANSIENT: the code survives and the request is retried. Once
-    // the retry lands, the request is in the operator's list — leaving "заявка отклонена"
-    // on screen sends the operator hunting a problem that is already fixed.
-    await chrome.storage.local.set({
-      enrollCode: "WIN-CODE",
-      enrollState: {
-        requestPending: true,
-        approved: false,
-        quarantined: false,
-        lastVerdict: null,
-        enrollReject: "capacity",
-        requestRegisteredAt: null,
-      },
-    });
-    const conn = makeConnection();
-    await conn.ensureSocket();
-    conn.ws._open();
-    await flush();
-    expect(conn.ws.sent.find((m) => m.type === "enroll_request")).toBeDefined();
-    conn.ws._serverSend({ type: "enroll_pending" });
-    await flush();
+  it("a NAME refusal is terminal: the reason is stored and the code is dropped", async () => {
+    // id_taken / bad_id are about the NAME, not the code: the window may well still be
+    // open, but re-sending the same frame draws the same answer forever. The operator has
+    // to change the name and submit again. And the reason must be DURABLE, because the
+    // extension settings are the ONLY place a human ever sees it — /admin has no list of
+    // refused attempts anymore.
+    for (const reason of ["id_taken", "bad_id"]) {
+      await chrome.storage.local.set({
+        enrollCode: "WIN-CODE",
+        browserName: "bobs-chrome",
+        enrollState: {
+          requestPending: true,
+          approved: false,
+          quarantined: false,
+          lastVerdict: null,
+        },
+      });
+      const conn = makeConnection();
+      await conn.ensureSocket();
+      conn.ws._open();
+      await flush();
+      conn.ws._serverSend({ type: "enroll_rejected", reason });
+      await flush();
 
-    const facts = (await chrome.storage.local.get("enrollState")).enrollState;
-    expect(facts.enrollReject).toBe(null);
-    expect(typeof facts.requestRegisteredAt).toBe("number");
-    // A COLD worker over the same storage must not report the dead rejection either.
-    const cold = makeConnection();
-    expect((await cold.getConnectionState()).enrollReject).toBe(null);
-    // …and now that the request is confirmed, the next opening frame is a hello (acc 5).
-    await cold.ensureSocket();
-    cold.ws._open();
-    await flush();
-    expect(cold.ws.sent.find((m) => m.type === "hello")).toBeDefined();
-    expect(cold.ws.sent.find((m) => m.type === "enroll_request")).toBeUndefined();
+      const facts = (await chrome.storage.local.get("enrollState")).enrollState;
+      expect(facts.enrollReject).toBe(reason);
+      expect((await chrome.storage.local.get("enrollCode")).enrollCode).toBeUndefined();
+      // A COLD worker reports it too — the settings page is opened by one.
+      expect((await makeConnection().getConnectionState()).enrollReject).toBe(reason);
+    }
   });
 
-  it("a rejected request is not treated as registered (retried on the very next opening)", async () => {
+  it("a TRANSIENT refusal keeps the code so the next opening retries", async () => {
+    // A protocol skew during a rollout resolves itself; the staged code is still good.
     await chrome.storage.local.set({
       enrollCode: "WIN-CODE",
+      browserName: "bobs-chrome",
       enrollState: {
         requestPending: true,
         approved: false,
         quarantined: false,
         lastVerdict: null,
-        requestRegisteredAt: Date.now(), // confirmed a moment ago…
       },
     });
     const conn = makeConnection();
     await conn.ensureSocket();
     conn.ws._open();
     await flush();
-    // …then the service refuses it transiently: nothing was written server-side.
-    conn.ws._serverSend({ type: "enroll_rejected", reason: "capacity" });
+    conn.ws._serverSend({ type: "enroll_rejected", reason: "protocol" });
     await flush();
-    expect((await chrome.storage.local.get("enrollState")).enrollState.requestRegisteredAt).toBe(null);
+    expect((await chrome.storage.local.get("enrollCode")).enrollCode).toBe("WIN-CODE");
 
     const cold = makeConnection();
     await cold.ensureSocket();
@@ -677,8 +702,11 @@ describe("hello_ack{ok:false} verdicts (§7)", () => {
     expect(cold.ws.sent.find((m) => m.type === "hello")).toBeDefined(); // falls back to hello
   });
 
-  it("a not-yet-approved `unknown_instance` just keeps waiting — no quarantine, no re-enroll", async () => {
-    // Pending (submitted, not approved). unknown is the NORMAL not-approved-yet answer.
+  it("a never-enrolled `unknown_instance` just keeps trying — no quarantine, no re-enroll", async () => {
+    // A secret exists but was never accepted, so `unknown` is the ONLY answer a hello can
+    // draw. Quarantine is for a PREVIOUSLY approved instance that suddenly goes unknown
+    // (a restore from an old backup); treating this one as quarantined would stage a
+    // second secret for nothing.
     await chrome.storage.local.set({
       enrollState: { requestPending: true, approved: false, quarantined: false, lastVerdict: null },
       enrollCode: "SOME-CODE",
@@ -690,8 +718,8 @@ describe("hello_ack{ok:false} verdicts (§7)", () => {
     await flush();
     ws._serverSend({ type: "hello_ack", ok: false, error: { code: "unknown_instance" } });
     await flush();
-    // Still pending; NOT quarantined, and no pending secret was staged.
-    expect(await conn.getEnrollState()).toBe("pending");
+    // Still not enrolled; NOT quarantined, and no pending secret was staged.
+    expect(await conn.getEnrollState()).toBe("needs-enroll");
     expect((await chrome.storage.local.get("instanceSecretPending")).instanceSecretPending).toBeUndefined();
   });
 });
