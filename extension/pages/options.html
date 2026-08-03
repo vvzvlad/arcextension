@@ -7,23 +7,71 @@
   </head>
   <body>
     <!--
-      Options page. The execute_js opt-in checkbox (§12) is the "stop" button for
-      the most dangerous operation in the system: per-copy, default OFF, stored in
-      chrome.storage.local (the authoritative runtime state reported in `hello`).
-      The script is external (options.js) because the extension_pages CSP is
-      `script-src 'self'` — an inline handler would be blocked.
+      Options page (§7, §12). It carries the enrollment settings — the service
+      address, the browser name (→ suggested_title), the ~10-min window code the
+      operator reads off /admin, and a submit-enrollment action — plus the first 8
+      chars of installUuid so the operator can identify THEIR request in the /admin
+      list (origin is uniform fleet-wide). The execute_js opt-in checkbox (§12) is the
+      "stop" button for the most dangerous operation. All settings live in
+      chrome.storage.local (per-profile; NEVER in the bundle) — the shared token is
+      gone. The script is external (options.js) because the extension_pages CSP is
+      `script-src 'self'`.
     -->
-    <main>
+    <main style="max-width: 34rem; font: 14px system-ui, sans-serif">
       <h1>arcextension options</h1>
-      <label>
-        <input type="checkbox" id="allow-execute-js" />
-        Allow <code>execute_js</code> on this copy
-      </label>
-      <p>
-        When off, the service cannot run arbitrary JavaScript through this
-        extension: every <code>execute_js</code> command is refused with
-        <code>js_disabled</code> and nothing is executed. Default: off.
-      </p>
+
+      <section>
+        <h2 style="font-size: 1rem">Enrollment (§7)</h2>
+        <p>
+          This instance identity:
+          <code id="install-uuid" data-role="install-uuid">…</code>
+          — quote it to the operator to find your request in the admin list.
+        </p>
+        <p>
+          Status: <strong id="enroll-state" data-role="enroll-state">…</strong>
+        </p>
+        <p>
+          <label>
+            Service address (<code>wss://…</code>)<br />
+            <input
+              type="text"
+              id="service-address"
+              data-role="service-address"
+              size="40"
+              placeholder="wss://curator.example"
+            />
+          </label>
+        </p>
+        <p>
+          <label>
+            Browser name (shown to the operator as the suggested title)<br />
+            <input type="text" id="browser-name" data-role="browser-name" size="40" />
+          </label>
+        </p>
+        <p>
+          <label>
+            Enrollment code (from the admin page, valid ~10 min)<br />
+            <input type="text" id="enroll-code" data-role="enroll-code" size="20" />
+          </label>
+          <button type="button" id="submit-enroll" data-role="submit-enroll">
+            Submit enrollment
+          </button>
+        </p>
+      </section>
+
+      <section>
+        <h2 style="font-size: 1rem">Dangerous operations (§12)</h2>
+        <label>
+          <input type="checkbox" id="allow-execute-js" />
+          Allow <code>execute_js</code> on this copy
+        </label>
+        <p>
+          When off, the service cannot run arbitrary JavaScript through this
+          extension: every <code>execute_js</code> command is refused with
+          <code>js_disabled</code> and nothing is executed. Default: off.
+        </p>
+      </section>
+
       <p id="status" role="status" aria-live="polite"></p>
     </main>
     <script src="options.js" type="module"></script>

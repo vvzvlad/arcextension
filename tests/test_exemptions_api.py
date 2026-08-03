@@ -17,8 +17,11 @@ from starlette.testclient import TestClient
 
 from src.app import create_app
 
-EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _now_ms():
@@ -49,7 +52,7 @@ def _conn(db_path):
 def _seed_instance(db_path, iid):
     c = _conn(db_path)
     try:
-        c.execute("INSERT INTO instances (id, connected) VALUES (?, 1)", (iid,))
+        c.execute("INSERT INTO instances (id, connected, status) VALUES (?, 1, 'active')", (iid,))
         c.commit()
     finally:
         c.close()
@@ -103,6 +106,32 @@ def test_post_creates_and_refreshes_by_instance_and_url(tmp_path):
         rows = _rows(db_path)
         assert len(rows) == 1
         assert rows[0][2] > ex["until"] and rows[0][3] == "renovating"
+
+
+def test_exemption_to_revoked_rejected_but_x_to_main_allowed(tmp_path):
+    """issue #35 §6 cascade at the ``exemptions`` consumer of ``known_instance_ids``: an
+    exemption on a REVOKED instance is rejected while one on MAIN (no active row) is
+    accepted — the consumer exempts MAIN. Reverting the active-only filter makes the
+    revoked target pass (the ``== 422`` reddens); dropping the main exemption makes MAIN a
+    422 (the ``== 201`` reddens)."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "prox")
+        c = _conn(db_path)
+        c.execute("UPDATE instances SET status='revoked' WHERE id='prox'")
+        c.commit()
+        c.close()
+        # Revoked target => 422.
+        assert client.post(
+            "/api/exemptions", headers=AUTH,
+            json={"instance_id": "prox", "url": "https://a", "minutes": 5},
+        ).status_code == 422
+        # X -> main (no active main row) => allowed by the main exemption.
+        assert client.post(
+            "/api/exemptions", headers=AUTH,
+            json={"instance_id": "main", "url": "https://a", "minutes": 5},
+        ).status_code == 201
 
 
 def test_post_validates_target_and_deadline(tmp_path):

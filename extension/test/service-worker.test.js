@@ -7,7 +7,17 @@ import { QUEUE_KEY } from "../src/quicklinks.js";
 // and runs its start-up work (alarms, socket, stranded-flush). So every test imports
 // it FRESH (vi.resetModules) against a fresh chrome mock + globals.
 
-const CONFIG = { instanceId: "prox", title: "Prox", serviceUrl: "wss://host.example/", token: "tok" };
+const CONFIG = { title: "Prox", serviceUrl: "wss://host.example/" };
+
+// An enrolled instance: a 32-byte secret in storage.local + the approved enroll fact.
+// The SW only opens a socket once there is something to say (§7), so socket-level tests
+// seed this so the connection actually connects. serviceUrl comes from CONFIG (the
+// instance.json bootstrap fallback resolves the address).
+const SECRET_HEX = "01".repeat(32);
+const ENROLLED_SEED = {
+  instanceSecret: SECRET_HEX,
+  enrollState: { requestPending: false, approved: true, quarantined: false, lastVerdict: null },
+};
 
 // Let the module's top-level async work settle. The storage mock resolves on real
 // macrotasks, so a few timer turns are needed — not just microtasks.
@@ -34,11 +44,14 @@ function routedFetch(routes = {}) {
   return { fn, calls };
 }
 
-async function loadServiceWorker({ alarms, seedLocal, fetchRoutes } = {}) {
+async function loadServiceWorker({ alarms, seedLocal, fetchRoutes, notEnrolled, WebSocketImpl } = {}) {
   vi.resetModules();
   globalThis.chrome = createChromeMock({ alarms });
+  // Enroll by default so the socket opens; a test wanting the not-enrolled gate passes
+  // notEnrolled:true. Explicit seedLocal is merged on top.
+  if (!notEnrolled) await chrome.storage.local.set({ ...ENROLLED_SEED });
   if (seedLocal) await chrome.storage.local.set(seedLocal);
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = WebSocketImpl || FakeWebSocket;
   const { fn, calls } = routedFetch(fetchRoutes);
   globalThis.fetch = fn;
   const mod = await import("../src/service-worker.js");
@@ -191,7 +204,10 @@ describe("get_connection_state (§6)", () => {
     const { mod } = await loadServiceWorker();
     mod.connection.ws._open();
     mod.connection.ws._serverSend({ type: "hello_ack", ok: true });
-    await settle(2);
+    // A successful ack now also promotes/records durable enroll facts (async
+    // storage.local writes) before its trailing session persist — let ALL of that
+    // settle so the spy below only sees writes the command frames would cause.
+    await settle(8);
 
     const writes = vi.spyOn(chrome.storage.session, "set");
     for (let i = 0; i < 20; i += 1) {
@@ -227,16 +243,75 @@ describe("get_connection_state (§6)", () => {
   });
 });
 
-// --- floating promises are logged, not unhandled (§6) ------------------------
-describe("start-up failures are named", () => {
-  it("a broken instance.json is LOGGED instead of becoming an unhandled rejection", async () => {
-    await loadServiceWorker({ fetchRoutes: { instanceThrows: true } });
-    const logged = errorSpy.mock.calls.map((c) => String(c[0]));
-    expect(logged.some((m) => m.includes("ensureSocket failed"))).toBe(true);
+// --- §7 enrollment message channel (get_credential / submit / enrollState) ---
+describe("enrollment message channel (§7)", () => {
+  function ask(message) {
+    const listener = chrome.runtime.onMessage.listeners[0];
+    return new Promise((resolve) => listener(message, {}, resolve));
+  }
+
+  it("get_credential returns the address + the RAW instance secret (slice C / option A Bearer)", async () => {
+    await loadServiceWorker();
+    const cred = await ask({ type: "get_credential" });
+    // Address falls back to the instance.json bootstrap serviceUrl; the Bearer is the RAW
+    // seeded secret — the server hashes it on receipt (option A), the client never does.
+    expect(cred.serviceUrl).toBe("wss://host.example/");
+    expect(cred.secret).toBe(SECRET_HEX);
   });
 
-  it("the reconnect ALARM path is guarded too (every fire would otherwise reject)", async () => {
+  it("get_connection_state carries the durable enrollState (approved when seeded)", async () => {
+    await loadServiceWorker();
+    const st = await ask({ type: "get_connection_state" });
+    expect(st.enrollState).toBe("approved");
+    expect(st.hasAddress).toBe(true);
+  });
+
+  it("get_identity returns the server-assigned id from storage, not instance.json", async () => {
+    await loadServiceWorker({ seedLocal: { instanceId: "srv-9", browserName: "Lab" } });
+    const id = await ask({ type: "get_identity" });
+    expect(id.instanceId).toBe("srv-9");
+    expect(id.title).toBe("Lab");
+  });
+
+  it("submit_enrollment marks the request pending and acks ok", async () => {
+    // A fresh profile: no secret yet. Submitting generates it + flags pending.
+    await loadServiceWorker({ notEnrolled: true, seedLocal: { serviceAddress: "wss://host.example" } });
+    const res = await ask({ type: "submit_enrollment", code: "WIN-CODE" });
+    expect(res.ok).toBe(true);
+    await settle(6);
+    const facts = (await chrome.storage.local.get("enrollState")).enrollState;
+    expect(facts.requestPending).toBe(true);
+    expect((await chrome.storage.local.get("instanceSecret")).instanceSecret).toBeTruthy();
+  });
+});
+
+// --- instance.json is OPTIONAL now (§7); floating promises stay guarded ------
+describe("start-up robustness", () => {
+  it("a broken/absent instance.json does NOT crash the worker (it is optional now, §7)", async () => {
+    // Enrolled via storage.local, so the address falls back to nothing when
+    // instance.json throws — the SW must tolerate it (no ensureSocket-failed spam) and
+    // still register its message channel.
     await loadServiceWorker({ fetchRoutes: { instanceThrows: true } });
+    const logged = errorSpy.mock.calls.map((c) => String(c[0]));
+    expect(logged.some((m) => m.includes("ensureSocket failed"))).toBe(false);
+    // Positive control: the worker booted far enough to wire its onMessage channel.
+    expect(chrome.runtime.onMessage.listeners.length).toBeGreaterThan(0);
+  });
+
+  it("the reconnect ALARM path is guarded (a throwing socket ctor would otherwise reject)", async () => {
+    // A WebSocket that throws on construction makes connect() (hence ensureSocket)
+    // reject; the alarm handler's .catch must name it rather than leak an unhandled
+    // rejection once per fire. Seed a serviceAddress so the enrolled instance actually
+    // tries to connect.
+    class ThrowingWS {
+      constructor() {
+        throw new Error("socket ctor boom");
+      }
+    }
+    await loadServiceWorker({
+      seedLocal: { serviceAddress: "wss://host.example" },
+      WebSocketImpl: ThrowingWS,
+    });
     errorSpy.mockClear();
     chrome.alarms.onAlarm._emit({ name: RECONNECT_ALARM });
     await settle(4);

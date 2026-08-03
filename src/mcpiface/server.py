@@ -23,8 +23,9 @@ takes the port; the service needs ``/ext``, ``/api/*``, ``/healthz``, ``/metrics
 the same port. The SDK version is NOT pinned (the 307-redirect concern that once
 motivated a pin is false: the client hardcodes ``follow_redirects=True``).
 
-Auth: ``/mcp`` sits behind the SAME ``EXT_TOKEN`` Bearer as ``/api/*`` (§12, one
-token). The check runs in the ASGI wrapper before the request reaches the session
+Auth: ``/mcp`` sits behind the ``ADMIN_TOKEN`` Bearer (issue #35 §4: the agent equals
+the human — both authenticate with ADMIN_TOKEN, which opens ``/mcp`` and ``/admin/*``).
+The check runs in the ASGI wrapper before the request reaches the session
 manager. DNS-rebinding Host/Origin validation is DISABLED: the endpoint is
 Bearer-gated and reached server-to-server (no browser origin), behind Traefik — the
 protection guards browser-driven localhost servers, which this is not, and enabling
@@ -214,7 +215,7 @@ def build_mcp(app_ref) -> MCPServer:
 
 # --- the auth-gated ASGI handler + its Route --------------------------------
 class _MCPAsgi:
-    """ASGI app: enforce the ``EXT_TOKEN`` Bearer, bind the MCP session id, then hand
+    """ASGI app: enforce the ``ADMIN_TOKEN`` Bearer, bind the MCP session id, then hand
     off to the streamable-HTTP handler. A class instance (not a bare function) so a
     Starlette ``Route`` treats it as an ASGI app rather than a request endpoint."""
 
@@ -227,9 +228,10 @@ class _MCPAsgi:
         settings = scope["app"].state.settings
         auth = headers.get(b"authorization", b"").decode("latin-1")
         scheme, _, token = auth.partition(" ")
-        # Constant-time compare, as bytes, exactly like require_ext_token (§12).
+        # Constant-time compare, as bytes, against ADMIN_TOKEN (issue #35 §4: the MCP
+        # agent authenticates as the human/admin, not with EXT_TOKEN).
         if scheme.lower() != "bearer" or not secrets.compare_digest(
-            token.encode("utf-8", "ignore"), settings.ext_token.encode("utf-8")
+            token.encode("utf-8", "ignore"), settings.admin_token.encode("utf-8")
         ):
             # Count the rejection for curator_auth_rejections_total (§12).
             auth_rejections.incr("mcp_token")

@@ -44,9 +44,11 @@ services:
       - curator_restore_marker:/app/restore:ro
     environment:
       # EXT_TOKEN opens /ext, /api/* and /mcp; METRICS_TOKEN is read-only for
-      # /metrics. Both are REQUIRED — an empty value fails startup (§4).
+      # /metrics; ADMIN_TOKEN opens /admin (enrollment, §13). All three are REQUIRED —
+      # an empty value fails startup (§4). ADMIN_TOKEN must DIFFER from METRICS_TOKEN.
       EXT_TOKEN: XXX
-      METRICS_TOKEN: XXX
+      METRICS_TOKEN: YYY
+      ADMIN_TOKEN: ZZZ
       # Backups live on the separate curator_backups volume above, NOT under
       # /app/data. The entrypoint mkdir+chowns this path before dropping to `app`.
       BACKUP_DIR: /app/backups

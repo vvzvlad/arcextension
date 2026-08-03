@@ -92,7 +92,21 @@ def delete_rule(conn: sqlite3.Connection, rule_id: int) -> None:
 
 
 def known_instance_ids(conn: sqlite3.Connection) -> set[str]:
-    return {r[0] for r in conn.execute("SELECT id FROM instances").fetchall()}
+    """Ids of ACTIVE instances (issue #35 §6).
+
+    Filtered to ``status='active'`` so a revoked/pending instance is no longer a legal
+    rule/exemption target: its rules go ``invalid=1`` on the next ``revalidate_rules`` and
+    a new rule/exemption pointing at it is rejected at save. Its THREE consumers each
+    exempt the configured MAIN INDEPENDENTLY (``curator._revalidate_rules`` unions
+    ``{main}``; ``api.rules`` and ``api.exemptions`` check ``!= main``), so a legal
+    ``X -> main`` rule stays valid even when MAIN has no active row — the
+    ``curator-main-instance-never-seen`` / unruled-drain cascade is preserved."""
+    return {
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM instances WHERE status = 'active'"
+        ).fetchall()
+    }
 
 
 def count_rules(conn: sqlite3.Connection) -> int:

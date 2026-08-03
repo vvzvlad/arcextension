@@ -16,7 +16,8 @@ Shape follows the table and how the pass reads it:
 * ``until`` is absolute server-clock ms; ``reason`` is free text (``restore`` for the
   rows restore writes, ``manual`` for these).
 
-Guards are the ``/api/*`` standard: Bearer ``EXT_TOKEN``, ``require_operational``, and
+Guards are the ``/api/*`` standard: ``require_api_caller`` (Bearer ADMIN_TOKEN or an
+instance secret — §35 §4), ``require_operational``, and
 the pause gate on the two mutating verbs. There is deliberately no ``force`` here: §7
 grants that escape to the human's own BUTTONS (focus / restore / undo), and editing the
 protection policy while the emergency stop is pulled is not one of them.
@@ -31,7 +32,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_not_paused, require_operational
+from src.api.guards import require_api_caller, require_not_paused, require_operational
 from src.db.actions import normalize_url
 from src.rules import access as rules_access
 from src.rules.matcher import normalize_target
@@ -181,7 +182,7 @@ async def list_exemptions(request: Request) -> JSONResponse:
 
     Expired rows are not deleted eagerly (the pass simply ignores them), so the flag is
     what makes "it WAS protected until 14:20" answerable after the fact."""
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     include_expired = _flag(request.query_params.get("include_expired"))
     now = _now_ms()
@@ -192,7 +193,7 @@ async def list_exemptions(request: Request) -> JSONResponse:
 # --- POST /api/exemptions ----------------------------------------------------
 async def create_exemption(request: Request) -> JSONResponse:
     """Create/refresh «не трогать <instance>+<url> до …»."""
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     await require_not_paused(request)  # 423 while paused (§7); no force here
 
@@ -229,7 +230,7 @@ async def delete_exemption(request: Request) -> JSONResponse:
     Accepts ``instance_id`` / ``url`` from a JSON body OR the query string — a DELETE
     with a body is legal but awkward for some clients, and the pair is short enough to
     ride in the query string."""
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     await require_not_paused(request)  # 423 while paused (§7); no force here
 

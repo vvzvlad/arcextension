@@ -39,6 +39,7 @@ from starlette.responses import Response
 
 from src.api.auth_metrics import auth_rejections
 from src.api.guards import require_metrics_token
+from src.curator.enroll import ENROLL_WINDOW_UNTIL_KEY
 
 # Prometheus text exposition content type (§12).
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
@@ -156,6 +157,11 @@ class Snapshot:
     deferred: dict[tuple[str, str], int] = field(default_factory=dict)
     pause_until: int | None = None
     resume_pending: bool = False
+    # Absolute deadline (epoch ms) of an armed enrollment window, or None when no window
+    # is armed (§8). Read straight from `settings` at scrape time, exactly like
+    # ``pause_until`` — the signed remaining seconds are computed against ``now`` in
+    # ``_enroll_window_seconds_remaining`` so a restart is a no-op.
+    enroll_window_until: int | None = None
     clock_step_seconds: float = 0.0
     # Default False, and that default is the answer for a brand-new install: "no pass has
     # looked at the marker yet" is not "the marker is broken" (§12).
@@ -285,6 +291,17 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
     ).fetchone()
     snap.resume_pending = bool(resume_row is not None and resume_row[0])
 
+    # Enrollment-window deadline (§8). Absent/blank/garbage reads as "no window armed"
+    # (None) — never a spurious 0 deadline, mirroring how ``pause_until`` is decoded.
+    enroll_row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (ENROLL_WINDOW_UNTIL_KEY,)
+    ).fetchone()
+    if enroll_row is not None and enroll_row[0] not in (None, ""):
+        try:
+            snap.enroll_window_until = int(enroll_row[0])
+        except (TypeError, ValueError):
+            snap.enroll_window_until = None
+
     step_row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (CLOCK_STEP_KEY,)
     ).fetchone()
@@ -355,6 +372,31 @@ def _pass_overdue_seconds(snap: Snapshot, now_ms: int, interval_s: int, paused: 
         reference_ms = snap.pause_until
     overdue = (now_ms - reference_ms) // 1000 - interval_s
     return overdue if overdue > 0 else 0
+
+
+def _enroll_window_seconds_remaining(snap: Snapshot, now_ms: int) -> int:
+    """Whole seconds until the enrollment window's deadline, CLAMPED at 0 (§8).
+
+    * No window armed (absent/blank/garbage deadline) -> EXACTLY 0.
+    * Armed and still open (deadline in the future) -> POSITIVE seconds remaining,
+      rounded UP so a sub-second-but-open window still reads >= 1 and never collides
+      with the "no window" 0 (matches :func:`src.curator.enroll._ceil_seconds`).
+    * Armed and AT-OR-PAST its deadline -> 0. A naturally-expired window is not an
+      anomaly — it simply reads closed, symmetric with the no-window case. (The
+      window-overdue alert was dropped in #37, so the gauge no longer needs to encode a
+      negative "overdue" magnitude; a closed window and no window are both benign 0.)
+
+    Read from the DB at scrape time, so a restart re-reads the SAME stored deadline and
+    changes nothing; a degraded scrape (no snapshot) leaves ``enroll_window_until`` None
+    and reports 0 (no window), never a 500.
+    """
+    until = snap.enroll_window_until
+    if until is None:
+        return 0
+    remaining_ms = until - now_ms
+    if remaining_ms <= 0:
+        return 0
+    return (remaining_ms + 999) // 1000
 
 
 def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
@@ -518,6 +560,19 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         [({}, 1 if snap.resume_pending else 0)],
     )
 
+    # --- enrollment window (§8) ---------------------------------------------
+    # Registered on EVERY scrape (like every other gauge): the sample is always emitted,
+    # computed from the stored deadline in `settings`, not process memory — so a restart
+    # re-reads the same window and a degraded scrape reports 0 (no window), never a 500.
+    reg.metric(
+        "curator_enroll_window_seconds_remaining",
+        "Whole seconds until the enrollment window deadline: >0 while open, 0 otherwise "
+        "(no window armed OR the window has reached/passed its deadline — a naturally "
+        "expired window reads closed, not overdue).",
+        "gauge",
+        [({}, _enroll_window_seconds_remaining(snap, now_ms))],
+    )
+
     # --- backup (filesystem) ------------------------------------------------
     newest = _newest_backup(settings.backup_dir)
     if newest is not None:
@@ -583,11 +638,24 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         "gauge",
         [({}, 1 if snap.restore_marker_unreadable else 0)],
     )
+    # Process-monotonic auth-rejection counter, now a LABELED family: one series per
+    # coarse {reason} the increment sites already pass (api_token / metrics_token /
+    # mcp_token, the /ext reject codes protocol|auth|origin|duplicate_instance|revoked|
+    # unknown_instance|capacity, cors_preflight, and the enroll_* labels). Read from the
+    # process-memory singleton — legitimately in-memory (a rejections counter resets on
+    # restart like any Prometheus process counter), so it is served even in degraded mode.
+    # An empty breakdown (a fresh process that has rejected nothing) emits NO samples,
+    # exactly like the other per-label families (`{kind}` / `{to_instance}`): the HELP/TYPE
+    # lines are still present, so a scrape never breaks.
     reg.metric(
         "curator_auth_rejections_total",
-        "Process-monotonic count of auth rejections across every gated surface.",
+        "Process-monotonic count of auth rejections across every gated surface, by "
+        "coarse reason; resets on restart. Empty (no rejections yet) emits no series.",
         "counter",
-        [({}, auth_rejections.total())],
+        [
+            ({"reason": reason}, count)
+            for reason, count in sorted(auth_rejections.by_reason().items())
+        ],
     )
 
     return reg.render()

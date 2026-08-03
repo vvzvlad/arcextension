@@ -17,13 +17,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import _recv, approve_instance, make_settings, secret_for
 from starlette.testclient import TestClient
 
 from src.app import create_app
 
-EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 IDLE_MS = 60 * 60_000            # idle_minutes=60 => a tab must be ~1h idle to move
 OLD = 4_000_000                  # an age (ms) comfortably past IDLE_MS => guarded
@@ -56,8 +59,8 @@ def _seed_instance(db_path, iid, connected=1, snapshot_at=None, focused=None):
     c = _conn(db_path)
     try:
         c.execute(
-            "INSERT INTO instances (id, connected, snapshot_at, focused_window_id) "
-            "VALUES (?,?,?,?)",
+            "INSERT INTO instances (id, connected, snapshot_at, focused_window_id, status) "
+            "VALUES (?,?,?,?,'active')",
             (iid, connected, _now_ms() if snapshot_at is None else snapshot_at, focused),
         )
         c.commit()
@@ -113,7 +116,7 @@ def _hello(instance_id, session="sess-1", **over):
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "token": EXT_TOKEN,
+        "secret": secret_for(instance_id),
         "instanceId": instance_id,
         "installUuid": f"uuid-{instance_id}",
         "origin": "chrome-extension://abc",
@@ -171,6 +174,8 @@ def _connect_fresh(client, db_path, instance_id, session="sess-1", tabs=None):
     After this the mirror holds ``tabs`` and preview finds the instance already
     fresh (no re-request), so the HTTP call can run inline.
     """
+    # Secret-based hello (issue #35): approve the instance (Task E) before it can hello.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
     _recv(ws)                # hello_ack
@@ -191,12 +196,14 @@ def _connect_fresh(client, db_path, instance_id, session="sess-1", tabs=None):
     return ws
 
 
-def _connect_unanswered(client, instance_id, session="sess-1"):
+def _connect_unanswered(client, db_path, instance_id, session="sess-1"):
     """hello + DISCARD the initial snapshot_request (leave snapshot_at NULL).
 
     The instance is connected but has never delivered a snapshot, so preview MUST
     actively request one — the hook the `preview-requests-snapshot` guard tests.
     """
+    # Secret-based hello (issue #35): approve the instance (Task E) before it can hello.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
     _recv(ws)                # hello_ack
@@ -242,6 +249,36 @@ def test_create_rejects_unknown_instance_422(tmp_path):
             json={"pattern": "borneo.lc", "instance_id": "ghost"},
         )
         assert resp.status_code == 422
+
+
+def test_rule_to_revoked_rejected_but_x_to_main_stays_valid(tmp_path):
+    """issue #35 §6 cascade at the ``rules`` consumer of ``known_instance_ids``: a rule
+    targeting a REVOKED instance is rejected (the id is no longer active/known), while a
+    rule ``X -> main`` is still accepted even though MAIN has no active row — the consumer
+    exempts MAIN. Reverting the active-only filter makes the revoked target pass (the
+    ``== 422`` reddens); dropping the main exemption makes ``X -> main`` a 422 (the
+    ``!= 422`` reddens)."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "prox")   # active, then revoked below
+        c = _conn(db_path)
+        c.execute("UPDATE instances SET status='revoked' WHERE id='prox'")
+        c.commit()
+        c.close()
+        # Target is revoked => rejected like an unknown instance.
+        r = client.post(
+            "/api/rules", headers=AUTH,
+            json={"pattern": "borneo.lc", "instance_id": "prox"},
+        )
+        assert r.status_code == 422
+        # X -> main (no active main row) is NOT rejected: the target validates (whatever
+        # confirm gating follows is orthogonal — a 422 would mean the target was refused).
+        r2 = client.post(
+            "/api/rules", headers=AUTH,
+            json={"pattern": "borneo.lc", "instance_id": "main"},
+        )
+        assert r2.status_code != 422
 
 
 # --- confirm_impact: only relocations (closures=0) still gated (SUM) ---------
@@ -417,8 +454,9 @@ def test_preview_marks_unanswering_instance_not_counted(tmp_path):
     # refresh (never a silent stale zero). Runs inline: preview only POLLS the DB
     # while it waits, so nothing on the socket has to be driven — it just times out.
     app = create_app(_settings(tmp_path, snapshot_timeout_ms=300))
+    db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
-        ws = _connect_unanswered(client, "prox")   # connected, snapshot_at NULL
+        ws = _connect_unanswered(client, db_path, "prox")  # connected, snapshot_at NULL
         try:
             resp = client.post(
                 "/api/rules/preview", headers=AUTH,

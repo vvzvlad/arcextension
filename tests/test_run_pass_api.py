@@ -7,7 +7,11 @@ from starlette.testclient import TestClient
 from src.app import create_app
 
 EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
@@ -16,13 +20,15 @@ def _settings(tmp_path, **over):
         backup_dir=str(tmp_path / "backups"),
         host="0.0.0.0", port=8000,
         heartbeat_ms=600_000, protocol_version=1,
-        ext_token=EXT_TOKEN, metrics_token="m", ext_allowed_origins="",
+        ext_token=EXT_TOKEN, metrics_token="m", admin_token=ADMIN_TOKEN,
+        ext_allowed_origins="",
         idle_minutes=60, pass_interval_min=5, tick_ms=60000,
         cmd_timeout_ms=1000, snapshot_timeout_ms=500, lease_ttl_ms=600_000,
         restore_exemption_min=120, pause_default_min=60, incomplete_after_min=15,
         self_nav_limit=10, state_fresh_ms=3000, quarantine_ttl_min=1440,
         actions_retention_days=90, js_audit_retention_days=730,
         main_instance_id="main", log_level="INFO",
+        enroll_request_ttl_min=60,
     )
     s.update(over)
     return SimpleNamespace(**s)

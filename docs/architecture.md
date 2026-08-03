@@ -266,7 +266,54 @@ quick_links(
 settings(key TEXT PRIMARY KEY, value TEXT)  -- рантайм-состояние, НЕ конфиг:
                                            -- аренда прохода, pause_until,
                                            -- pause_started_at, resume_pending,
-                                           -- рантайм-выключатель execute_js
+                                           -- рантайм-выключатель execute_js,
+                                           -- enroll_window_until, enroll_window_code
+```
+
+**Миграция 2 — enrollment (§13, замена общего `EXT_TOKEN`).** Инстанс здоровается
+своим `install_uuid` и персональным секретом, попадает в `enroll_requests`, оператор
+подтверждает его в `instances` в течение короткого окна enrollment. Шаг миграции
+добавляет только хранилище (таблицы + колонки + гард-индекс) и переводит уже
+существующие строки; сам handshake `/ext`, эндпоинты `/admin` и отзыв — отдельные
+задачи.
+
+```sql
+enroll_requests(
+  install_uuid TEXT PRIMARY KEY,
+  origin TEXT,                          -- chrome-extension:// origin приветствия
+  suggested_title TEXT,                 -- предложенное клиентом имя
+  protocol_version INTEGER NOT NULL,
+  secret_hash TEXT NOT NULL,            -- хеш персонального секрета, не сам секрет
+  first_seen_at INTEGER NOT NULL,       -- НЕ обновляется повтором: иначе TTL заявки
+                                        -- никогда не достигается
+  last_seen_at INTEGER NOT NULL
+)
+
+admin_audit(                            -- след действий оператора; ВНЕ ретеншна
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  install_uuid TEXT,
+  instance_id TEXT,
+  initiator TEXT NOT NULL,              -- кто действовал: admin | system
+  detail TEXT
+)
+CREATE INDEX admin_audit_ts ON admin_audit(ts);
+
+-- новые колонки instances:
+ALTER TABLE instances ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+                                        -- 'pending', НЕ 'active': hello после миграции
+                                        -- не переактивирует строку молча
+ALTER TABLE instances ADD COLUMN secret_hash TEXT;
+ALTER TABLE instances ADD COLUMN install_uuid TEXT;
+ALTER TABLE instances ADD COLUMN enrolled_at INTEGER;
+ALTER TABLE instances ADD COLUMN revoked_at INTEGER;
+CREATE UNIQUE INDEX instances_secret_hash ON instances(secret_hash);
+                                        -- NULL под UNIQUE в SQLite не конфликтует,
+                                        -- поэтому все ещё-не-enrolled строки сосуществуют
+UPDATE instances SET status='revoked' WHERE secret_hash IS NULL;
+                                        -- каждая доенролловая строка (включая MAIN)
+                                        -- переходит в 'revoked' и требует переподтверждения
 ```
 
 `actions.kind ∈ {relocate, dedupe_close, singleton_close, window_merge, reset,
@@ -388,6 +435,8 @@ restore}` — физическая операция. `actions.status ∈ {done, 
 | `PROTOCOL_VERSION` | 1 | целое | точное равенство; §6 |
 | `EXT_TOKEN` | — | — | обязателен, пустой = отказ старта; открывает и `/ext`, и `/api/*` |
 | `METRICS_TOKEN` | — | — | обязателен; read-only (§12) |
+| `ADMIN_TOKEN` | — | — | обязателен, пустой = отказ старта; открывает `/admin`; ОБЯЗАН отличаться от `METRICS_TOKEN` |
+| `ENROLL_WINDOW_MIN` | 10 | минуты | окно enrollment (§13); read-time сравнение, не таймер |
 
 ---
 

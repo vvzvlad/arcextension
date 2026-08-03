@@ -429,8 +429,23 @@ def load_preview_input(
         "SELECT instance_id, tab_id, window_id, url, title, pinned, active, "
         "audible, opened_at, last_active_at, age_unknown FROM tabs"
     ).fetchall()
+    # ACTIVE-only, mirroring ``access.known_instance_ids`` (issue #35 §6: "the filter is
+    # needed in BOTH places or neither"). A revoked instance must not contribute its tabs
+    # to the simulation nor be listed as a countable instance — even in the transient
+    # window where its socket close after revoke has not yet flipped ``connected`` to 0.
+    #
+    # NO main exemption here, deliberately (unlike the known_instance_ids consumers, which
+    # exempt MAIN to keep an "X -> main" RULE valid). The drain is a property of the RULE
+    # set: ``simulate`` reads ``has_active_rules(inp.rules)`` — not this instance list — to
+    # decide ``enables_drain``, and the drain TARGET is ``inp.main_instance_id`` passed
+    # straight from settings, never resolved from this list. So filtering MAIN out never
+    # switches the drain off; excluding a revoked/pending MAIN only (correctly) DEFERS
+    # relocations toward a MAIN that genuinely cannot receive them, exactly as an
+    # unreachable target already does. An active MAIN passes the filter unchanged, and a
+    # never-connected MAIN had no row to begin with — so the plain status filter is right.
     instances = conn.execute(
-        "SELECT id, connected, snapshot_at, focused_window_id FROM instances"
+        "SELECT id, connected, snapshot_at, focused_window_id FROM instances "
+        "WHERE status = 'active'"
     ).fetchall()
     windows = {
         (r["instance_id"], r["window_id"]): (r["type"], r["state"])

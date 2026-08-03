@@ -12,8 +12,8 @@
   activates the tab and raises its own window). ``no_such_tab`` is surfaced as a
   clear 409 so the page re-fetches ``/api/state`` and re-renders — never silent.
 
-All routes: Bearer ``EXT_TOKEN`` then ``require_operational``; all snapshot/command
-I/O is async and OUTSIDE any DB transaction (Фаза 2 contract).
+All routes: :func:`require_api_caller` (§35 §4) then ``require_operational``; all
+snapshot/command I/O is async and OUTSIDE any DB transaction (Фаза 2 contract).
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from starlette.responses import JSONResponse
 from src.api.freshness import is_fresh, request_snapshot
 from src.api.guards import (
     read_force_body,
-    require_ext_token,
+    require_api_caller,
     require_not_paused,
     require_operational,
 )
@@ -123,7 +123,7 @@ async def kick_state_refresh(app, db, settings) -> None:
 
 # --- GET /api/state ---------------------------------------------------------
 async def get_state(request: Request) -> JSONResponse:
-    require_ext_token(request)      # 401 before anything else
+    await require_api_caller(request)  # 401 before anything else
     require_operational(request)    # 503 in degraded mode
 
     app = request.app
@@ -143,7 +143,7 @@ async def get_state(request: Request) -> JSONResponse:
 
 # --- POST /api/focus --------------------------------------------------------
 async def focus(request: Request) -> JSONResponse:
-    require_ext_token(request)
+    caller = await require_api_caller(request)  # 401 before anything else
     require_operational(request)
 
     # No `if not body` shortcut: `{}` is a well-formed JSON object that simply lacks the
@@ -153,8 +153,11 @@ async def focus(request: Request) -> JSONResponse:
     # `read_force_body`.
     body = await read_force_body(request)
     # A paused curator silences focus too (§7) — unless the human clicked with an
-    # explicit force:true. Jumping to a tab is one of the human's own buttons.
-    await require_not_paused(request, force=body.get("force") is True)
+    # explicit force:true. Jumping to a tab is one of the human's own buttons, and the
+    # human authenticates with the INSTANCE secret (§35 §4): an admin/agent's force:true
+    # must NOT cross the pause, so force is honoured only for an instance caller.
+    forced = body.get("force") is True and caller.kind == "instance"
+    await require_not_paused(request, force=forced)
 
     instance_id = body.get("instance")
     tab_id = body.get("tabId")

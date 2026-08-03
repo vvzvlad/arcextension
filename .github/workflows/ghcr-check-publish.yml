@@ -27,6 +27,7 @@ jobs:
       env:
         EXT_TOKEN: test-ext-token        # required ENV so importing settings works
         METRICS_TOKEN: test-metrics-token
+        ADMIN_TOKEN: test-admin-token    # required + must differ from METRICS_TOKEN (§13)
       run: pytest --tb=short -q
 
   # Extension (MV3) tests: independent Node/vitest toolchain under extension/.

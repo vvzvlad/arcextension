@@ -18,11 +18,14 @@ from starlette.testclient import TestClient
 from src.app import create_app
 
 EXT_TOKEN = "test-ext-token"
+ADMIN_TOKEN = "test-admin-token"
 METRICS_TOKEN = "test-metrics-token"
 GOOD_ORIGIN = "chrome-extension://abc"
 EVIL_ORIGIN = "https://evil.com"
 OTHER_EXT_ORIGIN = "chrome-extension://zzz"  # a non-listed extension id
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+# /api/* now authenticates a caller (issue #35 §4); the CORS behaviour is orthogonal, so
+# the generic admin credential is used to reach a 200.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
@@ -184,15 +187,17 @@ def test_empty_allowlist_is_open_on_ext_and_closed_on_cors(tmp_path):
 
     allowed = parse_origins("")
     assert allowed == set()
-    # /ext half: ANY origin passes the hello check when the list is empty.
+    # /ext half: ANY origin passes the hello check when the list is empty. Under
+    # enrollment (issue #35) auth is by the resolved instance id, not a shared token;
+    # a non-None id means the secret already matched an active instance in the channel.
     hello = {
-        "protocolVersion": 1, "token": EXT_TOKEN, "instanceId": "i1",
+        "protocolVersion": 1, "instanceId": "i1",
         "origin": "chrome-extension://whatever-id",
     }
-    assert hello_reject_reason(hello, 1, EXT_TOKEN, allowed) is None
+    assert hello_reject_reason(hello, 1, "i1", allowed) is None
     # …and a NON-empty list that does not contain it is rejected with 'origin', which
     # is what makes a real mismatch visible in the status row.
-    assert hello_reject_reason(hello, 1, EXT_TOKEN, {GOOD_ORIGIN}) == "origin"
+    assert hello_reject_reason(hello, 1, "i1", {GOOD_ORIGIN}) == "origin"
 
     # CORS half: the same empty value emits no ACAO for anybody, and the rejection is
     # counted into curator_auth_rejections_total (the audible signal for the mismatch).

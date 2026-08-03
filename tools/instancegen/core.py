@@ -221,21 +221,45 @@ def host_from_service_url(service_url: str) -> str:
     return host
 
 
-def stamp_manifest(manifest: dict, host: str, key_b64: str) -> dict:
-    """Return a copy of *manifest* with `<host>` filled and `key` pinned.
+def stamp_manifest(manifest: dict, host: str | None, key_b64: str) -> dict:
+    """Return a copy of *manifest* with `<host>` filled (when a host is given) and `key` pinned.
 
-    ``<all_urls>`` (which carries no ``<host>``) is left untouched; every
-    ``host_permissions`` entry has its ``<host>`` token replaced. The ``key`` is
-    replaced whether it is the placeholder or already a real value (idempotent
-    re-stamp).
+    ``<all_urls>`` (which carries no ``<host>``) is left untouched; when *host* is a
+    string, every ``host_permissions`` entry has its ``<host>`` token replaced.
+
+    When *host* is ``None`` this is the HOSTLESS path taken by the universal ``bundle``
+    build (§9): the manifest carries only ``<all_urls>`` (issue #35 removed the two
+    per-host patterns — there is no ``<host>`` to fill), so ``host_permissions`` is left
+    EXACTLY as-is and only the ``key`` is pinned. Note that even with a host string this
+    is a no-op on a hostless manifest — there is no ``<host>`` token to replace — so the
+    two paths differ only in intent, not in effect on the current manifest.
+
+    The ``key`` is replaced whether it is the placeholder or already a real value
+    (idempotent re-stamp).
     """
     out = json.loads(json.dumps(manifest))  # deep copy
-    perms = out.get("host_permissions", [])
-    out["host_permissions"] = [p.replace(HOST_PLACEHOLDER, host) for p in perms]
+    if host is not None:
+        perms = out.get("host_permissions", [])
+        out["host_permissions"] = [p.replace(HOST_PLACEHOLDER, host) for p in perms]
     if not key_b64:
         raise ValueError("a real base64 `key` is required to pin the extension id")
     out["key"] = key_b64
     return out
+
+
+def stamp_bundle_manifest(manifest_path: str | Path, key_b64: str) -> None:
+    """Pin the manifest ``key`` IN PLACE with a DETERMINISTIC, hostless stamp (§9).
+
+    Used by the universal ``bundle`` build: the manifest carries only ``<all_urls>``, so
+    this leaves ``host_permissions`` untouched and only pins ``key`` (via the hostless
+    :func:`stamp_manifest` path). The re-serialisation is stable — ``indent=2`` with the
+    input key order preserved (no timestamps, no randomness) — so two runs with the SAME
+    key produce a byte-for-byte identical manifest (acc 16).
+    """
+    manifest_path = Path(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    stamped = stamp_manifest(manifest, None, key_b64)
+    manifest_path.write_text(json.dumps(stamped, indent=2) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #

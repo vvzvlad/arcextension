@@ -11,14 +11,17 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import _recv, approve_instance, make_settings, secret_for
 from starlette.testclient import TestClient
 
 from src.app import create_app
 from src.db.actions import insert_action
 
-EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
@@ -36,7 +39,7 @@ def _hello(instance_id="i1", session="sess-1", **over):
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "token": EXT_TOKEN,
+        "secret": secret_for(instance_id),
         "instanceId": instance_id,
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",
@@ -108,6 +111,9 @@ def _seed_tab(db_path, instance_id, tab_id, url):
 
 def _connect_fresh(client, db_path, instance_id="i1", session="sess-1", tabs=None):
     """hello + answer the initial snapshot_request so the instance is FRESH."""
+    # Secret-based hello (issue #35): the instance must be an APPROVED active row first
+    # (what Task E does), else the hello resolves to no instance and is rejected.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json(_hello(instance_id=instance_id, session=session))
     _recv(ws)                # hello_ack

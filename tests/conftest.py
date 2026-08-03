@@ -6,7 +6,10 @@ import os
 # injected via the workflow's `env:` block.
 os.environ.setdefault("EXT_TOKEN", "test-ext-token")
 os.environ.setdefault("METRICS_TOKEN", "test-metrics-token")
+os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
+import hashlib  # noqa: E402
+import sqlite3  # noqa: E402
 import threading  # noqa: E402
 from types import SimpleNamespace  # noqa: E402 - must follow the env defaults above
 
@@ -14,6 +17,7 @@ import pytest  # noqa: E402
 
 EXT_TOKEN = "test-ext-token"
 METRICS_TOKEN = "test-metrics-token"
+ADMIN_TOKEN = "test-admin-token"
 
 # --- THE settings surface for tests ------------------------------------------
 # Every test that builds an app used to hand-roll its own ``SimpleNamespace``. Nine of
@@ -29,6 +33,7 @@ _DEFAULTS: dict = {
     # tokens / transport
     "ext_token": EXT_TOKEN,
     "metrics_token": METRICS_TOKEN,
+    "admin_token": ADMIN_TOKEN,
     "protocol_version": 1,
     "ext_allowed_origins": "",
     "host": "0.0.0.0",
@@ -55,6 +60,10 @@ _DEFAULTS: dict = {
     "main_instance_id": "main",
     "restore_marker_path": "",
     "log_level": "INFO",
+    "enroll_window_min": 10,
+    "enroll_max_pending": 64,
+    "enroll_preauth_max": 128,
+    "enroll_request_ttl_min": 60,
 }
 
 # Parked far beyond any test's lifetime. ``src.app._curator_driver`` sleeps this long
@@ -93,6 +102,69 @@ def make_settings(tmp_path=None, **over) -> SimpleNamespace:
 def settings_factory():
     """``settings_factory(tmp_path, **over)`` -> the shared settings object."""
     return make_settings
+
+
+# --- secret-based /ext hello helpers (enrollment, issue #35) -----------------
+# Under enrollment a hello authenticates by a per-install SECRET (option A): the client
+# sends the RAW secret over TLS, the server hashes it (sha256) and resolves that to an
+# ACTIVE instances row, taking the server-assigned id from that row. A test that wants to
+# drive the hello path must therefore first have an approved (active) row whose stored
+# ``secret_hash`` is sha256(raw) — the thing Task E's operator approval creates — and then
+# present the RAW secret. These helpers make that a one-liner so every /ext test converges
+# on the same shape instead of hand-rolling INSERTs.
+
+
+def admin_headers() -> dict:
+    """Authorization for an ADMIN_TOKEN caller on ``/api/*`` and ``/mcp`` (issue #35 §4).
+
+    The human/agent credential: opens every ``/api/*`` route of either caller kind, and
+    is the DB-free branch of :func:`src.api.guards.require_api_caller`.
+    """
+    return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
+def instance_headers(raw_secret: str) -> dict:
+    """Authorization for an INSTANCE caller on ``/api/*`` — its RAW secret (issue #35 §4,
+    option A), the SAME credential the client sends on /ext hello; the server hashes it and
+    matches the stored sha256. Pair with :func:`approve_instance` to have an active row the
+    secret resolves to."""
+    return {"Authorization": f"Bearer {raw_secret}"}
+
+
+def secret_for(instance_id: str) -> str:
+    """A deterministic per-instance RAW secret for tests (never a real credential) — the
+    value the client presents on the wire / as the /api Bearer."""
+    return f"secret-{instance_id}"
+
+
+def secret_hash_for(instance_id: str) -> str:
+    """sha256 hex of :func:`secret_for` — the value STORED in ``instances.secret_hash``
+    (what the server computes on receipt of the raw secret). Tests seed a row with this and
+    present :func:`secret_for` (the raw) on the wire."""
+    return hashlib.sha256(secret_for(instance_id).encode("utf-8")).hexdigest()
+
+
+def approve_instance(db_path, instance_id, *, status="active", secret_hash=None):
+    """Insert (or update) an ``instances`` row so a secret-hello authenticates.
+
+    Mimics the operator approval of Task E: a row with a human-assigned ``id``, a
+    ``secret_hash`` and ``status`` (default 'active'). ``conn_epoch`` starts at 0 and the
+    first hello bumps it to 1 via the UPDATE-only upsert.
+    """
+    sh = secret_hash if secret_hash is not None else secret_hash_for(instance_id)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(
+            "INSERT INTO instances (id, status, secret_hash, connected, conn_epoch) "
+            "VALUES (?, ?, ?, 0, 0) "
+            "ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
+            "secret_hash=excluded.secret_hash",
+            (instance_id, status, sh),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # --- bounded socket waits ----------------------------------------------------
