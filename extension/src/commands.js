@@ -14,9 +14,8 @@
 //      (a 200-tab pass runs for minutes; in that window a background tab can
 //      start playing audio, get pinned, be re-viewed, or fall out of idle).
 //   2. open_tab / navigate_tab accept ONLY http/https, validated HERE at the
-//      edge — otherwise the EXT_TOKEN holder could steer a tab to
-//      `data:`/`javascript:` via a rule's canonical_url, bypassing the entire
-//      gate built around execute_js.
+//      edge — otherwise a caller could steer a tab to `data:`/`javascript:` via a
+//      rule's canonical_url, bypassing the entire gate built around execute_js.
 //
 // The module uses the global `chrome` (like activity-map.js / snapshot.js) and
 // imports the activity map directly; both are overridable through `ctx` so the

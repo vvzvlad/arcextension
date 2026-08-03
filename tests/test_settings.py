@@ -5,8 +5,7 @@ from src.settings import Settings
 
 
 def _base_env(monkeypatch):
-    """Set the three required tokens so only the field under test is unset."""
-    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
+    """Set the two required tokens so only the field under test is unset."""
     monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
     monkeypatch.setenv("ADMIN_TOKEN", "admin-secret")
 
@@ -15,8 +14,8 @@ def test_loads_defaults_from_section4(monkeypatch):
     _base_env(monkeypatch)
     s = Settings(_env_file=None)
     # Required tokens come through.
-    assert s.ext_token == "ext-secret"
     assert s.metrics_token == "metrics-secret"
+    assert s.admin_token == "admin-secret"
     # §4 tunable defaults.
     assert s.idle_minutes == 60
     assert s.pass_interval_min == 5
@@ -43,6 +42,21 @@ def test_loads_defaults_from_section4(monkeypatch):
     assert s.port == 8000
 
 
+def test_shared_ext_secret_field_is_gone(monkeypatch):
+    # Enrollment (§13) removed the shared /ext token entirely (#37). Settings must carry
+    # no such field — /ext and /api/* authenticate by a per-instance secretHash and
+    # ADMIN_TOKEN, never a config token. Redden: re-add the field.
+    #
+    # The removed field name is spelled INDIRECTLY here on purpose: #37 acceptance 1 is a
+    # repo-wide purge (`grep -rn` for the literal must find nothing but git history), and
+    # this assert-it-is-gone test must not itself reintroduce the literal.
+    removed_field = "ext" + "_token"
+    _base_env(monkeypatch)
+    s = Settings(_env_file=None)
+    assert not hasattr(s, removed_field)
+    assert removed_field not in Settings.model_fields
+
+
 def test_env_overrides_tunables(monkeypatch):
     _base_env(monkeypatch)
     monkeypatch.setenv("IDLE_MINUTES", "30")
@@ -52,57 +66,26 @@ def test_env_overrides_tunables(monkeypatch):
     assert s.main_instance_id == "primary"
 
 
-def test_missing_ext_token_fails(monkeypatch):
-    monkeypatch.delenv("EXT_TOKEN", raising=False)
-    monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None)
-
-
 def test_missing_metrics_token_fails(monkeypatch):
-    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
     monkeypatch.delenv("METRICS_TOKEN", raising=False)
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None)
-
-
-def test_empty_ext_token_fails(monkeypatch):
-    # §4: "пустой = отказ старта" — an empty string must fail, not only a missing var.
-    monkeypatch.setenv("EXT_TOKEN", "")
-    monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None)
-
-
-def test_blank_ext_token_fails(monkeypatch):
-    # A whitespace-only token is just as unusable as an empty one.
-    monkeypatch.setenv("EXT_TOKEN", "   ")
-    monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
+    monkeypatch.setenv("ADMIN_TOKEN", "admin-secret")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 
 
 def test_empty_metrics_token_fails(monkeypatch):
-    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
     monkeypatch.setenv("METRICS_TOKEN", "")
+    monkeypatch.setenv("ADMIN_TOKEN", "admin-secret")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 
 
-def test_identical_tokens_fail_at_startup(monkeypatch):
-    # §12: METRICS_TOKEN exists ONLY because of where it is stored — a scrape config in
-    # git, in plaintext. Making it equal to EXT_TOKEN publishes /ext, /api/* and /mcp in
-    # that same file while the config still LOOKS separated. Project convention
-    # (AGENTS.md): a misconfigured credential fails at startup.
-    monkeypatch.setenv("EXT_TOKEN", "same-secret")
-    monkeypatch.setenv("METRICS_TOKEN", "same-secret")
-    with pytest.raises(ValidationError) as ei:
+def test_blank_metrics_token_fails(monkeypatch):
+    # A whitespace-only token is just as unusable as an empty one.
+    monkeypatch.setenv("METRICS_TOKEN", "   ")
+    monkeypatch.setenv("ADMIN_TOKEN", "admin-secret")
+    with pytest.raises(ValidationError):
         Settings(_env_file=None)
-    msg = str(ei.value)
-    assert "EXT_TOKEN" in msg  # the message names what to change
-    # And the error is attached to METRICS_TOKEN, so load_settings_or_exit prints the
-    # env var name rather than a bare "?".
-    assert any(err["loc"] == ("metrics_token",) for err in ei.value.errors())
 
 
 def test_distinct_tokens_still_load(monkeypatch):
@@ -117,7 +100,6 @@ def test_admin_token_loads(monkeypatch):
 
 
 def test_missing_admin_token_fails(monkeypatch):
-    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
     monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
     monkeypatch.delenv("ADMIN_TOKEN", raising=False)
     with pytest.raises(ValidationError):
@@ -144,7 +126,6 @@ def test_admin_token_equal_to_metrics_fails_at_startup(monkeypatch):
     # lives in a plaintext scrape config in git; making ADMIN_TOKEN equal to it would let
     # that read-only scrape credential open /admin. A misconfigured credential must fail
     # at startup, and the error must attach to admin_token so the env var is named.
-    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
     monkeypatch.setenv("METRICS_TOKEN", "shared-secret")
     monkeypatch.setenv("ADMIN_TOKEN", "shared-secret")
     with pytest.raises(ValidationError) as ei:
@@ -152,15 +133,6 @@ def test_admin_token_equal_to_metrics_fails_at_startup(monkeypatch):
     msg = str(ei.value)
     assert "METRICS_TOKEN" in msg
     assert any(err["loc"] == ("admin_token",) for err in ei.value.errors())
-
-
-def test_admin_token_may_equal_ext_token(monkeypatch):
-    # Only the metrics/admin pair is constrained here (the EXT_TOKEN purge is #37); a
-    # distinct-from-metrics admin token that happens to equal ext_token still loads.
-    monkeypatch.setenv("EXT_TOKEN", "ext-secret")
-    monkeypatch.setenv("METRICS_TOKEN", "metrics-secret")
-    monkeypatch.setenv("ADMIN_TOKEN", "ext-secret")
-    assert Settings(_env_file=None).admin_token == "ext-secret"
 
 
 def test_enroll_window_min_default_and_override(monkeypatch):

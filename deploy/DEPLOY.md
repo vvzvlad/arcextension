@@ -120,9 +120,12 @@ Rules for the value:
 
 ## 5. Tokens & volumes recap
 
-- **`EXT_TOKEN`** — opens `/ext`, `/api/*`, `/mcp`. **`METRICS_TOKEN`** — read-only,
-  opens `/metrics` only, and is the token that goes into the plaintext
-  `deploy/scrape.yml` (§12). Both are REQUIRED; an empty value fails startup (§4).
+- **`ADMIN_TOKEN`** — opens `/admin` (the enrollment console), `/api/*` (as the
+  human/agent caller) and `/mcp`. **`METRICS_TOKEN`** — read-only, opens `/metrics`
+  only, and is the token that goes into the plaintext `deploy/scrape.yml` (§12). Both are
+  REQUIRED and must DIFFER; an empty value fails startup (§4). There is **no shared /ext
+  token** — instances authenticate by a per-install secret entered during enrollment
+  (§7).
 - **`curator`** volume → `/app/data` (DB + WAL). **`curator_backups`** volume →
   `/app/backups`, mounted **separately** from the DB (§12), with
   `BACKUP_DIR=/app/backups`. The entrypoint `mkdir -p` + `chown`s an absolute
@@ -147,44 +150,64 @@ no second container in CI). Verify them by hand at deploy time:
       extension connects over `wss://` with no manual cert exception (§1 above).
 
 Everything else — CORS allow-list echo (never `*`), `/metrics` needs
-`METRICS_TOKEN`, `/api/*` needs `EXT_TOKEN`, the `reject_reason='origin'` path — is
-covered by the automated tests (`tests/test_cors.py`, `tests/test_metrics_api.py`,
-`tests/test_state_api.py`, `tests/test_ext_channel.py`).
+`METRICS_TOKEN`, `/api/*` needs `ADMIN_TOKEN` (or an active-instance secret), the
+`reject_reason='origin'` path — is covered by the automated tests
+(`tests/test_cors.py`, `tests/test_metrics_api.py`, `tests/test_state_api.py`,
+`tests/test_ext_channel.py`).
 
-## 7. Instances & token rotation (§13)
+## 7. Instances & enrollment (§13)
 
-Themed browser instances are built with the **instance generator** — see
-`tools/README.md` for the full guide. In short:
+Under enrollment there is **no shared token to distribute or rotate**. Each instance
+authenticates with a **per-install secret** it generates itself; the operator approves it
+once, on `/admin`, during a short window. Themed browser instances are built with the
+**instance generator** — a two-step, token-free flow (`make bundle` then `make instance`,
+see `tools/README.md`):
 
-- `EXT_TOKEN=… make instance INSTANCE_ID=… SERVICE_URL=wss://host OUT=…` creates an
-  instance (own profile, extension copy, `instance.json`, `.app`). No manual
-  options-page edit is needed — `instance.json` carries all four config fields.
-- `EXT_TOKEN=<new> make restamp OUT=…` rotates the token across **all** instances
-  **and refreshes each copy's extension code** at once (then restart the browsers).
-  Rotating by hand across N options pages would leave every instance silently dead
-  in between.
-- **Cloning a `.app` does not add an instance** — the clone is rejected as
-  `duplicate_instance` (the `install_uuid` guarantee, §6). Run the generator again
-  with a new `instanceId`.
+- `make bundle OUT=~/dist [KEY_FILE=…]` builds the **one** universal, key-pinned bundle
+  the whole fleet loads.
+- `make instance INSTANCE_ID=… BUNDLE_DIR=~/dist OUT=…` wraps that shared bundle in a
+  per-instance `.app` (own profile, `.app`, launcher). It writes **no** extension copy and
+  **no** `instance.json` — the launcher's `--load-extension` points at the shared bundle.
+- **Cloning a `.app` does not add an instance** — a clone mints a new `install_uuid` in
+  its fresh profile and is simply an un-enrolled install; it must enroll separately (the
+  `install_uuid` guarantee, §6). Run the generator again with a new `instanceId`.
 
-The token assignment goes **before** `make`, never after it. Written after, it is a
-make *argument*: it lands in `argv`, where it is visible in `ps` output for the whole
-run and recorded in shell history. Before, it is an ordinary environment variable —
-which is the only thing the generator reads (there is no `--token` option; a
-`--token-file PATH` exists for the file case). The same rule applies to the CLI form.
+### Adding a browser (the enrollment procedure)
 
-**Refreshing the code is the point, not a bonus.** Each instance owns a *copy* of the
-extension bundle (because `instance.json` lives inside it), while `protocolVersion` is
-compared by **exact equality** (§6). So an extension update that bumps
-`PROTOCOL_VERSION`, followed by a routine token rotation that only rewrote
-`instance.json`, would leave every copy on the old code — each rejected on `hello`
-forever, and visible **only** in the status bar (§13). `make restamp` therefore copies
-the code from this repo's `extension/` by default, preserving the pinned manifest
-`key` (same extension id/origin) and the profile (same `install_uuid`).
-`--no-code-update` opts out; do not use it after a protocol bump.
+An operator adds an instance by pairing it during a short, deliberately-opened window:
 
-Its three operational acceptance checks (new instance connects; re-stamp
-reconnects; clone rejected) are a manual list in `tools/README.md`.
+1. **Open a window.** On `/admin`, open an enrollment window (`ENROLL_WINDOW_MIN`,
+   default 10 min). `/admin` shows a short **enrollment code** for the open window.
+2. **Take the code into the extension.** In the new instance's extension settings, enter
+   the service address and the enrollment code, and submit — the extension sends its
+   `install_uuid` + a freshly generated per-install secret and lands in the pending list.
+3. **Approve it on `/admin`.** While the window is open, approve the pending request (give
+   it its `instanceId`). Approval binds the secret's hash to that row; from then on the
+   instance's `hello` (and its `/api/*` calls) authenticate by that secret. Approval is
+   accepted **only** while the window is open — a stolen hello cannot be approved at an
+   arbitrary later time.
+
+If the window closes before you approve, just open another and re-submit; a pending
+request lives `ENROLL_REQUEST_TTL_MIN` (default 60 min) and self-clears if abandoned.
+
+### Revoking a browser
+
+On `/admin`, **revoke** the instance. Revocation flips its row out of `active` at once
+(the resolution is never cached, §12), so the next `hello` and every `/api/*` call from
+that secret are rejected immediately — a lost or decommissioned laptop is cut off without
+touching any other instance. To bring it back, enroll it again (open a window, re-submit,
+approve).
+
+> **Release note — MAIN must re-enroll after migration.** The former shared /ext token
+> is **gone**. After upgrading into the enrollment release, **every** existing instance —
+> including `MAIN_INSTANCE_ID` — must re-enroll: the migration leaves rows without a bound
+> secret, so nothing authenticates until an operator opens a window and approves each one.
+> Expect the stock branch to stay disabled (and `curator_main_instance_never_seen` to
+> read 1) until MAIN has been re-approved.
+
+Its operational acceptance checks (new instance enrolls & connects; two instances share
+one bundle; clone re-enrolls rather than taking over) are a manual list in
+`tools/README.md`.
 
 ---
 
@@ -381,14 +404,14 @@ from the *second* pass onwards.
    docker compose up -d curator
    # …then, without waiting:
    curl -sS -K - -X POST -d '{"minutes":120}' https://<host>/api/pause <<EOF
-   header = "Authorization: Bearer $EXT_TOKEN"
+   header = "Authorization: Bearer $ADMIN_TOKEN"
    EOF
    ```
 
    The token goes in a `-K` config read from **stdin**, never in `curl -H …`: an
-   argument is visible in `ps` to every user on the box for the lifetime of the request
-   (same rule as §7 above). `$EXT_TOKEN` is expanded by the shell into the heredoc, so
-   it never reaches `argv` and nothing is written to disk.
+   argument is visible in `ps` to every user on the box for the lifetime of the request.
+   `$ADMIN_TOKEN` is expanded by the shell into the heredoc, so it never reaches `argv`
+   and nothing is written to disk.
 
    A pause blocks mutating passes but **not** `dry_run` (§7), which is exactly the
    combination this step needs: nothing acts, and you can still look.
@@ -398,7 +421,7 @@ from the *second* pass onwards.
    ```bash
    # What WOULD it do? (works under the pause)
    curl -sS -K - -X POST -d '{"dry_run":true}' https://<host>/api/run_pass <<EOF
-   header = "Authorization: Bearer $EXT_TOKEN"
+   header = "Authorization: Bearer $ADMIN_TOKEN"
    EOF
    ```
 
@@ -411,7 +434,7 @@ from the *second* pass onwards.
 
    ```bash
    curl -sS -K - -X DELETE https://<host>/api/pause <<EOF
-   header = "Authorization: Bearer $EXT_TOKEN"
+   header = "Authorization: Bearer $ADMIN_TOKEN"
    EOF
    ```
 
@@ -420,7 +443,7 @@ from the *second* pass onwards.
 
      ```bash
      curl -sS -K - -X POST -d '{"confirm_pending":true}' https://<host>/api/run_pass <<EOF
-     header = "Authorization: Bearer $EXT_TOKEN"
+     header = "Authorization: Bearer $ADMIN_TOKEN"
      EOF
      ```
 
@@ -457,12 +480,12 @@ protects you immediately and works regardless of fingerprint state:
 ```bash
 # 1. Stop the bleeding. Nothing mutating runs while this holds.
 curl -sS -K - -X POST -d '{"minutes":120}' https://<host>/api/pause <<EOF
-header = "Authorization: Bearer $EXT_TOKEN"
+header = "Authorization: Bearer $ADMIN_TOKEN"
 EOF
 
 # 2. Read what it wants to do (dry_run is not blocked by the pause).
 curl -sS -K - -X POST -d '{"dry_run":true}' https://<host>/api/run_pass <<EOF
-header = "Authorization: Bearer $EXT_TOKEN"
+header = "Authorization: Bearer $ADMIN_TOKEN"
 EOF
 
 # 3. Write a fresh marker value (see «Writing the marker»), then lift the pause

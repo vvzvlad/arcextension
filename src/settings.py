@@ -3,9 +3,9 @@
 Every value comes from the environment (or `.env`); nothing is hardcoded. The
 table below mirrors §4 "Конфигурация (ENV)" of docs/architecture.md verbatim:
 non-secret tunables carry the §4 defaults, self-hosted/infra paths carry a
-dev-friendly default under data/, and the three tokens are REQUIRED with no default
-and reject an empty/blank string as well as a missing variable (§4:
-"обязателен, пустой = отказ старта").
+dev-friendly default under data/, and the two tokens (ADMIN_TOKEN, METRICS_TOKEN)
+are REQUIRED with no default and reject an empty/blank string as well as a missing
+variable (§4: "обязателен, пустой = отказ старта").
 """
 
 from pydantic import Field, field_validator
@@ -16,12 +16,12 @@ from src.config_errors import load_settings_or_exit
 
 class Settings(BaseSettings):
     # --- Required tokens: no default; missing OR empty/blank fails at startup ---
-    # EXT_TOKEN opens /ext, /api/* and /mcp; METRICS_TOKEN is a separate read-only
-    # token for /metrics (§12: it lives in git plaintext scrape configs, so it must
-    # never be able to touch anything but /metrics). ADMIN_TOKEN opens /admin (the
-    # enrollment console, §13) and must differ from METRICS_TOKEN for the same reason
-    # METRICS_TOKEN must differ from EXT_TOKEN. All three are validated below.
-    ext_token: str = Field(min_length=1)
+    # ADMIN_TOKEN opens /admin (the enrollment console, §13), /api/* (as the
+    # human/agent caller) and /mcp; /ext and /api/* also accept a per-instance
+    # secretHash under enrollment (§13 — no shared token anymore). METRICS_TOKEN is a
+    # separate read-only token for /metrics (§12: it lives in git plaintext scrape
+    # configs, so it must never be able to touch anything but /metrics), and ADMIN_TOKEN
+    # must DIFFER from it. Both are validated below.
     metrics_token: str = Field(min_length=1)
     admin_token: str = Field(min_length=1)
 
@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    @field_validator("ext_token", "metrics_token", "admin_token")
+    @field_validator("metrics_token", "admin_token")
     @classmethod
     def _reject_blank_token(cls, v: str) -> str:
         # Field(min_length=1) already rejects a missing var and the empty string,
@@ -119,33 +119,14 @@ class Settings(BaseSettings):
             raise ValueError("must not be empty or blank")
         return v
 
-    @field_validator("metrics_token")
-    @classmethod
-    def _must_differ_from_ext_token(cls, v: str, info) -> str:
-        # The ONLY reason METRICS_TOKEN exists is its storage location (§12): the scrape
-        # config lives in git as plaintext, so the credential that goes there must open
-        # nothing but /metrics. Setting it to the same string as EXT_TOKEN publishes the
-        # key to /ext, /api/* and /mcp in that same plaintext file — the separation
-        # becomes decorative while looking configured. Fail at startup instead (project
-        # convention: a misconfigured credential never starts).
-        # ``ext_token`` is declared first, so it is already validated in ``info.data``;
-        # if it failed its own validation it is absent and there is nothing to compare.
-        ext = info.data.get("ext_token")
-        if ext is not None and v == ext:
-            raise ValueError(
-                "must differ from EXT_TOKEN — METRICS_TOKEN is the read-only /metrics "
-                "credential that lives in a plaintext scrape config; reusing EXT_TOKEN "
-                "there would expose /ext, /api/* and /mcp"
-            )
-        return v
-
     @field_validator("admin_token")
     @classmethod
     def _must_differ_from_metrics_token(cls, v: str, info) -> str:
-        # ADMIN_TOKEN opens /admin (enrollment approvals, revocation — §13). METRICS_TOKEN
-        # is the plaintext scrape credential that lives in git (§12). If ADMIN_TOKEN equals
-        # METRICS_TOKEN, that plaintext scrape credential now opens /admin too — the same
-        # "decorative separation" failure guarded between EXT_TOKEN and METRICS_TOKEN. It
+        # ADMIN_TOKEN opens /admin (enrollment approvals, revocation — §13), /api/* (as
+        # the human/agent caller) and /mcp. METRICS_TOKEN is the plaintext scrape
+        # credential that lives in git (§12). If ADMIN_TOKEN equals METRICS_TOKEN, that
+        # plaintext scrape credential now opens /admin, /api/* and /mcp too — a
+        # "decorative separation" that looks configured while protecting nothing. It
         # would also collapse the compare_digest bearer check: an empty/whitespace Bearer
         # never matches a non-empty token, but a credential SHARED with metrics does. Fail
         # at startup (project convention: a misconfigured credential never starts).

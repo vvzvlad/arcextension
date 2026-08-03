@@ -2,9 +2,8 @@ import os
 
 # Provide the required tokens BEFORE any test module imports src.settings
 # (Settings() is instantiated at import time and would otherwise fail because
-# EXT_TOKEN / METRICS_TOKEN have no default). In CI the same variables are
+# METRICS_TOKEN / ADMIN_TOKEN have no default). In CI the same variables are
 # injected via the workflow's `env:` block.
-os.environ.setdefault("EXT_TOKEN", "test-ext-token")
 os.environ.setdefault("METRICS_TOKEN", "test-metrics-token")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
@@ -15,7 +14,6 @@ from types import SimpleNamespace  # noqa: E402 - must follow the env defaults a
 
 import pytest  # noqa: E402
 
-EXT_TOKEN = "test-ext-token"
 METRICS_TOKEN = "test-metrics-token"
 ADMIN_TOKEN = "test-admin-token"
 
@@ -31,7 +29,6 @@ ADMIN_TOKEN = "test-admin-token"
 # ``Settings`` gains a field, add it HERE and every test file inherits it.
 _DEFAULTS: dict = {
     # tokens / transport
-    "ext_token": EXT_TOKEN,
     "metrics_token": METRICS_TOKEN,
     "admin_token": ADMIN_TOKEN,
     "protocol_version": 1,
