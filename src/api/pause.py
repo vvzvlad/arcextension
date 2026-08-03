@@ -82,12 +82,23 @@ async def resume_now(app) -> dict:
     """
     now = _now_ms()
     shift = await app.state.db.write(lambda c: pause_ops.resume(c, now=now))
-    # Human (or agent) asked for it → handle the backlog immediately (§7). The pause is
-    # now cleared, so this real (non-dry, non-confirm) pass runs normally past step 1.
+    # Human (or agent) asked for it → handle the backlog immediately (§7).
+    #
+    # ``confirm_pending=True`` is REQUIRED, not decorative. Clearing the pause is not
+    # enough to get past step 1: an armed ``resume_pending`` latch makes an unconfirmed
+    # pass return ``{"status": "resume_pending"}` before it does anything, and the latch
+    # is armed by a CONTINUITY BREAK too — not only by an expired pause. In that case
+    # there is no pause to clear, the stored fingerprint is refreshed only by a real
+    # pass, and a real pass is exactly what the latch is blocking: pressing the button
+    # cleared nothing, ran nothing, and re-armed on the next tick. The state had no exit.
+    #
+    # Passing it unconditionally is safe: with no armed latch the runner logs and
+    # degrades it to an ordinary pass (see ``confirm_pending and not resume_armed``).
     result = await runner.run_pass(
         app.state.db,
         app.state.ext_registry,
         app.state.settings,
+        confirm_pending=True,
         clock_guard=getattr(app.state, "curator_clock", None),
     )
     return {"ttl_shift_ms": shift, "pass": result}
