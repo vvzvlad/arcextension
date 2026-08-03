@@ -155,15 +155,44 @@ dies — it keeps rendering «кэш от <время>» that never updates. Tha
   REQUIRED and must DIFFER; an empty value fails startup (§4). There is **no shared /ext
   token** — instances authenticate by a per-install secret entered during enrollment
   (§7).
-- **`curator`** volume → `/app/data` (DB + WAL). **`curator_backups`** volume →
-  `/app/backups`, mounted **separately** from the DB (§12), with
-  `BACKUP_DIR=/app/backups`. The entrypoint `mkdir -p` + `chown`s an absolute
-  `BACKUP_DIR` as root before dropping to `app` via gosu.
-- **`curator_restore_marker`** volume → `/app/restore` (read-only for the service),
-  with `RESTORE_MARKER_PATH=/app/restore/continuity-marker`. A **third** volume on
-  purpose: see §8 below. ⚠️ **Write the marker once at install**, before the first
-  `up -d` (§8 «Writing the marker») — until it exists, restore detection is the only
-  guard that is not armed.
+- **One volume**, `curator` → `/app/data`, holding **all** mutable state (the project
+  convention is "all mutable state goes under `data/`"):
+  - `/app/data/curator.db` (+ WAL) — the DB;
+  - `/app/data/backups` — the nightly `VACUUM INTO` copies (`BACKUP_DIR`);
+  - `/app/data/restore/continuity-marker` — the continuity marker
+    (`RESTORE_MARKER_PATH`, §8).
+
+  The entrypoint runs as root before dropping to `app` via gosu: it `chown -R`s
+  `/app/data`, `mkdir -p` + `chown`s an absolute `BACKUP_DIR`, and **creates the
+  continuity marker with a fresh uuid if it is not there** (never rewriting an existing
+  one — §8). The marker and its directory are left **root-owned** (`644` / `755`): the
+  service must be able to read the marker and must not be able to rewrite it.
+
+### ⚠️ What one volume costs — read this before you plan your backups
+
+Two prices, both accepted deliberately; neither is an oversight.
+
+- **A rollback of the VOLUME AS A WHOLE is undetectable.** Three separate volumes used
+  to protect against exactly that: restore a storage/ZFS/`docker volume` snapshot of the
+  DB volume and the marker, living elsewhere, stayed put — so the curator saw a changed
+  fingerprint and stopped for confirmation. With one volume the snapshot brings the
+  marker back too, at its old value, and the first pass after such a rollback looks
+  perfectly continuous: it acts on yesterday's rules and stale `relocate` rows with **no
+  `dry_run` and no click**. The reason this is acceptable and not a hole: the documented
+  restore procedure below puts back a **file** (`curator.db`), not the volume — under it
+  the marker is untouched by the copy and step 4 changes it, so the detector works
+  exactly as designed. **If you restore volume snapshots instead, the detector does not
+  cover you** — pause the service by hand first (§8, "If you forget step 4"), or keep the
+  marker on a mount of its own and point `RESTORE_MARKER_PATH` at it.
+- **Backups share free space with the DB.** A DB that grows until the volume is full
+  also takes the nightly copy down with it — `VACUUM INTO` needs room for a full copy
+  beside the original. `curator-backup-stale` (`deploy/alerts.yml`,
+  `curator_backup_age_seconds > 26h`) is the alert that catches it; size the volume for
+  the DB **plus** the retained copies, not for the DB alone.
+
+There is **no manual marker step at install** any more — the entrypoint creates the file.
+The **restore** step (§8, step 4) stays manual, and by design: the service cannot know it
+was rolled back.
 
 ---
 
@@ -389,12 +418,17 @@ restored DB looks perfectly continuous (see `WARNING 2` in `src/curator/clock.py
 **Any** value kept inside the DB travels inside the backup — which is why the fix
 cannot live there.
 
-Hence `RESTORE_MARKER_PATH` (`/app/restore/continuity-marker`) on its **own**
-`curator_restore_marker` volume: separate from `/app/data` (the DB) *and* from
-`/app/backups`. The service hashes the file's contents into the fingerprint, so writing
-a new value is what makes the restore visible. Put the marker on the DB volume and it
-rolls back with the DB; put it on the backup volume and it travels inside the copy.
-Both silently restore the old value and the break goes undetected.
+Hence `RESTORE_MARKER_PATH` (`/app/data/restore/continuity-marker`): a file that is
+**not the DB and not part of a backup copy**. The service hashes its contents into the
+fingerprint, so writing a new value is what makes the restore visible. Keep the value
+inside the DB and it rolls back with the DB; keep it inside `BACKUP_DIR` and it travels
+inside the copy. Both silently restore the old value and the break goes undetected.
+
+It sits on the **same volume** as the DB — one volume holds all mutable state (§5) — and
+that is a deliberate trade: the separation this detector needs is at **file** level and
+the documented procedure below restores a **file**, so the marker survives it. A rollback
+of the whole volume defeats the detector; §5 spells out that cost and what to do if that
+is how you restore.
 
 Marker states, per `clock.read_restore_marker`:
 
@@ -417,65 +451,51 @@ Marker states, per `clock.read_restore_marker`:
 > change; it is not a symptom of anything. Only the *upgrade* case below is exempt,
 > and only because the stored fingerprint has no marker key at all.
 
-The volume is mounted **`:ro`** for the `curator` service on purpose: the service only
-reads the marker, and a service able to rewrite it could "heal" the value and silently
-disable the very detection this exists for. Writing is therefore an **operator**
-action, done from a separate container that mounts the volume read-write (below) —
-`docker compose run` cannot do it, because it builds the throwaway container from this
-same service definition and inherits the `:ro` mount. Read-only is enforced by the
-kernel at mount level; running as root does not bypass it.
+The marker and its directory are left **root-owned** (`644` / `755`) by the entrypoint on
+purpose: the service reads the marker as uid 1000 and must **not** be able to rewrite it,
+because a service able to "heal" the value could silently disable the very detection this
+exists for. (That used to be a `:ro` mount of a dedicated volume; with one volume,
+ownership is what carries the guarantee — and the directory matters as much as the file,
+since write access to a directory is enough to unlink and recreate what is inside it.)
+Writing stays an **operator** action, from a root shell in the container — which
+`docker compose run --entrypoint sh curator` gives you, since the image has no `USER`
+directive.
 
-### Writing the marker
+### Writing the marker (during a restore)
 
-Used twice: **once at install**, and **after every restore**. Same command both times.
+**At install there is nothing to do here.** The entrypoint creates the marker on the
+first start if the file is absent: a fresh uuid, mode `644`, owner `root`. It **never**
+rewrites an existing one.
 
-**Get the volume's real name from compose — do not guess it.** Compose prefixes volume
-names with the *project* name, and it normalises that name (lower-cased, characters
-outside `[a-z0-9_-]` dropped), so a directory called `Arc.Extension` does **not** give
-the prefix you would guess. Guessing wrong is silent and expensive: `docker run -v
-<wrong-name>:/rw` **creates a brand-new empty volume**, your marker goes into it,
-compose keeps using its own empty one, and you believe detection is armed when it is
-not.
+**What stays manual — and why it cannot be automated.** During a restore the operator
+must write a **NEW** value into the marker (step 4 of the procedure below). No amount of
+entrypoint cleverness can do this: the service cannot know it was rolled back — that is
+precisely why the marker is external. A service that rewrote the marker on every start
+would erase the only evidence of its own rollback and the detector would report continuity
+after every restore. So: **create automatically, change by hand.** Do not "finish the
+automation" here.
 
-```bash
-# Ask compose itself. `config` needs no containers and works before the first `up`:
-docker compose config --format json | \
-  python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["volumes"]))'
-```
-
-If you prefer `docker volume ls`, note that the volume does not exist until compose
-creates it — so on a fresh host you must materialise it first, and `--filter name=` is
-a *substring* match that will list every project's copy on a host running more than one
-(stage + prod). Pick the row whose prefix is this project's:
+Write a fresh uuid from a root shell in the service container:
 
 ```bash
-docker compose create curator          # creates volumes without starting anything
-docker volume ls --filter name=curator_restore_marker
-```
-
-Then write a fresh uuid, mounting **that** volume read-write in a throwaway container:
-
-```bash
-# Any image with a shell works. The curator image has no USER directive, so `sh` runs
-# as root — but on a brand-new host it is not pulled yet, so `alpine` is the smaller
-# choice at install time.
-docker run --rm -v <volume-name>:/rw alpine \
-  sh -c 'cat /proc/sys/kernel/random/uuid > /rw/continuity-marker &&
-         chmod 644 /rw/continuity-marker'
+docker compose run --rm --entrypoint sh curator \
+  -c 'cat /proc/sys/kernel/random/uuid > /app/data/restore/continuity-marker &&
+      chmod 644 /app/data/restore/continuity-marker'
 ```
 
 ⚠️ **The `chmod 644` is not cosmetic — do not drop it.** You write this file as **root**,
 but the service reads it as **uid 1000**. Under a `umask 077` (common on hardened
-hosts) the redirect above creates it `600 root:root`, which uid 1000 can never read —
+hosts) a *newly created* file lands `600 root:root`, which uid 1000 can never read —
 and an unreadable marker means restore detection is **silently off**, because the
-`unreadable` state is deliberately not comparable (see the marker states above).
+`unreadable` state is deliberately not comparable (see the marker states above). The
+redirect above truncates an existing `644` file rather than creating one, so the mode
+normally survives; the `chmod` is there for the case where it does not.
 
-Verify it landed (this one *can* use the service definition — reading is all `:ro`
-allows) and check the permissions while you are there:
+Verify it landed, and check the permissions while you are there:
 
 ```bash
 docker compose run --rm --entrypoint sh curator \
-  -c 'ls -l /app/restore/continuity-marker; cat /app/restore/continuity-marker'
+  -c 'ls -l /app/data/restore/continuity-marker; cat /app/data/restore/continuity-marker'
 ```
 
 **Then confirm the service can actually read it** — the check that matters, since the
@@ -495,14 +515,22 @@ yesterday's policy with no confirmation. The `curator-restore-marker-unreadable`
 reads `0` until a pass has needed the marker, so check it after the service has been up
 for at least one `PASS_INTERVAL`.
 
-**On a NEW install, write the marker before the first `docker compose up -d`.** Once a
-pass has recorded "the marker is `missing`", creating the file later is a genuine
-change of a tracked component — a continuity break, costing one dry_run + confirmation.
+**On a NEW install there is no timing to get right any more.** The marker exists before
+the application process does: the entrypoint creates it as root, in the same startup that
+chowns `/app/data`, so the very first pass already sees a digest instead of `missing`. The
+old failure mode — a pass records "the marker is `missing`", the file appears later, and
+that appearance costs a dry_run + confirmation — is gone with the manual step.
 
 > Note this does **not** buy you a click-free first run. A brand-new install whose
 > browser has already connected takes its *own* first-run break by §7 (no stored
 > fingerprint + a populated DB), so expect one `dry_run` + confirmation regardless.
-> Writing the marker early avoids a **second**, avoidable one later.
+> Having the marker from the start avoids a **second**, avoidable one later.
+>
+> **Deleting the marker is still a thing that can happen**, so the `missing` state has
+> not gone away and the code still handles it (`clock.MARKER_MISSING`). If someone
+> removes the file while the service runs, the next pass records `missing`; the next
+> container start recreates it with a fresh uuid, and that appearance is a break like any
+> other — one `dry_run`, one click.
 
 **On an EXISTING install upgrading into this release, there is nothing to time.** The
 stored fingerprint predates the marker component, so `clock._marker_comparable` skips
@@ -530,11 +558,11 @@ from the *second* pass onwards.
    docker compose stop curator
    ```
 
-2. **Pick the copy.** Backups are `curator-<timestamp>.db` under `/app/backups`
+2. **Pick the copy.** Backups are `curator-<timestamp>.db` under `/app/data/backups`
    (nightly `VACUUM INTO`, newest last):
 
    ```bash
-   docker compose run --rm --entrypoint sh curator -c 'ls -la /app/backups'
+   docker compose run --rm --entrypoint sh curator -c 'ls -la /app/data/backups'
    ```
 
 3. **Put the copy in place** as `/app/data/curator.db`. Remove the stale WAL/SHM
@@ -543,16 +571,21 @@ from the *second* pass onwards.
 
    ```bash
    docker compose run --rm --entrypoint sh curator -c '
-     cp /app/backups/curator-<timestamp>.db /app/data/curator.db &&
+     cp /app/data/backups/curator-<timestamp>.db /app/data/curator.db &&
      rm -f /app/data/curator.db-wal /app/data/curator.db-shm &&
      chown app:app /app/data/curator.db'
    ```
 
+   ⚠️ Copy the **file**. Do not restore the volume (or a storage snapshot of it) —
+   that rolls the marker back together with the DB and the break becomes undetectable
+   (§5, "What one volume costs").
+
 4. **Write a NEW value into the marker** — the step that makes the restore
-   *detectable*. Use the command in **«Writing the marker»** above (it must mount the
-   volume read-write; `docker compose run` inherits the `:ro` mount and fails with
-   `Read-only file system`). Only the *change* matters, so a fresh uuid is enough. Do
-   this on **every** restore, including a re-restore of the same copy.
+   *detectable*, and the one step the service cannot do for you (it does not know it was
+   rolled back). Use the command in **«Writing the marker»** above. Only the *change*
+   matters, so a fresh uuid is enough. Do this on **every** restore, including a
+   re-restore of the same copy. The entrypoint will **not** do it: it only creates a
+   marker that is absent, and after step 3 the marker is still there with its old value.
 
 5. **Start the service, then immediately pause it.** The periodic driver sleeps one
    `PASS_INTERVAL` (default 5 min) *before* its first pass, and that sleep is your

@@ -54,6 +54,10 @@ _COMPARED_KEYS = ("user_version", "idle_minutes", "main_instance_id", "restore_m
 # Sentinel for "RESTORE_MARKER_PATH is configured, the file is simply NOT THERE".
 # A stable, meaningful state (distinct from ``None`` = not configured), so a marker that
 # DISAPPEARS breaks exactly once and a persistently absent one does not re-break.
+# In the container this state became hard to reach — ``entrypoint.sh`` creates the marker
+# on every start when it is absent — but it is NOT dead code: the file can be deleted (or
+# its directory emptied) while the service runs, and a pass in that window must record a
+# state rather than crash. Keep it.
 MARKER_MISSING = "missing"
 
 # Sentinel for "the read FAILED" (mount wedged, EACCES, EIO). NOT a state: it is the
@@ -71,9 +75,10 @@ _MARKER_READ_LIMIT = 4096
 
 # The marker read gets its OWN single-thread executor, never the loop's default one.
 # ``Database.read`` runs on the default executor (``asyncio.to_thread``), and that pool
-# is min(32, cpu+4) threads — six on a two-core container. The marker sits on a separate
-# mount by design, and a wedged mount makes ``open()`` an uninterruptible syscall: on the
-# shared pool, one stuck read per pass trigger (the driver, POST /api/run_pass, the pass
+# is min(32, cpu+4) threads — six on a two-core container. The marker sits on a volume
+# (the same one as the DB, or a mount of its own), and a wedged mount makes ``open()``
+# an uninterruptible syscall: on the shared pool, one stuck read per pass trigger (the
+# driver, POST /api/run_pass, the pass
 # DELETE /api/pause runs, MCP) would exhaust the pool within minutes and every
 # ``Database.read`` — the whole HTTP API, /metrics, /api/state, MCP — would block behind
 # it. Isolated here, the damage is capped at this one thread; later reads queue behind it
@@ -128,11 +133,19 @@ def read_restore_marker(path: str | None) -> str | None:
     ``relocate`` rows are stale and its rules are yesterday's. The marker therefore
     has to sit OUTSIDE the file that gets restored.
 
-    **Operator contract.** ``RESTORE_MARKER_PATH`` names a small file on the service's
-    own volume — NOT inside the DB and NOT part of the DB backup — whose content is a
-    fresh uuid written on EVERY restore, e.g.::
+    **Operator contract.** ``RESTORE_MARKER_PATH`` names a small file that is NOT the DB
+    and NOT part of a DB backup copy (in the shipped deployment it sits beside them on
+    the same volume, ``/app/data/restore/continuity-marker`` — the separation that
+    matters is at file level, since the documented procedure restores the DB *file*).
+    Its content is a fresh uuid written on EVERY restore, e.g.::
 
-        uuidgen > "$RESTORE_MARKER_PATH"      # once at install, and after each restore
+        uuidgen > "$RESTORE_MARKER_PATH"      # after each restore
+
+    The container creates the file itself on first start (``entrypoint.sh``), with a
+    fresh uuid and never overwriting an existing one — so at install there is nothing to
+    do. Rewriting it on a restore stays an OPERATOR action and cannot be automated: the
+    service has no way to know it was rolled back, which is the whole reason the marker
+    is external.
 
     Only the CHANGE matters, so any stable-then-rewritten token works; a uuid is just
     the cheapest collision-free one. (The restore procedure itself is documented in
@@ -140,12 +153,12 @@ def read_restore_marker(path: str | None) -> str | None:
     the one its stored fingerprint recorded => continuity break => the first pass is a
     ``dry_run`` awaiting a click.
 
-    **Blocking I/O — call it OUTSIDE any ``Database`` transaction.** The marker lives on
-    its own mount by design, and a wedged mount turns ``open()`` into an uninterruptible
-    syscall; run inside a writer ``fn(conn)`` that would hold the single writer thread
-    and the global write lock for the duration. The runner reads it ONCE per pass, in a
-    worker thread, and passes the VALUE down (which also guarantees the pass compares
-    and stores the same digest — reading twice could swallow a break landing between).
+    **Blocking I/O — call it OUTSIDE any ``Database`` transaction.** A wedged mount turns
+    ``open()`` into an uninterruptible syscall; run inside a writer ``fn(conn)`` that
+    would hold the single writer thread and the global write lock for the duration. The
+    runner reads it ONCE per pass, in a worker thread, and passes the VALUE down (which
+    also guarantees the pass compares and stores the same digest — reading twice could
+    swallow a break landing between).
 
     Return values — each is a recorded STATE, and a break is a CHANGE between two of
     them (never "the value is bad"):

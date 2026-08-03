@@ -105,19 +105,22 @@ class Settings(BaseSettings):
     # but switching detection on or off later is a break like any other fingerprint
     # config change (deliberate — a silent switch-OFF would drop restore detection with
     # no signal; see clock.is_continuity_break). When set, it must point at a small file
-    # on a
-    # volume that is NOT part of the DB backup, holding a fresh uuid written on every
-    # restore — see src/curator/clock.read_restore_marker for the operator contract and
-    # deploy/DEPLOY.md for the procedure. No default path: an invented one would either
-    # never exist (silently disabling the detector) or accidentally sit inside the
-    # backup (detecting nothing).
+    # that is NOT the DB and NOT inside the backup copies, holding a fresh uuid
+    # written on every restore — see src/curator/clock.read_restore_marker for the
+    # operator contract and deploy/DEPLOY.md for the procedure. In prod the shipped
+    # compose file points it at /app/data/restore/continuity-marker: the same volume as
+    # the DB, but its own file (the container entrypoint creates it once and never
+    # rewrites it). No default path: an invented one would either never exist (silently
+    # disabling the detector) or accidentally sit inside the backup (detecting nothing).
     restore_marker_path: str = ""
 
     # --- Non-secret infra defaults ----------------------------------------------
     log_level: str = "INFO"
     db_path: str = "data/curator.db"  # all mutable state lives under data/
-    # Backups mount on a volume separate from the DB (§12); default under data/ for
-    # dev, overridable via BACKUP_DIR in prod.
+    # Backups live under data/ beside the DB — one volume for all mutable state, in
+    # prod BACKUP_DIR=/app/data/backups (deploy/DEPLOY.md §5). They therefore share
+    # free space with the DB; `curator-backup-stale` is the alert that surfaces a
+    # copy that stopped landing.
     backup_dir: str = "data/backups"
     host: str = "0.0.0.0"
     port: int = 8000

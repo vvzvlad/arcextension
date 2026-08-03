@@ -5,17 +5,15 @@
 # no inbound port, drop `networks`, the Traefik labels and the healthcheck.
 
 volumes:
+  # ONE volume for all mutable state (project convention: "all mutable state goes
+  # under data/"). Inside it: the DB (/app/data/curator.db), the nightly backup copies
+  # (/app/data/backups) and the continuity marker (/app/data/restore/continuity-marker).
+  # What that costs, spelled out in deploy/DEPLOY.md §5: backups now share free space
+  # with the DB, and a rollback of the VOLUME AS A WHOLE (a storage snapshot) rolls the
+  # marker back with the DB and is therefore undetectable. The documented restore
+  # procedure (§8) puts back the DB FILE, not the volume — the marker survives it and
+  # the detector works.
   curator:
-  # Backup copies mount on a SEPARATE volume from the DB (§12): a full DB volume
-  # must not also swallow the nightly VACUUM INTO copies, and a copy volume can be
-  # snapshotted / off-boxed independently.
-  curator_backups:
-  # The restore marker lives on its OWN volume — outside the DB and outside the
-  # backups (§7). That separation IS the mechanism: any value kept inside the DB
-  # travels inside the backup, so a restore would bring the old value back with it
-  # and look perfectly continuous. Only a marker that stays put while the DB rolls
-  # back can turn "restored from backup" into a detectable continuity break.
-  curator_restore_marker:
 
 networks:
   docker_main_net:
@@ -31,21 +29,18 @@ services:
     container_name: curator
     restart: always
     # The app runs as non-root user `app` (uid 1000): the entrypoint starts as
-    # root, chowns /app/data and drops privileges via gosu. Setting a
-    # `user: "UID:GID"` override here makes the entrypoint skip the chown —
-    # the volume must then already be owned by that uid.
+    # root, chowns /app/data, creates the continuity marker if it is missing and
+    # drops privileges via gosu. Setting a `user: "UID:GID"` override here makes the
+    # entrypoint skip the chown (the volume must then already be owned by that uid)
+    # and leaves the marker owned by that uid instead of root.
     security_opt:
       - no-new-privileges:true   # forbids privilege escalation via setuid binaries; compatible with gosu (it only drops privileges)
     # Optional hardening. The cap_add list is the minimum the root entrypoint
-    # needs (chown -R the volume + gosu setuid/setgid drop):
+    # needs (chown -R the volume + the marker chown/chmod + gosu setuid/setgid drop):
     # cap_drop: [ALL]
     # cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID]
     volumes:
       - curator:/app/data              # all mutable state survives restart/update
-      - curator_backups:/app/backups   # backup copies on a SEPARATE volume (§12)
-      # Read-only for the service: the OPERATOR writes the marker during a restore
-      # (deploy/DEPLOY.md §8), the curator only fingerprints its contents.
-      - curator_restore_marker:/app/restore:ro
     environment:
       # Under enrollment (§13) there is NO shared /ext token: METRICS_TOKEN is read-only
       # for /metrics; ADMIN_TOKEN opens /admin (enrollment), /api/* (human/agent caller)
@@ -54,16 +49,20 @@ services:
       # during enrollment, not by any value set here.
       METRICS_TOKEN: YYY
       ADMIN_TOKEN: ZZZ
-      # Backups live on the separate curator_backups volume above, NOT under
-      # /app/data. The entrypoint mkdir+chowns this path before dropping to `app`.
-      BACKUP_DIR: /app/backups
-      # Continuity marker (§7). Its CONTENTS join the curator's continuity
-      # fingerprint, so changing them is what makes the first pass after a restore a
-      # dry_run awaiting confirmation instead of one that acts on yesterday's rules
-      # and stale `relocate` rows. An absent file is a stable value, not an error —
-      # on a fresh deploy the marker simply does not exist yet. The restore
-      # procedure (DEPLOY.md §8) writes a NEW unique value here.
-      RESTORE_MARKER_PATH: /app/restore/continuity-marker
+      # Backups live INSIDE the single volume, under the DB directory. They therefore
+      # share free space with the DB — `curator-backup-stale` is what tells you the
+      # nightly copy stopped landing (DEPLOY.md §5).
+      BACKUP_DIR: /app/data/backups
+      # Continuity marker (§7), also inside the single volume but OUTSIDE the DB file
+      # and OUTSIDE the backup copies — which is what the detector actually needs: any
+      # value kept inside the DB travels inside the backup, so a restored DB would look
+      # perfectly continuous. Its CONTENTS join the continuity fingerprint, so changing
+      # them is what makes the first pass after a restore a dry_run awaiting
+      # confirmation instead of one that acts on yesterday's rules and stale `relocate`
+      # rows. The entrypoint creates this file with a fresh uuid on the first start and
+      # never rewrites it; the restore procedure (DEPLOY.md §8) writes a NEW unique
+      # value here — that step stays manual on purpose.
+      RESTORE_MARKER_PATH: /app/data/restore/continuity-marker
       TZ: Europe/Moscow
     networks:
       - docker_main_net
