@@ -2,7 +2,7 @@
 
 The intricate endpoint of Фаза 4. Structure (per the brief / §10):
 
-1. Auth (Bearer ``EXT_TOKEN``) then ``require_operational`` (503 if degraded).
+1. Auth (:func:`require_api_caller`, §35 §4) then ``require_operational`` (503 if degraded).
 2. Load the original action; refuse if it has no source instance/url.
 3. Freshness (§6 out-of-pass): the source instance must be ``connected=1``, its
    ``session_id`` unchanged, and ``snapshot_at`` fresher than ``STATE_FRESH_MS`` —
@@ -38,8 +38,9 @@ from starlette.responses import JSONResponse
 
 from src.api.freshness import _now_ms, ensure_fresh, is_fresh, request_snapshot
 from src.api.guards import (
+    initiator_for,
     read_force_body,
-    require_ext_token,
+    require_api_caller,
     require_not_paused,
     require_operational,
 )
@@ -227,6 +228,7 @@ def _record_restore(
     now: int,
     until: int,
     detail: str = "restore",
+    initiator: str = "user",
 ) -> int:
     """Atomic DB side of restore. Returns the new restore action's id.
 
@@ -250,14 +252,15 @@ def _record_restore(
             # Exemption on BOTH sides — source (above) AND target (here).
             _upsert_exemption(conn, target, url, until)
 
-    # (c) the restore action row (§10: kind='restore', initiator='user',
-    # origin_action_id = the restored row). instance_to = where it was reopened.
+    # (c) the restore action row (§10: kind='restore', origin_action_id = the restored
+    # row). instance_to = where it was reopened. ``initiator`` is 'user' for the human
+    # (instance secret) or 'admin' for an ADMIN_TOKEN caller (§35 §5).
     restore_id = insert_action(
         conn,
         ts=now,
         kind="restore",
         status="done",
-        initiator="user",
+        initiator=initiator,
         origin_action_id=orig["id"],
         instance_from=instance_from,
         instance_to=instance_from,
@@ -396,7 +399,7 @@ async def restore_row(
     restore_id = await db.write(
         lambda c: _record_restore(
             c, orig, instance_from, url, url_norm, new_tab_id, session_now, now, until,
-            detail,
+            detail, initiator,
         )
     )
     return {
@@ -409,13 +412,14 @@ async def restore_row(
 
 # --- the endpoint -----------------------------------------------------------
 async def restore_action(request: Request) -> JSONResponse:
-    require_ext_token(request)      # 401 before anything else
+    caller = await require_api_caller(request)  # 401 before anything else
     require_operational(request)    # 503 in degraded mode
     # §7: a pause silences ALL automation, but restore is one of the human's OWN
     # buttons, so an explicit `force:true` in the body may cross the gate. Read the
-    # body BEFORE the gate so the flag can be seen.
+    # body BEFORE the gate so the flag can be seen. force is honoured only for the
+    # instance caller (the human at the startpage); an admin's force cannot cross (§35 §4).
     body = await read_force_body(request)
-    forced = body.get("force") is True
+    forced = body.get("force") is True and caller.kind == "instance"
     await require_not_paused(request, force=forced)
 
     action_id = request.path_params["action_id"]
@@ -423,7 +427,9 @@ async def restore_action(request: Request) -> JSONResponse:
     if orig is None:
         raise HTTPException(status_code=404, detail=f"action {action_id} not found")
 
-    res = await restore_row(request.app, orig, forced=forced)
+    res = await restore_row(
+        request.app, orig, initiator=initiator_for(caller), forced=forced
+    )
     if res["restored"]:
         return JSONResponse(
             {"ok": True, "restored": True, "action_id": res["action_id"], "tab_id": res["tab_id"]}

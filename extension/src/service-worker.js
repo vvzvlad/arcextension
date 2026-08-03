@@ -18,7 +18,13 @@ import {
 import { buildSnapshot } from "./snapshot.js";
 import { chromeEnv, Connection } from "./connection.js";
 import { enqueueOp, flushQueue } from "./quicklinks.js";
-import { TICK_MS, RECONNECT_ALARM, TICK_ALARM } from "./constants.js";
+import {
+  TICK_MS,
+  RECONNECT_ALARM,
+  TICK_ALARM,
+  INSTANCE_ID_KEY,
+  BROWSER_NAME_KEY,
+} from "./constants.js";
 
 const now = () => Date.now();
 
@@ -38,13 +44,19 @@ const logFail = (p) => {
 const connection = new Connection(chromeEnv(), { buildSnapshot });
 
 // Quick-links queue env (§6/§10): the SW owns the durable offline op queue and its
-// flush. Injected deps mirror connection.js's chromeEnv so both sides read
-// instance.json + storage.local the same way.
+// flush. The credential moved off instance.json onto the SW (§7): the `/api/*` Bearer
+// is now the RAW instance secret (slice C / option A — the server hashes it), and the
+// address is the operator setting in storage.local. quicklinks.js still reads
+// `config.serviceUrl` + `config.token`, so we synthesize that shape from the
+// connection's resolved address + raw secret.
 function quickLinksEnv() {
   return {
     getInstanceConfig: async () => {
-      const resp = await fetch(chrome.runtime.getURL("instance.json"));
-      return await resp.json();
+      await connection.init();
+      return {
+        serviceUrl: await connection._resolveAddress(),
+        token: await connection._apiSecret(), // slice C: the /api credential IS the raw secret
+      };
     },
     storageLocalGet: (key) => chrome.storage.local.get(key),
     storageLocalSet: (obj) => chrome.storage.local.set(obj),
@@ -149,12 +161,57 @@ flushQueue(quickLinksEnv()).catch((e) =>
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message !== "object") return false;
   if (message.type === "get_identity") {
-    connection.init().then(() => {
-      sendResponse({
-        instanceId: connection.config && connection.config.instanceId,
-        title: connection.config && connection.config.title,
+    // Identity moved off instance.json (§7): the id is SERVER-assigned (learned from a
+    // successful hello_ack, stored durably) and the title is the operator's browser
+    // name. Both are read from storage.local so a cold worker still answers.
+    connection
+      .init()
+      .then(async () => {
+        const idGot = await chrome.storage.local.get(INSTANCE_ID_KEY);
+        const nameGot = await chrome.storage.local.get(BROWSER_NAME_KEY);
+        sendResponse({
+          instanceId: (idGot && idGot[INSTANCE_ID_KEY]) || null,
+          title:
+            (nameGot && nameGot[BROWSER_NAME_KEY]) ||
+            (connection.config && connection.config.title) ||
+            null,
+        });
+      })
+      .catch((e) => {
+        console.error("[ext] get_identity failed:", e);
+        sendResponse({ instanceId: null, title: null });
       });
-    });
+    return true; // async response
+  }
+  if (message.type === "get_credential") {
+    // The startpage/popup ask the SW for the /api base + Bearer (§7): the address
+    // setting + the RAW instance secret (slice C / option A). The raw secret crosses only
+    // SW->page in-process, then the TLS'd /api call — the server hashes it on receipt.
+    connection
+      .init()
+      .then(async () => {
+        sendResponse({
+          serviceUrl: await connection._resolveAddress(),
+          secret: await connection._apiSecret(),
+        });
+      })
+      .catch((e) => {
+        console.error("[ext] get_credential failed:", e);
+        sendResponse({ serviceUrl: null, secret: null });
+      });
+    return true; // async response
+  }
+  if (message.type === "submit_enrollment") {
+    // The operator entered a window code in the settings UI and pressed submit (§7):
+    // generate the secret if needed, mark the request pending, and send the
+    // enroll_request now. Approval is learned later by a successful hello (acc 5).
+    connection
+      .submitEnrollment(message.code)
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => {
+        console.error("[ext] submit_enrollment failed:", e);
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      });
     return true; // async response
   }
   if (message.type === "get_connection_state") {

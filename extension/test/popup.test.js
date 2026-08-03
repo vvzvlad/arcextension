@@ -317,3 +317,39 @@ describe("init: build -> preview -> save", () => {
     expect(doc.els.status.textContent).toContain("Cannot build a rule");
   });
 });
+
+// --- §7: the popup prefers the SW credential (raw secret Bearer) over instance.json ---
+describe("loadPopupContext (§7)", () => {
+  it("uses get_credential + get_identity from the SW (the RAW secret is the /api Bearer)", async () => {
+    const { loadPopupContext } = await import("../pages/popup.js");
+    const chromeApi = {
+      runtime: {
+        getURL: (p) => "chrome-extension://mock/" + p,
+        sendMessage: async (msg) => {
+          if (msg.type === "get_credential") return { serviceUrl: "wss://curator/", secret: "raw-abc" };
+          if (msg.type === "get_identity") return { instanceId: "srv-7" };
+          return null;
+        },
+      },
+    };
+    // fetch must NOT be consulted when the SW answers.
+    const fetchFn = vi.fn();
+    const ctx = await loadPopupContext(chromeApi, fetchFn);
+    expect(ctx).toEqual({ base: "https://curator", token: "raw-abc", instanceId: "srv-7" });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("falls back to instance.json when the SW has no credential yet", async () => {
+    const { loadPopupContext } = await import("../pages/popup.js");
+    const chromeApi = {
+      runtime: {
+        getURL: (p) => "chrome-extension://mock/" + p,
+        sendMessage: async () => null, // SW channel empty (pre-enrollment)
+      },
+    };
+    const fetchFn = vi.fn(async () => ({ json: async () => ({ serviceUrl: "wss://host.example/", token: "tok", instanceId: "prox" }) }));
+    const ctx = await loadPopupContext(chromeApi, fetchFn);
+    expect(ctx).toEqual({ base: "https://host.example", token: "tok", instanceId: "prox" });
+    expect(fetchFn).toHaveBeenCalled();
+  });
+});

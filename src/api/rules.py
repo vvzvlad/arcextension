@@ -1,6 +1,7 @@
 """``/api/rules`` CRUD + ``/api/rules/preview`` + ``/api/rules/:id/reset`` (§8, §10).
 
-Every route is Bearer-authed (``EXT_TOKEN``) and refuses degraded mode. The
+Every route is authed via ``require_api_caller`` (Bearer ADMIN_TOKEN or an instance
+secret — §35 §4) and refuses degraded mode. The
 mutating routes (POST/PUT/DELETE) run the SAME server-side preview and require
 ``confirm_impact`` when the change is momentous (§8):
 
@@ -38,7 +39,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from src.api.freshness import ensure_fresh
-from src.api.guards import require_ext_token, require_not_paused, require_operational
+from src.api.guards import require_api_caller, require_not_paused, require_operational
 from src.curator.decide import survivor_key
 from src.db.actions import insert_action, normalize_url
 from src.ext import protocol
@@ -266,7 +267,7 @@ async def _validate_instance_or_422(request: Request, instance_id) -> None:
 
 # --- GET /api/rules ---------------------------------------------------------
 async def list_rules(request: Request) -> JSONResponse:
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     rows = await request.app.state.db.read(access.list_rules)
     return JSONResponse({"rules": [_rule_to_dict(r) for r in rows]})
@@ -279,7 +280,7 @@ async def get_rule(request: Request) -> JSONResponse:
     The body is EXACTLY the object ``GET /api/rules`` puts in its ``rules`` array —
     same mapper, so an editor that fetched the list and one that fetched a single rule
     can never see two shapes. 404 when there is no such rule."""
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     rule_id = request.path_params["rule_id"]
     row = await request.app.state.db.read(lambda c: access.get_rule(c, rule_id))
@@ -290,7 +291,7 @@ async def get_rule(request: Request) -> JSONResponse:
 
 # --- POST /api/rules --------------------------------------------------------
 async def create_rule(request: Request) -> JSONResponse:
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     await require_not_paused(request)  # 423 while paused — a rule edit mutates (§7)
     body = await _body(request)
@@ -322,7 +323,7 @@ async def create_rule(request: Request) -> JSONResponse:
 
 # --- PUT /api/rules/:id -----------------------------------------------------
 async def update_rule(request: Request) -> JSONResponse:
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     await require_not_paused(request)  # 423 while paused (§7)
     rule_id = request.path_params["rule_id"]
@@ -356,7 +357,7 @@ async def update_rule(request: Request) -> JSONResponse:
 
 # --- DELETE /api/rules/:id --------------------------------------------------
 async def delete_rule(request: Request) -> JSONResponse:
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     await require_not_paused(request)  # 423 while paused (§7)
     rule_id = request.path_params["rule_id"]
@@ -380,7 +381,7 @@ async def delete_rule(request: Request) -> JSONResponse:
 
 # --- POST /api/rules/preview ------------------------------------------------
 async def preview_rule(request: Request) -> JSONResponse:
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     body = await _body(request)
     op = body.get("op", "create")
@@ -618,7 +619,7 @@ async def reset_rule(request: Request) -> JSONResponse:
     (§8: «`canonical_url` применяется только ручным действием `reset`; проход
     содержимое вкладок не меняет»). Delegates to :func:`perform_reset` — the same core
     the MCP ``reset_singleton`` tool runs, so the two cannot drift."""
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
     await require_not_paused(request)  # 423 while paused (§7)
     rule_id = request.path_params["rule_id"]

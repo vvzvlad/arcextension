@@ -13,13 +13,22 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import (
+    _recv,
+    approve_instance,
+    instance_headers,
+    make_settings,
+    secret_for,
+)
 from starlette.testclient import TestClient
 
 from src.app import create_app
 
-EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
@@ -47,9 +56,12 @@ def _q_one(db_path, sql, params=()):
 
 
 def _connect(client, instance_id="prox", session="sess-1", db_path=None):
+    # Secret-based hello (issue #35): approve the instance (Task E) before it can hello.
+    approve_instance(db_path, instance_id)
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json({
-        "type": "hello", "protocolVersion": 1, "token": EXT_TOKEN,
+        "type": "hello", "protocolVersion": 1,
+        "secret": secret_for(instance_id),
         "instanceId": instance_id, "installUuid": f"u-{instance_id}",
         "origin": "chrome-extension://abc", "title": "T",
         "sessionId": session, "allowExecuteJs": False,
@@ -156,9 +168,14 @@ def test_http_and_mcp_share_one_implementation(tmp_path):
     instances_api.merge_windows = _fake_core
     try:
         app = create_app(_settings(tmp_path))
+        db_path = str(tmp_path / "curator.db")
         with TestClient(app) as client:
+            # Authenticate the HTTP call as instance 'prox' so its initiator is 'user'
+            # (the human), the value this test contrasts with the MCP tool's 'mcp'.
+            approve_instance(db_path, "prox")
             assert client.post(
-                "/api/instances/prox/merge_windows", headers=AUTH
+                "/api/instances/prox/merge_windows",
+                headers=instance_headers(secret_for("prox")),
             ).json() == {"merged": 7}
 
             import asyncio
@@ -238,8 +255,12 @@ def test_merge_windows_force_crosses_the_pause_and_is_journaled(tmp_path):
         try:
             _set_setting(db_path, "pause_until", str(int(time.time() * 1000) + 3_600_000))
             pool = ThreadPoolExecutor(1)
+            # force is honoured only for the INSTANCE caller (the human at the §9 button,
+            # §35 §4) — authenticate as prox with its RAW secret, not as admin.
             fut = pool.submit(lambda: client.post(
-                "/api/instances/prox/merge_windows", headers=AUTH, json={"force": True}
+                "/api/instances/prox/merge_windows",
+                headers=instance_headers(secret_for("prox")),
+                json={"force": True},
             ))
             cmd = _recv(ws)                 # the pause did NOT stop it
             assert cmd["command"] == "merge_windows"
@@ -256,6 +277,34 @@ def test_merge_windows_force_crosses_the_pause_and_is_journaled(tmp_path):
             assert instance_from == "prox" and pass_id is None
             payload = json.loads(detail)
             assert payload == {"manual": True, "merged": 2, "force": True}
+        finally:
+            ws.__exit__(None, None, None)
+
+
+def test_admin_authenticated_merge_writes_initiator_admin(tmp_path):
+    """§35 §5: an ``/api/*`` merge authenticated by ADMIN_TOKEN journals
+    ``initiator='admin'`` — distinct from the instance caller's 'user' (the force test
+    above) and the MCP tool's 'mcp' (the share test). Reddens if the endpoint stops
+    deriving initiator from the caller kind."""
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect(client, db_path=db_path)  # instance 'prox' active + connected
+        try:
+            pool = ThreadPoolExecutor(1)
+            # AUTH is the admin credential; admin may merge any instance.
+            fut = pool.submit(
+                lambda: client.post("/api/instances/prox/merge_windows", headers=AUTH)
+            )
+            cmd = _recv(ws)
+            assert cmd["command"] == "merge_windows"
+            ws.send_json({"type": "response", "id": cmd["id"], "ok": True,
+                          "result": {"merged": 1}})
+            assert fut.result(timeout=5).status_code == 200
+            rows = _actions(db_path)
+            assert len(rows) == 1
+            kind, status, initiator, instance_from, pass_id, detail = rows[0]
+            assert (kind, status, initiator) == ("window_merge", "done", "admin")
         finally:
             ws.__exit__(None, None, None)
 

@@ -15,6 +15,8 @@ import {
   enqueueQuickLinkOp,
   fetchRules,
   fetchState,
+  getConnectionState,
+  getCredential,
   getIdentity,
   httpBaseFromServiceUrl,
   loadInstanceConfig,
@@ -48,6 +50,14 @@ export function createStore(deps = {}) {
   const offline = ref(false);
   const search = ref("");
   const fallbackMessage = ref("");
+  // Enrollment (§7): the SW's durable-fact state + whether an address is configured.
+  // The status bar shows "ожидает одобрения" / "отозван" / "адрес не настроен" from
+  // these; connectivity itself stays with /api/state (offline/instances).
+  const enrollState = ref("needs-enroll");
+  const hasAddress = ref(false);
+  // The last enroll_rejected reason (bad_code/closed/capacity/…), so a pending banner
+  // shows WHY instead of an eternal "ожидает одобрения" (§7).
+  const enrollReject = ref(null);
 
   // --- the clock (§10) ------------------------------------------------------
   // Every timestamp the server hands us — snapshot_at, last_seen_at, paused_until — is
@@ -219,6 +229,30 @@ export function createStore(deps = {}) {
     })),
   );
 
+  // The OWN-instance enroll banner (§7). Only the non-connected enroll states are
+  // surfaced here; an approved instance shows nothing (its connectivity is the normal
+  // /api/state status rows). `null` => no banner. acc 13: a fresh profile with no
+  // address → "адрес не настроен", sourced from getConnectionState (not /api/state).
+  const enrollStatus = computed(() => {
+    if (!hasAddress.value) {
+      return { state: "no-address", label: "адрес не настроен" };
+    }
+    switch (enrollState.value) {
+      case "pending":
+        return enrollReject.value
+          ? { state: "pending", label: "заявка отклонена: " + enrollReject.value }
+          : { state: "pending", label: "ожидает одобрения" };
+      case "revoked":
+        return { state: "revoked", label: "отозван" };
+      case "quarantined":
+        return { state: "quarantined", label: "неизвестный инстанс — требуется повторная регистрация" };
+      case "needs-enroll":
+        return { state: "needs-enroll", label: "не зарегистрирован" };
+      default:
+        return null; // approved / unknown → the normal status rows speak
+    }
+  });
+
   // --- lifecycle ------------------------------------------------------------
   async function init() {
     // Identity first so foreign filtering is correct; a failure just leaves own
@@ -226,14 +260,36 @@ export function createStore(deps = {}) {
     const ident = await getIdentity(chromeApi);
     if (ident && ident.instanceId) ownInstanceId.value = ident.instanceId;
 
+    // Enroll state + address presence from the SW (durable facts, §7). Read first so
+    // the status bar can show "адрес не настроен" / "ожидает одобрения" on the very
+    // first paint even before any /api/state round-trip (acc 13).
+    const cs = await getConnectionState(chromeApi);
+    if (cs) {
+      if (cs.enrollState) enrollState.value = cs.enrollState;
+      hasAddress.value = !!cs.hasAddress;
+      enrollReject.value = cs.enrollReject ?? null;
+    }
+
     // Config (base + token) for the background refresh; a failure keeps us offline.
-    try {
-      const config = await loadInstanceConfig(chromeApi, fetchFn);
-      base = httpBaseFromServiceUrl(config.serviceUrl);
-      token = config.token;
-    } catch {
-      base = null;
-      token = null;
+    // PREFER the SW credential (§7): the address setting + the RAW instance secret
+    // (slice C / option A — the /api Bearer IS the raw secret; the server hashes it).
+    // Fall back to a bundled instance.json only when the SW channel has nothing
+    // (pre-enrollment / bootstrap).
+    const cred = await getCredential(chromeApi);
+    if (cred && cred.serviceUrl && cred.secret) {
+      base = httpBaseFromServiceUrl(cred.serviceUrl);
+      token = cred.secret;
+      hasAddress.value = true;
+    } else {
+      try {
+        const config = await loadInstanceConfig(chromeApi, fetchFn);
+        base = httpBaseFromServiceUrl(config.serviceUrl);
+        token = config.token;
+        if (config.serviceUrl) hasAddress.value = true;
+      } catch {
+        base = null;
+        token = null;
+      }
     }
 
     // FIRST PAINT — local sources only (§10). Own tabs + the cache; never blank.
@@ -619,6 +675,10 @@ export function createStore(deps = {}) {
     offline,
     search,
     fallbackMessage,
+    // enrollment (§7)
+    enrollState,
+    hasAddress,
+    enrollReject,
     // clock (§10)
     clockTick,
     serverOffset,
@@ -646,6 +706,7 @@ export function createStore(deps = {}) {
     foreignTabGroups,
     foreignGroups,
     statusRows,
+    enrollStatus,
     invalidRules,
     // methods
     init,

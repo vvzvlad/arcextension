@@ -4,7 +4,8 @@ Body (all optional): ``{dry_run?: bool, confirm_pending?: bool}``. ``dry_run`` t
 the lease, requests snapshots and returns the plan WITHOUT writing actions and is NOT
 muted by a pause (looking at the plan is exactly why a pause is taken).
 ``confirm_pending`` confirms the deferred plan armed by a pause expiry or a
-continuity break. Bearer ``EXT_TOKEN``; refuses degraded mode.
+continuity break. Authed via ``require_api_caller`` (Bearer ADMIN_TOKEN or an instance
+secret — §35 §4); refuses degraded mode.
 """
 
 from __future__ import annotations
@@ -13,12 +14,12 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_api_caller, require_operational
 from src.curator import runner
 
 
 async def run_pass_endpoint(request: Request) -> JSONResponse:
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
 
     body: dict = {}

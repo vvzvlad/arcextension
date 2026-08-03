@@ -362,15 +362,22 @@ def test_clock_step_seconds_from_settings(tmp_path):
 
 # --- auth-rejections counter increments -------------------------------------
 def test_auth_rejections_counter_increments(tmp_path):
+    # `curator_auth_rejections_total` is now a LABELED counter family (one series per
+    # {reason}); a rejected /metrics scrape lands under reason="metrics_token". Reddens if
+    # the reason label is dropped (the by-label lookup returns None) or the count breaks.
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
-        before = _scalar(_scrape(client), "curator_auth_rejections_total")
+        before = _by_label(
+            _scrape(client), "curator_auth_rejections_total", "reason", "metrics_token"
+        ) or 0.0
         # One rejected request (wrong token) between two good scrapes.
         assert client.get(
             "/metrics", headers={"Authorization": "Bearer wrong"}
         ).status_code == 401
-        after = _scalar(_scrape(client), "curator_auth_rejections_total")
-        assert after >= before + 1
+        after = _by_label(
+            _scrape(client), "curator_auth_rejections_total", "reason", "metrics_token"
+        )
+        assert after is not None and after >= before + 1
 
 
 # --- degraded mode still serves /metrics ------------------------------------

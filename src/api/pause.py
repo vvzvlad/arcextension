@@ -14,7 +14,8 @@ the MCP ``pause`` / ``resume`` tools.
   immediately: a human at the keyboard wants the backlog handled now, unlike a timeout
   expiry which defers behind a click (§7). Also NOT gated (it is a resume verb).
 
-Bearer ``EXT_TOKEN``; both refuse degraded mode (``require_operational``).
+authed via ``require_api_caller`` (Bearer ADMIN_TOKEN or an instance secret — §35 §4);
+both refuse degraded mode (``require_operational``).
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.api.guards import require_ext_token, require_operational
+from src.api.guards import require_api_caller, require_operational
 from src.curator import pause as pause_ops
 from src.curator import runner
 from src.db.settings_store import get_setting
@@ -37,7 +38,7 @@ def _now_ms() -> int:
 
 async def pause_endpoint(request: Request) -> JSONResponse:
     """``POST /api/pause`` — arm/extend a finite pause. NOT behind the pause gate."""
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
 
     body: dict = {}
@@ -94,7 +95,7 @@ async def resume_now(app) -> dict:
 
 async def resume_endpoint(request: Request) -> JSONResponse:
     """``DELETE /api/pause`` — manual resume (TTL shift + clear) then run a pass now."""
-    require_ext_token(request)
+    await require_api_caller(request)
     require_operational(request)
 
     outcome = await resume_now(request.app)

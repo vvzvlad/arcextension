@@ -63,8 +63,11 @@ ALLOWED_KINDS = frozenset(
 # B is in-flight), and ``undo`` skips a pending row (in-flight, nothing to reverse).
 ALLOWED_STATUSES = frozenset({"done", "failed", "deferred", "abandoned", "pending"})
 
-# Who initiated the action; orthogonal to ``kind`` (§4).
-ALLOWED_INITIATORS = frozenset({"curator", "mcp", "user"})
+# Who initiated the action; orthogonal to ``kind`` (§4). ``admin`` (issue #35 §5) is an
+# ``/api/*`` write authenticated by ADMIN_TOKEN — distinct from ``mcp`` (the MCP
+# transport), from ``user`` (the human at the startpage, authenticated by the instance
+# secret) and from ``curator`` (the autonomous pass).
+ALLOWED_INITIATORS = frozenset({"curator", "mcp", "user", "admin"})
 
 # Column order for the INSERT below — kept next to the SQL so the two never drift.
 _ACTION_COLUMNS = (
@@ -241,3 +244,31 @@ def read_pending_closes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         "WHERE status = 'pending' "
         "AND kind IN ('relocate_close', 'dedupe_close', 'singleton_close')"
     ).fetchall()
+
+
+def read_revoked_relocations(conn: sqlite3.Connection) -> list[int]:
+    """Ids of in-flight ``relocate`` rows whose source OR target is now ``revoked``
+    (issue #35 §5 — the curator PASS retire step).
+
+    "In-flight" is EXACTLY ``mirror.load_mirror``'s liveness for ``live_relocations``: a
+    ``relocate`` that is ``done``, not restored, and has NO terminal (``done``/``pending``)
+    ``relocate_close`` (phase B neither completed nor mid-flight). A row with a PENDING
+    relocate_close is deliberately EXCLUDED — that is phase B recorded before the browser
+    close, which the reconcile step owns; a revoked source simply leaves it ``pending``
+    for retention to collect, as :func:`src.curator.phases.run_reconcile` documents.
+    Marking the returned rows ``abandoned`` retires a revoked instance's relocations so the
+    mirror stops treating them as live forever. Read-only; the caller abandons each id
+    under the lease guard, reusing :func:`mark_action_abandoned` (no parallel mechanism)."""
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT a.id FROM actions a "
+            "WHERE a.kind = 'relocate' AND a.status = 'done' "
+            "AND a.restored_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM actions rc "
+            "WHERE rc.kind = 'relocate_close' AND rc.status IN ('done', 'pending') "
+            "AND rc.origin_action_id = a.id) "
+            "AND (a.instance_from IN (SELECT id FROM instances WHERE status = 'revoked') "
+            "OR a.instance_to IN (SELECT id FROM instances WHERE status = 'revoked'))"
+        ).fetchall()
+    ]

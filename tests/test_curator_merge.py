@@ -281,8 +281,8 @@ class _Ext:
         self.windows[iid] = windows
         self.focused[iid] = focused
         await self.db.write(lambda c: c.execute(
-            "INSERT INTO instances (id, conn_epoch, connected, session_id) "
-            "VALUES (?, 1, 1, ?)", (iid, session)))
+            "INSERT INTO instances (id, conn_epoch, connected, session_id, status) "
+            "VALUES (?, 1, 1, ?, 'active')", (iid, session)))
 
     def _snapshot(self, iid, rid):
         return {

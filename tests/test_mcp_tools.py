@@ -87,8 +87,8 @@ async def _run_with_response(coro_factory, cs, ws, response_result):
 async def _insert_instance(db, iid, *, session_id=None, snapshot_at=None, connected=0):
     def _w(c):
         c.execute(
-            "INSERT INTO instances (id, connected, session_id, snapshot_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO instances (id, connected, session_id, snapshot_at, status) "
+            "VALUES (?, ?, ?, ?, 'active')",
             (iid, connected, session_id, snapshot_at),
         )
     await db.write(_w)

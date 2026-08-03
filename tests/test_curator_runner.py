@@ -68,12 +68,15 @@ class Ext:
         self.sessions[instance_id] = session
         self.tabs[instance_id] = list(tabs or [])
         self.focused[instance_id] = focused
-        # Seed the instances row so apply_snapshot's epoch guard passes.
+        # Seed the instances row so apply_snapshot's epoch guard passes. status='active'
+        # models an enrolled instance (issue #35): the known_instance_ids / send_command
+        # status filters only see 'active' rows.
         await self.db.write(
             lambda c: c.execute(
-                "INSERT INTO instances (id, conn_epoch, connected, session_id) "
-                "VALUES (?, ?, 1, ?) ON CONFLICT(id) DO UPDATE SET "
-                "conn_epoch=excluded.conn_epoch, connected=1, session_id=excluded.session_id",
+                "INSERT INTO instances (id, conn_epoch, connected, session_id, status) "
+                "VALUES (?, ?, 1, ?, 'active') ON CONFLICT(id) DO UPDATE SET "
+                "conn_epoch=excluded.conn_epoch, connected=1, session_id=excluded.session_id, "
+                "status='active'",
                 (instance_id, conn_epoch, session),
             )
         )
@@ -833,6 +836,67 @@ async def test_reconcile_skipped_when_source_instance_not_ready(tmp_path):
         assert res["instances_ready"] == 0
         # STILL pending: neither done nor abandoned.
         assert await _rows(db, "SELECT status FROM actions WHERE id=?", (pending_id,)) == [("pending",)]
+    finally:
+        await db.close()
+
+
+# --- revoke: retire-relocations pass step + drain cascade (issue #35 §5, acc 8) --
+async def test_revoke_retires_relocation_invalidates_rule_and_keeps_drain(tmp_path):
+    """Acceptance 8, end to end. Revoke a NON-main instance that owns a live relocation
+    and a rule; ONE pass must:
+
+      (a) mark the live relocation ``abandoned`` (the retire step) — remove the step and
+          the row stays ``done`` => reddens;
+      (b) mark the rule targeting the revoked instance ``invalid=1`` (the known_instance_ids
+          filter) — revert the filter and the revoked id leaks back in, rule stays valid
+          => reddens;
+      (c) keep the ``X -> main`` rule VALID and the drain ON — MAIN is exempt in
+          ``_revalidate_rules`` even with NO active main row here, so ``has_active_rules``
+          stays True. Drop the exemption and both rules go invalid, the drain switches off
+          => reddens.
+    """
+    from src.db.queries import revoke_instance
+    from src.rules import access as rules_access
+    from src.rules.preview import has_active_rules
+
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await ext.add_instance("prox", tabs=[])  # the ready survivor; answers snapshots
+        # 'gone' is enrolled (active) but has NO live socket — it is not registered, so it
+        # does not answer this pass's snapshot. main deliberately has NO instances row, so
+        # the X->main rule's validity rests entirely on the main exemption.
+        await db.write(lambda c: c.execute(
+            "INSERT INTO instances (id, status, session_id, connected) "
+            "VALUES ('gone', 'active', 's', 1)"))
+        await _seed_rule(db, "gone.lc", "gone")   # target = the instance we revoke
+        await _seed_rule(db, "keep.lc", "main")   # X -> main keeps the policy non-empty
+        reloc_id = await _seed_relocate(
+            db, instance_from="gone", instance_to="prox", tab_id=20,
+            session_id_from="s", tab_id_to=99, session_id_to="s",
+            url="https://gone.lc/x", url_norm="https://gone.lc/x",
+        )
+        ext.responder = lambda i, c, p: {"ok": True, "result": {}}
+
+        # Revoke 'gone' (non-main) — the transaction Task E will call.
+        rev = await db.write(
+            lambda c: revoke_instance(c, "gone", now=5000, main_instance_id="main")
+        )
+        assert rev.revoked and not rev.was_main
+        assert await _rows(
+            db, "SELECT status, session_id, revoked_at FROM instances WHERE id='gone'"
+        ) == [("revoked", None, 5000)]
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+
+        # (a) the live relocation was retired to 'abandoned' by the pass step.
+        assert await _rows(db, "SELECT status FROM actions WHERE id=?", (reloc_id,)) == [("abandoned",)]
+        # (b) the rule targeting the revoked instance is now invalid=1.
+        assert await _rows(db, "SELECT invalid FROM rules WHERE instance_id='gone'") == [(1,)]
+        # (c) the X->main rule stayed valid and the drain is still ON.
+        assert await _rows(db, "SELECT invalid FROM rules WHERE instance_id='main'") == [(0,)]
+        assert has_active_rules(await db.read(rules_access.list_rules)) is True
     finally:
         await db.close()
 

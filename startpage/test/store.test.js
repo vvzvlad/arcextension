@@ -790,3 +790,100 @@ describe("jump foreign (§10)", () => {
     expect(store.fallbackMessage.value).toContain("other");
   });
 });
+
+// --- enrollment status banner (§7) — sourced from getConnectionState, not /api/state ---
+describe("enroll status banner (§7)", () => {
+  it("acc 13: a fresh profile with NO address shows 'адрес не настроен'", async () => {
+    const env = makeChrome({
+      tabs: [],
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: { enrollState: "needs-enroll", hasAddress: false },
+        // get_credential absent -> null
+      },
+    });
+    // instance.json carries no serviceUrl either, so the fallback cannot set an address.
+    const { fetchFn } = makeFetch({ instance: {}, state: undefined });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    expect(store.hasAddress.value).toBe(false);
+    expect(store.enrollStatus.value).toEqual({ state: "no-address", label: "адрес не настроен" });
+  });
+
+  it("shows 'ожидает одобрения' from the SW enrollState (pending)", async () => {
+    const env = makeChrome({
+      tabs: [],
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: { enrollState: "pending", hasAddress: true },
+      },
+    });
+    const store = storeWith(env, makeFetch({}).fetchFn);
+    await store.init();
+    expect(store.enrollStatus.value.label).toBe("ожидает одобрения");
+  });
+
+  it("a pending request the server rejected shows WHY, not an eternal 'ожидает одобрения'", async () => {
+    const env = makeChrome({
+      tabs: [],
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: { enrollState: "pending", hasAddress: true, enrollReject: "bad_code" },
+      },
+    });
+    const store = storeWith(env, makeFetch({}).fetchFn);
+    await store.init();
+    expect(store.enrollStatus.value.label).toBe("заявка отклонена: bad_code");
+  });
+
+  it("shows 'отозван' from the SW enrollState (revoked)", async () => {
+    const env = makeChrome({
+      tabs: [],
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: { enrollState: "revoked", hasAddress: true },
+      },
+    });
+    const store = storeWith(env, makeFetch({}).fetchFn);
+    await store.init();
+    expect(store.enrollStatus.value.label).toBe("отозван");
+  });
+
+  it("an approved instance shows NO banner (the normal status rows speak)", async () => {
+    const env = makeChrome({
+      tabs: [],
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: { enrollState: "approved", hasAddress: true },
+      },
+    });
+    const store = storeWith(env, makeFetch({}).fetchFn);
+    await store.init();
+    expect(store.enrollStatus.value).toBe(null);
+  });
+
+  it("uses the SW raw secret as the /api Bearer (slice C / option A) when a credential is served", async () => {
+    const env = makeChrome({
+      tabs: [],
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_credential: { serviceUrl: "wss://curator/", secret: "rawsecret" },
+        get_connection_state: { enrollState: "approved", hasAddress: true },
+      },
+    });
+    let seenAuth = null;
+    const { fetchFn } = makeFetch({
+      state: (n) => ({ status: 200, body: { instances: [], tabs: [], quick_links: [] } }),
+    });
+    // Wrap fetch to capture the Authorization header on /api/state. Option A: the Bearer is
+    // the RAW secret (the server hashes it), NOT a client-derived sha256.
+    const wrapped = async (url, opts) => {
+      if (String(url).includes("/api/state")) seenAuth = opts && opts.headers && opts.headers.Authorization;
+      return fetchFn(url, opts);
+    };
+    const store = storeWith(env, wrapped);
+    await store.init();
+    await store.refresh();
+    expect(seenAuth).toBe("Bearer rawsecret");
+  });
+});

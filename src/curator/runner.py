@@ -26,7 +26,7 @@ from src.curator import clock as clockmod
 from src.curator import decide as decidemod
 from src.curator import lease, pause, phases
 from src.curator.mirror import load_mirror
-from src.db.actions import read_pending_closes
+from src.db.actions import read_pending_closes, read_revoked_relocations
 from src.db.settings_store import get_setting, set_setting
 from src.ext import protocol
 from src.rules import access
@@ -411,6 +411,23 @@ async def run_pass(
             )
         )
 
+        # --- retire relocations of REVOKED instances (issue #35 §5) ----------
+        # The one lease-guarded region that does NOT depend on ready_ids (§5: "единственный
+        # участок под гардом аренды, не зависящий от ready_ids"), placed AFTER
+        # _revalidate_rules and BEFORE the mirror is frozen — which is what makes it
+        # race-free against phase B: a relocation marked `abandoned` here is no longer
+        # `status='done'`, so the mirror captured just below excludes it from
+        # `live_relocations`, and `decide`/phase B never see it as a phase-B candidate.
+        # phases.py warns a retire racing phase B would journal a relocation both `closed`
+        # AND `abandoned`; running before the capture — with no other pass able to run,
+        # the lease slot — removes that race entirely. Reuses the §33 action-status helper
+        # (`mark_action_abandoned`), not a parallel mechanism. Skipped on dry_run (a
+        # dry_run writes no actions, exactly like reconcile). Per row isolated; one failed
+        # retire must not abort the pass.
+        if not effective_dry_run:
+            for reloc_id in await db.read(read_revoked_relocations):
+                await _isolated(_retire_revoked_relocation(db, epoch, reloc_id))
+
         # --- capture the frozen mirror; all decisions run against it ---------
         mirror = await db.read(load_mirror)
         ctx = phases.PassCtx(
@@ -552,6 +569,15 @@ async def run_pass(
 
 
 # --- sub-executions ----------------------------------------------------------
+async def _retire_revoked_relocation(db, epoch: int, reloc_id: int) -> None:
+    """Mark ONE live relocate row of a revoked instance ``abandoned`` (issue #35 §5),
+    under the lease guard. Reuses the §33 helper; a lost lease propagates (stopping the
+    pass), a per-row failure is isolated by :func:`_isolated`."""
+    from src.db.actions import mark_action_abandoned
+
+    await db.write(lease.guarded(epoch, lambda c: mark_action_abandoned(c, reloc_id)))
+
+
 async def _abandon(ctx, ab) -> None:
     from src.db.actions import mark_action_abandoned
 

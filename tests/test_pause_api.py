@@ -15,14 +15,25 @@ and grows once the pause has expired (the click-wait fires the alert).
 
 from types import SimpleNamespace
 
-from conftest import _recv, make_settings
+from conftest import (
+    _recv,
+    admin_headers,
+    approve_instance,
+    instance_headers,
+    make_settings,
+    secret_for,
+    secret_hash_for,
+)
 from starlette.testclient import TestClient
 
 from src.api.metrics import Snapshot, _pass_overdue_seconds
 from src.app import create_app
 
-EXT_TOKEN = "test-ext-token"
-AUTH = {"Authorization": f"Bearer {EXT_TOKEN}"}
+ADMIN_TOKEN = "test-admin-token"
+# /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
+# The generic tests here just need a valid caller, so they use the admin credential;
+# the force/pause tests that must EXECUTE a forced verb switch to an instance secret.
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def _settings(tmp_path, **over):
@@ -234,9 +245,12 @@ def _seed_instance_and_action(db_path):
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA busy_timeout = 5000")
+        # Active row WITH a secret_hash so 'main' can authenticate as an INSTANCE caller
+        # (issue #35 §4) — the force-verb tests below cross the pause only for that kind.
         conn.execute(
-            "INSERT INTO instances (id, connected, session_id, snapshot_at) "
-            "VALUES ('main', 0, 's', 0)"
+            "INSERT INTO instances (id, status, secret_hash, connected, session_id, "
+            "snapshot_at) VALUES ('main', 'active', ?, 0, 's', 0)",
+            (secret_hash_for("main"),),
         )
         aid = insert_action(
             conn, ts=1_000_000, kind="dedupe_close", status="done", initiator="curator",
@@ -263,6 +277,10 @@ def test_force_crosses_the_pause_gate_only_for_the_human_verbs(tmp_path):
         aid = _seed_instance_and_action(db_path)
         client.post("/api/pause", headers=AUTH, json={"minutes": 60})
 
+        # The human at the startpage authenticates with the INSTANCE secret (§35 §4), and
+        # force is honoured ONLY for that caller — so the forced buttons run as 'main'.
+        instance_auth = instance_headers(secret_for("main"))
+
         # Human buttons WITH force: past the gate. They then fail on their own merits
         # (no live socket => 409/502/422), which is the point — the PAUSE no longer
         # decides, so anything but 423 proves the gate was crossed.
@@ -274,13 +292,14 @@ def test_force_crosses_the_pause_gate_only_for_the_human_verbs(tmp_path):
             ("/api/instances/main/merge_windows", {"force": True}),
         ]
         for path, body in forced:
-            resp = client.post(path, headers=AUTH, json=body)
+            resp = client.post(path, headers=instance_auth, json=body)
             assert resp.status_code != 423, f"{path} should honour force:true"
 
-        # …and WITHOUT force they are still gated (force is explicit, never implied).
+        # …and WITHOUT force they are still gated (force is explicit, never implied) —
+        # same instance caller, so only the flag differs.
         for path, body in forced:
             plain = {k: v for k, v in body.items() if k != "force"}
-            resp = client.post(path, headers=AUTH, json=plain)
+            resp = client.post(path, headers=instance_auth, json=plain)
             assert resp.status_code == 423, f"{path} must stay gated without force"
 
         # NOT human buttons: force is ignored — a policy edit or an agent-shaped verb
@@ -312,10 +331,12 @@ def test_forced_restore_is_journaled_as_user_and_marked_in_detail(tmp_path):
     app = create_app(_settings(tmp_path, state_fresh_ms=3_000_000))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        approve_instance(db_path, "i1")  # secret-hello needs an approved active row (#35)
         ws = client.websocket_connect("/ext").__enter__()
         try:
             ws.send_json({
-                "type": "hello", "protocolVersion": 1, "token": EXT_TOKEN,
+                "type": "hello", "protocolVersion": 1,
+                "secret": secret_for("i1"),
                 "instanceId": "i1", "installUuid": "u", "origin": "chrome-extension://a",
                 "title": "T", "sessionId": "sess-1", "allowExecuteJs": False,
             })
@@ -343,8 +364,12 @@ def test_forced_restore_is_journaled_as_user_and_marked_in_detail(tmp_path):
 
             client.post("/api/pause", headers=AUTH, json={"minutes": 60})
             pool = ThreadPoolExecutor(1)
+            # Authenticate as instance i1 (its RAW secret): force crosses the pause and
+            # the row is written initiator='user' (the human), not 'admin' (§35 §4/§5).
             fut = pool.submit(lambda: client.post(
-                f"/api/actions/{aid}/restore", headers=AUTH, json={"force": True}
+                f"/api/actions/{aid}/restore",
+                headers=instance_headers(secret_for("i1")),
+                json={"force": True},
             ))
             cmd = _recv(ws)
             assert cmd["command"] == "open_tab"     # the pause did NOT stop it
