@@ -19,8 +19,8 @@ Security posture:
   ``http`` and deriving ``Secure`` from the request scheme would silently drop it in prod) +
   ``SameSite=Strict`` + ``Path=/admin``.
 * **``GET /admin`` is behind the auth guard** (:func:`src.api.admin.require_admin`) — an
-  unauthenticated hit is a 401 pointing at the login form, never a secret leak (acc 1). The
-  login/asset routes are public.
+  unauthenticated hit never receives the console, only a 303 to the public login form
+  (acc 1); the JSON API keeps answering a flat 401. The login/asset routes are public.
 """
 
 from __future__ import annotations
@@ -32,13 +32,14 @@ from pathlib import Path
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from src.api import admin_session
 from src.api.admin import require_admin
 from src.api.auth_metrics import auth_rejections
 from src.api.guards import (
     MAX_UNAUTHENTICATED_BODY_BYTES,
+    _bearer_token,
     read_bounded_body,
     require_same_origin,
 )
@@ -156,16 +157,67 @@ def _set_session_cookie(response: Response, session_id: str, max_age: int) -> No
     )
 
 
+# Where a browser that failed the guard on GET /admin is sent. It is the PUBLIC route
+# (`login_page` below, no `require_admin`), which is what makes the redirect terminal: the
+# target cannot refuse and bounce back here, so no loop is constructible.
+_LOGIN_PATH = "/admin/login"
+
+
 # --- HTML pages --------------------------------------------------------------
 async def admin_page(request: Request) -> Response:
     """``GET /admin`` — the console page (auth-gated read; degraded-OK).
 
-    Requires a valid cookie OR Bearer ADMIN_TOKEN via :func:`require_admin`; an
-    unauthenticated hit raises 401 (acc 1). No ``require_operational`` — the console must
-    render (reads) even in degraded mode (acc 8). The HTML itself holds no data: it fetches
-    the JSON API on load.
+    Requires a valid cookie OR Bearer ADMIN_TOKEN via :func:`require_admin`. No
+    ``require_operational`` — the console must render (reads) even in degraded mode (acc 8).
+    The HTML itself holds no data: it fetches the JSON API on load.
+
+    **An unauthenticated hit is redirected to the login form, not answered 401** (acc 1,
+    amended). The gate itself is untouched — the console body is still served ONLY to an
+    authenticated caller — but the REFUSAL is presented differently on this one route,
+    because this is the only ``/admin`` surface a human reaches by typing an address. The
+    401 was correct and useless: it put the bare text ``admin authentication required`` in
+    front of an operator whose only mistake was not having a cookie yet, while the login
+    form that fixes it sat one public URL away, reachable only from ``app.js`` — i.e. only
+    for a console that had ALREADY loaded. Two surfaces, two right answers: a program gets
+    a status it can branch on, a person gets the place to type the password.
+
+    The redirect is deliberately narrow, because "redirect instead of 401" is a footgun
+    anywhere else:
+
+    * **HTML route only.** Every ``/admin/*`` JSON route keeps its flat 401 (:func:`
+      require_admin` is unchanged). Redirecting an API call would swap a machine-readable
+      refusal for an HTML page — a client that follows redirects by default (``fetch``
+      does) would parse the login form as its payload.
+    * **No-credential branch only.** A request that DID present ``Authorization: Bearer``
+      and was rejected keeps the 401: that caller is curl/MCP/the agent, not a browser, and
+      it also keeps #35 acc 6 intact — an instance secret probing ``/admin`` still gets the
+      same 401 as an unknown token, with no page to distinguish them by.
+    * **401 only.** A 503 (degraded resolve) or 403 (CSRF) propagates untouched; sending a
+      DB outage to a login form would hide it.
+
+    ``303 See Other``: the request is a GET whose answer lives at a different URI. 303 says
+    exactly that and rewrites the method to GET on any future use, where 302 is the
+    historically ambiguous one and 307 preserves a method this GET-only route has no use
+    for; 301/308 would additionally invite a client to REMEMBER the substitution, which is
+    wrong the moment the operator logs in. (``Cache-Control: no-store`` from
+    :class:`AdminSecurityHeadersMiddleware` covers the redirect too.)
+
+    The rejection is still counted: ``require_admin`` has already ticked
+    ``curator_auth_rejections_total{reason="admin_session"}`` by the time the exception
+    reaches here, and that stays. ``admin_session`` is the AMBIENT label by design — it
+    ticks once per browser that opens the console before logging in, carries no alert rule
+    (deploy/alerts.yml, and the exclusion is pinned in tests/test_deploy_alerts.py), and is
+    precisely the label the brute-force rule was split AWAY from. So a human walking into
+    the login form neither inflates ``admin_bad_token`` (only a WRONG token POSTed to
+    ``login_submit`` does) nor pages anyone — while the series itself stays alive, so
+    "the console is being hit without a session" remains observable.
     """
-    await require_admin(request)
+    try:
+        await require_admin(request)
+    except HTTPException as exc:
+        if exc.status_code != 401 or _bearer_token(request) is not None:
+            raise
+        return RedirectResponse(_LOGIN_PATH, status_code=303)
     return _asset_response("admin.html", "text/html; charset=utf-8")
 
 

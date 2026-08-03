@@ -243,9 +243,11 @@ def create_app(settings) -> Starlette:
         # (revoke / window arm+close) answer 503 while degraded.
         # /admin HTML console (§13, issue #36) — the presentation layer over the JSON API
         # above. Serving is by EXPLICIT handlers (never StaticFiles) so every HTML/asset
-        # response can carry the CSP header. GET /admin is auth-gated (cookie OR Bearer);
-        # the login form + .js/.css assets are public and hold no secrets. Login mints a
-        # random-id cookie session (in-memory); logout drops it.
+        # response can carry the CSP header. GET /admin is auth-gated (cookie OR Bearer)
+        # and, being the only surface here reached from the address bar, answers a
+        # no-credential hit with a 303 to the login form instead of a bare 401 — the JSON
+        # routes below keep the 401. The login form + .js/.css assets are public and hold
+        # no secrets. Login mints a random-id cookie session (in-memory); logout drops it.
         Route("/admin", admin_page, methods=["GET"]),
         Route("/admin/login", login_page, methods=["GET"]),
         Route("/admin/login", login_submit, methods=["POST"]),

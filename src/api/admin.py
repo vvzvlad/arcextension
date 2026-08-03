@@ -72,6 +72,15 @@ async def require_admin(request: Request) -> Caller:
 
     A request with a Bearer header takes the Bearer path (so a stray cookie can never
     downgrade a curl call into the CSRF-gated branch). Neither credential → 401 (acc 1).
+
+    The 401 is the answer for every JSON route under ``/admin/*`` and stays that way — a
+    machine asking for data must get a status it can branch on, never a page. The ONE
+    caller that presents this refusal differently is the HTML route ``GET /admin``
+    (:func:`src.api.admin_page.admin_page`), which turns a no-credential 401 into a 303 to
+    the public login form, because that is the only ``/admin`` surface a human reaches by
+    typing an address. The gate is identical either way — no console body is ever served
+    to an unauthenticated caller; only the shape of the refusal differs, and the choice
+    lives in that route, not here.
     """
     # (a) Bearer wins when an Authorization header is present. No CSRF: no ambient cookie.
     if _bearer_token(request) is not None:

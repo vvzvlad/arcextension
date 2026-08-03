@@ -2,7 +2,9 @@
 #35 JSON API. Each test maps a numbered acceptance row and is written to REDDEN on the
 specific invariant it guards (noted inline).
 
-* (1) GET /admin with no cookie AND no Bearer → 401, no ADMIN_TOKEN leaked in the body.
+* (1) GET /admin with no cookie AND no Bearer → the console is NOT served; the human is
+      sent to /admin/login (303) with no ADMIN_TOKEN in the body. The JSON API under
+      /admin/* keeps answering a flat 401 — the split is per surface, not a weaker gate.
 * (2) POST /admin/login (correct token) → 200 + a hardened Set-Cookie whose VALUE is a
       random id, NOT the ADMIN_TOKEN.
 * (3) cookie-authenticated mutating request with a FOREIGN Origin → 403 (CSRF); a Bearer
@@ -64,15 +66,75 @@ def _session_value(client):
     return client.cookies.get(admin_session.COOKIE_NAME)
 
 
+# A fragment of templates/admin.html that appears NOWHERE else (not in login.html): if it
+# is in a response, the console body was served.
+_CONSOLE_MARKER = 'id="instances-body"'
+
+
+def _console_refused(client, **kw):
+    """Assert GET /admin refused the caller as a BROWSER: no console body, and a hop to the
+    login form. Returns the response.
+
+    ``follow_redirects=False`` is load-bearing — the TestClient follows redirects by
+    default, so without it the hop under test is invisible (one would see the login page
+    at 200 and could not tell it from the console being served).
+    """
+    r = client.get("/admin", follow_redirects=False, **kw)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/admin/login"
+    assert _CONSOLE_MARKER not in r.text
+    return r
+
+
 # --- (1) unauthenticated GET /admin -----------------------------------------
-def test_admin_page_requires_auth_and_leaks_nothing(tmp_path):
-    """Acc 1. Reddens if GET /admin stops calling require_admin (an anonymous hit would then
-    receive the console HTML), or if the token appears in the 401 body."""
+def test_admin_page_refuses_console_and_points_at_the_login_form(tmp_path):
+    """Acc 1, amended: the PAGE refuses by sending the human to the login form.
+
+    Both halves matter and fail differently. The gate half — reddens if GET /admin stops
+    calling require_admin (an anonymous hit would then receive the console HTML, which the
+    marker assertion catches even though the status would be 200). The usability half —
+    reddens if the refusal goes back to a bare 401, which is what an operator typing
+    https://…/admin into the address bar used to get: the plain text "admin authentication
+    required", with the login form one public URL away and reachable only from the console
+    JS, i.e. only for a console that had already loaded.
+    """
     app = create_app_for(tmp_path)
     with _tc(app) as client:
-        r = client.get("/admin")
-        assert r.status_code == 401
+        r = _console_refused(client)
         assert ADMIN_TOKEN not in r.text  # no secret leak in the unauthenticated body
+
+        # And the hop terminates: the target is public, so it answers the form itself
+        # rather than refusing again (a guarded target would make this a loop).
+        form = client.get(r.headers["location"])
+        assert form.status_code == 200
+        assert 'id="login-form"' in form.text
+        assert _CONSOLE_MARKER not in form.text
+
+
+def test_admin_json_api_still_401s_and_never_redirects(tmp_path):
+    """The redirect is confined to the HTML page; the JSON API keeps its flat 401.
+
+    A redirect is a fine answer for a person and a bad one for a program: ``fetch`` follows
+    by default, so a console whose session expired mid-session would receive the login HTML
+    where it expected its payload and would have to guess. Reddens if the redirect is moved
+    into ``require_admin`` (every /admin/* JSON route would inherit it), and — via the
+    Bearer case — if a rejected CREDENTIAL starts being answered with a page: that also
+    keeps #35 acc 6, an instance secret probing /admin getting the same 401 as an unknown
+    token, with no page to tell them apart by.
+    """
+    app = create_app_for(tmp_path)
+    with _tc(app) as client:
+        for path in ("/admin/instances", "/admin/enroll/window"):
+            r = client.get(path, follow_redirects=False)
+            assert r.status_code == 401, path
+            assert "location" not in {k.lower() for k in r.headers}, path
+
+        # A PRESENTED-but-wrong Bearer on the page route is a program, not a browser: 401.
+        r = client.get("/admin", follow_redirects=False,
+                       headers={"Authorization": "Bearer not-the-admin-token"})
+        assert r.status_code == 401
+        assert "location" not in {k.lower() for k in r.headers}
+        assert ADMIN_TOKEN not in r.text
 
 
 # --- (2) login mints a hardened cookie whose value is NOT the token ----------
@@ -146,7 +208,7 @@ def test_token_rotation_invalidates_cookie(tmp_path):
         assert client.get("/admin").status_code == 200
         # Rotate the ADMIN_TOKEN in place; the stored session fingerprint no longer matches.
         client.app.state.settings.admin_token = "rotated-admin-token"
-        assert client.get("/admin").status_code == 401
+        _console_refused(client)  # dead cookie -> no console, back to the login form
 
 
 # --- (5) logout drops the session server-side --------------------------------
@@ -163,9 +225,9 @@ def test_logout_revokes_session_server_side(tmp_path):
             "/admin/logout", headers={"Sec-Fetch-Site": "same-origin"}
         ).status_code == 200
         # Replay the captured id explicitly: it must be gone from the SERVER store, not just
-        # the client jar.
-        r = client.get("/admin", headers={"Cookie": f"{admin_session.COOKIE_NAME}={sid}"})
-        assert r.status_code == 401
+        # the client jar. The console body is what must not come back — the status is the
+        # browser-facing hop to the login form.
+        _console_refused(client, headers={"Cookie": f"{admin_session.COOKIE_NAME}={sid}"})
 
 
 # --- (6) the console renders as text, not markup -----------------------------
@@ -313,7 +375,7 @@ def test_session_expiry_through_request(tmp_path):
         # Force the stored entry into the past.
         expires_at, fp = client.app.state.admin_sessions[sid]
         client.app.state.admin_sessions[sid] = (0, fp)
-        assert client.get("/admin").status_code == 401
+        _console_refused(client)  # stale cookie -> no console, back to the login form
 
 
 # --- wrong-token login -------------------------------------------------------
@@ -337,6 +399,12 @@ def test_failed_login_counts_under_its_own_reason(tmp_path):
     the background noise and still catches a brute force. Reddens if login_submit goes back
     to incrementing ``admin_session`` (the bad-token counter would stop moving and the
     ambient one would move twice).
+
+    Half (b) is also what keeps the login redirect honest. Sending the anonymous page hit
+    to the login form did not make it a non-event: it is still a refusal and still counts,
+    under the AMBIENT label that carries no alert rule. Reddens in the other direction too
+    — if the redirect were ever counted as ``admin_bad_token``, every operator opening the
+    console cold would push the brute-force rule toward firing on nothing.
     """
     from src.api.admin_page import ADMIN_BAD_TOKEN_REASON
     from src.api.auth_metrics import auth_rejections
@@ -352,7 +420,7 @@ def test_failed_login_counts_under_its_own_reason(tmp_path):
 
         # (b) an ordinary unauthenticated console hit -> the ambient reason, and NOT the
         # brute-force one (this is the noise the split exists to keep out of the alert).
-        assert client.get("/admin", cookies={}).status_code == 401
+        _console_refused(client, cookies={})
         after = auth_rejections.by_reason()
         assert after.get("admin_session", 0) == mid.get("admin_session", 0) + 1
         assert after.get(ADMIN_BAD_TOKEN_REASON, 0) == mid.get(ADMIN_BAD_TOKEN_REASON, 0)
@@ -535,9 +603,12 @@ def test_admin_responses_are_never_cached(tmp_path):
         window = client.get("/admin/enroll/window", headers=admin_headers())
         assert window.status_code == 200
         assert window.headers["cache-control"] == "no-store"
-        # …and the same on the page, the assets, the login form and the JSON reads.
+        # …and the same on the page, the assets, the login form and the JSON reads —
+        # including the unauthenticated page's 303, which is a response on /admin like any
+        # other and must not be remembered by anything.
         for resp in (
             client.get("/admin", headers=admin_headers()),
+            client.get("/admin", follow_redirects=False),
             client.get("/admin/instances", headers=admin_headers()),
             client.get("/admin/login"),
             client.get("/admin/app.js"),
