@@ -1,21 +1,34 @@
 """Per-instance browser generator (docs/architecture.md §13).
 
-An instance is a themed Brave launcher with its OWN ``--user-data-dir`` and its
-OWN copy of the extension bundle. The generator produces, per instance:
+Under enrollment (§6/§13, issue #35/#37) the fleet loads ONE universal extension
+bundle and an instance is a THIN wrapper around it. Two commands, in order:
 
-* a copy of the extension bundle (``extension/``) with a per-instance
-  ``instance.json`` inside it — the FOUR fields ``{instanceId, title,
-  serviceUrl, token}`` (+ ``allowExecuteJs``) that a fresh, empty profile has no
-  other way to receive (§3/§6);
-* a stamped ``manifest.json``: the ``<host>`` placeholders in ``host_permissions``
-  filled from ``serviceUrl`` and the ``key`` pinned so the extension id is stable
-  across path/rename and IDENTICAL across all instances (§13, arch row 21);
+``bundle`` builds that single fleet-wide bundle ONCE:
+
+* a copy of the repo's ``extension/`` (dev cruft skipped), with the ``key``
+  stamped into ``manifest.json`` so the extension id is stable across
+  path/rename and IDENTICAL for every instance (§13, arch row 21). The manifest
+  is HOSTLESS — issue #35 removed the two ``https://<host>/*`` / ``wss://<host>/*``
+  patterns, leaving only ``<all_urls>``, so there is no ``<host>`` left to stamp;
+* NO ``instance.json``, no token, no service URL, no ``instanceId``: the bundle
+  carries no credential and no address at all.
+
+``generate`` then wraps that SHARED bundle per instance:
+
 * an empty per-instance profile dir (the ``--user-data-dir``) — deliberately
   empty so the extension mints its own ``install_uuid`` there on first run (§6),
-  which is what lets the service tell a legit reconnect from a cloned ``.app``
-  (``duplicate_instance``);
-* a ``.app`` wrapper (Info.plist + launcher script + icon) that execs the system
-  Brave with the two flags above.
+  which is what makes a cloned ``.app`` an un-enrolled install rather than a
+  takeover of the original;
+* a ``.app`` wrapper (Info.plist + launcher script + icon) whose launcher execs
+  the system Brave with ``--user-data-dir`` (the profile above) and
+  ``--load-extension`` pointing at the SHARED bundle — NO per-instance copy of
+  the extension and NO ``instance.json``.
+
+The service address and the per-install secret are not in the build at all: each
+profile receives them through the extension's enrollment settings UI, and the
+operator approves the request on ``/admin`` (§13). There is consequently no
+``restamp`` command and no token rotation — the shared token they existed for is
+gone, and a code update is a rebuild of the one shared bundle.
 
 The module is split into a PURE core (`core`, all filesystem/text logic, runs on
 Linux/CI), a `keys` helper (signing-key generation/persistence — the one place

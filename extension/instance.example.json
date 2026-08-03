@@ -1,5 +1,0 @@
-{
-  "//": "With enrollment (§7, issue #35) the build is UNIVERSAL — there is NO generator and NO per-instance instance.json to stamp. The credential is a per-profile SECRET the extension generates itself into chrome.storage.local (never in the bundle); only its sha256 (secretHash) goes on the wire. The service address and browser name are operator SETTINGS entered on the options page (also storage.local). This file is now only an OPTIONAL bootstrap: ship a serviceUrl to pre-fill the address so a fresh profile does not have to type it. The old shared `token` and self-reported `instanceId` are GONE — do NOT add them back.",
-  "serviceUrl": "wss://<host>",
-  "title": "Example instance"
-}

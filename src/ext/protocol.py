@@ -78,6 +78,13 @@ REJECT_UNKNOWN = "unknown_instance"
 ENROLL_CLOSED = "closed"
 ENROLL_BAD_CODE = "bad_code"
 ENROLL_CAPACITY = "capacity"
+# A pending request for this install_uuid already exists carrying a DIFFERENT secret. The
+# stored credential is frozen at creation (see ``queries._UPSERT_ENROLL_REQUEST``), so this
+# request is refused rather than silently answered ``enroll_pending`` — the client would
+# otherwise wait for the approval of a secret it does not hold. TRANSIENT for the client:
+# it keeps retrying, and the stale row either ages out under TTL or is rejected by the
+# operator, after which the retry is accepted.
+ENROLL_SECRET_CONFLICT = "secret_conflict"
 
 # Two consecutive heartbeat misses close the socket (§6).
 MAX_HEARTBEAT_MISSES = 2
@@ -172,23 +179,39 @@ def enroll_reject_reason(
     protocol_version: int,
     window_open: bool,
     code_ok: bool,
-    has_capacity: bool,
 ) -> str | None:
-    """Decide whether an ``enroll_request`` is refused; return a reason or None.
+    """Decide whether an ``enroll_request`` is refused by the CONFIG-shaped gates.
 
     Pure so the enroll gate is unit-testable without a socket or the DB. **Order is
-    load-bearing** (issue acceptance 2/3): protocol version first, then the WINDOW must
-    be open, then the CODE must be correct, then there must be pending capacity — every
-    one of these gates BEFORE the channel writes any ``enroll_requests`` row. In
-    particular a request with a missing/blank code at an OPEN window must be refused
-    (``bad_code``) and write NO row, so the channel passes ``code_ok=False`` for a
+    load-bearing** (issue acceptance 2/3): protocol version first — the one check that
+    needs neither the DB nor the window — then the WINDOW must be open, then the CODE must
+    be correct. In particular a request with a missing/blank code at an OPEN window must be
+    refused (``bad_code``) and write NO row, so the channel passes ``code_ok=False`` for a
     missing/blank/mismatched code (acceptance 2).
 
     * protocolVersion mismatch -> ``REJECT_PROTOCOL`` (same string as the hello path)
     * not ``window_open``      -> ``ENROLL_CLOSED``
     * not ``code_ok``          -> ``ENROLL_BAD_CODE``
-    * not ``has_capacity``     -> ``ENROLL_CAPACITY``
-    * otherwise                -> ``None`` (accept, record the request)
+    * otherwise                -> ``None`` (this helper accepts; see below)
+
+    ``None`` is NOT "the request is accepted" — it is "the config gates passed". Two more
+    gates run afterwards in :mod:`src.ext.channel`, and they are not here because they
+    cannot be pure:
+
+    1. the STRUCTURAL check (non-blank, non-oversized ``installUuid``/``secret``), done
+       after the code gate so a wrong code never reveals whether the frame was well-formed;
+    2. capacity AND the frozen-secret conflict, decided INSIDE the write transaction by
+       :func:`src.db.queries.upsert_enroll_request_capped` — ``ENROLL_CAPACITY`` and
+       ``ENROLL_SECRET_CONFLICT`` are returned by the channel from that transaction's
+       outcome.
+
+    This function used to take a ``has_capacity`` flag and own ``ENROLL_CAPACITY``, and its
+    docstring claimed every gate ran "BEFORE the channel writes any ``enroll_requests``
+    row". That stopped being true when the capacity decision moved into the write (a
+    pre-read in its own transaction could never be authoritative against racing enrolls):
+    the only caller passed ``has_capacity=True`` unconditionally, so the branch was dead
+    code and the documented order was the opposite of the real one. The parameter is gone
+    rather than left as a trap for the next reader.
     """
     if msg.get("protocolVersion") != protocol_version:
         return REJECT_PROTOCOL
@@ -196,8 +219,6 @@ def enroll_reject_reason(
         return ENROLL_CLOSED
     if not code_ok:
         return ENROLL_BAD_CODE
-    if not has_capacity:
-        return ENROLL_CAPACITY
     return None
 
 

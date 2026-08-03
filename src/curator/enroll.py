@@ -42,7 +42,7 @@ ENROLL_WINDOW_CODE_KEY = "enroll_window_code"
 
 # Code alphabet: unambiguous, human-typeable — no 0/O or 1/I/L that get misread when an
 # operator reads the code off one screen and types it on another. Uppercase only for the
-# same reason. Six characters over 32 symbols is ~30 bits: plenty for a short-lived,
+# same reason. Six characters over 31 symbols is ~29.7 bits: plenty for a short-lived,
 # single-window code that is ALSO gated by the window being open at read time.
 _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 _CODE_LENGTH = 6
@@ -131,7 +131,13 @@ def read_enroll_window(conn: sqlite3.Connection, *, now: int) -> EnrollWindowSta
     until = _to_int(get_setting(conn, ENROLL_WINDOW_UNTIL_KEY))
     code = get_setting(conn, ENROLL_WINDOW_CODE_KEY) or None
     if until is None:
-        return EnrollWindowState(open=False, seconds_remaining=0, code=code, until=None)
+        # No (or unparseable) deadline: closed. code=None, NOT the stored code — the
+        # docstring's contract is that a caller may render ``state.code`` without checking
+        # ``state.open``, and the two closed branches must therefore be symmetric. Returning
+        # the row here handed a live-looking code back whenever the deadline row was
+        # missing/blank/garbage while the code row survived — the exact shape a half-written
+        # or hand-edited settings pair leaves behind.
+        return EnrollWindowState(open=False, seconds_remaining=0, code=None, until=None)
     remaining_ms = until - now
     if remaining_ms <= 0:
         # Deadline reached: closed at read time, no seconds left. The stored rows are left

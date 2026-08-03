@@ -212,6 +212,85 @@ def require_operational(request: Request) -> None:
         raise HTTPException(status_code=503, detail="service degraded")
 
 
+# Ceiling on a request body this service will BUFFER before any credential has been
+# checked. 4 KiB is two orders of magnitude more than the only such body we accept (an
+# ADMIN_TOKEN in a JSON object or a form field) and small enough that N concurrent
+# unauthenticated posters cannot make the process the cheapest thing to attack: neither
+# the app nor uvicorn imposes any limit of its own, so ``await request.json()`` on
+# ``POST /admin/login`` would happily buffer a gigabyte from an anonymous peer.
+MAX_UNAUTHENTICATED_BODY_BYTES = 4096
+
+
+async def read_bounded_body(request: Request, limit: int) -> bytes:
+    """Buffer at most ``limit`` bytes of the request body; **413** past that.
+
+    Both halves matter. ``Content-Length`` is checked first so an honest oversized POST is
+    refused without reading a byte, and the stream is then accumulated with a running
+    check so a CHUNKED body (no ``Content-Length`` at all — the trivial way around a
+    header check) is cut off at the same ceiling rather than buffered whole.
+
+    The bytes are stashed in Starlette's own ``_body`` cache, which is exactly what
+    ``Request.body()`` does, so a later ``request.json()`` / ``request.form()`` parses THIS
+    bounded buffer instead of re-reading the (already consumed) stream. That cache is a
+    PRIVATE attribute and there is no public equivalent in Starlette (``Request.body()``
+    reads and writes the same ``self._body``, with no setter and no "already read this"
+    hook), so the coupling is deliberate — and it is pinned by a test that reddens loudly
+    if a Starlette upgrade stops honouring it, rather than letting the ceiling quietly
+    stop applying.
+
+    A refusal on a branch that leaves the WIRE readable is made sticky by pinning the cache
+    to ``b""``, so no later reader can go back and buffer the body this call just refused.
+    That is the declared-``Content-Length`` branch, which returns before reading a byte:
+    without the pin a subsequent ``await request.body()`` read the whole oversized body and
+    the ceiling bounded nothing. Nothing does that today (the 413 propagates out of the
+    only caller), but "no caller happens to do it" is not a bound.
+
+    The pin is deliberately NOT applied on the already-buffered branch. There the cache
+    holds a body a previous reader legitimately read; wiping it destroys valid data to make
+    a refusal stick that is already stuck — the stream is drained, so nothing can re-read
+    the wire anyway. Sticky is a property of the two branches the wire can still be reached
+    from, not of the 413.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            oversized = int(declared) > limit
+        except ValueError:
+            raise HTTPException(status_code=400, detail="malformed Content-Length")
+        if oversized:
+            # Nothing has been read yet: pin the cache empty so the refusal survives a
+            # later reader (see the docstring).
+            request._body = b""
+            raise _too_large()
+    if hasattr(request, "_body"):
+        # Already buffered by an earlier reader; re-check rather than trust it. No pin
+        # here — that buffer is somebody else's valid body, and there is no wire left to
+        # re-read even if the caller swallows the 413.
+        if len(request._body) > limit:
+            raise _too_large()
+        return request._body
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            # Cut off mid-stream: the remainder is unread and the consumed part is
+            # unrecoverable, so pin the cache empty rather than leave a later reader to
+            # either resume buffering the oversized body or trip over a consumed stream.
+            request._body = b""
+            raise _too_large()
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    request._body = body
+    return body
+
+
+def _too_large() -> HTTPException:
+    """The 413 itself. Making a refusal STICK is the caller's job — only two of the three
+    branches have a wire left to protect (see :func:`read_bounded_body`)."""
+    return HTTPException(status_code=413, detail="request body too large")
+
+
 async def read_force_body(request: Request) -> dict:
     """Parse an OPTIONAL JSON-object request body; ``{}`` when there is none.
 

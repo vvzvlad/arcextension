@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createChromeMock, FakeWebSocket } from "./chrome-mock.js";
+import { createChromeMock, FakeWebSocket, settle } from "./chrome-mock.js";
 import { chromeEnv, Connection } from "../src/connection.js";
 import { PROTOCOL_VERSION } from "../src/constants.js";
 
@@ -16,8 +16,12 @@ const SECRET_HEX = "01".repeat(32);
 const APPROVED_FACTS = { requestPending: false, approved: true, quarantined: false, lastVerdict: null };
 
 // hello/enroll read the secret from storage (several async ticks), so the opening frame
-// lands a few macrotasks later than the old token-only path.
-const flush = () => new Promise((r) => setTimeout(r, 25));
+// lands a few macrotasks later than the old token-only path — and "a few" is not a number
+// this file may guess at. `settle()` drains the mock until it reports nothing in flight,
+// so the wait is as long as the machine needs and no longer; a fixed sleep asserted on a
+// half-written chain whenever the box was busy. Nothing under extension/src schedules a
+// timer of its own, so the mock's queue is the complete picture of the pending work.
+const flush = () => settle();
 
 // Seed an ENROLLED profile (secret + approved) so the socket opens and hello is sent.
 async function seedEnrolled() {
@@ -40,6 +44,26 @@ afterEach(() => {
   globalThis.WebSocket = savedWS;
 });
 
+// The real chromeEnv(), with its STORAGE seams bound to the mock of THIS test.
+//
+// chromeEnv()'s closures read `globalThis.chrome` at CALL time, while beforeEach installs
+// a brand-new mock per test. Any storage write still in flight when a test ends therefore
+// lands in the NEXT test's storage — and because the mock is whole-object last-write-wins,
+// a late `enrollState` write silently replaces the state the next test just seeded. That
+// produced phantom failures in whichever test ran next. Binding the seams here keeps a
+// late write on the storage it belongs to; everything else still comes from the real env.
+function testEnv() {
+  const mock = globalThis.chrome;
+  return {
+    ...chromeEnv(),
+    storageLocalGet: (key) => mock.storage.local.get(key),
+    storageLocalSet: (obj) => mock.storage.local.set(obj),
+    storageLocalRemove: (key) => mock.storage.local.remove(key),
+    storageSessionGet: (key) => mock.storage.session.get(key),
+    storageSessionSet: (obj) => mock.storage.session.set(obj),
+  };
+}
+
 function makeConnection(overrides = {}) {
   const buildSnapshot =
     overrides.buildSnapshot ||
@@ -49,7 +73,7 @@ function makeConnection(overrides = {}) {
       tabs: [{ tabId: 1, ageMs: 0, openedAgoMs: 0 }],
       windows: [{ id: 5, type: "normal", state: "normal" }],
     }));
-  return new Connection(chromeEnv(), { buildSnapshot, commandHandler: overrides.commandHandler });
+  return new Connection(testEnv(), { buildSnapshot, commandHandler: overrides.commandHandler });
 }
 
 describe("ids & config (§6)", () => {
@@ -241,7 +265,7 @@ describe("ensureSocket idempotence (§6)", () => {
 
 // A bare env (stubbable crypto) around the current chrome mock.
 function bareConn(overrides = {}) {
-  const env = { ...chromeEnv(), ...overrides };
+  const env = { ...testEnv(), ...overrides };
   return new Connection(env, { buildSnapshot: async () => ({}) });
 }
 
@@ -269,7 +293,7 @@ describe("secret (§7, option A: raw secret on the wire)", () => {
 });
 
 describe("enroll_request frame (§2/§7)", () => {
-  it("sends enroll_request{code, secret, installUuid, suggestedTitle} — NOT a hello", async () => {
+  it("sends enroll_request{code, secret, installUuid, title} — NOT a hello", async () => {
     // Keep the seeded secret but make the state not-approved, and stage a browser name.
     await chrome.storage.local.set({
       enrollState: { requestPending: false, approved: false, quarantined: false, lastVerdict: null },
@@ -288,24 +312,152 @@ describe("enroll_request frame (§2/§7)", () => {
       code: "WIN-CODE",
       secret: SECRET_HEX,
       installUuid: conn.installUuid,
-      suggestedTitle: "Bob's Chrome", // documented frame field
-      title: "Bob's Chrome", // what the server actually reads (wire contract)
+      title: "Bob's Chrome", // ONE name for the browser name — the one the server reads
     });
+    // The frame used to carry `suggestedTitle` as well "to be safe". Two spellings of one
+    // field is how the name silently drifted: only `title` is consumed
+    // (src/ext/channel.py `_handle_enroll`), so the redundant one hid the fact that the
+    // other spelling lands a NULL title in the operator console.
+    expect(req.suggestedTitle).toBeUndefined();
     expect(ws.sent.find((m) => m.type === "hello")).toBeUndefined();
   });
 
   it("after a pending submit a FRESH worker sends HELLO (not enroll_request) to learn approval (acc 5)", async () => {
-    // Durable: secret + requestPending, but a fresh worker has NO in-memory code.
+    // Durable: secret + requestPending, and the service CONFIRMED the request just now
+    // (an enroll_pending frame). A cold worker must then learn approval by hello, not
+    // re-register on every reconnect.
     await chrome.storage.local.set({
-      enrollState: { requestPending: true, approved: false, quarantined: false, lastVerdict: null },
+      enrollCode: "WIN-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: false,
+        lastVerdict: null,
+        requestRegisteredAt: Date.now(),
+      },
     });
-    const conn = makeConnection(); // _pendingEnrollCode is null (cold)
+    const conn = makeConnection(); // cold worker
     await conn.ensureSocket();
     const ws = conn.ws;
     ws._open();
     await flush();
     expect(ws.sent.find((m) => m.type === "hello")).toBeDefined();
     expect(ws.sent.find((m) => m.type === "enroll_request")).toBeUndefined();
+  });
+
+  // --- the request must EXIST server-side, not merely have been submitted -------
+  it("re-sends the request when no enroll_pending ever confirmed it (submit with no open socket)", async () => {
+    // The operator pressed submit while the service was down: the forced reconnect never
+    // opened, so the enroll_request never went out — yet the UI already says "ожидает
+    // одобрения" and /admin has nothing at all. The next opening frame must be the
+    // enroll_request, not a hello that can only ever answer `unknown_instance`.
+    await chrome.storage.local.set({
+      enrollCode: "WIN-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: false,
+        lastVerdict: null,
+        requestRegisteredAt: null, // never confirmed
+      },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    const req = conn.ws.sent.find((m) => m.type === "enroll_request");
+    expect(req).toBeDefined();
+    expect(req.code).toBe("WIN-CODE");
+    expect(conn.ws.sent.find((m) => m.type === "hello")).toBeUndefined();
+  });
+
+  it("NEVER re-registers a confirmed request, however old the confirmation is", async () => {
+    // There is no age-based re-registration, on purpose. The staged code belongs to ONE
+    // window (arm_enroll_window mints a fresh code on every open), so a resend after the
+    // window closed draws enroll_rejected{closed} — which CLEARS the code and durably
+    // marks the enrollment rejected, over a request that is still approvable in /admin.
+    // That would break the very case ("operator came back an hour later") it claimed to
+    // fix, so a confirmed request stays on `hello` no matter how stale the confirmation.
+    await chrome.storage.local.set({
+      enrollCode: "WIN-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: false,
+        lastVerdict: null,
+        requestRegisteredAt: Date.now() - 24 * 60 * 60000, // a day old
+      },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    expect(conn.ws.sent.find((m) => m.type === "enroll_request")).toBeUndefined();
+    expect(conn.ws.sent.find((m) => m.type === "hello")).toBeDefined();
+  });
+
+  it("enroll_pending timestamps the request AND clears a stale reject (transient capacity)", async () => {
+    // capacity/protocol are TRANSIENT: the code survives and the request is retried. Once
+    // the retry lands, the request is in the operator's list — leaving "заявка отклонена"
+    // on screen sends the operator hunting a problem that is already fixed.
+    await chrome.storage.local.set({
+      enrollCode: "WIN-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: false,
+        lastVerdict: null,
+        enrollReject: "capacity",
+        requestRegisteredAt: null,
+      },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    expect(conn.ws.sent.find((m) => m.type === "enroll_request")).toBeDefined();
+    conn.ws._serverSend({ type: "enroll_pending" });
+    await flush();
+
+    const facts = (await chrome.storage.local.get("enrollState")).enrollState;
+    expect(facts.enrollReject).toBe(null);
+    expect(typeof facts.requestRegisteredAt).toBe("number");
+    // A COLD worker over the same storage must not report the dead rejection either.
+    const cold = makeConnection();
+    expect((await cold.getConnectionState()).enrollReject).toBe(null);
+    // …and now that the request is confirmed, the next opening frame is a hello (acc 5).
+    await cold.ensureSocket();
+    cold.ws._open();
+    await flush();
+    expect(cold.ws.sent.find((m) => m.type === "hello")).toBeDefined();
+    expect(cold.ws.sent.find((m) => m.type === "enroll_request")).toBeUndefined();
+  });
+
+  it("a rejected request is not treated as registered (retried on the very next opening)", async () => {
+    await chrome.storage.local.set({
+      enrollCode: "WIN-CODE",
+      enrollState: {
+        requestPending: true,
+        approved: false,
+        quarantined: false,
+        lastVerdict: null,
+        requestRegisteredAt: Date.now(), // confirmed a moment ago…
+      },
+    });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    // …then the service refuses it transiently: nothing was written server-side.
+    conn.ws._serverSend({ type: "enroll_rejected", reason: "capacity" });
+    await flush();
+    expect((await chrome.storage.local.get("enrollState")).enrollState.requestRegisteredAt).toBe(null);
+
+    const cold = makeConnection();
+    await cold.ensureSocket();
+    cold.ws._open();
+    await flush();
+    expect(cold.ws.sent.find((m) => m.type === "enroll_request")).toBeDefined();
   });
 });
 
@@ -561,6 +713,81 @@ describe("socket identity guard (§6/§7)", () => {
     await flush();
     expect(conn.helloAcked).toBe(false); // not marked connected by the preempted socket
     expect((await chrome.storage.local.get("instanceId")).instanceId).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// The service address is a TLS gate, not a hint (§7)
+// ============================================================================
+describe("service address gate (§7)", () => {
+  // Option A puts the RAW secret on the wire — in the enroll_request, in every hello and
+  // as the /api Bearer — so an unencrypted address does not degrade the system, it
+  // publishes a permanent credential. The client must refuse to open the socket at all.
+  it("does NOT connect over a plaintext ws:// address, and says why", async () => {
+    await chrome.storage.local.set({ serviceAddress: "ws://curator.lan:8000" });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    expect(conn.ws).toBe(null); // no socket => the secret never leaves this profile
+
+    const st = await conn.getConnectionState();
+    expect(st.hasAddress).toBe(false);
+    // Distinguishable from "never configured": the operator typed something and must be
+    // told it was refused, not that the field is empty.
+    expect(st.addressError).toBe("insecure");
+  });
+
+  it("refuses an http(s) site URL where the socket URL belongs", async () => {
+    await chrome.storage.local.set({ serviceAddress: "https://curator.example" });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    expect(conn.ws).toBe(null);
+    expect((await conn.getConnectionState()).addressError).toBe("http-scheme");
+  });
+
+  it("refuses a bundle instance.json bootstrap that ships a ws:// serviceUrl", async () => {
+    // The bootstrap address goes through the SAME gate: a bundle cannot smuggle plaintext
+    // past a setting the operator never touched.
+    globalThis.fetch = async () => ({ json: async () => ({ serviceUrl: "ws://curator.lan" }) });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    expect(conn.ws).toBe(null);
+    expect((await conn.getConnectionState()).addressError).toBe("insecure");
+  });
+
+  it("allows ws:// on loopback (development) and wss:// anywhere", async () => {
+    await chrome.storage.local.set({ serviceAddress: "ws://localhost:8000" });
+    const dev = makeConnection();
+    await dev.ensureSocket();
+    expect(dev.ws).not.toBe(null);
+    expect((await dev.getConnectionState()).addressError).toBe(null);
+
+    await chrome.storage.local.set({ serviceAddress: "wss://curator.example/" });
+    const prod = makeConnection();
+    await prod.ensureSocket();
+    expect(prod.ws).not.toBe(null);
+    expect(prod.ws.url).toBe("wss://curator.example/ext");
+  });
+
+  it("refuses to submit an enrollment against a refused address (no phantom 'pending')", async () => {
+    // Arming the durable pending facts here would make every surface report "ожидает
+    // одобрения" for a request that cannot leave the machine.
+    await chrome.storage.local.remove("instanceSecret"); // fresh profile
+    await chrome.storage.local.remove("enrollState");
+    await chrome.storage.local.set({ serviceAddress: "ws://curator.lan:8000" });
+    const conn = makeConnection();
+    await expect(conn.submitEnrollment("WIN-CODE")).rejects.toThrow(/refused/i);
+    expect((await chrome.storage.local.get("enrollState")).enrollState).toBeUndefined();
+    expect((await chrome.storage.local.get("instanceSecret")).instanceSecret).toBeUndefined();
+    expect(await conn.getEnrollState()).toBe("needs-enroll"); // NOT "pending"
+  });
+
+  it("hides the /api credential too while the address is refused", async () => {
+    // The startpage and the popup take the Bearer from the SW; a refused address must not
+    // resolve for them either, or the raw secret still goes out over plain http.
+    await chrome.storage.local.set({ serviceAddress: "ws://curator.lan:8000" });
+    const conn = makeConnection();
+    await conn.init();
+    expect(await conn._resolveAddress()).toBe(null);
   });
 });
 

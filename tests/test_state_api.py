@@ -121,6 +121,55 @@ def _seed_quick_link(db_path, url, title, position):
         conn.close()
 
 
+def test_revoked_instance_and_its_tabs_leave_the_state_mirror(tmp_path):
+    """``/api/state`` is the CURATED fleet, so a revoked instance leaves it — with its
+    tabs.
+
+    The same status filter ``known_instance_ids`` and ``load_preview_input`` already apply
+    (issue #35 §6: "in both places or neither"), extended to the two read surfaces that
+    still lacked it. For the startpage a revoked instance is dead weight in every sense:
+    its socket is closed, a jump to its tabs can only fail, its mirror can never refresh
+    again, and the row would sit in the status strip reading "offline for N days" with no
+    way for the human to clear it — retired instances are administered in
+    ``/admin/instances``, which lists every status on purpose.
+
+    The tabs go with it: nothing ever deletes a revoked instance's tabs (``apply_snapshot``
+    is their only writer and it needs a live socket), so leaving them behind would render a
+    phantom group labelled with a bare instance id — the title lived on the instance row
+    that just disappeared. Reddens if either filter is dropped.
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect_fresh(
+            client, db_path,
+            tabs=[{"tabId": 7, "windowId": 1, "url": "https://a/b", "title": "A"}],
+        )
+        try:
+            body = client.get("/api/state", headers=AUTH).json()
+            assert [i["id"] for i in body["instances"]] == ["i1"]
+            assert [t["tab_id"] for t in body["tabs"]] == [7]
+
+            # Revoke it exactly as the /admin handler's transaction does.
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                conn.execute("UPDATE instances SET status='revoked' WHERE id='i1'")
+                conn.commit()
+            finally:
+                conn.close()
+
+            after = client.get("/api/state", headers=AUTH).json()
+            assert after["instances"] == []
+            assert after["tabs"] == [], "a retired instance's tabs became a phantom group"
+            # The row itself is NOT deleted — it is still there for /admin/instances.
+            assert _db_row(db_path, "SELECT status FROM instances WHERE id='i1'") == (
+                "revoked",
+            )
+        finally:
+            ws.__exit__(None, None, None)
+
+
 # --- auth + degraded --------------------------------------------------------
 def test_state_requires_bearer_and_refuses_degraded(tmp_path):
     app = create_app(_settings(tmp_path))

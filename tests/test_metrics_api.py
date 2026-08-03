@@ -79,6 +79,15 @@ def _exec(db_path, sql, params=()):
         conn.close()
 
 
+def _row(db_path, sql, params=()):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn.execute(sql, params).fetchone()
+    finally:
+        conn.close()
+
+
 def _insert_pass(db_path, pass_id, started_at, finished_at=None, ok=None,
                  instances_ready=None):
     _exec(
@@ -89,11 +98,16 @@ def _insert_pass(db_path, pass_id, started_at, finished_at=None, ok=None,
     )
 
 
-def _insert_instance(db_path, iid, connected=0, last_seen_at=None, snapshot_at=None):
+def _insert_instance(db_path, iid, connected=0, last_seen_at=None, snapshot_at=None,
+                     status="active"):
+    # ``status`` is explicit because the per-instance metric families are ACTIVE-only
+    # (§35 §6): the schema default is 'pending', so a row seeded without it would be
+    # filtered out and every by-label assertion below would silently read None.
     _exec(
         db_path,
-        "INSERT INTO instances (id, connected, last_seen_at, snapshot_at) VALUES (?,?,?,?)",
-        (iid, connected, last_seen_at, snapshot_at),
+        "INSERT INTO instances (id, connected, last_seen_at, snapshot_at, status) "
+        "VALUES (?,?,?,?,?)",
+        (iid, connected, last_seen_at, snapshot_at, status),
     )
 
 
@@ -305,6 +319,97 @@ def test_main_instance_never_seen(tmp_path):
         # Once actually seen -> 0.
         _exec(s.db_path, "UPDATE instances SET last_seen_at = ? WHERE id = 'main'", (now,))
         assert _scalar(_scrape(client), "curator_main_instance_never_seen") == 0.0
+        # …and a MAIN that HAS been seen but is no longer enrolled reads 1 again: the
+        # gauge is "MAIN cannot curate", not "MAIN has no timestamp".
+        _exec(s.db_path, "UPDATE instances SET status = 'revoked' WHERE id = 'main'")
+        assert _scalar(_scrape(client), "curator_main_instance_never_seen") == 1.0
+
+
+def test_main_unusable_after_the_real_enrollment_migration(tmp_path):
+    """THE upgrade scenario, run through the REAL migration rather than a hand-made row.
+
+    Issue #35 «Совместимость» promises that after the enrollment upgrade a MAIN which now
+    needs re-approval rings ``curator-main-instance-never-seen`` within 15 minutes, and
+    deploy/DEPLOY.md's release note repeats it. Migration step 2 gets there by moving every
+    pre-existing row to ``status='revoked'`` — and it touches NEITHER ``last_seen_at`` NOR
+    ``connected``, so the post-upgrade row is exactly (revoked, connected=1,
+    last_seen_at=<yesterday>): a shape a clean-DB test can never produce.
+
+    Keyed on ``last_seen_at`` alone the gauge read 0 on that row — every hello rejected,
+    the stock branch dead, the drain stopped, and not one alert. Redden: drop the status
+    arm from ``_collect``'s MAIN query and this returns 0.0 while
+    ``curator_instance_connected{id="main"}`` still claims 1.
+    """
+    from src.db.migrations import migrate
+    from src.db.schema import STEPS
+
+    s = _settings(tmp_path)
+    yesterday = int(time.time() * 1000) - 24 * 3_600_000
+
+    # Build the PRE-enrollment database (version 1) and populate it as a live install:
+    # MAIN connected, seen, curating.
+    conn = sqlite3.connect(s.db_path, isolation_level=None)
+    try:
+        result = migrate(conn, s.db_path, s.backup_dir, steps=[STEPS[0]], max_version=1)
+        assert result.ok
+        conn.execute(
+            "INSERT INTO instances (id, connected, last_seen_at, snapshot_at) "
+            "VALUES ('main', 1, ?, ?)",
+            (yesterday, yesterday),
+        )
+    finally:
+        conn.close()
+
+    # Starting the app runs the REAL step 2 over that DB (the upgrade itself).
+    app = create_app(s)
+    with TestClient(app) as client:
+        migrated = _row(
+            s.db_path,
+            "SELECT status, connected, last_seen_at FROM instances WHERE id='main'",
+        )
+        # The migration did what it does: retired, but still flagged connected and seen.
+        assert migrated == ("revoked", 1, yesterday)
+
+        body = _scrape(client)
+        assert _scalar(body, "curator_main_instance_never_seen") == 1.0
+        # And the retired row no longer poses as a live instance in the per-instance
+        # families, so nothing else reports the fleet as healthy either.
+        assert _by_label(body, "curator_instance_connected", "id", "main") is None
+
+
+def test_revoked_instance_leaves_the_per_instance_families(tmp_path):
+    """Revoking a laptop is a ROUTINE operation, and it must not leave an alert nobody can
+    clear.
+
+    ``curator-instance-absent`` fires on ``curator_instance_absent_seconds > 43200``. A
+    revoked instance never says hello again, there is no ``DELETE FROM instances`` in the
+    project, and re-approving under a new id does not touch the old row — so an unfiltered
+    family lights that alert ~12h after every retirement, forever. Dropping the row from
+    the family lets Prometheus mark the series stale and the alert resolve by itself.
+    Redden: remove the status filter in ``_collect`` and the revoked id reappears with a
+    growing absent_seconds.
+    """
+    s = _settings(tmp_path)
+    app = create_app(s)
+    now = int(time.time() * 1000)
+    with TestClient(app) as client:
+        _insert_instance(s.db_path, "live", connected=1, last_seen_at=now, snapshot_at=now)
+        _insert_instance(s.db_path, "retired", connected=1,
+                         last_seen_at=now - 48 * 3_600_000, snapshot_at=now)
+        body = _scrape(client)
+        # Both present while both are active (non-vacuity: the filter is what removes it).
+        assert _by_label(body, "curator_instance_absent_seconds", "id", "retired") is not None
+
+        _exec(s.db_path, "UPDATE instances SET status='revoked' WHERE id='retired'")
+        body2 = _scrape(client)
+        for name in (
+            "curator_instance_connected",
+            "curator_instance_last_seen_ts",
+            "curator_instance_absent_seconds",
+            "curator_instance_snapshot_age_seconds",
+        ):
+            assert _by_label(body2, name, "id", "retired") is None, name
+            assert _by_label(body2, name, "id", "live") is not None, name
 
 
 # --- deferred / quarantine / relocations ------------------------------------

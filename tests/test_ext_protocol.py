@@ -53,14 +53,22 @@ def test_hello_no_token_field_consulted():
 
 
 # --- enroll_reject_reason: each branch + the load-bearing order --------------
+# The helper owns the CONFIG-shaped gates ONLY (protocol -> window -> code). Capacity used
+# to be a fifth parameter here; it moved into the write transaction
+# (queries.upsert_enroll_request_capped) so it could be authoritative against racing
+# enrolls, after which the only caller pinned `has_capacity=True` and the branch became
+# unreachable — a dead argument whose docstring still promised capacity was checked before
+# any row was written. `None` from this helper therefore means "the config gates passed",
+# not "the request is accepted"; the channel still has the structural check and the
+# in-transaction capacity/secret-conflict gates ahead of it.
 def test_enroll_all_ok_returns_none():
-    assert enroll_reject_reason({"protocolVersion": 1}, 1, True, True, True) is None
+    assert enroll_reject_reason({"protocolVersion": 1}, 1, True, True) is None
 
 
 def test_enroll_protocol_gates_before_window():
-    # Wrong protocol wins even over a closed window / bad code / no capacity.
+    # Wrong protocol wins even over a closed window and a bad code.
     assert (
-        enroll_reject_reason({"protocolVersion": 9}, 1, False, False, False)
+        enroll_reject_reason({"protocolVersion": 9}, 1, False, False)
         == REJECT_PROTOCOL
     )
 
@@ -68,24 +76,32 @@ def test_enroll_protocol_gates_before_window():
 def test_enroll_closed_gates_before_bad_code():
     # A closed window wins over a bad code (order: window before code).
     assert (
-        enroll_reject_reason({"protocolVersion": 1}, 1, False, False, True)
+        enroll_reject_reason({"protocolVersion": 1}, 1, False, False)
         == ENROLL_CLOSED
     )
 
 
-def test_enroll_bad_code_gates_before_capacity():
-    # A bad code wins over no capacity (order: code before capacity).
+def test_enroll_bad_code_is_the_last_gate_here():
+    # The code is the LAST thing this helper decides — everything after it needs the DB.
     assert (
-        enroll_reject_reason({"protocolVersion": 1}, 1, True, False, False)
+        enroll_reject_reason({"protocolVersion": 1}, 1, True, False)
         == ENROLL_BAD_CODE
     )
 
 
-def test_enroll_capacity_last():
-    assert (
-        enroll_reject_reason({"protocolVersion": 1}, 1, True, True, False)
-        == ENROLL_CAPACITY
-    )
+def test_enroll_reject_reason_takes_no_capacity_argument():
+    """The capacity gate is the write transaction's, and the signature must say so.
+
+    Reddens if a ``has_capacity`` parameter is reintroduced — which is how the previous
+    version lied: the flag existed, the caller hardcoded it True, and a reader of the pure
+    helper concluded the ceiling was enforced before any row was written.
+    """
+    import inspect
+
+    params = list(inspect.signature(enroll_reject_reason).parameters)
+    assert params == ["msg", "protocol_version", "window_open", "code_ok"]
+    # The constant survives — the CHANNEL returns it from the transaction's outcome.
+    assert protocol.ENROLL_CAPACITY == "capacity"
 
 
 def test_enroll_reason_constants_are_stable_strings():

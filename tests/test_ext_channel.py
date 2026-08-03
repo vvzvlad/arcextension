@@ -506,6 +506,164 @@ def test_enroll_request_wrong_protocol_rejected(tmp_path):
         assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
 
 
+def test_enroll_repeat_with_a_different_secret_is_refused(tmp_path):
+    """Through the socket: the pending credential cannot be swapped out from under the
+    operator (the DB-level guard is pinned in test_ext_snapshot).
+
+    The client is told ``secret_conflict`` rather than being answered ``enroll_pending``:
+    silently queueing it would leave the client waiting on the approval of a secret it does
+    not hold, which is indistinguishable (from the client's side) from an operator who has
+    not got round to it. Reddens if the channel maps the mismatch to ``enroll_pending`` or
+    lets the write refresh the hash.
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        code = _arm_window(db_path)
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_enroll(code=code, secret="a" * 64))
+            assert _recv(ws) == {"type": "enroll_pending"}
+        stored = _wait_until(
+            lambda: _db_row(
+                db_path,
+                "SELECT secret_hash FROM enroll_requests WHERE install_uuid='install-1'",
+            )
+        )
+        assert stored == (queries.sha256_hex("a" * 64),)
+
+        # Same install_uuid, same visible fields, DIFFERENT secret -> refused, row intact.
+        with client.websocket_connect("/ext") as ws2:
+            ws2.send_json(_enroll(code=code, secret="b" * 64))
+            assert _recv(ws2) == {"type": "enroll_rejected", "reason": "secret_conflict"}
+        assert _db_row(
+            db_path, "SELECT secret_hash FROM enroll_requests WHERE install_uuid='install-1'"
+        ) == (queries.sha256_hex("a" * 64),)
+        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (1,)
+
+
+def test_enroll_wrong_protocol_version_touches_no_database(tmp_path):
+    """The DB-free gate runs FIRST: a wrong-version enroll_request must not open a single
+    reader connection.
+
+    Every ``Database.read`` is a fresh sqlite connection on a thread of the shared pool, and
+    this handler runs fully unauthenticated — so a read a hostile peer can trigger before
+    its code is checked is a lever on the curator pass, /api/state and /metrics alike.
+    Reddens if the window read moves back ahead of the protocol check (the counter below
+    goes to 1) or if the removed capacity pre-count returns (2).
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _arm_window(db_path)  # so the second frame below reaches the CODE gate
+        db = client.app.state.db
+        reads = {"n": 0}
+        original = db.read
+
+        async def counting_read(fn):
+            reads["n"] += 1
+            return await original(fn)
+
+        db.read = counting_read
+        try:
+            with client.websocket_connect("/ext") as ws:
+                ws.send_json(_enroll(code="ABC123", protocolVersion=999))
+                assert _recv(ws) == {"type": "enroll_rejected", "reason": "protocol"}
+            assert reads["n"] == 0, "a wrong-version frame reached the DB"
+
+            # Non-vacuity: a well-formed frame DOES read — and reads exactly ONCE (the
+            # window). The capacity pre-count that used to make it two is gone; capacity is
+            # decided inside the write.
+            with client.websocket_connect("/ext") as ws2:
+                ws2.send_json(_enroll(code="WRONGC"))
+                assert _recv(ws2) == {"type": "enroll_rejected", "reason": "bad_code"}
+            assert reads["n"] == 1
+        finally:
+            db.read = original
+
+
+def test_enroll_non_ascii_code_is_rejected_cleanly(tmp_path):
+    """A non-ASCII code must be a plain ``bad_code``, not a 500.
+
+    The code comparison is ``secrets.compare_digest`` (a plain ``==`` leaks the operator's
+    window code prefix by timing to an unauthenticated peer), and compare_digest raises
+    TypeError on a non-ASCII str — which an anonymous socket can send for free. Reddens if
+    the operands stop being encoded before the compare.
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _arm_window(db_path)
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_enroll(code="Ж" * 6))
+            assert _recv(ws) == {"type": "enroll_rejected", "reason": "bad_code"}
+        assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
+
+
+# --- hello field hygiene (§36 symmetry with the enroll path) -----------------
+def test_hello_title_is_clamped_and_a_non_string_title_is_not_stored(tmp_path):
+    """An approved instance must not be able to overwrite its clamped enrolled name with a
+    megabyte, nor to crash the write with a non-string.
+
+    ``title`` travels from here into /admin/instances, /api/state and the operator console.
+    The enroll path has always clamped its ``suggested_title`` to 200 chars; the hello path
+    took the value straight off the frame, so one hello could replace a carefully clamped
+    name with 10 MB of anything — and a list/dict title reached sqlite3 as a bind parameter
+    and raised an unhandled ``InterfaceError`` inside a write whose only guard is a
+    ``finally``. Reddens if the ``_clamp`` is dropped from the hello path.
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        approve_instance(db_path, "i1")
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_hello(title="T" * 10_000))
+            assert _recv(ws)["ok"] is True
+            _recv(ws)  # snapshot_request
+        title = _db_row(db_path, "SELECT title FROM instances WHERE id='i1'")[0]
+        assert len(title) == 200 and set(title) == {"T"}
+
+        # A structurally wrong title is stored as NULL — the hello still succeeds (the
+        # frame is otherwise valid) and nothing raises.
+        with client.websocket_connect("/ext") as ws2:
+            ws2.send_json(_hello(title=["not", "a", "string"]))
+            assert _recv(ws2)["ok"] is True
+            _recv(ws2)
+        assert _db_row(db_path, "SELECT title FROM instances WHERE id='i1'") == (None,)
+
+
+def test_hello_with_an_unusable_session_id_is_a_protocol_reject(tmp_path):
+    """``sessionId`` is IDENTITY, so it is refused rather than truncated.
+
+    The mirror compares this value verbatim against the sessionId later reported in
+    snapshots, and a relocation counts as live only while both endpoints' sessions still
+    match — clamping it would silently corrupt those comparisons (a truncated session would
+    read as a session CHANGE and wipe the instance's tabs). So an oversized or non-string
+    session id is a malformed frame, exactly like an oversized install_uuid on the enroll
+    path. Reddens if the check is dropped (a 10 MB session id lands in the DB) or softened
+    into a clamp.
+    """
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        approve_instance(db_path, "i1")
+        for bad in ("s" * 201, 12345, {"a": 1}):
+            with client.websocket_connect("/ext") as ws:
+                ws.send_json(_hello(sessionId=bad))
+                ack = _recv(ws)
+                assert ack["ok"] is False, bad
+                assert ack["error"]["code"] == "protocol", bad
+        # Never registered, never bumped: the row is untouched by the refused hellos.
+        assert _db_row(
+            db_path, "SELECT connected, conn_epoch, session_id FROM instances WHERE id='i1'"
+        ) == (0, 0, None)
+        # A missing sessionId stays legal (it is optional) — the reject is about SHAPE.
+        with client.websocket_connect("/ext") as ws2:
+            msg = _hello()
+            del msg["sessionId"]
+            ws2.send_json(msg)
+            assert _recv(ws2)["ok"] is True
+
+
 # --- first-frame timeout closes the socket (§2) -----------------------------
 def test_first_frame_timeout_closes(tmp_path, monkeypatch):
     # An accepted socket that never sends a first frame is closed after the timeout.
@@ -535,6 +693,86 @@ def test_preauth_ceiling_refuses_and_healthz_still_answers(tmp_path):
             assert client.get("/healthz").status_code == 200
         # The refusal was counted.
         assert client.app.state.ext_rejections == 1
+
+
+def test_silent_socket_quota_compresses_the_first_frame_deadline():
+    """Silent sockets are separated from real clients by TIME, not by a second ceiling.
+
+    A reconnect is silent at handshake time too — it must be accepted before it can send
+    its hello — so a smaller hard ceiling on silent sockets would refuse reconnects at a
+    QUARTER of the connection rate: the same DoS, four times cheaper. What a flood cannot
+    fake is speaking promptly, so the quota compresses the first-frame deadline instead:
+    over quota, a new socket gets one second rather than ten to identify itself, which
+    raises the sustained connection rate needed to hold the pre-auth ceiling by the same
+    factor (~13/s -> ~128/s at ENROLL_PREAUTH_MAX=128) and refuses nobody.
+
+    Reddens if the quota is removed (the deadline stops moving) or if it becomes an
+    admission check again (this pure test would no longer describe the mechanism).
+    """
+    from src.ext.channel import (
+        _FIRST_FRAME_TIMEOUT_S,
+        _FIRST_FRAME_TIMEOUT_UNDER_PRESSURE_S,
+        first_frame_timeout_s,
+        silent_preauth_max,
+    )
+
+    assert silent_preauth_max(128) == 32
+    assert silent_preauth_max(8) == 2
+    assert silent_preauth_max(1) == 1  # floored: never zero, which would pin the pressure on
+
+    # Idle service: the full window, so an ordinary client on a slow link is unaffected.
+    assert first_frame_timeout_s(0, 128) == _FIRST_FRAME_TIMEOUT_S
+    assert first_frame_timeout_s(31, 128) == _FIRST_FRAME_TIMEOUT_S
+    # Over quota: compressed, and strictly shorter (the whole point).
+    assert first_frame_timeout_s(32, 128) == _FIRST_FRAME_TIMEOUT_UNDER_PRESSURE_S
+    assert _FIRST_FRAME_TIMEOUT_UNDER_PRESSURE_S < _FIRST_FRAME_TIMEOUT_S
+
+
+def test_silent_flood_never_refuses_a_reconnect_below_the_ceiling(tmp_path):
+    """Sockets over the silent quota are admitted, not refused — the fleet keeps
+    reconnecting while the flood is in progress.
+
+    ENROLL_PREAUTH_MAX=8 → silent quota 2. Three silent sockets are held open (over quota,
+    so their own deadline is compressed), and an approved instance's hello must still be
+    accepted and registered. Reddens if the silent quota is turned back into a refusal:
+    the third socket, and then the hello, would be closed at the handshake.
+    """
+    app = create_app(_settings(tmp_path, enroll_preauth_max=8))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        approve_instance(db_path, "i1")
+        with client.websocket_connect("/ext"), client.websocket_connect("/ext"), \
+                client.websocket_connect("/ext"):
+            assert client.app.state.ext_silent_count == 3  # over the quota of 2, all live
+            with client.websocket_connect("/ext") as ws:
+                ws.send_json(_hello())
+                assert _recv(ws)["ok"] is True
+                _recv(ws)  # snapshot_request
+                assert _db_row(
+                    db_path, "SELECT connected FROM instances WHERE id='i1'"
+                ) == (1,)
+        assert client.app.state.ext_silent_count == 0
+
+
+def test_silent_count_is_released_by_the_first_frame_not_by_the_close(tmp_path):
+    """The silent count measures sockets that are CURRENTLY saying nothing.
+
+    A socket that has spoken must not keep counting as silent for the rest of its life —
+    otherwise a handful of healthy long-lived connections would put the service into
+    permanent "under pressure" mode and hand every new client the 1 s deadline. Reddens if
+    the release moves out of the first-frame `finally` and back to the end of the handler.
+    """
+    app = create_app(_settings(tmp_path, enroll_preauth_max=8))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        approve_instance(db_path, "i1")
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_hello())
+            _recv(ws)  # hello_ack
+            _recv(ws)  # snapshot_request
+            # A LIVE, connected socket counts as neither silent nor pre-auth.
+            assert client.app.state.ext_silent_count == 0
+            assert client.app.state.ext_preauth_count == 0
 
 
 def test_preauth_slot_released_after_hello_and_after_reject(tmp_path):

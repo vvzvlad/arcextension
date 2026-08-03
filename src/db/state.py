@@ -41,10 +41,27 @@ _TAB_COLUMNS = (
 )
 
 
+# The curated fleet is the ACTIVE fleet (issue #35 §6: the status filter belongs in BOTH
+# read surfaces or neither — ``rules.access.known_instance_ids`` and
+# ``rules.preview.load_preview_input`` already carry it, and ``/metrics`` now does too).
+#
+# ``/api/state`` is the mirror the STARTPAGE renders, and a revoked instance is not part
+# of it in any sense the page can use: its socket is closed, a jump to its tabs can only
+# fail, its mirror can never refresh again, and the row would sit in the status strip
+# forever reading "offline for N days" with no way for the human to make it stop. The
+# alternative — ship the row with a ``status`` field and let the client hide it — was
+# rejected: it needs a client change to avoid exactly that phantom row, and it would leave
+# the same dead weight in the tab groups. Administration of retired instances lives in
+# ``/admin/instances``, which deliberately lists every status (and is where the operator
+# re-approves or inspects them).
+_ACTIVE_ONLY = "WHERE status = 'active'"
+
+
 def _read_instances(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT " + ", ".join(_INSTANCE_COLUMNS) + " FROM instances ORDER BY id"
+        "SELECT " + ", ".join(_INSTANCE_COLUMNS) + " FROM instances "
+        f"{_ACTIVE_ONLY} ORDER BY id"
     ).fetchall()
     return [
         {
@@ -63,8 +80,14 @@ def _read_instances(conn: sqlite3.Connection) -> list[dict]:
 
 def _read_tabs(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
+    # Tabs follow their instance through the SAME filter. Nothing ever deletes a revoked
+    # instance's tabs (``apply_snapshot`` is the only writer and it needs a live socket),
+    # so leaving them in would render a phantom group on the startpage — labelled with a
+    # bare instance id, since the instance row that carried its title is gone — full of
+    # tabs whose "jump" can only fail. One rule, applied to the whole StateResponse.
     rows = conn.execute(
         "SELECT " + ", ".join(_TAB_COLUMNS) + " FROM tabs "
+        "WHERE instance_id IN (SELECT id FROM instances WHERE status = 'active') "
         "ORDER BY instance_id, tab_id"
     ).fetchall()
     return [
@@ -180,11 +203,15 @@ def build_state(conn: sqlite3.Connection, server_now: int) -> dict:
 
 
 def connected_snapshot_ages(conn: sqlite3.Connection) -> dict[str, int | None]:
-    """``{instance_id: snapshot_at}`` for every ``connected=1`` instance — the input
-    to the single-flight staleness decision in the endpoint (§10). ``snapshot_at``
-    may be NULL (connected, never snapshotted) → always stale."""
+    """``{instance_id: snapshot_at}`` for every ACTIVE, ``connected=1`` instance — the
+    input to the single-flight staleness decision in the endpoint (§10). ``snapshot_at``
+    may be NULL (connected, never snapshotted) → always stale.
+
+    The status filter is the same rule the rest of this module follows: refreshing the
+    mirror of an instance that is no longer curated is work whose result nothing reads.
+    """
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT id, snapshot_at FROM instances WHERE connected = 1"
+        "SELECT id, snapshot_at FROM instances WHERE connected = 1 AND status = 'active'"
     ).fetchall()
     return {r["id"]: r["snapshot_at"] for r in rows}

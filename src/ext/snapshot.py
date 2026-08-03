@@ -25,6 +25,26 @@ from typing import Any
 
 from src.ext.protocol import tab_info_to_row
 
+# The SAME ceiling the hello path enforces (``src.ext.channel._MAX_SESSION_ID``), applied
+# here because this is the OTHER writer of ``instances.session_id`` and an invariant only
+# one writer honours is not an invariant. The hello check was justified by "the mirror
+# compares the value verbatim, so it must never be truncated or coerced" — which is a
+# statement about the COLUMN, not about one frame type, and snapshots overwrite that column
+# on every pass. Duplicated as a literal rather than imported: channel.py imports this
+# module, so reaching back for the constant would close an import cycle.
+_MAX_SESSION_ID = 200
+
+
+def _valid_session_id(value: Any) -> bool:
+    """Is ``value`` storable in ``instances.session_id``?
+
+    ``None`` IS valid and meaningful — it is how a client reports "no session", and the
+    caller treats a change to/from it as a session change. Anything that is not a str, or a
+    str past the ceiling, is not a session id at all.
+    """
+    return value is None or (isinstance(value, str) and len(value) <= _MAX_SESSION_ID)
+
+
 _UPSERT_TAB = """
 INSERT INTO tabs (instance_id, tab_id, window_id, url, title, fav_icon_url,
                   pinned, active, opened_at, last_active_at, age_unknown,
@@ -64,6 +84,7 @@ def apply_snapshot(
     new_session = snapshot.get("sessionId")
 
     # --- epoch guard (§6): discard a snapshot from a superseded socket -------
+    # (the session/window-id hygiene below needs the stored row, so it comes after)
     # Re-check the epoch INSIDE this write transaction (atomic with the writes):
     # a hello that evicted this socket between the channel's synchronous identity
     # check and this write (a point of `await`) would otherwise let a stale
@@ -75,6 +96,26 @@ def apply_snapshot(
     if row is None or row[0] != expected_epoch:
         return
     stored_session = row[1]
+
+    # --- field hygiene on the two instance-level values (§6) ----------------
+    # Same rule as the hello path, on the same columns. A snapshot arrives on an
+    # AUTHENTICATED socket, but authenticated is not trusted, and unlike hello this code
+    # cannot answer REJECT_PROTOCOL — it runs inside the write transaction, where the only
+    # tool is to skip the bad value (exactly what the tab/window loops below do, and for
+    # the same reason: a raised sqlite3.InterfaceError would abort the WHOLE snapshot and
+    # drop a live instance out of curation until it reconnects).
+    #
+    # An unusable sessionId is NOT read as "session changed" — that would wipe every tab of
+    # the instance on a malformed frame. It carries no information, so the stored session
+    # stands and the tab table is left alone.
+    if not _valid_session_id(new_session):
+        new_session = stored_session
+    # focused_window_id is an INTEGER column. A dict/list would reach sqlite3 as a bound
+    # parameter it cannot adapt; a bool is not a window id. Unusable => NULL ("no focused
+    # window"), which is already the column's benign default.
+    focused_window_id = snapshot.get("focusedWindowId")
+    if not isinstance(focused_window_id, int) or isinstance(focused_window_id, bool):
+        focused_window_id = None
 
     # --- session-change clear (§5) ------------------------------------------
     if stored_session != new_session:
@@ -124,7 +165,7 @@ def apply_snapshot(
     conn.execute(
         "UPDATE instances SET focused_window_id = ?, session_id = ?, "
         "snapshot_at = ?, last_seen_at = ? WHERE id = ?",
-        (snapshot.get("focusedWindowId"), new_session, sent_at, now, instance_id),
+        (focused_window_id, new_session, sent_at, now, instance_id),
     )
 
     # --- `sent_at`-bounded delete (AFTER the upserts) -----------------------

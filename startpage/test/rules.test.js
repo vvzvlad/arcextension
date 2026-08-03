@@ -99,10 +99,10 @@ describe("rules editor: preview before save (§8/§10)", () => {
 // --- offline-graceful (§10) --------------------------------------------------
 describe("rules editor: offline-graceful (§10)", () => {
   it("with no base/token the editor degrades to an offline note, no throw", async () => {
-    // No instance.json route => loadInstanceConfig fails => base/token stay null.
-    const env = makeChrome({ tabs: [], messages: {} });
-    const fetchFn = async (url) => {
-      if (String(url).includes("instance.json")) throw new Error("no config");
+    // The SW has no credential (not enrolled) => base/token stay null. There is no
+    // instance.json fallback to smuggle a token in from the bundle anymore (§7).
+    const env = makeChrome({ tabs: [], credential: null, messages: {} });
+    const fetchFn = async () => {
       throw new Error("network down");
     };
     const store = createStore({ chromeApi: env.chrome, fetchFn, now: () => NOW });

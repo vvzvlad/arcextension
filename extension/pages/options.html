@@ -9,9 +9,10 @@
     <!--
       Options page (§7, §12). It carries the enrollment settings — the service
       address, the browser name (→ suggested_title), the ~10-min window code the
-      operator reads off /admin, and a submit-enrollment action — plus the first 8
-      chars of installUuid so the operator can identify THEIR request in the /admin
-      list (origin is uniform fleet-wide). The execute_js opt-in checkbox (§12) is the
+      operator reads off /admin, and a submit-enrollment action — plus an installUuid
+      prefix so the operator can identify THEIR request in the /admin list (origin is
+      uniform fleet-wide, and the list prints the SAME prefix length so the two can be
+      compared char for char). The execute_js opt-in checkbox (§12) is the
       "stop" button for the most dangerous operation. All settings live in
       chrome.storage.local (per-profile; NEVER in the bundle) — the shared token is
       gone. The script is external (options.js) because the extension_pages CSP is
@@ -41,6 +42,13 @@
               placeholder="wss://curator.example"
             />
           </label>
+          <br />
+          <small>
+            <code>wss://</code> only. This instance's secret is sent as-is over this
+            connection, so an unencrypted <code>ws://</code> (or an <code>http://</code>)
+            address is refused — except <code>ws://localhost</code> /
+            <code>ws://127.0.0.1</code> for development.
+          </small>
         </p>
         <p>
           <label>

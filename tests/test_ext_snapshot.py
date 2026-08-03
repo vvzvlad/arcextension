@@ -11,6 +11,12 @@ from src.ext.protocol import heartbeat_step
 from src.ext.snapshot import apply_snapshot
 
 
+# The pending-request TTL these tests hand to `upsert_enroll_request_capped`. Wide enough
+# that every row in the tests below is LIVE, so the TTL branch only fires where a test
+# deliberately reaches past it (see the expired-row test).
+_TTL_MS = 60 * 60_000
+
+
 async def _make_db(tmp_path):
     db = Database(str(tmp_path / "curator.db"), str(tmp_path / "backups"))
     await db.open()
@@ -251,6 +257,110 @@ async def test_invalid_tab_id_is_skipped_not_fatal(tmp_path):
         await db.close()
 
 
+async def test_snapshot_session_id_obeys_the_same_rule_as_hello(tmp_path):
+    """``instances.session_id`` has TWO writers; the invariant must bind both.
+
+    The hello path refuses a non-str / >200-char ``sessionId`` outright, on the grounds
+    that the mirror compares the value VERBATIM (a relocation stays live only while both
+    endpoints' sessions match), so it may never be truncated or coerced. That is a claim
+    about the COLUMN — and `apply_snapshot` rewrites the very same column on every pass,
+    where it used to accept anything the frame carried.
+
+    Here the frame is already authenticated and there is no socket to reject from inside a
+    write transaction, so an unusable value is SKIPPED (the rule the tab/window loops
+    follow). Skipping specifically must not read as "the session changed": that would wipe
+    every tab of a live instance on one malformed frame. Reddens if the checks are dropped,
+    or if a bad value is allowed to trigger the session-change clear.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        base = 6_500_000
+        epoch = await _register(db, "i", "s1", base)
+        good = {"sessionId": "s1", "focusedWindowId": 1,
+                "tabs": [_tab(1), _tab(2)], "windows": []}
+        await db.write(
+            lambda c: apply_snapshot(c, "i", good, sent_at=base, now=base, expected_epoch=epoch)
+        )
+        assert await _tab_ids(db, "i") == [1, 2]
+
+        async def stored_session():
+            return await db.read(
+                lambda c: c.execute(
+                    "SELECT session_id FROM instances WHERE id='i'"
+                ).fetchone()[0]
+            )
+
+        # A non-str and an over-ceiling session id are both unusable. sent_at is set well
+        # BEFORE the tabs' updated_at so the bounded delete cannot be what keeps them —
+        # only the absence of a session-change clear can.
+        for bad in ({"a": 1}, 12345, "x" * 201):
+            snap = {"sessionId": bad, "focusedWindowId": 1, "tabs": [], "windows": []}
+            await db.write(
+                lambda c, s=snap: apply_snapshot(
+                    c, "i", s, sent_at=base - 1000, now=base + 100, expected_epoch=epoch
+                )
+            )
+            assert await stored_session() == "s1", f"{bad!r} must not overwrite the session"
+            assert await _tab_ids(db, "i") == [1, 2], f"{bad!r} must not wipe the tabs"
+
+        # A str at exactly the ceiling IS a session id — and so is None ("no session").
+        # Both are real changes and clear the tabs, which is what proves the guard above
+        # is a validity check and not a blanket "never change the session".
+        at_ceiling = "y" * 200
+        await db.write(
+            lambda c: apply_snapshot(
+                c, "i", {"sessionId": at_ceiling, "focusedWindowId": 1, "tabs": [], "windows": []},
+                sent_at=base - 1000, now=base + 200, expected_epoch=epoch,
+            )
+        )
+        assert await stored_session() == at_ceiling
+        assert await _tab_ids(db, "i") == []
+    finally:
+        await db.close()
+
+
+async def test_snapshot_focused_window_id_is_not_fatal_when_malformed(tmp_path):
+    # focused_window_id is an INTEGER column. A dict/list reaches sqlite3 as a parameter it
+    # cannot adapt and raises InterfaceError INSIDE the write — aborting the whole snapshot
+    # and dropping a live instance out of curation until it reconnects, which is exactly
+    # the failure mode the tab/window loops are written to avoid. Unusable => NULL.
+    db = await _make_db(tmp_path)
+    try:
+        base = 6_600_000
+        epoch = await _register(db, "i", "s", base)
+        for bad in ({"w": 1}, ["w"], "3", True):
+            snap = {"sessionId": "s", "focusedWindowId": bad,
+                    "tabs": [_tab(1)], "windows": []}
+            await db.write(
+                lambda c, s=snap: apply_snapshot(
+                    c, "i", s, sent_at=base, now=base + 5, expected_epoch=epoch
+                )
+            )
+            assert await db.read(
+                lambda c: c.execute(
+                    "SELECT focused_window_id FROM instances WHERE id='i'"
+                ).fetchone()[0]
+            ) is None, f"{bad!r} must land as NULL"
+            # The rest of the snapshot still applied — the transaction was not aborted.
+            assert await _tab_ids(db, "i") == [1]
+
+        # A real window id is still stored.
+        await db.write(
+            lambda c: apply_snapshot(
+                c, "i", {"sessionId": "s", "focusedWindowId": 7, "tabs": [_tab(1)],
+                         "windows": []},
+                sent_at=base, now=base + 6, expected_epoch=epoch,
+            )
+        )
+        assert await db.read(
+            lambda c: c.execute(
+                "SELECT focused_window_id FROM instances WHERE id='i'"
+            ).fetchone()[0]
+        ) == 7
+    finally:
+        await db.close()
+
+
 # --- epoch-guarded disconnect write (THE headline invariant) ----------------
 async def test_late_disconnect_does_not_clobber_newer_connection(tmp_path):
     db = await _make_db(tmp_path)
@@ -386,7 +496,8 @@ async def test_resolve_secret_db_leak_resistance(tmp_path):
 
 async def test_upsert_enroll_request_does_not_bump_first_seen_at(tmp_path):
     # first_seen_at is frozen across repeats (so the TTL is reachable); last_seen_at /
-    # title / secret_hash refresh to the latest.
+    # title / origin refresh to the latest. secret_hash is frozen TOO — see
+    # test_pending_request_credential_is_frozen_against_substitution for why.
     db = await _make_db(tmp_path)
     try:
         await db.write(
@@ -405,7 +516,7 @@ async def test_upsert_enroll_request_does_not_bump_first_seen_at(tmp_path):
                 "FROM enroll_requests WHERE install_uuid='u1'"
             ).fetchone()
         )
-        assert row == (100, 200, "T2", "h2", "o2")
+        assert row == (100, 200, "T2", "h1", "o2")
         count = await db.read(
             lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
         )
@@ -414,23 +525,164 @@ async def test_upsert_enroll_request_does_not_bump_first_seen_at(tmp_path):
         await db.close()
 
 
+async def test_pending_request_credential_is_frozen_against_substitution(tmp_path):
+    """THE TOCTOU on the pending list: the operator must approve the credential they SAW.
+
+    Attack shape: the row is keyed on ``install_uuid``, and the enroll gate only requires
+    the (shared, short-lived) window code — so anyone who knows a victim's install_uuid and
+    the current code could re-file that request with THEIR secret. Every operator-visible
+    field (origin, suggested_title, protocol_version, the first-8 uuid) can be left
+    identical, so the console row does not change at all and the click enrolls the
+    attacker's credential under the victim's identity.
+
+    The fix is that the stored credential is immutable for the life of the row: a repeat
+    with a DIFFERENT hash writes nothing at all — not the hash, and not last_seen_at, so
+    the stale row still ages out on its original schedule and the honest client's next
+    attempt is accepted. Reddens if ``secret_hash = excluded.secret_hash`` returns to the
+    ON CONFLICT clause, or if the mismatch stops being reported to the caller.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "victim", "o", "Laptop", 1, "victim-hash", 100, 8, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
+
+        # The substitution attempt: same uuid, same visible fields, different secret.
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "victim", "o", "Laptop", 1, "attacker-hash", 200, 8, _TTL_MS)
+        ) == queries.ENROLL_SECRET_MISMATCH
+        assert await db.read(
+            lambda c: c.execute(
+                "SELECT secret_hash, last_seen_at FROM enroll_requests "
+                "WHERE install_uuid='victim'"
+            ).fetchone()
+        ) == ("victim-hash", 100)
+
+        # The honest repeat (the client re-sends the secret it persisted) still refreshes
+        # everything it is allowed to refresh — the freeze is not a freeze of the row.
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "victim", "o2", "Renamed", 1, "victim-hash", 300, 8, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
+        assert await db.read(
+            lambda c: c.execute(
+                "SELECT last_seen_at, suggested_title, origin FROM enroll_requests "
+                "WHERE install_uuid='victim'"
+            ).fetchone()
+        ) == (300, "Renamed", "o2")
+
+        # And once the row is gone (operator rejected it, or the TTL sweep took it), the
+        # new secret enrolls normally — the freeze self-heals, it does not brick a uuid.
+        await db.write(lambda c: queries.reject_enroll_request(c, "victim"))
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "victim", "o", "Laptop", 1, "fresh-hash", 400, 8, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
+    finally:
+        await db.close()
+
+
+async def test_expired_pending_row_does_not_freeze_the_credential(tmp_path):
+    """The credential freeze must follow the SAME TTL both read surfaces apply.
+
+    `list_pending_enroll_requests` and `get_enroll_request` filter on
+    ``first_seen_at >= now - ttl_ms``; the physical sweep only catches up within a tick.
+    A row inside that gap is invisible in /admin and unapprovable — yet the freeze used to
+    consult it anyway and answer ``secret_conflict`` to a legitimate re-registration,
+    leaving the operator with nothing to reject and the client with no way through. An
+    expired row must therefore read as ABSENT: replaced outright, new secret, new
+    first_seen_at. Reddens if the TTL filter is dropped from the lookup, or if the replace
+    degrades to the plain UPSERT (which leaves secret_hash and first_seen_at alone).
+    """
+    db = await _make_db(tmp_path)
+    try:
+        t0 = 1_000_000
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "u1", "o", "Laptop", 1, "old-hash", t0, 8, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
+
+        # Exactly ON the cutoff the row is still LIVE (the readers compare with `>=`), so
+        # the freeze is untouched for rows an operator can still act on.
+        live = t0 + _TTL_MS
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "u1", "o", "Laptop", 1, "new-hash", live, 8, _TTL_MS)
+        ) == queries.ENROLL_SECRET_MISMATCH
+
+        # One ms past it the row is expired — gone for every reader — so the new secret
+        # goes in and the row restarts its TTL from this request.
+        past = t0 + _TTL_MS + 1
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "u1", "o2", "Renamed", 1, "new-hash", past, 8, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
+        assert await db.read(
+            lambda c: c.execute(
+                "SELECT secret_hash, first_seen_at, last_seen_at, suggested_title "
+                "FROM enroll_requests WHERE install_uuid='u1'"
+            ).fetchone()
+        ) == ("new-hash", past, past, "Renamed")
+        # Exactly one row — the expired one was replaced, not duplicated.
+        assert await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
+        ) == 1
+    finally:
+        await db.close()
+
+
+async def test_capacity_count_is_not_ttl_filtered(tmp_path):
+    """The ceiling counts ROWS, expired or not — deliberately stricter than the readers.
+
+    The anti-flood bound exists to keep the table (and the operator's list) from growing
+    without bound; a row that is expired but not yet swept is still a row. TTL-filtering
+    this count would let a flood hold `max_pending` live rows AND an unbounded tail of
+    expired ones between sweeps. The refusal it produces is self-clearing — the sweeper
+    runs every TICK_MS — unlike the credential freeze above. Reddens if a `WHERE
+    first_seen_at >= ?` is added to the COUNT.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        t0 = 1_000_000
+        for uuid, h in (("u1", "h1"), ("u2", "h2")):
+            assert await db.write(
+                lambda c, u=uuid, hh=h: queries.upsert_enroll_request_capped(
+                    c, u, None, None, 1, hh, t0, 2, _TTL_MS)
+            ) == queries.ENROLL_ACCEPTED
+        # Both rows are now EXPIRED, and a NEW uuid is still refused: the count saw them.
+        past = t0 + _TTL_MS + 1
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(
+                c, "u3", None, None, 1, "h3", past, 2, _TTL_MS)
+        ) == queries.ENROLL_AT_CAPACITY
+        assert await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
+        ) == 2
+    finally:
+        await db.close()
+
+
 async def test_upsert_enroll_request_capped_enforces_capacity_atomically(tmp_path):
     # The capacity gate must be authoritative under one transaction: a NEW install_uuid is
     # rejected once the list is at max_pending, but an EXISTING one is always accepted (an
     # update, not a new row — so a full list can still refresh last_seen_at under TTL).
+    # This is now the ONLY capacity gate: the channel's advisory pre-count was removed (it
+    # was a second unauthenticated DB read per socket and could never be authoritative).
     db = await _make_db(tmp_path)
     try:
         # Fill to a max_pending of 2.
         assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, None, 1, "h1", 100, 2)
-        )
+            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, None, 1, "h1", 100, 2, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
         assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u2", None, None, 1, "h2", 100, 2)
-        )
+            lambda c: queries.upsert_enroll_request_capped(c, "u2", None, None, 1, "h2", 100, 2, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
         # A third, NEW uuid at capacity is refused and writes nothing.
-        assert not await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u3", None, None, 1, "h3", 100, 2)
-        )
+        assert await db.write(
+            lambda c: queries.upsert_enroll_request_capped(c, "u3", None, None, 1, "h3", 100, 2, _TTL_MS)
+        ) == queries.ENROLL_AT_CAPACITY
         assert await db.read(
             lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
         ) == 2
@@ -439,14 +691,15 @@ async def test_upsert_enroll_request_capped_enforces_capacity_atomically(tmp_pat
         ) is None
         # An EXISTING uuid at capacity is still accepted (refresh), count unchanged.
         assert await db.write(
-            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, "T1b", 1, "h1b", 300, 2)
-        )
+            lambda c: queries.upsert_enroll_request_capped(c, "u1", None, "T1b", 1, "h1", 300, 2, _TTL_MS)
+        ) == queries.ENROLL_ACCEPTED
         row = await db.read(
             lambda c: c.execute(
-                "SELECT last_seen_at, secret_hash FROM enroll_requests WHERE install_uuid='u1'"
+                "SELECT last_seen_at, suggested_title FROM enroll_requests "
+                "WHERE install_uuid='u1'"
             ).fetchone()
         )
-        assert row == (300, "h1b")
+        assert row == (300, "T1b")
         assert await db.read(
             lambda c: c.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
         ) == 2

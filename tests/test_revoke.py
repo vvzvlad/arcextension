@@ -91,6 +91,34 @@ async def test_revoke_instance_clears_session_stamps_status_and_revoked_at(tmp_p
         await db.close()
 
 
+async def test_revoke_clears_a_stuck_connected_flag_with_no_live_socket(tmp_path):
+    """Revoking an OFFLINE instance must clear ``connected``, because nothing else will.
+
+    The revoke handler's socket close is best-effort AND registry-driven: with no entry it
+    returns immediately (``admin._close_live_socket``). ``mark_disconnected`` only ever runs
+    from a socket's own finalizer and is epoch-guarded, so there is no other writer either.
+    A row left ``connected=1`` by a process kill — the state a crash leaves behind — used
+    to stay that way forever after a revoke, and a "connected" instance whose snapshot
+    never advances is precisely what ``curator-instance-snapshot-stale`` reads as a
+    half-open socket. Reddens if the ``connected = 0`` clause leaves ``_REVOKE_UPDATE``.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        # connected=1 with NO registry entry anywhere: an instance whose process died.
+        await db.write(lambda c: _seed_instance(c, "stuck", connected=1))
+        await db.write(
+            lambda c: c.execute("UPDATE instances SET focused_window_id = 7 WHERE id='stuck'")
+        )
+        await db.write(
+            lambda c: revoke_instance(c, "stuck", now=9000, main_instance_id="main")
+        )
+        assert await _rows(
+            db, "SELECT status, connected, focused_window_id FROM instances WHERE id='stuck'"
+        ) == [("revoked", 0, None)]
+    finally:
+        await db.close()
+
+
 # --- MAIN guard (acc 9) -----------------------------------------------------
 async def test_revoke_main_requires_matching_replacement(tmp_path):
     """Revoking MAIN is refused (RevokeMainRefused → 409) unless replacement == the

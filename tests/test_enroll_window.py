@@ -7,7 +7,7 @@ open purely as a function of the stored deadline and the caller's ``now``, so a
 
 from src.curator import enroll
 from src.db.access import Database
-from src.db.settings_store import get_setting
+from src.db.settings_store import get_setting, set_setting
 
 
 async def _make_db(tmp_path) -> Database:
@@ -174,6 +174,45 @@ async def test_rearm_mints_a_fresh_code(tmp_path):
         # The stored code is the latest one.
         stored = await db.read(lambda c: get_setting(c, enroll.ENROLL_WINDOW_CODE_KEY))
         assert stored == second.code
+    finally:
+        await db.close()
+
+
+async def test_a_code_without_a_deadline_never_surfaces(tmp_path):
+    """The two CLOSED branches must be symmetric: no deadline reads exactly like an expired
+    one — closed, ``code=None``, ``until=None``.
+
+    The contract the docstring states (and that ``/admin`` relies on) is that a caller may
+    render ``state.code`` without separately checking ``state.open``. The absent-deadline
+    branch returned the STORED code, so any state where the deadline row is
+    missing/blank/garbage while the code row survives — a half-written pair, a hand-edited
+    settings table, a partially restored backup — handed back a live-looking code for a
+    window that is not open. Reddens if that branch goes back to passing ``code``.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        armed = await db.write(lambda c: enroll.arm_enroll_window(c, now=1_000, minutes=10))
+        assert armed.code
+        # Blank the DEADLINE only, leaving the code row intact.
+        await db.write(
+            lambda c: set_setting(c, enroll.ENROLL_WINDOW_UNTIL_KEY, "")
+        )
+        state = await db.read(lambda c: enroll.read_enroll_window(c, now=1_500))
+        assert state.open is False
+        assert state.seconds_remaining == 0
+        assert state.code is None
+        assert state.until is None
+        # Non-vacuity: the code row really is still there — the state HIDES it.
+        assert await db.read(
+            lambda c: get_setting(c, enroll.ENROLL_WINDOW_CODE_KEY)
+        ) == armed.code
+
+        # The same for an unparseable deadline (a foreign write).
+        await db.write(
+            lambda c: set_setting(c, enroll.ENROLL_WINDOW_UNTIL_KEY, "soon")
+        )
+        garbage = await db.read(lambda c: enroll.read_enroll_window(c, now=1_500))
+        assert garbage.open is False and garbage.code is None
     finally:
         await db.close()
 

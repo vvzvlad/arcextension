@@ -8,8 +8,60 @@
 
 // A tiny async gap on a real macrotask — enough for two independent async
 // functions to interleave their get/await/set.
+//
+// Every gap is ACCOUNTED FOR: `pending` counts the operations that have been started
+// but whose macrotask has not fired yet, so a test can drain the mock by STATE ("no
+// unserviced operation is left") instead of by wall clock. That distinction is the
+// whole point of the counter. The opening frame of an enrollment path costs 5-7
+// chained storage round-trips, i.e. 5-7 real macrotasks; on a loaded machine (three
+// vitest processes on two cores) they do not all fit inside any fixed timeout short
+// enough to be worth writing, so a `setTimeout(25)`-style flush asserted on a
+// half-written chain and the suite failed in a different place on every run. A
+// time-based flush can only ever be tuned, never made correct.
+let pending = 0;
+
 function tick() {
-  return new Promise((resolve) => setTimeout(resolve, 0));
+  pending += 1;
+  return new Promise((resolve) =>
+    setTimeout(() => {
+      // Decrement BEFORE resolving: the awaiting continuation runs as a microtask off
+      // this resolve and may start the next operation, which must be counted afresh.
+      pending -= 1;
+      resolve();
+    }, 0),
+  );
+}
+
+// How many mock operations are in flight right now. Module-level on purpose: it covers
+// every mock built in this test file, including a leftover write from the previous test
+// still on its way to storage.
+export function pendingOps() {
+  return pending;
+}
+
+// Run the event loop until the mock has nothing left to serve, then return.
+//
+// Termination is decided by the QUEUE, not by elapsed time: each round yields one
+// macrotask, which lets every already-expired mock timer fire and — because the
+// microtask queue is drained after each timer callback — lets every continuation those
+// unblocked either finish or start its next operation. Seeing `pending === 0` on two
+// consecutive rounds therefore means the chain is genuinely done, on a fast laptop and
+// on a starved CI runner alike.
+//
+// `maxRounds` is a stuck-detector, not a timeout to tune: real chains settle in well
+// under twenty rounds, so hitting the cap means an await that will never be satisfied.
+// Failing loudly there beats hanging until vitest's own timeout says only "5000ms".
+export async function settle({ maxRounds = 1000 } = {}) {
+  let quiet = 0;
+  for (let round = 0; round < maxRounds; round += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    quiet = pending === 0 ? quiet + 1 : 0;
+    if (quiet >= 2) return round + 1;
+  }
+  throw new Error(
+    `chrome mock never went quiet: ${pending} operation(s) still in flight after ` +
+      `${maxRounds} macrotasks — that is a stuck await, not a slow machine`,
+  );
 }
 
 class AsyncStorageArea {

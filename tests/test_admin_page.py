@@ -188,6 +188,74 @@ def test_xss_payload_served_verbatim_and_page_uses_textcontent(tmp_path):
         assert "innerHTML" not in served
 
 
+# --- the operator must SEE the refusal reason, not just its status code -------
+def test_error_detail_reaches_the_console_not_just_the_status(tmp_path):
+    """A refusal carries a WRITTEN reason and the console must be able to print it.
+
+    ``_http_exception`` (src/app.py) renders a dict ``detail`` as JSON and every other
+    ``detail`` as PLAIN TEXT. The console's ``apiSend`` used to read only
+    ``res.json().error``, so every string detail was lost to the failed parse and the
+    operator saw a bare "POST /admin/enroll/approve -> 409" — while approve alone answers
+    409 with three different meanings (window closed / id already active / secret already
+    enrolled) and the closed one spells out the fix.
+
+    ``apiGet`` had the same hole for longer: it threw ``path + " -> " + res.status`` and
+    ALL THREE ``render*`` calls go through it, so a degraded service showed
+    "/admin/enroll/requests -> 503" instead of the sentence the server sent. The extraction
+    therefore lives in ONE helper both wrappers call — the thing this test pins, because a
+    second copy is exactly how the two paths drifted apart the first time.
+
+    There is no JS harness for ``templates/app.js`` (it is a served static asset, not a
+    module — see the acc-6 test above for the same source-level style), so this pins the
+    two halves that must meet: the server really does put the sentence in a plain-text
+    body, and the SHIPPED page JS reads that body as text. Reddens if the detail is
+    swallowed on either side — in particular if the helper goes back to ``res.json()``
+    first, which consumes the body and makes any ``res.text()`` fallback unreachable, or
+    if either wrapper stops routing its refusal through the helper."""
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with _tc(app) as client:
+        _seed_request(db_path, "u-detail", secret_hash=secret_hash_for("detail"))
+        # No window armed → the 409 whose detail tells the operator what to do.
+        r = client.post("/admin/enroll/approve", headers=admin_headers(),
+                        json={"install_uuid": "u-detail", "instance_id": "lap"})
+        assert r.status_code == 409
+        assert "text/plain" in r.headers["content-type"]  # NOT JSON: no `error` field
+        assert "the enrollment window is closed" in r.text
+        assert "POST /admin/enroll/window" in r.text
+
+        # The shipped console reads the body as TEXT and only then tries to parse it as
+        # JSON — the order matters, res.json() consumes the body on a failed parse.
+        served = client.get("/admin/app.js").text
+
+        def _source_of(signature):
+            """The body of one TOP-LEVEL function: from its signature to the first closing
+            brace in column 0. Excludes the comment block above it, which names res.json()
+            precisely to explain why the code does not call it."""
+            src = served[served.index(signature):]
+            return src[: src.index("\n}\n")]
+
+        # Comments inside the helper NAME res.json() for the same reason; strip them so the
+        # assertions below read the CODE.
+        code = "\n".join(
+            line for line in _source_of("async function responseError(").splitlines()
+            if not line.strip().startswith("//")
+        )
+        assert "res.text()" in code
+        assert "JSON.parse(" in code
+        assert code.index("res.text()") < code.index("JSON.parse(")
+        assert "res.json()" not in code  # would consume the body before the text read
+        assert "err.status = res.status" in code  # the MAIN-revoke 409 branch reads it
+
+        # BOTH wrappers report a refusal through that ONE helper, and neither keeps a
+        # private copy of the extraction (a second copy is how apiGet drifted).
+        for signature in ("async function apiGet(", "async function apiSend("):
+            wrapper = _source_of(signature)
+            assert "responseError(" in wrapper, signature
+            assert "res.text()" not in wrapper, signature
+            assert "JSON.parse(" not in wrapper, signature
+
+
 # --- (7) Bearer still opens everything, and beats an ambient cookie ----------
 def test_bearer_opens_admin_and_beats_cookie(tmp_path):
     """Acc 7. Reddens if the #36 changes break the #35 Bearer path, or if an ambient cookie
@@ -259,6 +327,225 @@ def test_wrong_token_login_rejected_no_cookie(tmp_path):
         assert r.status_code == 401
         assert "set-cookie" not in {k.lower() for k in r.headers}
         assert _session_value(client) is None
+
+
+def test_failed_login_counts_under_its_own_reason(tmp_path):
+    """A wrong ADMIN_TOKEN must be countable APART from "no session presented".
+
+    ``admin_session`` ticks on every unauthenticated hit of the console — a browser opening
+    /admin before logging in produces one — so folding failed logins into it makes guessing
+    the credential that opens /admin, /api/* and /mcp unalertable: no threshold survives
+    the background noise and still catches a brute force. Reddens if login_submit goes back
+    to incrementing ``admin_session`` (the bad-token counter would stop moving and the
+    ambient one would move twice).
+    """
+    from src.api.admin_page import ADMIN_BAD_TOKEN_REASON
+    from src.api.auth_metrics import auth_rejections
+
+    app = create_app_for(tmp_path)
+    with _tc(app) as client:
+        before = auth_rejections.by_reason()
+        # (a) a wrong token at the LOGIN endpoint -> the brute-force reason.
+        assert client.post("/admin/login", json={"token": "guess"}).status_code == 401
+        mid = auth_rejections.by_reason()
+        assert mid.get(ADMIN_BAD_TOKEN_REASON, 0) == before.get(ADMIN_BAD_TOKEN_REASON, 0) + 1
+        assert mid.get("admin_session", 0) == before.get("admin_session", 0)
+
+        # (b) an ordinary unauthenticated console hit -> the ambient reason, and NOT the
+        # brute-force one (this is the noise the split exists to keep out of the alert).
+        assert client.get("/admin", cookies={}).status_code == 401
+        after = auth_rejections.by_reason()
+        assert after.get("admin_session", 0) == mid.get("admin_session", 0) + 1
+        assert after.get(ADMIN_BAD_TOKEN_REASON, 0) == mid.get(ADMIN_BAD_TOKEN_REASON, 0)
+
+
+# --- pre-auth body ceiling ---------------------------------------------------
+def test_login_body_is_capped(tmp_path):
+    """``POST /admin/login`` is the service's only PRE-AUTH body, and it was unbounded.
+
+    It cannot sit behind ``require_admin`` (it is how one authenticates) and neither the
+    app nor uvicorn imposes a size limit, so ``await request.json()`` would buffer whatever
+    an anonymous peer sent — the cheapest possible way to spend the process's memory.
+    Reddens if the cap is removed: the 1 MiB post below turns back into a 401 (i.e. it was
+    read in full first).
+    """
+    app = create_app_for(tmp_path)
+    with _tc(app) as client:
+        # (a) declared oversize: refused on the header, before a byte is buffered.
+        big = client.post(
+            "/admin/login",
+            content=b'{"token": "' + b"x" * (1024 * 1024) + b'"}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert big.status_code == 413
+
+        # (b) CHUNKED (no Content-Length — the trivial way past a header check) is cut off
+        # at the same ceiling by the running total.
+        def _chunks():
+            yield b'{"token": "'
+            for _ in range(64):
+                yield b"x" * 1024
+            yield b'"}'
+
+        chunked = client.post(
+            "/admin/login", content=_chunks(),
+            headers={"Content-Type": "application/json"},
+        )
+        assert chunked.status_code == 413
+
+        # (c) a normal login is unaffected — the cap is orders of magnitude above a token.
+        assert client.post("/admin/login", json={"token": ADMIN_TOKEN}).status_code == 200
+
+
+def test_bounded_body_binds_every_later_reader():
+    """The ceiling must hold for whoever reads the body NEXT, not just for this call.
+
+    ``read_bounded_body`` stashes its buffer in Starlette's PRIVATE ``Request._body`` —
+    the same attribute ``Request.body()`` reads and writes — because Starlette exposes no
+    public equivalent (no setter, no "already read" hook). That coupling is the thing an
+    upgrade can break SILENTLY: the guard would keep returning 413s while every later
+    reader went back to the wire, and no existing test would notice. So both directions are
+    pinned here, against the real ASGI stack rather than a hand-built Request:
+
+    * accepted body -> ``request.body()`` returns THAT buffer (if the stash stopped being
+      honoured, this raises "Stream consumed" instead — loud, not silent);
+    * refused body -> a later read yields nothing. The declared-Content-Length branch is
+      the sharp one: it returns before touching the stream, so without a sticky refusal the
+      next ``request.body()`` happily buffered the whole oversized body (measured: 1000
+      bytes past a 64-byte limit) and the ceiling bounded nothing at all.
+    """
+    from starlette.applications import Starlette
+    from starlette.exceptions import HTTPException
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    from src.api.guards import read_bounded_body
+
+    limit = 64
+
+    async def probe(request):
+        out = {}
+        try:
+            out["first"] = len(await read_bounded_body(request, limit))
+        except HTTPException as exc:
+            out["first"] = exc.status_code
+        # Whatever happened above, this is what the NEXT reader of the body sees.
+        out["second"] = len(await request.body())
+        return JSONResponse(out)
+
+    probe_app = Starlette(routes=[Route("/probe", probe, methods=["POST"])])
+    with TestClient(probe_app) as client:
+        # Accepted: the stash is what Starlette's own reader returns.
+        assert client.post("/probe", content=b"z" * 10).json() == {"first": 10, "second": 10}
+
+        # Refused on the declared Content-Length — nothing was read, and nothing may be.
+        assert client.post("/probe", content=b"y" * 1000).json() == {"first": 413, "second": 0}
+
+        # Refused mid-stream on a CHUNKED body (no Content-Length): same guarantee.
+        def _chunks():
+            for _ in range(10):
+                yield b"x" * 100
+
+        assert client.post("/probe", content=_chunks()).json() == {"first": 413, "second": 0}
+
+
+def test_a_refusal_does_not_destroy_a_body_someone_else_already_read():
+    """The already-buffered branch RE-CHECKS a buffer; it must never wipe it.
+
+    Sticky-on-refusal exists for the branches that leave the wire readable — it stops a
+    later reader from going back and buffering the body this call refused. On the branch
+    where the body is already in ``Request._body`` there is no wire left to protect (the
+    stream is drained), and the buffer belongs to whoever read it first: pinning it to
+    ``b""`` there deleted a valid body before anyone had even decided whether to catch the
+    413. Harmless only for as long as the single caller keeps letting the exception fly.
+
+    Both outcomes of that branch are pinned, on the real ASGI stack rather than a hand-built
+    Request, because they fail differently:
+
+    * a LEGAL pre-read body (within the limit) is handed back BYTE-FOR-BYTE and is still
+      there for the next reader — an unconditional wipe on this branch would be invisible
+      to the 413 case alone;
+    * an oversized one still answers 413, and the buffer survives it — reddens the moment
+      the wipe is put back on this branch, ``second`` dropping to 0.
+
+    Both bodies are sent CHUNKED (no ``Content-Length``) so the header check cannot short-
+    circuit them and the already-buffered branch is really the one under test.
+    """
+    from starlette.applications import Starlette
+    from starlette.exceptions import HTTPException
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    from src.api.guards import read_bounded_body
+
+    limit = 64
+
+    async def probe(request):
+        # An earlier reader legitimately buffers the whole body first.
+        first = await request.body()
+        out = {"first": len(first), "verbatim": None}
+        try:
+            bounded = await read_bounded_body(request, limit)
+            out["bounded"] = len(bounded)
+            out["verbatim"] = bounded == first  # returned, not merely sized right
+        except HTTPException as exc:
+            out["bounded"] = exc.status_code
+        # Whatever happened above, this is what the NEXT reader of the body sees.
+        out["second"] = len(await request.body())
+        return JSONResponse(out)
+
+    probe_app = Starlette(routes=[Route("/probe", probe, methods=["POST"])])
+
+    def _chunks(count):
+        def gen():
+            for _ in range(count):
+                yield b"x" * 10
+        return gen()
+
+    with TestClient(probe_app) as client:
+        # (a) within the limit: the earlier reader's buffer comes back untouched.
+        assert client.post("/probe", content=_chunks(3)).json() == {
+            "first": 30,
+            "bounded": 30,
+            "verbatim": True,
+            "second": 30,
+        }
+
+        # (b) over the limit on the SAME branch: 413, and the buffer is still whole.
+        assert client.post("/probe", content=_chunks(100)).json() == {
+            "first": 1000,
+            "bounded": 413,
+            "verbatim": None,
+            "second": 1000,
+        }
+
+
+# --- no-store on every /admin response ---------------------------------------
+def test_admin_responses_are_never_cached(tmp_path):
+    """Every ``/admin`` response carries ``Cache-Control: no-store``.
+
+    ``GET /admin/enroll/window`` returns the LIVE window code — the credential an operator
+    reads out loud to enrol a browser — and with no cache directive at all the default
+    heuristics let a browser or intermediary write it to the DISK cache, where it outlives
+    both the window and the session. ``no-store`` is the only directive that forbids
+    writing it down (``no-cache`` still allows a stored copy). Reddens if the middleware
+    stops stamping it, or stamps the weaker directive.
+    """
+    app = create_app_for(tmp_path)
+    with _tc(app) as client:
+        window = client.get("/admin/enroll/window", headers=admin_headers())
+        assert window.status_code == 200
+        assert window.headers["cache-control"] == "no-store"
+        # …and the same on the page, the assets, the login form and the JSON reads.
+        for resp in (
+            client.get("/admin", headers=admin_headers()),
+            client.get("/admin/instances", headers=admin_headers()),
+            client.get("/admin/enroll/requests", headers=admin_headers()),
+            client.get("/admin/login"),
+            client.get("/admin/app.js"),
+            client.get("/admin/app.css"),
+        ):
+            assert resp.headers["cache-control"] == "no-store"
 
 
 # --- framing defenses + nosniff (review round) -------------------------------

@@ -77,6 +77,39 @@ The bearer tokens are a second line, not the perimeter: keep the service off the
 public internet regardless. Do not add a `ports:` mapping or an `EXPOSE` to "test
 from outside" — use the internal network.
 
+### ⚠️ The shipped compose labels are the PUBLIC form — narrow them before you deploy
+
+`docker-compose.yml` is an example, and its router labels describe a **publicly
+resolvable** service: `entrypoints: websecure`, `tls.certresolver: letsEncrypt`, and
+**not one `middlewares` label**. Nothing in the repo enforces the perimeter this section
+demands — "no `ports:` mapping" only keeps the *container* off the host, it says nothing
+about who can reach *Traefik*. If you deploy those labels unchanged on a Traefik whose
+`websecure` entrypoint is bound to a public interface, the curator is on the public
+internet with only its bearer tokens in front of it.
+
+Pick one and add it to the `curator` service's `labels:` before the first `up -d`:
+
+```yaml
+      # (a) IP allow-list on the router — the smallest self-contained change:
+      traefik.http.routers.curator.middlewares: curator-allowlist@docker
+      traefik.http.middlewares.curator-allowlist.ipallowlist.sourcerange: "10.0.0.0/8,192.168.0.0/16"
+
+      # …or (b) move the router to an INTERNAL entrypoint bound to a private/VPN
+      # interface (defined in your Traefik static config), and drop letsEncrypt:
+      traefik.http.routers.curator.entrypoints: internal
+```
+
+**This is load-bearing, not belt-and-braces.** The enrollment window code is six
+characters over a 31-symbol alphabet (~30 bits) and lives ~10 minutes, and there is **no
+server-side lockout after N bad codes** — `curator-enroll-code-bruteforce`
+(`deploy/alerts.yml`) *detects* a burst, it does not *stop* one. Each guess is one cheap
+socket that the service closes right after `enroll_rejected`; the only ceiling is
+`ENROLL_PREAUTH_MAX` on *concurrency*, not on total attempts. Behind a private perimeter
+that is amply safe. On a publicly reachable endpoint the guess rate is bounded by
+bandwidth alone, and every window an operator opens is an exposure. The same goes for
+`/admin`: it is the surface that mints instance credentials, and it is protected by
+`ADMIN_TOKEN` and nothing else.
+
 ---
 
 ## 4. CORS ↔ extension-id match — the SILENT failure (§12)
@@ -155,6 +188,28 @@ Everything else — CORS allow-list echo (never `*`), `/metrics` needs
 (`tests/test_cors.py`, `tests/test_metrics_api.py`, `tests/test_state_api.py`,
 `tests/test_ext_channel.py`).
 
+### Editing the alert rules — `make alerts`
+
+`deploy/alerts.yml` is the alert set the deployed curator runs on and
+`deploy/alerts_test.yml` holds its fire / stay-quiet cases. One target validates both:
+
+```bash
+make alerts        # promtool check rules  +  promtool test rules
+```
+
+Run it after **any** edit to either file. The schema half is not politeness: Prometheus
+and vmalert each unmarshal the rule file strictly, so one unknown field rejects the
+*whole* file and the curator runs with **no alerts at all** — the failure that looks
+exactly like nothing being wrong. The cases half is the other half of the same job: a
+rule can be schema-valid and still never fire.
+
+Locally, a missing `promtool` makes the target print how to install it
+(`brew install prometheus`) and exit 0 — it is not a Python dependency and `make install`
+cannot provide it. In CI it is a hard failure: the `test` job installs a pinned promtool
+and runs `make alerts` with `CI=true` (which turns that skip into an error), and the image
+`build` job depends on `test` — so rules that do not parse, or that stopped firing, never
+reach a published image.
+
 ## 7. Instances & enrollment (§13)
 
 Under enrollment there is **no shared token to distribute or rotate**. Each instance
@@ -181,14 +236,78 @@ An operator adds an instance by pairing it during a short, deliberately-opened w
 2. **Take the code into the extension.** In the new instance's extension settings, enter
    the service address and the enrollment code, and submit — the extension sends its
    `install_uuid` + a freshly generated per-install secret and lands in the pending list.
-3. **Approve it on `/admin`.** While the window is open, approve the pending request (give
-   it its `instanceId`). Approval binds the secret's hash to that row; from then on the
-   instance's `hello` (and its `/api/*` calls) authenticate by that secret. Approval is
-   accepted **only** while the window is open — a stolen hello cannot be approved at an
-   arbitrary later time.
+   The settings page shows that install's own `install_uuid` prefix — note it, it is what
+   you match against the console row in the next step.
+3. **Approve it on `/admin`, while the window is still open.** Approve the pending request
+   (give it its `instanceId`). Approval binds the secret's hash to that row; from then on
+   the instance's `hello` (and its `/api/*` calls) authenticate by that secret.
 
-If the window closes before you approve, just open another and re-submit; a pending
-request lives `ENROLL_REQUEST_TTL_MIN` (default 60 min) and self-clears if abandoned.
+> **Three independent time bounds. Two of them must hold at the moment you click Approve.**
+>
+> - The **window** bounds *approval*. `approve` re-reads the window and answers **409**
+>   when it is closed — so a stolen hello cannot be approved at an arbitrary later time.
+>   The check runs *before* the request lookup, so a closed window is a flat refusal and
+>   never doubles as an oracle for which `install_uuid`s are pending.
+> - The **code** bounds *who may file a request*: a request is only accepted while a
+>   window is open and only with that window's own code, otherwise the service answers
+>   `enroll_rejected{closed|bad_code}` and writes **no** row. This is what keeps unknown
+>   clients out of the pending list.
+> - **`ENROLL_REQUEST_TTL_MIN`** (60 min) bounds how long a filed request survives at all.
+>   The service refuses to start unless `ENROLL_REQUEST_TTL_MIN >= ENROLL_WINDOW_MIN`, so
+>   a request always outlasts the window it was filed in — otherwise one filed at the start
+>   of a window would expire before that window closed, and `approve` would 404 on a row
+>   still visible in front of you.
+>
+> **Practical consequence: a closed window does not just make you hurry — it makes
+> `approve` fail.** On a 409 saying the window is closed, open a new one
+> (`POST /admin/enroll/window`) and approve inside it. As long as the request is still
+> within its TTL it is still in the list, so nothing has to happen at the browser: the new
+> window's code exists to *file* requests, and this one is already filed.
+>
+> **Reject what you do not recognise, promptly.** How you tell your own request from
+> someone else's is the **18-character `install_uuid` prefix** (`xxxxxxxx-xxxx-xxxx`):
+> the extension's settings page and the `/admin` console print the same 18 characters of
+> the same value, so you compare them literally, and the full uuid is on the console cell
+> as a tooltip if you want to check every character. Nothing else in the row identifies
+> anybody — every instance in the fleet shares one `chrome-extension://` origin by
+> construction, and two browsers belonging to the same person carry the same suggested
+> title. `POST /admin/enroll/reject` clears a row you did not expect; do not leave it
+> sitting in the list on the theory that the window has closed, because the row outlives
+> the window and the next window you open is an approval opportunity for it too.
+
+### When you cannot approve (window closed, TTL expired, or you rejected the request)
+
+- **Window closed, request still within its TTL** — the request survives, but `approve`
+  answers **409**. Open a new window on `/admin` and approve inside it. The operator does
+  **not** have to touch the browser: the request is already filed, and the new window's
+  code only matters for filing.
+- **Request past `ENROLL_REQUEST_TTL_MIN`** — it stops being returned by
+  `GET /admin/enroll/requests` at read time and is physically swept within about one
+  `TICK_MS` (60 s) after that; `approve` answers **404**. Re-submitting is then
+  **mandatory, not an option** — there is nothing left to approve.
+- **The extension re-files the request on its own, but only while it still holds a code.**
+  A pending instance re-sends its `enroll_request` when it has never seen an
+  `enroll_pending` at all, or when the last confirmation is more than 5 minutes old — so a
+  request swept under TTL comes back by itself *if* the staged window code is still valid.
+  It is not: a code belongs to one window, and the re-file lands after the window closed,
+  which draws `enroll_rejected{closed}` and clears the code. That is the designed outcome —
+  it converts a silent wait into a visible "re-stage the code" — but it does mean the
+  instance stops on its own and waits for you.
+- **The recovery is therefore at the browser, not at `/admin`:** open a **new** window on
+  `/admin` (a new window always mints a **new** code — a previous window's code never
+  carries over), then in the instance's extension settings enter that new code and press
+  submit again. The instance reuses the **same** secret it already generated, so approving
+  the new request enrolls the same credential; what expired was the request, not the
+  secret. Approve it **promptly** this time — the request only outlives its window by
+  `ENROLL_REQUEST_TTL_MIN`.
+- **Tell "waiting" from "wrong code" without guessing:** the extension surfaces the last
+  `enroll_rejected` reason in its settings UI. An instance stuck on `bad_code` or `closed`
+  needs the procedure above; `capacity` means the pending list is full (clear it with
+  `reject`); `secret_conflict` means a pending request already exists for that
+  `install_uuid` carrying a **different** secret — reject the stale row on `/admin` (or let
+  it age out) and the retry is accepted, because the approved credential is deliberately
+  frozen at the value the request was created with. An instance showing no reason at all is
+  genuinely waiting for you.
 
 ### Revoking a browser
 
@@ -200,10 +319,54 @@ approve).
 
 > **Release note — MAIN must re-enroll after migration.** The former shared /ext token
 > is **gone**. After upgrading into the enrollment release, **every** existing instance —
-> including `MAIN_INSTANCE_ID` — must re-enroll: the migration leaves rows without a bound
-> secret, so nothing authenticates until an operator opens a window and approves each one.
-> Expect the stock branch to stay disabled (and `curator_main_instance_never_seen` to
-> read 1) until MAIN has been re-approved.
+> including `MAIN_INSTANCE_ID` — must re-enroll: migration step 2 runs
+> `UPDATE instances SET status='revoked' WHERE secret_hash IS NULL`, and before enrollment
+> *no* row had a `secret_hash`, so **every** row goes to `revoked`. Nothing authenticates
+> until an operator opens a window and approves each one, and the stock branch stays
+> disabled until MAIN has been re-approved. Approving MAIN reuses its existing id: the
+> approve upsert reactivates an existing `revoked` row rather than creating a second one,
+> so quarantines, exemptions and rules that reference `main` are not orphaned.
+>
+> **What the alert does.** `curator_main_instance_never_seen` reads **1** while MAIN is
+> un-enrolled, so `curator-main-instance-never-seen` fires ~15 min after the upgrade and
+> is your reminder; it clears once MAIN is approved and reconnects.
+>
+> That is true because the gauge keys on MAIN's **`status`** as well as its `last_seen_at`
+> — and the distinction matters on an upgrade. The migration touches neither `last_seen_at`
+> nor `connected`, so right after it a live install's MAIN row reads
+> *(revoked, connected=1, last_seen_at=yesterday)*. Keyed on `last_seen_at` alone the gauge
+> would report `0` — "MAIN is fine" — while every `hello` was being rejected, the stock
+> branch was dead and the dashboard was green. If you ever see a green board and a disabled
+> stock branch at the same time, that combination is the thing to distrust: cross-check
+> `GET /admin/instances`, which lists every status.
+>
+> ⚠️ **The migration retires every in-flight relocation in the fleet — read this before
+> upgrading a LIVE install.** A relocation takes two passes (§7): phase A opens the copy in
+> the target instance, phase B closes the original in the source. The pass's retire step
+> marks as `abandoned` every live `relocate` whose source **or** target is `revoked` — and
+> immediately after the migration that is *every* instance, so the first real pass after
+> the upgrade retires **all** in-flight relocations at once.
+>
+> Concretely: a tab that phase A had already copied never gets its phase B close. The copy
+> stays in the target, **the original stays open in the source**, and the pair is
+> journalled as `abandoned` — no second attempt, no reconciliation. After you re-enroll the
+> fleet, the next pass sees two ordinary tabs and decides the source one from scratch, so
+> it may be relocated again as a **fresh** `relocate` with a new `actions` row. Nothing is
+> lost, but nothing is silently cleaned up either: **expect one round of visible duplicates
+> across instances**, and expect the archive to show `abandoned` rows that are not a
+> malfunction.
+>
+> To minimise it, let the in-flight phase B's complete FIRST — leave the curator
+> **running, not paused**, for one full `PASS_INTERVAL` — and only *then* pause and pull
+> the new image. The order is the whole point, and reversing it produces the opposite of
+> what it promises: a live pause stops the **pass**, and phase B runs inside a pass
+> (`run_pass` returns `{"status": "paused"}` up front and `_acquire_unless_paused` does
+> not even take the lease), so a curator paused first closes **zero** phase B's — the
+> maximum number of half-done relocations instead of the minimum. Pause only once the
+> interval has elapsed, so that no fresh pass starts in the middle of the `docker pull`.
+> Relocations that finished are not in-flight and are unaffected. On the current state —
+> nothing deployed — this is hypothetical, and it is written down because this release
+> note addresses upgrades.
 
 Its operational acceptance checks (new instance enrolls & connects; two instances share
 one bundle; clone re-enrolls rather than taking over) are a manual list in

@@ -1,13 +1,12 @@
-# promtool test harness for deploy/alerts.yml (§12/§13).
+# promtool test harness for deploy/alerts.yml (§12/§6).
 #
 # Run:  promtool test rules deploy/alerts_test.yml
 # (rule_files is resolved relative to THIS file, so `alerts.yml` = deploy/alerts.yml).
 #
-# Focus: the enroll_bad_code brute-force rule added for issue #37 — it must FIRE on the
-# injected rapid rise and stay QUIET on a slow trickle. (There is deliberately no
-# window-overdue alert — see the NOTE in alerts.yml.) The rest of the file is covered
-# structurally by tests/test_deploy_alerts.py; `promtool check rules` validates the whole
-# schema.
+# Focus: the enrollment rules (issue #37) — each must FIRE on the injected fault and stay
+# QUIET on the corresponding healthy shape, which is the half a structural test cannot
+# check. The rest of the file is covered structurally by tests/test_deploy_alerts.py;
+# `promtool check rules` validates the whole schema.
 
 rule_files:
   - alerts.yml
@@ -30,7 +29,7 @@ tests:
               severity: warning
               reason: enroll_bad_code
             exp_annotations:
-              summary: "Repeated bad enrollment codes (brute-force on the enrollment window, §13)."
+              summary: "Repeated bad enrollment codes (brute-force on the enrollment window, §6)."
 
   # --- curator-enroll-code-bruteforce: QUIET on a slow trickle -------------------
   - interval: 1m
@@ -42,4 +41,170 @@ tests:
     alert_rule_test:
       - eval_time: 11m
         alertname: curator-enroll-code-bruteforce
+        exp_alerts: []
+
+  # --- curator-enroll-window-held-open: fires when the window is kept open -------
+  - interval: 1m
+    name: enrollment window held open fires
+    input_series:
+      - series: 'curator_enroll_window_seconds_remaining'
+        # Re-armed before every expiry (a 10-minute window restarted eight times): the
+        # gauge never returns to 0, so it stays >0 past the 65m `for:`. NO single armed
+        # window can do this — 65m is above the hard ENROLL_WINDOW_MAX_MIN=60 ceiling.
+        values: '600-60x8 600-60x8 600-60x8 600-60x8 600-60x8 600-60x8 600-60x8 600-60x8'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: curator-enroll-window-held-open
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Enrollment window has stayed open for over 65m — longer than any single armed window can last (ENROLL_WINDOW_MAX_MIN=60), so it is being re-armed; close it with DELETE /admin/enroll/window (§10)."
+
+  # --- curator-enroll-window-held-open: QUIET for one ordinary window ------------
+  - interval: 1m
+    name: one ordinary enrollment window is quiet
+    input_series:
+      - series: 'curator_enroll_window_seconds_remaining'
+        # The LONGEST window any legal ENROLL_WINDOW_MIN can arm — the 60m ceiling, not
+        # the 10m default. This is the case the old `for: 15m` got wrong: a deployment
+        # with ENROLL_WINDOW_MIN=20 paged on one ordinary arm, with a summary blaming
+        # repeated re-arming that never happened. >0 for 60 minutes, then clamped to 0 —
+        # never continuously positive for the 65m `for:`, so it must not fire.
+        values: '3600-60x59 0+0x11'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: curator-enroll-window-held-open
+        exp_alerts: []
+
+  # --- curator-enroll-secret-conflict: fires on a SINGLE occurrence --------------
+  - interval: 1m
+    name: one secret-substitution attempt pages
+    input_series:
+      - series: 'curator_auth_rejections_total{reason="enroll_secret_conflict"}'
+        # ONE refusal, ever. A healthy client always re-registers with the same durable
+        # secret, so this cannot happen by accident — hence the >0 threshold, unlike the
+        # brute-force rules. Reddens if the rule is given a >5-style threshold.
+        values: '0 0 0 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-enroll-secret-conflict
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: enroll_secret_conflict
+            exp_annotations:
+              summary: "An enroll_request tried to replace the frozen secret of a pending install_uuid (credential-substitution attempt, §6)."
+
+  # --- curator-enroll-secret-conflict: QUIET when nothing conflicts --------------
+  - interval: 1m
+    name: no secret conflicts is quiet
+    input_series:
+      # A flat series (the shape a healthy install keeps once one old refusal is behind
+      # it): increase() over the window is 0, so the >0 threshold stays silent. Without
+      # this the rule would page forever on a single historical counter value.
+      - series: 'curator_auth_rejections_total{reason="enroll_secret_conflict"}'
+        values: '1+0x11'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-enroll-secret-conflict
+        exp_alerts: []
+
+  # --- curator-enroll-pending-capacity: fires at the pending ceiling -------------
+  - interval: 1m
+    name: pending-list capacity refusals fire
+    input_series:
+      # Enrollments turned away at ENROLL_MAX_PENDING. Distinct from the /ext pre-auth
+      # ceiling below: that one is {reason="capacity"}, this one {reason="enroll_capacity"},
+      # and a rule matching the wrong label would be silent at the moment new browsers
+      # cannot enroll at all.
+      - series: 'curator_auth_rejections_total{reason="enroll_capacity"}'
+        values: '0+4x12'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-enroll-pending-capacity
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: enroll_capacity
+            exp_annotations:
+              summary: "Enrollments are being refused at the pending-request ceiling (ENROLL_MAX_PENDING) — a new browser cannot enroll (§6)."
+
+  # --- curator-admin-token-bruteforce: fires on repeated failed logins -----------
+  - interval: 1m
+    name: admin token brute-force fires
+    input_series:
+      - series: 'curator_auth_rejections_total{reason="admin_bad_token"}'
+        # +1 wrong ADMIN_TOKEN a minute -> increase over 10m >> 5.
+        values: '0+1x12'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-admin-token-bruteforce
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              reason: admin_bad_token
+            exp_annotations:
+              summary: "Repeated failed /admin/login attempts (brute-force on ADMIN_TOKEN)."
+
+  # --- curator-admin-token-bruteforce: QUIET on the ambient no-session label -----
+  - interval: 1m
+    name: unauthenticated console hits do not page
+    input_series:
+      # The OTHER label: every browser that opens /admin before logging in ticks this.
+      # It must not reach the ADMIN_TOKEN rule — that is the whole point of the split.
+      - series: 'curator_auth_rejections_total{reason="admin_session"}'
+        values: '0+3x12'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-admin-token-bruteforce
+        exp_alerts: []
+
+  # --- curator-ext-preauth-capacity: fires when /ext refuses at the ceiling ------
+  - interval: 1m
+    name: ext pre-auth capacity refusals fire
+    input_series:
+      - series: 'curator_auth_rejections_total{reason="capacity"}'
+        values: '0+4x12'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-ext-preauth-capacity
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: capacity
+            exp_annotations:
+              summary: "/ext is refusing connections at the pre-auth ceiling — instances cannot reconnect (§6)."
+
+  # --- curator-cors-preflight-rejected: fires when startpages are cut off -------
+  - interval: 1m
+    name: rejected CORS preflights fire
+    input_series:
+      # A mismatched (or empty) EXT_ALLOWED_ORIGINS: every startpage fetch dies at the
+      # preflight, so the counter climbs steadily while /ext stays connected and every
+      # instance looks healthy — the §12 silent failure this rule exists to expose.
+      - series: 'curator_auth_rejections_total{reason="cors_preflight"}'
+        values: '0+2x12'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-cors-preflight-rejected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: cors_preflight
+            exp_annotations:
+              summary: "/api/* CORS is rejecting preflights — startpages are cut off and serving stale cache while instances look healthy; check EXT_ALLOWED_ORIGINS against the real chrome-extension://<id> (§12, deploy/DEPLOY.md §4)."
+
+  # --- curator-cors-preflight-rejected: QUIET on a stray foreign page -----------
+  - interval: 1m
+    name: a stray rejected preflight is quiet
+    input_series:
+      # Two refusals total, then flat — a page that poked /api/* once and went away. A
+      # configured deployment produces nothing like the sustained rise above, so the
+      # threshold must not turn an isolated rejection into a page.
+      - series: 'curator_auth_rejections_total{reason="cors_preflight"}'
+        values: '2+0x11'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-cors-preflight-rejected
         exp_alerts: []

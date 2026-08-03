@@ -29,6 +29,35 @@ jobs:
         ADMIN_TOKEN: test-admin-token       # required + must differ from METRICS_TOKEN (§13)
       run: pytest --tb=short -q
 
+    # The alert rules (§12) live in this job, not a job of their own, so `build:
+    # needs: test` keeps gating the image on them as well: a rule file that no longer
+    # parses leaves the deployed curator with NO alerts at all, which is a worse state
+    # to ship than a failed build. promtool is not a Python dep and cannot come from
+    # requirements-dev.txt, so it is fetched here — pinned to the Prometheus LTS line,
+    # because an unpinned "latest" makes the meaning of a green run drift.
+    - name: Install promtool
+      env:
+        PROMETHEUS_VERSION: "3.5.5"   # LTS
+      run: |
+        mkdir -p "$HOME/.local/bin"
+        curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+          | tar -xz -C "$HOME/.local/bin" --strip-components=1 \
+              "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+        "$HOME/.local/bin/promtool" --version
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    # Through `make alerts`, never a hand-copied promtool line: the target IS the
+    # definition of "validated" (schema check + the fire/stay-quiet cases in
+    # deploy/alerts_test.yml), and a duplicate here would drift from what an operator
+    # runs locally. CI=true flips the target's "promtool missing -> skip and exit 0"
+    # branch into a hard failure, so a runner that failed to fetch the binary cannot
+    # report a skip as a pass. (GitHub already exports CI=true; set explicitly so the
+    # dependency is visible rather than inherited.)
+    - name: Validate the Prometheus alert rules
+      env:
+        CI: "true"
+      run: make alerts
+
   # Extension (MV3) tests: independent Node/vitest toolchain under extension/.
   # Kept separate from the Python `test` job and NOT a dependency of `build`
   # (the image ships the Python service only). Runs on the same triggers as the

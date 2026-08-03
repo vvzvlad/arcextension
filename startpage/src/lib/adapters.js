@@ -1,10 +1,10 @@
-// Thin adapters over chrome.* + fetch + instance.json (§6/§10/§12). Isolated so the
-// store can be unit-tested with a fake chrome + fetch, and so the "which globals"
-// choices live in one place.
+// Thin adapters over chrome.* + fetch (§6/§10/§12). Isolated so the store can be
+// unit-tested with a fake chrome + fetch, and so the "which globals" choices live in one
+// place.
 //
-// The startpage reads instance.json for the API base + token (exactly like the
-// popup, §6 "Откуда берётся конфигурация инстанса") — it does not PERSIST the token
-// itself (§6). Identity + connection state come from the SW over runtime.sendMessage.
+// Identity, the /api base + Bearer and the connection/enroll state ALL come from the SW
+// over runtime.sendMessage (§7). The page reads no instance.json: the bundle carries no
+// credential anymore, and the SW is the only side that validates the address.
 
 export const STATE_CACHE_KEY = "stateCache"; // storage.local: { state: StateResponse, cached_at }
 // KEEP IN SYNC with extension/src/quicklinks.js `QUEUE_KEY` and its value shape
@@ -20,12 +20,6 @@ export function httpBaseFromServiceUrl(serviceUrl) {
   if (base.startsWith("wss://")) return "https://" + base.slice("wss://".length);
   if (base.startsWith("ws://")) return "http://" + base.slice("ws://".length);
   return base;
-}
-
-export async function loadInstanceConfig(chromeApi, fetchFn) {
-  const url = chromeApi.runtime.getURL("instance.json");
-  const resp = await fetchFn(url);
-  return await resp.json();
 }
 
 // Own tabs come from chrome.tabs.query — a LOCAL source that needs no network and

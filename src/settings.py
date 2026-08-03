@@ -12,16 +12,26 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.config_errors import load_settings_or_exit
+# The armed-window ceiling lives with the arming code (src.curator.enroll, which imports
+# only sqlite3 + src.db.settings_store — no cycle back here). Imported rather than copied
+# so ENROLL_WINDOW_MIN's bound and the clamp arm_enroll_window applies can never drift:
+# a value above the clamp would be silently reduced at arm time, i.e. config that lies.
+from src.curator.enroll import ENROLL_WINDOW_MAX_MIN
 
 
 class Settings(BaseSettings):
     # --- Required tokens: no default; missing OR empty/blank fails at startup ---
     # ADMIN_TOKEN opens /admin (the enrollment console, §13), /api/* (as the
-    # human/agent caller) and /mcp; /ext and /api/* also accept a per-instance
-    # secretHash under enrollment (§13 — no shared token anymore). METRICS_TOKEN is a
-    # separate read-only token for /metrics (§12: it lives in git plaintext scrape
-    # configs, so it must never be able to touch anything but /metrics), and ADMIN_TOKEN
-    # must DIFFER from it. Both are validated below.
+    # human/agent caller) and /mcp; /ext and /api/* also accept a per-instance SECRET
+    # under enrollment (§13 — no shared token anymore). That secret is credential model
+    # OPTION A: the client generates it, sends the RAW value over TLS on every hello /
+    # /api Bearer, and the SERVER hashes it on receipt (``queries.sha256_hex``) — only the
+    # sha256 is ever stored, so a DB-only leak yields hashes, not usable credentials. It is
+    # NOT the rejected option B ("the client sends a secretHash"), under which the stored
+    # value would itself be the bearer credential and a DB leak would hand over the fleet.
+    # METRICS_TOKEN is a separate read-only token for /metrics (§12: it lives in git
+    # plaintext scrape configs, so it must never be able to touch anything but /metrics),
+    # and ADMIN_TOKEN must DIFFER from it. Both are validated below.
     metrics_token: str = Field(min_length=1)
     admin_token: str = Field(min_length=1)
 
@@ -46,39 +56,49 @@ class Settings(BaseSettings):
     # Enrollment window length (§13). A per-open window during which an operator can
     # approve pending enroll requests; compared against "now" AT READ TIME (no timer),
     # so a restart neither silently closes nor leaves-open-forever an armed window.
-    enroll_window_min: int = 10
+    # Bounded, like every enrollment knob below: 0/negative would arm an already-closed
+    # window (arm_enroll_window silently floors it to 1) and a value above the clamp would
+    # be silently reduced — both are config that does not mean what it says.
+    enroll_window_min: int = Field(default=10, ge=1, le=ENROLL_WINDOW_MAX_MIN)
     # Ceiling on the number of PENDING enroll_requests (§2). A not-yet-approved client's
     # enroll_request is refused with enroll_rejected{reason:capacity} once the pending
     # list is at this size, so a flood of anonymous enroll_requests cannot grow the
     # operator-facing list without bound. 64 is generous for a human-scale fleet while
     # still bounding the pre-auth list.
-    enroll_max_pending: int = 64
+    # ge=1: 0 is not "no ceiling", it is "no enrollment at all" — every enroll_request
+    # refused with {reason:capacity} and no way to add a browser, with nothing in the logs
+    # naming the cause. A knob that disables a subsystem must not be reachable by a typo.
+    enroll_max_pending: int = Field(default=64, ge=1)
     # Lifetime of a PENDING enroll_request (§13, acceptance 12). A request is filtered out
     # of GET /admin/enroll/requests once its FROZEN first_seen_at is older than this, and a
     # frequent sweep (TICK_MS, ~60s) physically deletes it — so a stale/abandoned request
     # self-clears within TTL+~60s instead of lingering in the operator list forever. 60
     # minutes is chosen as: (a) comfortably LONGER than the enrollment window
     # (ENROLL_WINDOW_MIN, 10 min) so an operator who opens a window always has a live
-    # request to approve — an approvable request must outlast the window; (b) long enough
+    # request to approve — an approvable request must outlast the window, which is now a
+    # HARD requirement (an approve is gated on the window being open) and is validated
+    # below rather than merely intended; (b) long enough
     # that a human noticing the request and approving it is unhurried; yet (c) bounded, so a
     # copied/abandoned install's request does not sit in the pre-auth list indefinitely
     # (the same self-clearing discipline the pending-cap and window give the pre-auth
     # surface). Also equals the window's own MAX (ENROLL_WINDOW_MAX_MIN=60), so a request
     # cannot expire under even a maximally-armed window.
-    enroll_request_ttl_min: int = 60
+    enroll_request_ttl_min: int = Field(default=60, ge=1)
     # Lifetime of an /admin HTML-console browser SESSION (§13, issue #36). The login cookie
     # carries a random id (never the ADMIN_TOKEN); this is how long that id stays valid in
     # the in-memory session store before a re-login is required. Enforced SERVER-side (the
     # cookie Max-Age is only a browser hint), and a rotated ADMIN_TOKEN invalidates every
     # session immediately regardless of this. 720 minutes = 12h: an unhurried operator
     # workday, bounded so a walked-away session does not stay open indefinitely.
-    admin_session_ttl_min: int = 720
+    admin_session_ttl_min: int = Field(default=720, ge=1)
     # Ceiling on simultaneously-open /ext sockets that have been accepted but have not
     # yet completed a hello/enroll (§2). Refused BEFORE accept() (a handshake rejection,
     # no TLS session), so a flood of opened-but-silent sockets cannot exhaust memory or
     # TLS sessions. A live authenticated connection releases its slot on a successful
     # hello, so this bounds only the pre-auth window, not the connected fleet.
-    enroll_preauth_max: int = 128
+    # ge=1: 0 refuses EVERY /ext handshake before accept() — the whole fleet drops out of
+    # curation with only `curator_auth_rejections_total{reason="capacity"}` to show for it.
+    enroll_preauth_max: int = Field(default=128, ge=1)
     # Comma-separated allow-list for the extension's `hello.origin`. DEFAULT
     # EMPTY = accept any origin and log a one-time warning (the concrete
     # chrome-extension:// id is unknown until the extension/generator phases;
@@ -108,6 +128,26 @@ class Settings(BaseSettings):
     backup_dir: str = "data/backups"
     host: str = "0.0.0.0"
     port: int = 8000
+
+    @field_validator("enroll_request_ttl_min")
+    @classmethod
+    def _ttl_must_outlast_the_window(cls, v: int, info) -> int:
+        # An approve is gated on the enrollment WINDOW being open (src.api.admin.approve),
+        # so a request must stay approvable for at least as long as one armed window lasts.
+        # With TTL < ENROLL_WINDOW_MIN a request filed at the start of a window expires
+        # BEFORE the window closes and the operator's approve answers 404 — the request is
+        # still in front of them in the console, because both surfaces apply the same
+        # read-time TTL filter and the list simply stops showing it a moment later.
+        # ``enroll_window_min`` is declared first, so it is already validated in info.data;
+        # if it failed its own validation it is absent and there is nothing to compare to.
+        window = info.data.get("enroll_window_min")
+        if window is not None and v < window:
+            raise ValueError(
+                f"must be >= ENROLL_WINDOW_MIN ({window}): an approve is only accepted "
+                "while the enrollment window is open, so a pending request has to outlast "
+                "the window it was filed in"
+            )
+        return v
 
     @field_validator("metrics_token", "admin_token")
     @classmethod

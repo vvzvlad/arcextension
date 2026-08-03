@@ -129,9 +129,24 @@ def _require_str(body: dict, field: str) -> str:
 async def approve(request: Request) -> JSONResponse:
     """``POST /admin/enroll/approve`` — enroll a pending request (§1, acceptance 4/11).
 
-    Body ``{install_uuid, instance_id, [title]}``. The operator assigns ``instance_id``
-    (stable across re-issue, §1). Flow:
+    Body ``{install_uuid, instance_id, [title]}`` — snake_case, like every other JSON body
+    and response field in this service (``/api/rules`` has always taken ``instance_id``).
+    The operator assigns ``instance_id`` (stable across re-issue, §1). Flow:
 
+    0. The enrollment WINDOW must be OPEN → 409 otherwise. This is the gate
+       :mod:`src.curator.enroll` and deploy/DEPLOY.md have always described («approval is
+       only accepted while the window is open — a short, operator-opened interval so a
+       stolen hello cannot be approved at an arbitrary later time») and that the code did
+       not implement: with ``ENROLL_WINDOW_MIN=10`` and ``ENROLL_REQUEST_TTL_MIN=60`` a
+       request could be approved 50 minutes after the window closed, which is precisely
+       the "at an arbitrary later time" the design excludes. The window is what BOUNDS the
+       approval surface in time; the code only bounds who may file a request.
+       The gate also changes what ``ENROLL_REQUEST_TTL_MIN`` is FOR: it no longer bounds
+       "how long an approval remains possible" (the window does that now) but "does a
+       request outlive the window it was filed in". :mod:`src.settings` enforces exactly
+       that relation — ``ENROLL_REQUEST_TTL_MIN >= ENROLL_WINDOW_MIN`` — because below it a
+       request filed at the start of a window expires before the window closes and the
+       approve 404s on the row still in front of the operator.
     1. READ the pending request (own read txn) → 404 if absent/expired, and capture its
        ``secret_hash``. Reading it out of band is what lets two racing approves BOTH hold
        the secret so the write-side guards (not a 404) decide the loser.
@@ -161,6 +176,17 @@ async def approve(request: Request) -> JSONResponse:
 
     now = _now_ms()
     db = request.app.state.db
+    # (0) The window gate, BEFORE the request lookup: a closed window is a flat refusal
+    # that must not double as an oracle for which install_uuids are pending.
+    window = await db.read(lambda c: read_enroll_window(c, now=now))
+    if not window.open:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "the enrollment window is closed; open it "
+                "(POST /admin/enroll/window) and approve within it"
+            ),
+        )
     req = await db.read(
         lambda c: queries.get_enroll_request(
             c, install_uuid, now=now, ttl_ms=_ttl_ms(request)
