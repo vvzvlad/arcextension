@@ -112,42 +112,38 @@ bandwidth alone, and every window an operator opens is an exposure. The same goe
 
 ---
 
-## 4. CORS ↔ extension-id match — the SILENT failure (§12)
+## 4. CORS — there is nothing to configure (and nothing left to get wrong)
 
-`EXT_ALLOWED_ORIGINS` is one comma-separated allow-list used in **two** places: the
-`/ext` hello check **and** the `/api/*` CORS middleware. It MUST list the real
-`chrome-extension://<id>` origin(s) of the installed extension(s).
+**This section used to describe a deployment step and a failure class. Both are gone.**
+`EXT_ALLOWED_ORIGINS` no longer exists, `/api/*` CORS accepts **any** origin, and the
+`/ext` hello check no longer looks at `origin` at all. If you are following an older
+runbook: skip the step, and do not set the variable — nothing reads it.
 
-A mismatch is a **silent** failure, not an error:
+Why it went, in one line each (the full argument lives in `src/api/cors.py`):
 
-- WebSocket traffic is not subject to CORS, so **`/ext` still connects** and the
-  instance looks healthy everywhere.
-- But the startpage's cross-origin `fetch /api/state` is cut at the **CORS
-  preflight**, and §10 guarantees the newtab is never empty — so the page keeps
-  rendering from **stale cache** («кэш от <время>») that never updates. Nothing looks
-  broken.
+- every `/api/*` route is already behind `require_api_caller` — an `ADMIN_TOKEN` or an
+  enrolled instance's secret. CORS was the second lock on that door, never the first;
+- `allow_credentials=False`, so nothing ambient (cookie, client cert, HTTP auth) is ever
+  attached to a cross-origin call. With credentials off, `*` is the standard answer and
+  there is no ambient session for a foreign page to ride;
+- CORS is enforced by **browsers only**. A script, `curl` or a bot ignored the list
+  entirely, so it never stopped an attacker — only a page, and only a page that had no
+  credential anyway;
+- the only unauthenticated readable route is `/healthz`, and §3 above requires the
+  service to be unreachable from the public internet regardless.
 
-Signals that expose the mismatch:
+What you get back: the extension **signing key is gone too** (it existed only to pin one
+`chrome-extension://<id>` so a single origin could be listed here). There is no secret to
+lose, and adding a machine no longer means editing the server's environment.
 
-- The service compares the `hello.origin` against the list and sets
-  **`reject_reason='origin'`** on the instance — visible as one of the four
-  status-bar states (§10).
-- A rejected CORS preflight increments **`curator_auth_rejections_total`** (the
-  `cors_preflight` reason) — alert/inspect via `/metrics`.
-
-Rules for the value:
-
-- Set it to the exact installed extension id(s), e.g.
-  `EXT_ALLOWED_ORIGINS=chrome-extension://<id1>,chrome-extension://<id2>`. The
-  **instance generator** (§13, `tools/README.md`) pins the id via a manifest `key`
-  and prints the exact `chrome-extension://<id>` origin — **all** instances share
-  **one** id/origin, so a single entry covers every instance.
-- **Empty in prod is wrong.** Empty leaves `/ext` open (accept-any + warning) and
-  leaves `/api/*` CORS **CLOSED** (no `Access-Control-Allow-Origin` emitted — the
-  secure default, never `*`). The startpage will not be able to call `/api/*` until
-  the id is configured. Both cases log a one-time loud warning at startup.
-- The header is **never** `Access-Control-Allow-Origin: *` — only an exact listed
-  origin is ever echoed.
+**One silent failure remains, and it is a code bug, not a deploy step.** `src/api/cors.py`
+still declares the `/api/*` methods and request headers explicitly. If the startpage ever
+sends a verb or a custom header that is not declared there, the browser's preflight is
+refused, `/ext` stays connected, the instance stays green, and only the newtab's fetch
+dies — it keeps rendering «кэш от <время>» that never updates. That is what
+`curator_auth_rejections_total{reason="cors_preflight"}` counts and what
+`curator-cors-preflight-rejected` (§12) alerts on. The fix is to add the method/header in
+`src/api/cors.py`, not to change anything on the server.
 
 ---
 
@@ -218,8 +214,8 @@ once, on `/admin`, during a short window. Themed browser instances are built wit
 **instance generator** — a two-step, token-free flow (`make bundle` then `make instance`,
 see `tools/README.md`):
 
-- `make bundle OUT=~/dist [KEY_FILE=…]` builds the **one** universal, key-pinned bundle
-  the whole fleet loads.
+- `make bundle OUT=~/dist` builds the **one** universal bundle the whole fleet loads. No
+  key, no other variable: it is a copy of `extension/` and nothing is stamped into it.
 - `make instance INSTANCE_ID=… BUNDLE_DIR=~/dist OUT=…` wraps that shared bundle in a
   per-instance `.app` (own profile, `.app`, launcher). It writes **no** extension copy and
   **no** `instance.json` — the launcher's `--load-extension` points at the shared bundle.

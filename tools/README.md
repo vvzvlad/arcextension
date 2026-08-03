@@ -3,8 +3,9 @@
 `tools/instancegen` builds themed Brave instances under **enrollment** (§7/§13, issue
 #35). It is a two-step, **token-free** flow:
 
-1. **`bundle`** — build the ONE universal, key-pinned extension bundle the whole fleet
-   loads. No token, no service URL, no `instanceId` are baked in.
+1. **`bundle`** — build the ONE universal extension bundle the whole fleet loads. It is
+   a copy of `extension/` and nothing else: no token, no service URL, no `instanceId`
+   and no signing key are baked in.
 2. **`generate`** — wrap that shared bundle in a per-instance `.app` (its own
    `--user-data-dir`, an icon, and a launcher whose `--load-extension` points at the
    **shared** bundle). It writes **no** extension copy and **no** `instance.json`.
@@ -33,12 +34,10 @@ anywhere, because there is no shared secret to pass. `make bundle` / `make insta
 the CLI (`tools/generate_instance.py`).
 
 ```bash
-# 1. Build the shared universal bundle ONCE (pass a stable --key-file for a
-#    reproducible chrome-extension:// id across rebuilds).
-make bundle OUT=~/arcextension-dist KEY_FILE=~/arcextension-signing_key.pem
+# 1. Build the shared universal bundle ONCE.
+make bundle OUT=~/arcextension-dist
 #   …or the CLI directly:
-.venv/bin/python -m tools.generate_instance bundle \
-    --out ~/arcextension-dist --key-file ~/arcextension-signing_key.pem
+.venv/bin/python -m tools.generate_instance bundle --out ~/arcextension-dist
 
 # 2. Wrap it in per-instance .apps. The launcher loads the SHARED bundle — no copy.
 make instance INSTANCE_ID=main BUNDLE_DIR=~/arcextension-dist \
@@ -49,10 +48,11 @@ make instance INSTANCE_ID=main BUNDLE_DIR=~/arcextension-dist \
     --out ~/arcextension-instances --title "Curator Main"
 ```
 
-`bundle` prints the derived **extension id** and the exact `chrome-extension://<id>`
-origin to add to `EXT_ALLOWED_ORIGINS` (§12); `generate` reprints it (read from the
-shared bundle's pinned key). All instances share **one** id/origin — one entry covers
-every instance.
+Neither step prints an extension id, because nothing consumes one. All instances load
+the same shared bundle and therefore share one `chrome-extension://<id>` — Chromium's
+hash of that dir's absolute path — but no origin is checked anywhere: `/ext` does not vet
+`hello.origin` and `/api/*` CORS accepts any origin (`src/api/cors.py`). Moving or
+renaming the bundle changes the id and breaks nothing.
 
 `--service-url` on `generate` is accepted for backward-compatibility but is
 **informational only**: the address is entered per profile during enrollment, never
@@ -68,27 +68,6 @@ stamped into the build.
 There is no "re-stamp" step anymore: the token that `restamp` used to rotate no longer
 exists, and code updates ship by rebuilding the **one** shared bundle (all instances load
 it, so there is nothing per-instance to refresh).
-
-## The signing key (extension id pinning)
-
-The unpacked extension id is normally a hash of the **load path**, so it would move on
-rename and differ per instance (breaking `EXT_ALLOWED_ORIGINS`/CORS). Stamping a `key`
-(base64 SPKI-DER public key) into the **shared** bundle's manifest pins the id to the KEY
-instead — one id for the whole fleet.
-
-`bundle` creates an RSA-2048 keypair and persists the private key in a `.instancegen`
-directory **beside** the output bundle (mode `0600`), or reuses one you pass via
-`--key-file`.
-
-- **Never commit** the key. It is a per-deployment **secret** that pins the fleet-wide
-  id; the repo ships only a manifest with a placeholder key. `.gitignore` covers
-  `.instancegen/`.
-- The key is written **outside** the distributed bundle on purpose: if it shipped inside
-  the tree, an attacker could rebuild a spoofed extension under the **same** id and defeat
-  `EXT_ALLOWED_ORIGINS`.
-- **Do not lose** it: regenerating it changes the extension id/origin. Bring your own with
-  `--key-file` (a PEM private key or a raw base64 public key) to keep a fixed id across
-  machines.
 
 ## Icon and `.app` on non-macOS (CI)
 

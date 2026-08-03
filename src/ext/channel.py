@@ -455,21 +455,9 @@ async def _handle_hello(
         await _reject(websocket, app, None, protocol.REJECT_UNKNOWN)
         return None
 
-    allowed = protocol.parse_origins(settings.ext_allowed_origins)
-    if not allowed and not getattr(app.state, "warned_open_origin", False):
-        app.state.warned_open_origin = True
-        logger.warning(
-            "EXT_ALLOWED_ORIGINS is empty: /ext accepts any origin (open) while "
-            "/api/* CORS is CLOSED for the same empty value — an instance will look "
-            "healthy here and the startpage's fetch will still die on preflight (§12). "
-            "Tighten this to the real chrome-extension://<id> once it is known."
-        )
-
-    reason = protocol.hello_reject_reason(
-        msg, settings.protocol_version, instance_id, allowed
-    )
+    reason = protocol.hello_reject_reason(msg, settings.protocol_version, instance_id)
     if reason is not None:
-        # protocol / origin: the id is a real active instance, so record the reject.
+        # protocol: the id is a real active instance, so record the reject.
         await _reject(websocket, app, instance_id, reason)
         return None
 

@@ -5,11 +5,11 @@ bundle and an instance is a THIN wrapper around it. Two commands, in order:
 
 ``bundle`` builds that single fleet-wide bundle ONCE:
 
-* a copy of the repo's ``extension/`` (dev cruft skipped), with the ``key``
-  stamped into ``manifest.json`` so the extension id is stable across
-  path/rename and IDENTICAL for every instance (§13, arch row 21). The manifest
-  is HOSTLESS — issue #35 removed the two ``https://<host>/*`` / ``wss://<host>/*``
-  patterns, leaving only ``<all_urls>``, so there is no ``<host>`` left to stamp;
+* a copy of the repo's ``extension/`` (dev cruft skipped) and nothing else. Nothing is
+  stamped into ``manifest.json``: issue #35 removed the ``<host>`` patterns (only
+  ``<all_urls>`` is left) and the ``key`` field is gone too, so the extension id is
+  Chromium's hash of the load path (arch row 21) — which nothing consumes anymore, since
+  no origin is checked on ``/ext`` and ``/api/*`` CORS accepts any origin;
 * NO ``instance.json``, no token, no service URL, no ``instanceId``: the bundle
   carries no credential and no address at all.
 
@@ -31,7 +31,6 @@ operator approves the request on ``/admin`` (§13). There is consequently no
 gone, and a code update is a rebuild of the one shared bundle.
 
 The module is split into a PURE core (`core`, all filesystem/text logic, runs on
-Linux/CI), a `keys` helper (signing-key generation/persistence — the one place
-that needs `cryptography`), and a thin macOS platform layer (`macos`, the real
-``.icns``/``.app`` build that cannot run in CI).
+Linux/CI) and a thin macOS platform layer (`macos`, the real ``.icns``/``.app``
+build that cannot run in CI).
 """

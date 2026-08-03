@@ -1,17 +1,19 @@
-"""CORS on /api/* (§12): explicit chrome-extension:// origins only, NEVER '*'.
+"""CORS on /api/* (§12): ANY origin is allowed, and credentials stay OFF.
 
 The startpage fetches /api/* cross-origin with an Authorization Bearer header, which
-forces a CORS preflight. These tests pin the allow-list behaviour end-to-end through
-the real ``create_app`` middleware stack (Starlette ``TestClient``), and the two
-acceptance auth gates (/metrics needs METRICS_TOKEN, /api/* needs ADMIN_TOKEN or an
-active-instance secret — never METRICS_TOKEN).
+forces a CORS preflight. The old ``EXT_ALLOWED_ORIGINS`` allow-list — and with it the
+"never emit ``*``" invariant — was removed on purpose (``src/api/cors.py`` carries the
+argument: /api/* is already behind ``require_api_caller``, credentials are off so there is
+no ambient session to ride, CORS binds browsers only, and the service is not reachable
+from the internet). These tests pin what replaced it, end-to-end through the real
+``create_app`` middleware stack, plus the two acceptance auth gates (/metrics needs
+METRICS_TOKEN, /api/* needs ADMIN_TOKEN or an active-instance secret — never
+METRICS_TOKEN).
 
-Each test reddens if its guard is removed: dropping the CORSMiddleware drops the
-Access-Control-Allow-Origin echo (test 1), and widening allow_origins to '*' or a
-regex would make test 3 (evil origin) start receiving an ACAO.
+Each test reddens if its guard is removed: dropping the CORSMiddleware drops the ACAO
+header (test 1), and turning ``allow_credentials`` back on would make the wildcard
+either illegal or dangerous (test 4).
 """
-
-from types import SimpleNamespace
 
 from conftest import make_settings
 from starlette.testclient import TestClient
@@ -20,9 +22,9 @@ from src.app import create_app
 
 ADMIN_TOKEN = "test-admin-token"
 METRICS_TOKEN = "test-metrics-token"
-GOOD_ORIGIN = "chrome-extension://abc"
-EVIL_ORIGIN = "https://evil.com"
-OTHER_EXT_ORIGIN = "chrome-extension://zzz"  # a non-listed extension id
+EXT_ORIGIN = "chrome-extension://abc"
+OTHER_EXT_ORIGIN = "chrome-extension://zzz"  # a different extension id
+FOREIGN_ORIGIN = "https://some-other-site.example"
 # /api/* now authenticates a caller (issue #35 §4); the CORS behaviour is orthogonal, so
 # the generic admin credential is used to reach a 200.
 AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
@@ -36,108 +38,110 @@ def _settings(tmp_path, **over):
     attribute can no longer surface as an AttributeError inside an unrelated background
     curator pass (which a TestClient's real lifespan does start).
     """
-    return make_settings(tmp_path, **{**{
-            "ext_allowed_origins": 'chrome-extension://abc',
-            "pass_interval_min": 5,
-        }, **over})
+    return make_settings(tmp_path, **{**{"pass_interval_min": 5}, **over})
 
 
-def _preflight(client, origin, path="/api/state", method="GET"):
-    return client.options(
-        path,
-        headers={
-            "Origin": origin,
-            "Access-Control-Request-Method": method,
-            "Access-Control-Request-Headers": "authorization,content-type",
-        },
-    )
+def _preflight(client, origin, path="/api/state", method="GET", headers="authorization,content-type"):
+    request_headers = {"Origin": origin, "Access-Control-Request-Method": method}
+    if headers is not None:
+        request_headers["Access-Control-Request-Headers"] = headers
+    return client.options(path, headers=request_headers)
 
 
-# --- allow-list: preflight ---------------------------------------------------
-def test_preflight_allowed_origin_is_echoed(tmp_path):
+# --- any origin passes the preflight -----------------------------------------
+def test_preflight_from_any_origin_is_allowed(tmp_path):
+    # Every id the fleet can produce, plus a page that is not an extension at all: the
+    # allow-list is gone, so all of them get through. Redden: reinstate an allow-list and
+    # the second and third of these start returning 400.
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
-        r = _preflight(client, GOOD_ORIGIN)
-        assert r.status_code == 200
-        assert r.headers["access-control-allow-origin"] == GOOD_ORIGIN
-        # Never '*', even on the happy path.
-        assert r.headers["access-control-allow-origin"] != "*"
-
-
-def test_preflight_evil_origin_gets_no_acao(tmp_path):
-    app = create_app(_settings(tmp_path))
-    with TestClient(app) as client:
-        r = _preflight(client, EVIL_ORIGIN)
-        # Non-vacuity: the CORS middleware ACTIVELY rejects a disallowed preflight with
-        # 400. Without the middleware, OPTIONS on a GET-only route is a plain 405 — so
-        # this 400 proves the guard is present, not merely that no ACAO leaked.
-        assert r.status_code == 400
-        assert r.headers.get("access-control-allow-origin") != EVIL_ORIGIN
-        assert r.headers.get("access-control-allow-origin") != "*"
-
-
-def test_preflight_nonlisted_extension_id_gets_no_acao(tmp_path):
-    # A DIFFERENT extension id (the §12 silent-failure case) must not be allowed.
-    app = create_app(_settings(tmp_path))
-    with TestClient(app) as client:
-        r = _preflight(client, OTHER_EXT_ORIGIN)
-        assert r.status_code == 400  # actively rejected by the middleware, not a 405
-        assert r.headers.get("access-control-allow-origin") != OTHER_EXT_ORIGIN
-        assert r.headers.get("access-control-allow-origin") != "*"
-
-
-# --- allow-list: simple (non-preflight) response -----------------------------
-def test_simple_get_echoes_allowed_origin_never_star(tmp_path):
-    app = create_app(_settings(tmp_path))
-    with TestClient(app) as client:
-        r = client.get("/api/state", headers={**AUTH, "Origin": GOOD_ORIGIN})
-        assert r.status_code == 200
-        assert r.headers["access-control-allow-origin"] == GOOD_ORIGIN
-        assert r.headers["access-control-allow-origin"] != "*"
-
-
-def test_simple_get_evil_origin_gets_no_acao(tmp_path):
-    app = create_app(_settings(tmp_path))
-    with TestClient(app) as client:
-        r = client.get("/api/state", headers={**AUTH, "Origin": EVIL_ORIGIN})
-        # The request itself still succeeds (CORS is browser-enforced) but the
-        # response carries no ACAO for the evil origin, so the browser blocks it.
-        assert r.headers.get("access-control-allow-origin") != EVIL_ORIGIN
-        assert r.headers.get("access-control-allow-origin") != "*"
-
-
-# --- never '*' even with multiple explicit origins configured ----------------
-def test_multiple_origins_never_wildcard(tmp_path):
-    two = f"{GOOD_ORIGIN},{OTHER_EXT_ORIGIN}"
-    app = create_app(_settings(tmp_path, ext_allowed_origins=two))
-    with TestClient(app) as client:
-        for origin in (GOOD_ORIGIN, OTHER_EXT_ORIGIN):
+        for origin in (EXT_ORIGIN, OTHER_EXT_ORIGIN, FOREIGN_ORIGIN):
             r = _preflight(client, origin)
-            assert r.status_code == 200
-            assert r.headers["access-control-allow-origin"] == origin
-            assert r.headers["access-control-allow-origin"] != "*"
+            assert r.status_code == 200, origin
+            assert r.headers["access-control-allow-origin"] == "*"
 
 
-# --- empty allow-list => cross-origin /api/* CLOSED, never widened to '*' -----
-def test_empty_allowlist_blocks_cross_origin_never_star(tmp_path):
-    app = create_app(_settings(tmp_path, ext_allowed_origins=""))
+def test_simple_get_carries_the_wildcard_acao(tmp_path):
+    app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
-        r = _preflight(client, GOOD_ORIGIN)
-        # No origin is allowed (secure default), and it is NEVER turned into '*'.
-        # 400 (not 405) proves the middleware is present and actively closing the door.
+        r = client.get("/api/state", headers={**AUTH, "Origin": EXT_ORIGIN})
+        assert r.status_code == 200
+        assert r.headers["access-control-allow-origin"] == "*"
+
+
+def test_an_unpinned_extension_id_is_no_longer_a_failure_mode(tmp_path):
+    """The §12 «бесшумный отказ» this file used to pin no longer exists.
+
+    An unpacked extension's id is the hash of its load path, so moving or renaming the
+    bundle changed the origin and used to cut the startpage off at the preflight while the
+    websocket stayed up and the instance looked green. With no allow-list there is nothing
+    for the id to disagree with. Redden: bring the allow-list back and one of these two
+    ids stops being served.
+    """
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        for origin in (EXT_ORIGIN, OTHER_EXT_ORIGIN):
+            assert _preflight(client, origin).status_code == 200
+
+
+# --- the invariant that DID survive: credentials stay off --------------------
+def test_credentials_are_never_allowed(tmp_path):
+    """``allow_credentials=False`` is what makes the wildcard safe, so it is pinned here.
+
+    With credentials off no cookie / TLS client cert / HTTP-auth is ever attached to a
+    cross-origin call, so a foreign page that reaches /api/* still carries no credential
+    and still gets 401. Redden: set ``allow_credentials=True`` in ``cors_kwargs`` and the
+    header below appears (and Starlette stops echoing a bare ``*``).
+    """
+    from src.api.cors import cors_kwargs
+
+    assert cors_kwargs()["allow_credentials"] is False
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        r = _preflight(client, FOREIGN_ORIGIN)
+        assert "access-control-allow-credentials" not in r.headers
+        # …and the wildcard is a real wildcard, not an echo of the requesting origin.
+        assert r.headers["access-control-allow-origin"] == "*"
+
+
+def test_a_foreign_origin_still_cannot_read_api_without_a_token(tmp_path):
+    # The point of the whole change: the lock on /api/* is require_api_caller, not CORS.
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        r = client.get("/api/state", headers={"Origin": FOREIGN_ORIGIN})
+        assert r.status_code == 401
+
+
+# --- the preflight can still be REJECTED, on method/header -------------------
+def test_preflight_with_an_undeclared_method_is_rejected_and_counted(tmp_path):
+    """``cors_preflight`` did NOT become unreachable when origins were opened up.
+
+    Starlette refuses a preflight on three grounds — origin, method, header — and only
+    the origin ground is gone. A verb outside ``_ALLOW_METHODS`` (or a header outside
+    ``_ALLOW_HEADERS``) is still a 400, and it is still the §12 silent-failure shape: the
+    socket stays up, the instance stays green, only the fetch dies. That is why
+    ``CountingCORSMiddleware`` and its alert rule are kept. Redden: delete the counting
+    override and the counter stops moving.
+    """
+    from src.api.auth_metrics import auth_rejections
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        before = auth_rejections.by_reason()
+        r = _preflight(client, EXT_ORIGIN, method="PATCH")
         assert r.status_code == 400
-        assert r.headers.get("access-control-allow-origin") != GOOD_ORIGIN
-        assert r.headers.get("access-control-allow-origin") != "*"
+        after = auth_rejections.by_reason()
+        assert after.get("cors_preflight", 0) > before.get("cors_preflight", 0)
 
 
-def test_literal_star_in_env_is_dropped_never_wildcard(tmp_path):
-    # An operator typo EXT_ALLOWED_ORIGINS="*" must NOT widen /api/* to any origin:
-    # cors_kwargs drops the literal '*', leaving the empty-list secure default.
-    app = create_app(_settings(tmp_path, ext_allowed_origins="*"))
+def test_preflight_with_an_undeclared_header_is_rejected(tmp_path):
+    # The other reachable branch: a custom header added to the startpage's fetch without
+    # being added to _ALLOW_HEADERS. Redden: widen allow_headers to "*" and this passes,
+    # which would ALSO make the counter above unreachable.
+    app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
-        r = _preflight(client, GOOD_ORIGIN)
-        assert r.status_code == 400  # '*' dropped => nothing allowed => rejected
-        assert r.headers.get("access-control-allow-origin") not in (GOOD_ORIGIN, "*")
+        r = _preflight(client, EXT_ORIGIN, headers="authorization,x-not-declared")
+        assert r.status_code == 400
 
 
 # --- acceptance auth gates (pinned here too) ---------------------------------
@@ -168,45 +172,3 @@ def test_api_rejects_unauthenticated_and_metrics_token(tmp_path):
         assert client.get(
             "/api/state", headers={"Authorization": f"Bearer {METRICS_TOKEN}"}
         ).status_code == 401
-
-
-# --- the empty-value asymmetry, pinned in ONE place --------------------------
-def test_empty_allowlist_is_open_on_ext_and_closed_on_cors(tmp_path):
-    """The two consumers of an EMPTY ``EXT_ALLOWED_ORIGINS`` read it differently on
-    purpose, and that is the §12 «бесшумный отказ» shape: the websocket connects (the
-    instance looks healthy everywhere) while the startpage's fetch dies on preflight.
-
-    Closing ``/ext`` by default is the worse option — the concrete
-    ``chrome-extension://<id>`` is unknowable before the extension is loaded, so it
-    would make bootstrap impossible and would disconnect every instance of a deployment
-    that never set the variable. CORS cannot widen to ``*`` (§12), so its empty case can
-    only be "closed". This test pins BOTH halves so the asymmetry stays a decision
-    rather than drifting, and the rejected preflight is counted (the audible signal).
-    """
-    from src.api.auth_metrics import auth_rejections
-    from src.ext.protocol import hello_reject_reason, parse_origins
-
-    allowed = parse_origins("")
-    assert allowed == set()
-    # /ext half: ANY origin passes the hello check when the list is empty. Under
-    # enrollment (issue #35) auth is by the resolved instance id, not a shared token;
-    # a non-None id means the secret already matched an active instance in the channel.
-    hello = {
-        "protocolVersion": 1, "instanceId": "i1",
-        "origin": "chrome-extension://whatever-id",
-    }
-    assert hello_reject_reason(hello, 1, "i1", allowed) is None
-    # …and a NON-empty list that does not contain it is rejected with 'origin', which
-    # is what makes a real mismatch visible in the status row.
-    assert hello_reject_reason(hello, 1, "i1", {GOOD_ORIGIN}) == "origin"
-
-    # CORS half: the same empty value emits no ACAO for anybody, and the rejection is
-    # counted into curator_auth_rejections_total (the audible signal for the mismatch).
-    app = create_app(_settings(tmp_path, ext_allowed_origins=""))
-    with TestClient(app) as client:
-        before = auth_rejections.by_reason()
-        r = _preflight(client, GOOD_ORIGIN)
-        assert r.status_code == 400
-        assert "access-control-allow-origin" not in r.headers
-        after = auth_rejections.by_reason()
-        assert after.get("cors_preflight", 0) > before.get("cors_preflight", 0)

@@ -91,14 +91,12 @@ startpage: ## Build the startpage, run the §10 build gates, then the vitest sui
 # token or a service address — both are entered per profile in the extension's
 # enrollment settings UI. See tools/README.md for the manual acceptance list.
 #
-# 1) Build the ONE universal, key-pinned bundle the whole fleet loads. Pass a stable
-#    --key-file for a reproducible chrome-extension:// id across rebuilds.
-#      make bundle OUT=~/dist [KEY_FILE=~/signing_key.pem]
+# 1) Build the ONE universal bundle the whole fleet loads. No signing key: the
+#    chrome-extension:// id is the load-path hash and nothing reads it.
+#      make bundle OUT=~/dist
 .PHONY: bundle
-bundle: install ## Build the shared universal bundle (vars: OUT [KEY_FILE])
-	$(PY) -m tools.generate_instance bundle \
-		--out "$(OUT)" \
-		$(if $(KEY_FILE),--key-file "$(KEY_FILE)",)
+bundle: install ## Build the shared universal bundle (vars: OUT)
+	$(PY) -m tools.generate_instance bundle --out "$(OUT)"
 
 # 2) Wrap that shared bundle in a per-instance .app + empty profile. NO extension copy
 #    and NO instance.json are written — the launcher's --load-extension points at the

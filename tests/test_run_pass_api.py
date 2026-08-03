@@ -20,7 +20,6 @@ def _settings(tmp_path, **over):
         host="0.0.0.0", port=8000,
         heartbeat_ms=600_000, protocol_version=1,
         metrics_token="m", admin_token=ADMIN_TOKEN,
-        ext_allowed_origins="",
         idle_minutes=60, pass_interval_min=5, tick_ms=60000,
         cmd_timeout_ms=1000, snapshot_timeout_ms=500, lease_ttl_ms=600_000,
         restore_exemption_min=120, pause_default_min=60, incomplete_after_min=15,

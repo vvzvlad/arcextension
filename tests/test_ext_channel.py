@@ -253,17 +253,22 @@ def test_anon_hello_with_public_protocol_creates_no_instances_row(tmp_path):
         assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
-# --- origin allow-list ------------------------------------------------------
-def test_origin_not_in_allowlist_rejected(tmp_path):
-    app = create_app(_settings(tmp_path, ext_allowed_origins="chrome-extension://good"))
+# --- hello.origin decides nothing -------------------------------------------
+def test_any_hello_origin_connects(tmp_path):
+    """There is no origin allow-list anymore, so an unexpected origin is not a refusal.
+
+    ``hello.origin`` is now inert on the service side: it is not compared to anything and
+    not stored (only the ENROLL request records an origin, for the operator to see at
+    approval time). Redden: reinstate the check and these hellos are refused with 'origin'.
+    """
+    app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         approve_instance(db_path, "i1")
-        with client.websocket_connect("/ext") as ws:
-            ws.send_json(_hello(origin="chrome-extension://evil"))
-            ack = _recv(ws)
-            assert ack["ok"] is False
-            assert ack["error"]["code"] == "origin"
+        for origin in ("chrome-extension://some-unexpected-id", "https://not-an-ext.example"):
+            with client.websocket_connect("/ext") as ws:
+                ws.send_json(_hello(origin=origin))
+                assert _recv(ws)["ok"] is True, origin
 
 
 # --- headline: old socket doesn't clobber the new one -----------------------

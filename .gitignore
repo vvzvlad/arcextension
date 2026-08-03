@@ -27,5 +27,3 @@ startpage/dist/
 # A stray instance.json is dev cruft under enrollment (config is entered per profile in
 # the extension UI, §13) — never commit one.
 extension/instance.json
-# Instance-generator signing key (§13) — a per-deployment secret, never commit it
-.instancegen/

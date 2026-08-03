@@ -4,9 +4,6 @@
   "version": "0.1.0",
   "description": "Curator client: reports tab activity snapshots and executes curator commands (§5, §6).",
 
-  "//key": "Fixes the extension id independent of the load path (§6). Replace this PLACEHOLDER with the real public key of the signing keypair at packaging time; the value below is not a real key and must be regenerated per deployment.",
-  "key": "REPLACE_WITH_BASE64_PUBLIC_KEY_TO_PIN_EXTENSION_ID",
-
   "permissions": [
     "tabs",
     "scripting",

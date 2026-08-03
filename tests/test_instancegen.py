@@ -8,7 +8,7 @@ longer copies the extension or writes an `instance.json`. It only builds an empt
 bundle built once by `instancegen bundle`. The service address and the per-install secret
 are entered per profile during enrollment, so `generate` takes no token and no serviceUrl.
 
-The `bundle` build (universal, key-pinned, instance.json-free) is covered in
+The `bundle` build (a universal, key-free, instance.json-free copy) is covered in
 `tests/test_enroll_metrics_and_bundle.py`. Operational acceptance (an instance actually
 enrolling, a clone re-enrolling) needs a real browser and is a MANUAL checklist in
 `tools/README.md` — deliberately NOT faked here.
@@ -19,12 +19,11 @@ Each test is written to redden if its guard is removed (noted inline).
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 
-from tools.instancegen import cli, core, keys, macos
+from tools.instancegen import cli, core, macos
 
 REPO_EXTENSION = Path(__file__).resolve().parents[1] / "extension"
 
@@ -32,7 +31,7 @@ REPO_EXTENSION = Path(__file__).resolve().parents[1] / "extension"
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _make_bundle(tmp_path, name="dist", key="AAAABBBBCCCC") -> Path:
+def _make_bundle(tmp_path, name="dist") -> Path:
     """A minimal SHARED universal bundle dir the generated .app points at.
 
     `generate` only requires a `manifest.json` to be present (it loads, never copies,
@@ -41,7 +40,7 @@ def _make_bundle(tmp_path, name="dist", key="AAAABBBBCCCC") -> Path:
     d = tmp_path / name
     d.mkdir(exist_ok=True)
     (d / "manifest.json").write_text(
-        json.dumps({"name": "x", "key": key, "host_permissions": ["<all_urls>"]})
+        json.dumps({"name": "x", "host_permissions": ["<all_urls>"]})
     )
     return d
 
@@ -192,11 +191,9 @@ def test_cli_has_no_token_options_anywhere(tmp_path):
 
 
 def test_cli_generate_runs_end_to_end(tmp_path):
-    # The whole CLI path (macos.build_icns no-op off-mac, ext-id derived from the shared
-    # bundle key) returns 0 and lays down a launcher pointing at the shared bundle.
-    bundle = _make_bundle(tmp_path, key=keys.public_key_b64_from_pem(
-        keys.load_or_create_private_key_pem(tmp_path / "k.pem")
-    ))
+    # The whole CLI path (macos.build_icns no-op off-mac) returns 0 and lays down a
+    # launcher pointing at the shared bundle.
+    bundle = _make_bundle(tmp_path)
     out = tmp_path / "inst"
     rc = cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
                    "--out", str(out), "--title", "Main"])
@@ -206,58 +203,32 @@ def test_cli_generate_runs_end_to_end(tmp_path):
     assert str(bundle.resolve()) in launcher.read_text()
 
 
-def test_cli_generate_survives_a_malformed_bundle_manifest(tmp_path):
-    # _bundle_extension_id runs AFTER the instance is created, purely for the id printout.
-    # A syntactically-broken manifest.json in the shared bundle must NOT crash the CLI with
-    # a bare JSONDecodeError — the instance is valid regardless. Redden: drop the try/except
-    # in _bundle_extension_id and this raises instead of returning 0.
-    bundle = tmp_path / "dist"
-    bundle.mkdir()
-    (bundle / "manifest.json").write_text("{ this is not valid json ")
-    out = tmp_path / "inst"
-    rc = cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
-                   "--out", str(out)])
-    assert rc == 0
-    assert (out / "main" / "main.app" / "Contents" / "MacOS" / "run").is_file()
-    # The helper itself returns None (a hint is printed instead of a bogus id).
-    assert cli._bundle_extension_id(bundle) is None
-
-
 # --------------------------------------------------------------------------- #
-# Manifest stamping (shared bundle build) + signing key still work
+# No signing key anywhere: not in the CLI, not in the module, not in the manifest
 # --------------------------------------------------------------------------- #
-def test_stamp_manifest_requires_a_real_key():
+def test_bundle_takes_no_key_file_and_nothing_stamps_a_manifest(tmp_path):
+    """The key existed only to PIN the extension id for `EXT_ALLOWED_ORIGINS`.
+
+    That allow-list is gone (src/api/cors.py), so the whole key layer went with it: no
+    `--key-file` flag, no `keys` module, no stamping helpers, and no `key` field in the
+    repo manifest. Redden: reintroduce any of them and one of these assertions fails.
+    """
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):  # argparse exits 2 on an unknown option
+        parser.parse_args(["bundle", "--out", str(tmp_path / "d"), "--key-file", "/k.pem"])
+    args = parser.parse_args(["bundle", "--out", str(tmp_path / "d")])
+    assert not hasattr(args, "key_file")
+
+    import tools.instancegen as instancegen
+
+    assert not hasattr(instancegen, "keys")
+    for gone in ("KEY_PLACEHOLDER", "HOST_PLACEHOLDER", "stamp_manifest",
+                 "stamp_bundle_manifest", "write_private_bytes"):
+        assert not hasattr(core, gone), gone
+
     manifest = json.loads((REPO_EXTENSION / "manifest.json").read_text())
-    with pytest.raises(ValueError):
-        core.stamp_manifest(manifest, "h.example.com", "")
-
-
-def test_signing_key_generated_persisted_and_reused(tmp_path):
-    key_path = tmp_path / ".instancegen" / "signing_key.pem"
-    pem1 = keys.load_or_create_private_key_pem(key_path)
-    assert key_path.is_file()
-    assert (key_path.stat().st_mode & 0o777) == 0o600  # secret perms
-    pem2 = keys.load_or_create_private_key_pem(key_path)
-    assert pem1 == pem2  # reused, not regenerated -> stable id
-
-
-def test_extension_id_is_32_chars_over_a_to_p_and_deterministic(tmp_path):
-    pem = keys.load_or_create_private_key_pem(tmp_path / "k.pem")
-    key_b64 = keys.public_key_b64_from_pem(pem)
-    ext_id = keys.derive_extension_id(key_b64)
-    assert len(ext_id) == 32
-    assert all("a" <= c <= "p" for c in ext_id)
-    assert keys.derive_extension_id(key_b64) == ext_id  # deterministic
-    assert keys.public_key_b64_from_pem(pem) == key_b64
-
-
-def test_extension_id_known_answer_vector():
-    # Chromium-correct KNOWN ANSWER (not just self-consistent): id = SHA-256 of the
-    # DER key bytes, first 16 bytes, each nibble high-then-low -> 'a'+n. Verified
-    # against an independent reimplementation.
-    import base64
-    key_b64 = base64.b64encode(b"hello-world").decode()
-    assert keys.derive_extension_id(key_b64) == "kpkchleenedlackjpokebnbdmonmcoea"
+    assert "key" not in manifest
+    assert "//key" not in manifest
 
 
 # --------------------------------------------------------------------------- #
@@ -399,37 +370,3 @@ def test_title_with_traversal_stays_under_out_root(tmp_path):
     # The human-readable title still survives verbatim in Info.plist.
     plist = res.paths.info_plist.read_text()
     assert "../../escape" in plist  # CFBundleName keeps the raw (xml-escaped) title
-
-
-# --------------------------------------------------------------------------- #
-# Private writes must be COMPLETE, not just created (the signing key)
-# --------------------------------------------------------------------------- #
-def _break_os_write(monkeypatch):
-    """Make a bare os.write() write only the first half of its buffer.
-
-    That is the real short-write failure mode (a filling disk, an interrupted
-    syscall): os.write returns the short count and raises nothing, so the caller
-    that ignores the return value leaves a TRUNCATED file which still satisfies
-    `p.exists()`. io.FileIO writes at the C level and does not route through this
-    patch, so a correct implementation is unaffected — an os.write-based one is not.
-    """
-    real_write = os.write
-
-    def half_write(fd, data):
-        return real_write(fd, bytes(data)[: max(1, len(bytes(data)) // 2)])
-
-    monkeypatch.setattr(os, "write", half_write)
-
-
-def test_signing_key_is_written_whole_under_short_writes(tmp_path, monkeypatch):
-    # A truncated PEM is worse than a missing one: `p.exists()` makes it look
-    # generated, so it is REUSED forever and the pinned extension id is lost.
-    key_path = tmp_path / ".instancegen" / "signing_key.pem"
-    _break_os_write(monkeypatch)
-
-    pem = keys.load_or_create_private_key_pem(key_path)
-
-    assert key_path.read_bytes() == pem
-    assert (key_path.stat().st_mode & 0o777) == 0o600
-    # The persisted key must still be usable — a half PEM would fail to parse.
-    assert keys.public_key_b64_from_pem(key_path.read_bytes())

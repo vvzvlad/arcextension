@@ -1,19 +1,15 @@
 """Pure core of the instance generator (§13) — filesystem + text only.
 
 Everything here runs on Linux/CI without a browser or a mac. The macOS-only real
-``.icns``/``.app`` build lives in `macos`; the signing key in `keys`. Nothing in
-this module touches the repo's own ``extension/`` — it only ever writes under the
-caller-supplied output root.
+``.icns``/``.app`` build lives in `macos`. Nothing in this module touches the repo's own
+``extension/`` — it only ever writes under the caller-supplied output root.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import shutil
 import struct
-import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,9 +21,10 @@ from pathlib import Path
 # is fine (AGENTS.md); override with --brave-binary.
 DEFAULT_BRAVE_BINARY = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
 
-# The manifest placeholder tokens (must match extension/manifest.json).
-HOST_PLACEHOLDER = "<host>"
-KEY_PLACEHOLDER = "REPLACE_WITH_BASE64_PUBLIC_KEY_TO_PIN_EXTENSION_ID"
+# No manifest placeholders remain: `<host>` went with issue #35 (the manifest is hostless,
+# only `<all_urls>`), and the `key` field went with the extension-id pinning (there is no
+# origin allow-list left to pin an id for — see src/api/cors.py). `bundle` therefore COPIES
+# the manifest verbatim and stamps nothing.
 
 # Directory name of an instance's empty --user-data-dir under the output root.
 _PROFILE_DIRNAME = "profile"
@@ -42,68 +39,6 @@ _COPY_IGNORE = shutil.ignore_patterns(
 # --------------------------------------------------------------------------- #
 # Layout
 # --------------------------------------------------------------------------- #
-def write_private_bytes(path, data: bytes) -> None:
-    """Atomically and durably write *data* to *path* owner-only (0600).
-
-    Write-to-temp + fsync + ``os.replace``, not a truncating write in place. Writing
-    straight into the destination leaves a TRUNCATED file if the disk fills on
-    flush/close or the process is killed mid-write — and a truncated signing key still
-    passes every ``p.exists()`` check while being an unparseable PEM. Here the
-    destination keeps its previous contents until a COMPLETE file is renamed over it;
-    ``os.replace`` is atomic within a directory, so a reader sees old or new, never
-    half.
-
-    The ``fsync`` before the rename is what makes that true across a POWER LOSS rather
-    than only across a crash: without it the rename can reach disk while the data
-    behind it has not, leaving an empty or partial file under the real name. The
-    directory is fsync'd too, so the rename itself survives.
-
-    ``tempfile.mkstemp`` supplies the temp file: it creates with ``O_EXCL`` and an
-    UNPREDICTABLE name at mode 0600. A fixed name like ``.<name>.tmp`` is guessable, so
-    in a shared/world-writable output dir a neighbour could pre-plant it as a symlink
-    and have this function write the signing key wherever the link points.
-    ``os.fchmod`` re-asserts 0600 on the descriptor before any bytes are written, and
-    since ``os.replace`` makes this inode the destination, 0600 lands on the final file
-    regardless of the mode the OLD file had.
-    """
-    path = Path(path)
-    # Same directory as the destination: os.replace is atomic only within a filesystem.
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        os.fchmod(fd, 0o600)
-        # os.fdopen takes ownership of fd and closes it. A buffered writer writes
-        # everything or raises — a bare os.write() may write only PART of the buffer
-        # and return the short count without raising (a filling disk, a signal).
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(path.parent)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
-def _fsync_dir(directory: Path) -> None:
-    """fsync a directory so a rename into it survives a power loss.
-
-    Best-effort: some platforms/filesystems refuse to open a directory for this, and
-    failing the whole write over a durability nicety would be worse than the risk.
-    """
-    try:
-        dir_fd = os.open(str(directory), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
-
-
 def slugify(text: str) -> str:
     """A filesystem-safe slug for a dir name / bundle id segment."""
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", text.strip()).strip("-._")
@@ -146,50 +81,6 @@ def instance_paths(out_root: str | Path, instance_id: str, title: str) -> Instan
         info_plist=contents / "Info.plist",
         icon_png=contents / "Resources" / "AppIcon.png",
     )
-
-
-# --------------------------------------------------------------------------- #
-# Manifest stamping (universal `bundle` build — §9)
-# --------------------------------------------------------------------------- #
-def stamp_manifest(manifest: dict, host: str | None, key_b64: str) -> dict:
-    """Return a copy of *manifest* with `<host>` filled (when a host is given) and `key` pinned.
-
-    ``<all_urls>`` (which carries no ``<host>``) is left untouched; when *host* is a
-    string, every ``host_permissions`` entry has its ``<host>`` token replaced.
-
-    When *host* is ``None`` this is the HOSTLESS path taken by the universal ``bundle``
-    build (§9): the manifest carries only ``<all_urls>`` (issue #35 removed the two
-    per-host patterns — there is no ``<host>`` to fill), so ``host_permissions`` is left
-    EXACTLY as-is and only the ``key`` is pinned. Note that even with a host string this
-    is a no-op on a hostless manifest — there is no ``<host>`` token to replace — so the
-    two paths differ only in intent, not in effect on the current manifest.
-
-    The ``key`` is replaced whether it is the placeholder or already a real value
-    (idempotent re-stamp).
-    """
-    out = json.loads(json.dumps(manifest))  # deep copy
-    if host is not None:
-        perms = out.get("host_permissions", [])
-        out["host_permissions"] = [p.replace(HOST_PLACEHOLDER, host) for p in perms]
-    if not key_b64:
-        raise ValueError("a real base64 `key` is required to pin the extension id")
-    out["key"] = key_b64
-    return out
-
-
-def stamp_bundle_manifest(manifest_path: str | Path, key_b64: str) -> None:
-    """Pin the manifest ``key`` IN PLACE with a DETERMINISTIC, hostless stamp (§9).
-
-    Used by the universal ``bundle`` build: the manifest carries only ``<all_urls>``, so
-    this leaves ``host_permissions`` untouched and only pins ``key`` (via the hostless
-    :func:`stamp_manifest` path). The re-serialisation is stable — ``indent=2`` with the
-    input key order preserved (no timestamps, no randomness) — so two runs with the SAME
-    key produce a byte-for-byte identical manifest (acc 16).
-    """
-    manifest_path = Path(manifest_path)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    stamped = stamp_manifest(manifest, None, key_b64)
-    manifest_path.write_text(json.dumps(stamped, indent=2) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -398,9 +289,10 @@ def generate_instance(
     ``instancegen bundle`` (§9). This therefore writes only three things — an empty
     ``--user-data-dir``, the ``.app`` (launcher + Info.plist + icon), and nothing else —
     with the launcher's ``--load-extension`` pointing at the SHARED *bundle_dir*. Two
-    instances built against the same *bundle_dir* load the exact same extension dir, so
-    they share one ``chrome-extension://`` id/origin (the key is pinned inside the shared
-    bundle, not here).
+    instances built against the same *bundle_dir* load the exact same extension dir, and
+    therefore the same ``chrome-extension://`` id — which is now simply the hash of that
+    shared load path, with nothing pinning it. Nothing depends on the id being stable: no
+    origin is checked anywhere anymore (see :mod:`src.api.cors`).
 
     The service address and the per-install secret are NOT baked in — the extension gets
     them through the enrollment settings UI, so ``generate`` needs no serviceUrl and no

@@ -306,19 +306,19 @@ groups:
       # /api/* CORS is cutting the startpage off — the §12 «бесшумный отказ», and the ONE
       # shape of it that no other signal reports.
       #
-      # EXT_ALLOWED_ORIGINS feeds two checks (§6 `parse_origins`), and they read an EMPTY
-      # list differently on purpose: /ext accepts ANY origin, /api/* CORS allows NONE. So a
-      # deployment that never set the variable keeps every instance connected and green
-      # while every startpage `fetch /api/state` dies at the preflight and the newtab
-      # re-renders yesterday's cache («кэш от <время>») forever. Nothing looks broken.
+      # The CAUSE narrowed when the origin allow-list was retired (src/api/cors.py explains
+      # why: /api/* is behind require_api_caller, credentials are off, CORS binds browsers
+      # only, and the service is not internet-reachable). `allow_origins: *` removes the
+      # ORIGIN ground for a refusal. Starlette's other two remain: a requested METHOD
+      # outside the declared /api/* verbs, or a requested HEADER outside the declared list —
+      # i.e. a new verb or a new custom header added to the startpage's fetch without being
+      # added to src/api/cors.py.
       #
-      # The OTHER mismatch — a non-empty list naming the wrong extension id — is already
-      # covered without this rule: /ext rejects the same origin, `reject_reason='origin'`
-      # lands on the instances row and the status bar goes red (deploy/DEPLOY.md §4). It is
-      # exactly the EMPTY case that leaves no row, no reject_reason and no red anything, so
-      # this counter is its only machine-readable trace. src/ext/protocol.parse_origins and
-      # DEPLOY.md §4 both already promise it makes the failure "audible" — that promise is
-      # only true once something alerts on it.
+      # That is why the rule survived the allow-list. The failure MODE is unchanged and is
+      # exactly the one nothing else catches: the websocket is unaffected by CORS, so /ext
+      # stays connected and every instance stays green, while the newtab re-renders
+      # yesterday's cache («кэш от <время>») forever. No row, no reject_reason, no red
+      # anything — this counter is the only machine-readable trace.
       #
       # >5 in 10m, no `for:` (the increase() window is the smoothing). A cut-off startpage
       # re-preflights on every newtab and on the service worker's quick-links flush, so a
@@ -334,7 +334,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "/api/* CORS is rejecting preflights — startpages are cut off and serving stale cache while instances look healthy; check EXT_ALLOWED_ORIGINS against the real chrome-extension://<id> (§12, deploy/DEPLOY.md §4)."
+          summary: "/api/* CORS is rejecting preflights — startpages are cut off and serving stale cache while instances look healthy; the client is asking for a method or a header that src/api/cors.py does not declare (§12)."
 
       # Half-open socket: connected but the mirror snapshot stopped advancing for
       # >6×PASS_INTERVAL (§12 reserves 6× for exactly this). snapshot_age is already 0

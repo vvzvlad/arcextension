@@ -9,8 +9,8 @@ Covers:
   * ``curator_auth_rejections_total{reason}`` — the newly LABELED counter family, one
     series per coarse reason (so the §37 alert can key on ``reason="enroll_bad_code"``),
     and the empty-breakdown case emitting a still-valid exposition.
-  * ``instancegen bundle`` — a key-pinned, hostless, instance.json-free universal bundle
-    that two runs with the same key produce byte-for-byte identically (acc 16).
+  * ``instancegen bundle`` — a hostless, key-free, instance.json-free universal bundle
+    that any two runs produce byte-for-byte identically (acc 16).
 
 Each assertion is written so that removing the guard it names reddens the test.
 """
@@ -34,7 +34,7 @@ from src.api.metrics import (
 )
 from src.app import create_app
 from src.curator.enroll import ENROLL_WINDOW_UNTIL_KEY
-from tools.instancegen import cli, core, keys
+from tools.instancegen import cli
 
 REPO_EXTENSION = Path(__file__).resolve().parents[1] / "extension"
 MAUTH = {"Authorization": f"Bearer {METRICS_TOKEN}"}
@@ -212,14 +212,8 @@ def test_auth_rejections_empty_breakdown_is_valid_exposition():
 
 
 # --------------------------------------------------------------------------- #
-# instancegen bundle — universal, key-pinned, hostless, no instance.json
+# instancegen bundle — universal, hostless, key-free, no instance.json
 # --------------------------------------------------------------------------- #
-def _key_file(tmp_path) -> Path:
-    kp = tmp_path / "signing_key.pem"
-    keys.load_or_create_private_key_pem(kp)
-    return kp
-
-
 def _content_digest(root: Path) -> list[tuple[str, str]]:
     """Sorted (relpath, sha256-of-contents) for every file under *root*.
 
@@ -233,20 +227,17 @@ def _content_digest(root: Path) -> list[tuple[str, str]]:
     ]
 
 
-def test_bundle_produces_key_pinned_hostless_manifest_no_instance_json(tmp_path):
-    keyfile = _key_file(tmp_path)
+def test_bundle_produces_a_hostless_key_free_manifest_no_instance_json(tmp_path):
     out = tmp_path / "dist"
     rc = cli.main(
-        ["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION),
-         "--key-file", str(keyfile)]
+        ["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)]
     )
     assert rc == 0
     manifest = json.loads((out / "manifest.json").read_text())
-    # key pinned to the file's public half, not the placeholder. Redden: skip the stamp
-    # and the placeholder leaks.
-    expected_key = keys.public_key_b64_from_pem(keyfile.read_bytes())
-    assert manifest["key"] == expected_key
-    assert manifest["key"] != core.KEY_PLACEHOLDER
+    # NO `key` field. An extension id is not pinned anymore (nothing checks an origin), and
+    # a leftover placeholder would be an INVALID key that stops Brave loading the unpacked
+    # extension at all. Redden: put a `key` back in extension/manifest.json.
+    assert "key" not in manifest
     # Hostless: ONLY <all_urls>, no per-host patterns, no <host> placeholder.
     assert manifest["host_permissions"] == ["<all_urls>"]
     assert not any("<host>" in p for p in manifest["host_permissions"])
@@ -256,52 +247,32 @@ def test_bundle_produces_key_pinned_hostless_manifest_no_instance_json(tmp_path)
 
 
 def test_bundle_two_runs_byte_identical(tmp_path):
-    keyfile = _key_file(tmp_path)
     d1 = tmp_path / "b1"
     d2 = tmp_path / "b2"
     for d in (d1, d2):
-        cli.main(
-            ["bundle", "--out", str(d), "--extension-dir", str(REPO_EXTENSION),
-             "--key-file", str(keyfile)]
-        )
-    # Same key + deterministic stamp + timestamp-free copy -> identical trees (acc 16).
-    # Redden: sort_keys/order drift or a nondeterministic stamp and these diverge.
+        cli.main(["bundle", "--out", str(d), "--extension-dir", str(REPO_EXTENSION)])
+    # A timestamp-free copy with nothing stamped into it -> identical trees (acc 16).
+    # Redden: reintroduce any stamping step whose input can vary between runs.
     assert _content_digest(d1) == _content_digest(d2)
-    # --key-file was given, so no secret .instancegen and no instance.json were created.
-    assert not (d1 / ".instancegen").exists()
-    assert not (d1 / "instance.json").exists()
 
 
-def test_bundle_generated_key_lands_outside_the_distributed_bundle(tmp_path):
-    # SECURITY: --out IS the extension bundle that ships fleet-wide, and the private
-    # signing key pins the single chrome-extension:// id (predpos. 19). A generated key
-    # must therefore live BESIDE the bundle, NEVER inside it — else shipping the tree
-    # leaks the key and an attacker can forge an extension under the same id, defeating
-    # EXT_ALLOWED_ORIGINS. Redden: point _resolve_key back at out_dir and the key
-    # reappears inside the distributed tree.
+def test_bundle_writes_no_secret_material_beside_or_inside_the_output(tmp_path):
+    # The generator used to persist an RSA private key in a `.instancegen` sibling of the
+    # bundle. Nothing generates or stores key material anymore, so neither the distributed
+    # tree nor its parent gains a secret. Redden: bring key generation back.
     root = tmp_path / "fleet"
     out = root / "dist"
-    rc = cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)])
-    assert rc == 0
-    # The generated key lives in a .instancegen SIBLING of the bundle (symmetric with
-    # `generate`), OUTSIDE out_dir.
-    assert (root / ".instancegen" / "signing_key.pem").is_file()
-    # The distributed bundle carries NO private key material at all.
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)]) == 0
+    assert not (root / ".instancegen").exists()
     assert not (out / ".instancegen").exists()
-    assert list(out.rglob("*.pem")) == []
-    # …and it is still a valid key-pinned, hostless, instance.json-free bundle.
-    manifest = json.loads((out / "manifest.json").read_text())
-    assert manifest["key"] != core.KEY_PLACEHOLDER  # a real generated key was pinned
-    assert manifest["host_permissions"] == ["<all_urls>"]
-    assert not (out / "instance.json").exists()
+    assert list(root.rglob("*.pem")) == []
 
 
 def test_bundle_refuses_an_existing_out_dir(tmp_path):
     out = tmp_path / "dist"
     out.mkdir()
     with pytest.raises(SystemExit):
-        cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION),
-                  "--key-file", str(_key_file(tmp_path))])
+        cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)])
 
 
 def test_bundle_rejects_token_service_url_and_instance_id_options(tmp_path):

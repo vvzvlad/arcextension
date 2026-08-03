@@ -64,11 +64,6 @@ services:
       # on a fresh deploy the marker simply does not exist yet. The restore
       # procedure (DEPLOY.md §8) writes a NEW unique value here.
       RESTORE_MARKER_PATH: /app/restore/continuity-marker
-      # Real chrome-extension://<id> origins, comma-separated. MUST match the
-      # installed extension id(s): a mismatch silently breaks the startpage's
-      # /api/* fetch (CORS preflight) while /ext still connects (§12). Empty here
-      # closes cross-origin /api/* entirely (secure default, not '*').
-      EXT_ALLOWED_ORIGINS: chrome-extension://XXX
       TZ: Europe/Moscow
     networks:
       - docker_main_net

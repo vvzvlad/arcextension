@@ -99,13 +99,6 @@ class Settings(BaseSettings):
     # ge=1: 0 refuses EVERY /ext handshake before accept() — the whole fleet drops out of
     # curation with only `curator_auth_rejections_total{reason="capacity"}` to show for it.
     enroll_preauth_max: int = Field(default=128, ge=1)
-    # Comma-separated allow-list for the extension's `hello.origin`. DEFAULT
-    # EMPTY = accept any origin and log a one-time warning (the concrete
-    # chrome-extension:// id is unknown until the extension/generator phases;
-    # §12 tightens this later). When non-empty, a hello whose origin is not in
-    # the list is rejected with reject_reason='origin'.
-    ext_allowed_origins: str = ""
-
     # Path to the EXTERNAL restore-from-backup marker (§7 WARNING 2). DEFAULT EMPTY =
     # detection off — which the continuity fingerprint records as a state ("no marker
     # configured"), not as a missing component: an install that stays off never breaks,

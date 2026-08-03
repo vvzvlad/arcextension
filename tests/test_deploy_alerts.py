@@ -331,8 +331,9 @@ def test_every_enrollment_signal_has_an_alert_rule():
 #     and self-describing: `reject_reason='protocol'` lands on the instances row and turns
 #     the status red, and if the whole fleet is skewed the OUTCOME is already covered by
 #     curator-instance-absent / curator-instance-snapshot-stale.
-#   * `origin` — a deploy-time EXT_ALLOWED_ORIGINS mistake, with the same per-instance
-#     trace on the row and the same absent-instance outcome alert above it.
+#   (`origin` used to be listed here — a deploy-time EXT_ALLOWED_ORIGINS mistake. The
+#   verdict itself is gone now: the allow-list was retired, so no reason label is emitted
+#   and there is nothing to excuse.)
 #   * `duplicate_instance` — two browsers loading one profile's credential. It resolves as
 #     soon as one of them goes away and it, too, is recorded on the row.
 #
@@ -362,7 +363,6 @@ def test_every_enrollment_signal_has_an_alert_rule():
 _REASONS_WITHOUT_A_RULE = frozenset({
     "auth",
     "instance",
-    "origin",
     "duplicate_instance",
     "protocol",
     "revoked",
@@ -799,25 +799,27 @@ def test_secret_conflict_rule_fires_on_a_single_occurrence():
 def test_cors_preflight_rejections_have_a_rule():
     """The §12 «бесшумный отказ» must be alertable, not merely counted.
 
-    An EMPTY `EXT_ALLOWED_ORIGINS` leaves /ext open and /api/* CORS closed (the deliberate
-    asymmetry in `parse_origins`), so every instance stays connected and green while every
-    startpage fetch dies at the preflight and the newtab re-renders a cache that never
-    refreshes. The other mismatch — a non-empty list with the wrong id — is already covered:
-    /ext rejects the same origin and `reject_reason='origin'` reddens the status bar. It is
-    the empty case that leaves NO row and NO reject_reason, which is why this counter needs
-    a rule of its own rather than a line in `_REASONS_WITHOUT_A_RULE`.
+    The rule's CAUSE narrowed when the origin allow-list was retired, but the failure it
+    reports did not go away. `allow_origins=["*"]` removes the origin ground for a refusal;
+    Starlette's other two — a requested METHOD outside `_ALLOW_METHODS`, a requested HEADER
+    outside `_ALLOW_HEADERS` — still 400, and they fail in exactly the same silent shape:
+    the websocket stays up, the instance stays green, and only the startpage's fetch dies,
+    so the newtab re-renders a cache that never refreshes. `tests/test_cors.py` pins that
+    both branches are reachable and counted.
 
-    Redden: delete the rule, and both `parse_origins`' claim that the counter makes the
-    failure "audible" and deploy/DEPLOY.md §4's list of exposing signals become false.
+    Redden: delete the rule and the counter becomes a series nothing ever alerts on.
     """
     rule = next(r for r in _rules() if r["alert"] == "curator-cors-preflight-rejected")
     assert 'curator_auth_rejections_total{reason="cors_preflight"}' in rule["expr"]
     # increase() over a window, so a healthy install's ABSENT series stays silent and one
     # historical rejection cannot page forever.
     assert "increase(" in rule["expr"]
-    # The summary must name the variable to fix: the metric name says "CORS preflight",
-    # which does not tell an operator that the cause is EXT_ALLOWED_ORIGINS.
-    assert "EXT_ALLOWED_ORIGINS" in rule["annotations"]["summary"]
+    # The summary must name what an operator can actually act on. It must NOT still send
+    # them to EXT_ALLOWED_ORIGINS — that variable no longer exists, and a summary naming it
+    # is worse than none: it is a confident wrong lead.
+    summary = rule["annotations"]["summary"]
+    assert "EXT_ALLOWED_ORIGINS" not in summary
+    assert "method" in summary and "header" in summary
 
 
 def test_scrape_job_name_matches_the_alert_selectors():

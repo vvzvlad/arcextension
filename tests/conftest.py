@@ -32,7 +32,6 @@ _DEFAULTS: dict = {
     "metrics_token": METRICS_TOKEN,
     "admin_token": ADMIN_TOKEN,
     "protocol_version": 1,
-    "ext_allowed_origins": "",
     "host": "0.0.0.0",
     "port": 8000,
     # timings — deliberately test-shaped, not production-shaped

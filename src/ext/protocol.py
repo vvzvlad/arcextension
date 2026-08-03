@@ -64,7 +64,11 @@ REJECT_PROTOCOL = "protocol"
 REJECT_AUTH = "auth"
 REJECT_INSTANCE = "instance"
 REJECT_DUPLICATE = "duplicate_instance"
-REJECT_ORIGIN = "origin"
+# There is no `origin` verdict anymore. The hello frame still CARRIES an origin, but the
+# service now ignores it entirely — it is neither compared nor stored. The check was
+# self-reported by the very client it was meant to vet, and the EXT_ALLOWED_ORIGINS
+# allow-list behind it is gone (see src/api/cors.py). The ENROLL path still records its
+# frame's origin, because there it is operator-facing evidence at approval time, not a gate.
 # hello verdicts the client acts on (§7): the secret matched a REVOKED row, or matched
 # no active/pending row at all (unknown — e.g. never approved, or deleted). The client
 # distinguishes these to decide whether to re-enroll (unknown) or stop (revoked).
@@ -106,41 +110,10 @@ def heartbeat_step(alive: bool, misses: int) -> tuple[int, bool]:
     return new_misses, new_misses >= MAX_HEARTBEAT_MISSES
 
 
-def parse_origins(raw: str) -> set[str]:
-    """Parse the comma-separated ``EXT_ALLOWED_ORIGINS`` value into a set.
-
-    Empty / blank => the EMPTY SET. **The two consumers of that empty set deliberately
-    read it differently, and this is the one place both are written down:**
-
-    * ``/ext`` (:func:`hello_reject_reason`, below) — **open**: an empty list skips the
-      origin check entirely and any origin may connect.
-    * ``/api/*`` CORS (:mod:`src.api.cors`) — **closed**: an empty list is an empty
-      allow-list, so no ``Access-Control-Allow-Origin`` is emitted for anybody.
-
-    The asymmetry is intentional and is the LESSER evil, not an oversight. The concrete
-    ``chrome-extension://<id>`` is not knowable before the extension is loaded, so
-    closing ``/ext`` by default would make the bootstrap impossible — and on an
-    already-running deployment that never set the variable it would disconnect every
-    instance at once, which is strictly worse than the CORS-closed state. CORS, by
-    contrast, must never widen to ``*`` (§12), so its empty case can only be "closed".
-
-    §12 warns that a MISMATCH between this list and the real extension id fails
-    SILENTLY — ``/ext`` connects, the instance looks healthy, and only the startpage's
-    ``fetch`` dies on preflight. Two things make the empty case audible instead:
-    a one-time loud WARNING from each side at startup / first hello, and the
-    ``curator_auth_rejections_total{reason="cors_preflight"}`` counter, which ticks on
-    every preflight this list rejects (:class:`src.api.cors.CountingCORSMiddleware`).
-    A NON-empty list that simply lists the wrong id is caught by the check below:
-    ``reject_reason='origin'`` lands in ``instances`` and the status row goes red.
-    """
-    return {part.strip() for part in raw.split(",") if part.strip()}
-
-
 def hello_reject_reason(
     msg: dict[str, Any],
     protocol_version: int,
     resolved_instance_id: str | None,
-    allowed_origins: set[str],
 ) -> str | None:
     """Validate a ``hello`` frame against config; return a reject reason or None.
 
@@ -153,9 +126,15 @@ def hello_reject_reason(
     Order mirrors §6: protocol version (exact int equality, never a silent downgrade)
     first; then ``resolved_instance_id`` — ``None`` means the secret matched no active
     instance, a last-line ``REJECT_AUTH`` guard (the channel normally rejects a
-    revoked/unknown secret with a more specific reason BEFORE reaching here); then origin
-    when an allow-list is configured. Duplicate-instance is NOT decided here — it needs
-    the live registry — so it lives in the channel.
+    revoked/unknown secret with a more specific reason BEFORE reaching here).
+    Duplicate-instance is NOT decided here — it needs the live registry — so it lives in
+    the channel.
+
+    There used to be a third check: ``origin`` against the ``EXT_ALLOWED_ORIGINS``
+    allow-list. It is gone. The value it compared is SELF-REPORTED by the peer being
+    vetted, so it never held against anything that was not already authenticated by the
+    secret; the allow-list's real consumer was ``/api/*`` CORS, and that was retired too
+    (:mod:`src.api.cors` carries the argument).
     """
     if msg.get("protocolVersion") != protocol_version:
         return REJECT_PROTOCOL
@@ -164,13 +143,6 @@ def hello_reject_reason(
     # the belt-and-suspenders guard for "no active instance behind this secret".
     if resolved_instance_id is None:
         return REJECT_AUTH
-    # Empty allow-list => accept ANY origin here, while /api/* CORS treats the same
-    # empty list as CLOSED. Deliberate asymmetry — see parse_origins' docstring for the
-    # full reasoning and for how the empty case is made audible (§12).
-    if allowed_origins:
-        origin = msg.get("origin")
-        if origin not in allowed_origins:
-            return REJECT_ORIGIN
     return None
 
 

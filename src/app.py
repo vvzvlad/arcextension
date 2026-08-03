@@ -280,14 +280,13 @@ def create_app(settings) -> Starlette:
         mcp_route(mcp),
         WebSocketRoute("/ext", ext_channel),
     ]
-    # CORS for /api/* (§12): explicit chrome-extension:// origins only, NEVER '*'.
-    # The middleware ignores non-http scopes (so /ext WebSocket is untouched) and
-    # only echoes an origin present in the allow-list, so /metrics/healthz scrapes
-    # (no Origin header) pass through unaffected. Same allow-list as the hello check.
+    # CORS for /api/* (§12): ANY origin, credentials off — the lock on /api/* is
+    # require_api_caller, not the browser's origin check (see src/api/cors.py for why the
+    # old allow-list was removed). The middleware ignores non-http scopes (so the /ext
+    # WebSocket is untouched) and /metrics/healthz scrapes (no Origin header) are
+    # unaffected either way.
     middleware = [
-        Middleware(
-            CountingCORSMiddleware, **cors_kwargs(settings.ext_allowed_origins)
-        ),
+        Middleware(CountingCORSMiddleware, **cors_kwargs()),
         # Stamp X-Content-Type-Options: nosniff on every /admin response (HTML/asset AND the
         # #35 JSON API that serves untrusted suggested_title/origin verbatim). Header-only,
         # so it never alters a #35 JSON body/status (§13, issue #36).

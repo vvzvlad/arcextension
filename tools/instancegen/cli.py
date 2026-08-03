@@ -1,90 +1,29 @@
 """CLI for the instance generator (§13): ``generate`` and ``bundle``.
 
 Under enrollment (§7/§13, issue #35) the extension build is UNIVERSAL: ``bundle``
-produces the ONE key-pinned bundle the whole fleet loads, and ``generate`` only wraps
-that shared bundle in a per-instance ``.app`` + empty profile. Neither bakes in a
-service address or a secret — both are entered per profile through the enrollment
-settings UI — so ``generate`` needs NO token and NO ``instance.json`` (both are gone).
-The signing key that pins the fleet-wide id is generated/persisted under
-``.instancegen/`` (or supplied via ``bundle --key-file``) — never hardcoded.
+produces the ONE bundle the whole fleet loads, and ``generate`` only wraps that shared
+bundle in a per-instance ``.app`` + empty profile. Neither bakes in a service address or
+a secret — both are entered per profile through the enrollment settings UI — so
+``generate`` needs NO token and NO ``instance.json`` (both are gone).
+
+There is no signing key and no ``--key-file`` either. The key existed only to PIN the
+``chrome-extension://`` id so one origin could be listed in ``EXT_ALLOWED_ORIGINS``; that
+allow-list is gone (``src/api/cors.py`` carries the argument), so nothing reads the id and
+letting Chromium derive it from the load path is fine.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import shlex
 import sys
 from pathlib import Path
 
-from . import core, keys, macos
-
-
-def _warn_if_inside_git_repo(out_root: Path) -> None:
-    """Warn (stderr) if *out_root* sits inside a git working tree: the 0600 signing
-    key under ``<out>/.instancegen/`` is a per-deployment secret and must not be
-    committed. ``.gitignore`` also covers ``.instancegen/``, but a loud warning is
-    the belt to that suspenders."""
-    for parent in [out_root, *out_root.parents]:
-        if (parent / ".git").exists():
-            print(
-                f"WARNING: --out {out_root} is inside a git repo ({parent}); the "
-                f"signing key under {out_root / _KEY_SUBDIR}/ is a secret — do NOT "
-                "commit it (see .gitignore for .instancegen/).",
-                file=sys.stderr,
-            )
-            return
-
-# Where the persistent signing key lives, relative to the output root. Keeping it
-# in the output tree is what makes the extension id stable across instances and
-# re-stamps. It is a SECRET — never commit it (the .example manifest ships a
-# placeholder; real keys live only in the operator's output dir).
-_KEY_SUBDIR = ".instancegen"
-_KEY_FILENAME = "signing_key.pem"
+from . import core, macos
 
 # The repo's extension bundle, resolved relative to this file (…/tools/instancegen).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_EXTENSION_DIR = _REPO_ROOT / "extension"
-
-
-def _resolve_key(out_root: Path, key_file: str | None) -> tuple[str, str]:
-    """Return (base64 manifest key, derived extension id).
-
-    Uses ``--key-file`` if given (a PEM private key or a raw base64 public key),
-    else generates/reuses ``<out>/.instancegen/signing_key.pem``.
-    """
-    if key_file:
-        raw = Path(key_file).read_bytes()
-        if b"-----BEGIN" in raw:
-            key_b64 = keys.public_key_b64_from_pem(raw)
-        else:
-            key_b64 = raw.decode("ascii").strip()
-    else:
-        key_path = out_root / _KEY_SUBDIR / _KEY_FILENAME
-        pem = keys.load_or_create_private_key_pem(key_path)
-        key_b64 = keys.public_key_b64_from_pem(pem)
-    return key_b64, keys.derive_extension_id(key_b64)
-
-
-def _bundle_extension_id(bundle_dir: Path) -> str | None:
-    """The pinned ``chrome-extension://`` id of the SHARED bundle, for the printout.
-
-    Derived from the ``key`` already pinned in the shared bundle's manifest (by
-    ``instancegen bundle``); ``None`` if the bundle still carries the placeholder key
-    (not yet pinned) OR the manifest is unreadable/malformed. This is a best-effort
-    convenience printout run AFTER the instance is already created, so a broken manifest
-    must NOT crash it with a bare traceback — the instance itself is valid, and the id
-    can be recovered by pinning the shared bundle's key. ``generate`` then prints a hint
-    instead of the id.
-    """
-    try:
-        manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
-        key_b64 = str(manifest.get("key") or "")
-    except (OSError, ValueError):
-        return None
-    if not key_b64 or key_b64 == core.KEY_PLACEHOLDER:
-        return None
-    return keys.derive_extension_id(key_b64)
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -112,18 +51,13 @@ def cmd_generate(args: argparse.Namespace) -> int:
     )
 
     p = result.paths
-    ext_id = _bundle_extension_id(bundle_dir)
     print(f"Generated instance {args.instance_id!r} -> {p.root}")
     print(f"  shared bundle  : {bundle_dir}  (--load-extension target; NOT copied)")
     print(f"  profile        : {p.profile_dir}  (empty; install_uuid born here)")
     print(f"  app bundle     : {p.app_dir}")
     print(f"  launcher       : {p.launcher}")
-    if ext_id is not None:
-        print(f"  extension id   : {ext_id}")
-        print(f"  origin (for EXT_ALLOWED_ORIGINS): chrome-extension://{ext_id}")
-    else:
-        print("  extension id   : (bundle key is the placeholder — pin it via "
-              "`instancegen bundle --key-file`)")
+    # No extension id is printed: it is Chromium's hash of the shared bundle's load path
+    # and nothing consumes it anymore (no origin allow-list, no CORS list to update).
     print(f"  icon (.icns)   : {icns.reason}")
     if args.service_url:
         # The address is NOT stamped anymore — the extension gets it via the enrollment
@@ -136,14 +70,14 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_bundle(args: argparse.Namespace) -> int:
-    """Build a UNIVERSAL, key-pinned extension bundle (§9).
+    """Build the UNIVERSAL extension bundle (§9) — a plain copy, nothing stamped.
 
     Like ``generate`` this needs NO token, NO service URL and NO instanceId: with
     enrollment (§7, issue #35) the build is universal — serviceUrl and the per-install
-    secret are entered per profile, not baked in. It only copies the
-    repo ``extension/`` into ``--out`` and pins the manifest ``key`` (the one
-    ``chrome-extension://`` id for the whole fleet — predpos. 19). NO ``instance.json``
-    is written. Two runs with the same ``--key-file`` are byte-identical (acc 16).
+    secret are entered per profile, not baked in. It also needs no signing key: the
+    manifest carries no ``key`` and no ``<host>``, so the whole build is
+    ``copy_bundle`` and nothing else. NO ``instance.json`` is written, and any two runs
+    are byte-identical because a copy has no inputs to vary (acc 16).
     """
     out_dir = Path(args.out).resolve()
     if out_dir.exists():
@@ -154,36 +88,18 @@ def cmd_bundle(args: argparse.Namespace) -> int:
             f"{out_dir} already exists — `bundle` writes a fresh dir; remove it or "
             "choose another --out"
         )
-    # 1. Copy the repo bundle into --out (dev cruft + any stray instance.json skipped).
-    #    NOTE: --out IS the extension bundle root — manifest.json + all code land here and
-    #    this whole tree ships to Chrome fleet-wide.
+    # Copy the repo bundle into --out (dev cruft + any stray instance.json skipped).
+    # NOTE: --out IS the extension bundle root — manifest.json + all code land here and
+    # this whole tree ships to Chrome fleet-wide.
     core.copy_bundle(args.extension_dir, out_dir)
-    # 2. Resolve the signing key. SECURITY: a GENERATED private key must NEVER land inside
-    #    out_dir. The key pins the single fleet-wide chrome-extension:// id (predpos. 19);
-    #    if it shipped inside the distributed bundle, an attacker could rebuild a spoofed
-    #    extension under the SAME id and defeat EXT_ALLOWED_ORIGINS. So the key store lives
-    #    in a `.instancegen` SIBLING of the bundle (out_dir.parent), symmetric with
-    #    `generate` — whose key store is likewise a sibling of the per-instance bundles,
-    #    never inside one. With --key-file the caller supplies the key; nothing is written.
-    key_root = out_dir.parent
-    if not args.key_file:
-        _warn_if_inside_git_repo(key_root)
-    key_b64, ext_id = _resolve_key(key_root, args.key_file)
-    # 3. Pin the key with a deterministic, hostless stamp (no <host>, <all_urls> kept).
-    core.stamp_bundle_manifest(out_dir / "manifest.json", key_b64)
 
     print(f"Built universal bundle -> {out_dir}")
-    print(f"  manifest key pinned : extension id {ext_id}")
-    print(f"  origin (for EXT_ALLOWED_ORIGINS): chrome-extension://{ext_id}")
     print("  NO instance.json written (universal build — serviceUrl/token are per-profile)")
-    if not args.key_file:
-        key_path = key_root / _KEY_SUBDIR / _KEY_FILENAME
-        print(f"  signing key (SECRET) written BESIDE the bundle: {key_path}")
-        print(
-            "  For a REPRODUCIBLE fleet-wide id (same chrome-extension:// id across "
-            "rebuilds) pass --key-file. Without it the id is derived from the key stored "
-            "beside the bundle — kept OUTSIDE the distributed tree, never shipped in it."
-        )
+    print(
+        "  The chrome-extension:// id is Chromium's hash of this dir's absolute path, so "
+        "it changes if you move or rename it. Nothing depends on it: no origin is checked "
+        "on /ext and /api/* CORS accepts any origin."
+    )
     return 0
 
 
@@ -233,24 +149,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser(
         "bundle",
-        help="build a UNIVERSAL, key-pinned extension bundle (no token/url/instanceId)",
+        help="build the UNIVERSAL extension bundle (no token/url/instanceId/key)",
         allow_abbrev=False,
     )
     b.add_argument("--out", required=True, help="output dir for the universal bundle")
     # Deliberately NO --token/--token-file, --service-url or --instance-id: the universal
     # build bakes in none of them (§9) — they are per-profile settings under enrollment.
+    # And deliberately NO --key-file: there is no signing key anymore (see the module
+    # docstring), so the id is the load-path hash and nothing reads it.
     b.add_argument(
         "--extension-dir",
         default=str(_DEFAULT_EXTENSION_DIR),
         help="source extension bundle (default: repo extension/)",
-    )
-    b.add_argument(
-        "--key-file",
-        default=None,
-        help="PEM private key or base64 pubkey. REQUIRED for a REPRODUCIBLE fleet-wide "
-        "id (same chrome-extension:// id across rebuilds). Without it a key is generated "
-        "in a .instancegen sibling BESIDE --out (never inside the distributed bundle — "
-        "it is a secret that pins the fleet id).",
     )
     b.set_defaults(func=cmd_bundle)
 

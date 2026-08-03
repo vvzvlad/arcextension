@@ -11,7 +11,6 @@ from src.ext.protocol import (
     ENROLL_CAPACITY,
     ENROLL_CLOSED,
     REJECT_AUTH,
-    REJECT_ORIGIN,
     REJECT_PROTOCOL,
     enroll_reject_reason,
     hello_reject_reason,
@@ -20,36 +19,32 @@ from src.ext.protocol import (
 
 # --- hello_reject_reason (secret-based) --------------------------------------
 def test_hello_protocol_mismatch_wins_first():
-    # Even with a resolved id and matching origin, a wrong protocolVersion rejects first.
+    # Even with a resolved id, a wrong protocolVersion rejects first.
     msg = {"protocolVersion": 2, "origin": "chrome-extension://x"}
-    assert hello_reject_reason(msg, 1, "i1", {"chrome-extension://x"}) == REJECT_PROTOCOL
+    assert hello_reject_reason(msg, 1, "i1") == REJECT_PROTOCOL
 
 
 def test_hello_none_resolved_id_is_auth():
     # The last-line guard: no active instance behind the secret => auth.
     msg = {"protocolVersion": 1}
-    assert hello_reject_reason(msg, 1, None, set()) == REJECT_AUTH
+    assert hello_reject_reason(msg, 1, None) == REJECT_AUTH
 
 
-def test_hello_empty_allowlist_accepts_any_origin():
-    msg = {"protocolVersion": 1, "origin": "chrome-extension://anything"}
-    assert hello_reject_reason(msg, 1, "i1", set()) is None
-
-
-def test_hello_origin_rejected_when_not_in_nonempty_list():
-    msg = {"protocolVersion": 1, "origin": "chrome-extension://evil"}
-    assert hello_reject_reason(msg, 1, "i1", {"chrome-extension://good"}) == REJECT_ORIGIN
-
-
-def test_hello_origin_ok_when_in_list():
-    msg = {"protocolVersion": 1, "origin": "chrome-extension://good"}
-    assert hello_reject_reason(msg, 1, "i1", {"chrome-extension://good"}) is None
+def test_hello_any_origin_is_accepted():
+    # The origin check is GONE (there is no allow-list to check against, and the value was
+    # self-reported by the peer being vetted anyway). Redden: re-add an origin verdict and
+    # one of these starts rejecting.
+    for origin in ("chrome-extension://anything", "https://not-an-extension.example", None):
+        msg = {"protocolVersion": 1, "origin": origin}
+        assert hello_reject_reason(msg, 1, "i1") is None, origin
+    assert not hasattr(protocol, "REJECT_ORIGIN")
+    assert not hasattr(protocol, "parse_origins")
 
 
 def test_hello_no_token_field_consulted():
     # There is no longer any token in the decision — a hello WITHOUT a token still passes.
     msg = {"protocolVersion": 1}
-    assert hello_reject_reason(msg, 1, "i1", set()) is None
+    assert hello_reject_reason(msg, 1, "i1") is None
 
 
 # --- enroll_reject_reason: each branch + the load-bearing order --------------

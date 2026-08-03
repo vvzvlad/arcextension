@@ -180,7 +180,7 @@ tests:
   - interval: 1m
     name: rejected CORS preflights fire
     input_series:
-      # A mismatched (or empty) EXT_ALLOWED_ORIGINS: every startpage fetch dies at the
+      # An undeclared method/header on the startpage's fetch: every fetch dies at the
       # preflight, so the counter climbs steadily while /ext stays connected and every
       # instance looks healthy — the §12 silent failure this rule exists to expose.
       - series: 'curator_auth_rejections_total{reason="cors_preflight"}'
@@ -193,15 +193,15 @@ tests:
               severity: warning
               reason: cors_preflight
             exp_annotations:
-              summary: "/api/* CORS is rejecting preflights — startpages are cut off and serving stale cache while instances look healthy; check EXT_ALLOWED_ORIGINS against the real chrome-extension://<id> (§12, deploy/DEPLOY.md §4)."
+              summary: "/api/* CORS is rejecting preflights — startpages are cut off and serving stale cache while instances look healthy; the client is asking for a method or a header that src/api/cors.py does not declare (§12)."
 
   # --- curator-cors-preflight-rejected: QUIET on a stray foreign page -----------
   - interval: 1m
     name: a stray rejected preflight is quiet
     input_series:
-      # Two refusals total, then flat — a page that poked /api/* once and went away. A
-      # configured deployment produces nothing like the sustained rise above, so the
-      # threshold must not turn an isolated rejection into a page.
+      # Two refusals total, then flat — one odd client that poked /api/* with an
+      # undeclared verb and went away. A healthy deployment produces nothing like the
+      # sustained rise above, so the threshold must not turn an isolated one into a page.
       - series: 'curator_auth_rejections_total{reason="cors_preflight"}'
         values: '2+0x11'
     alert_rule_test:
