@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Curator — Admin login</title>
+  <link rel="stylesheet" href="/admin/app.css">
+</head>
+<body>
+  <header class="topbar"><h1>Curator admin</h1></header>
+  <section>
+    <h2>Log in</h2>
+    <p id="error" class="error" hidden></p>
+    <!-- The form posts same-origin (form-action 'self'); login.js intercepts and uses
+         fetch so it can redirect to /admin on success. -->
+    <form id="login-form" method="post" action="/admin/login" autocomplete="off">
+      <p>
+        <label for="token">Admin token</label><br>
+        <input id="token" name="token" type="password" required autofocus>
+      </p>
+      <button type="submit">Log in</button>
+    </form>
+  </section>
+  <script src="/admin/login.js"></script>
+</body>
+</html>

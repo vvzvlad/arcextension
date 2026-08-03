@@ -30,11 +30,15 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from src.api import admin_session
+from src.api.auth_metrics import auth_rejections
 from src.api.guards import (
     Caller,
+    _bearer_token,
     read_force_body,
     require_api_caller,
     require_operational,
+    require_same_origin,
 )
 from src.curator.enroll import arm_enroll_window, close_enroll_window, read_enroll_window
 from src.db import queries
@@ -53,17 +57,45 @@ def _now_ms() -> int:
 async def require_admin(request: Request) -> Caller:
     """Authenticate an ``/admin/*`` request as an ADMIN caller; 401 otherwise (§4, acc 6).
 
-    Reuses :func:`src.api.guards.require_api_caller` (missing/invalid Bearer → 401, an
-    instance secret → an instance :class:`Caller`, a DB outage → 503) and then rejects a
-    non-admin: an instance secret on ``/admin/*`` is 401, never a silent pass. Kept thin —
-    the auth itself is NOT duplicated, only the admin-kind narrowing lives here.
+    Accepts EITHER credential (issue #36 extends #35's Bearer-only gate additively):
+
+    * **(a) ``Authorization: Bearer <ADMIN_TOKEN>``** — the #35 path (curl / MCP / the
+      startpage agent). Delegated to :func:`require_api_caller` (missing/invalid Bearer →
+      401, an instance secret → an instance :class:`Caller` we reject with 401, a DB outage
+      → 503) and narrowed to ``kind=='admin'``. A Bearer request carries NO ambient cookie,
+      so browsers cannot auto-send it cross-site — it therefore SKIPS the CSRF gate (acc 7).
+    * **(b) a valid session cookie** — the #36 HTML console. Validated against the in-memory
+      store (:mod:`src.api.admin_session`): server-side expiry + revoke + fingerprint match
+      (a rotated ADMIN_TOKEN kills it, acc 4). Because the cookie is AMBIENT, a cookie-
+      authenticated MUTATING verb (POST/PUT/DELETE) must additionally clear the same-origin
+      CSRF gate (:func:`require_same_origin`, acc 3); reads (GET) skip it.
+
+    A request with a Bearer header takes the Bearer path (so a stray cookie can never
+    downgrade a curl call into the CSRF-gated branch). Neither credential → 401 (acc 1).
     """
-    caller = await require_api_caller(request)
-    if caller.kind != "admin":
-        # An active-instance secret authenticated, but /admin is ADMIN-only (§4). 401,
-        # the same status an unknown token gets, so an instance cannot probe /admin.
-        raise HTTPException(status_code=401, detail="admin token required")
-    return caller
+    # (a) Bearer wins when an Authorization header is present. No CSRF: no ambient cookie.
+    if _bearer_token(request) is not None:
+        caller = await require_api_caller(request)
+        if caller.kind != "admin":
+            # An active-instance secret authenticated, but /admin is ADMIN-only (§4). 401,
+            # the same status an unknown token gets, so an instance cannot probe /admin.
+            raise HTTPException(status_code=401, detail="admin token required")
+        request.state.admin_auth = "bearer"
+        return caller
+
+    # (b) Session cookie. A valid cookie is an admin caller (the console operator).
+    session_id = request.cookies.get(admin_session.COOKIE_NAME)
+    if admin_session.validate(request.app, session_id):
+        # CSRF gate: reject a cross-origin mutating cookie request (no-op on GET).
+        require_same_origin(request)
+        caller = Caller(kind="admin")
+        request.state.caller = caller
+        request.state.admin_auth = "cookie"
+        return caller
+
+    # Neither a Bearer nor a valid session cookie → 401 (acc 1). No body leak.
+    auth_rejections.incr("admin_session")
+    raise HTTPException(status_code=401, detail="admin authentication required")
 
 
 def _ttl_ms(request: Request) -> int:

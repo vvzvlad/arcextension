@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Curator — Admin console</title>
+  <!-- No inline styles/scripts: CSP is default-src 'none' with script-src/style-src 'self'. -->
+  <link rel="stylesheet" href="/admin/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Curator admin</h1>
+    <button id="logout" type="button">Log out</button>
+  </header>
+
+  <p id="error" class="error" hidden></p>
+
+  <!-- Enrollment window -->
+  <section id="window-section">
+    <h2>Enrollment window</h2>
+    <p id="window-status">Loading…</p>
+    <div class="actions">
+      <button id="open-window" type="button">Open window</button>
+      <button id="close-window" type="button">Close window</button>
+    </div>
+  </section>
+
+  <!-- Pending enroll requests -->
+  <section id="requests-section">
+    <h2>Pending enroll requests</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>install_uuid</th>
+          <th>suggested title</th>
+          <th>origin</th>
+          <th>proto</th>
+          <th>id exists</th>
+          <th>approve as</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="requests-body"></tbody>
+    </table>
+    <p id="requests-empty" hidden>No pending requests.</p>
+  </section>
+
+  <!-- Instances -->
+  <section id="instances-section">
+    <h2>Instances</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>id</th>
+          <th>title</th>
+          <th>status</th>
+          <th>connected</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="instances-body"></tbody>
+    </table>
+    <p id="instances-empty" hidden>No instances.</p>
+  </section>
+
+  <script src="/admin/app.js"></script>
+</body>
+</html>
