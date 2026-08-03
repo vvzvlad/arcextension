@@ -37,13 +37,30 @@ export function installUuidPrefix(uuid) {
 // --- the service-address gate (§7) -----------------------------------------
 // KEEP IN SYNC with extension/src/service-address.js — that file carries the rationale
 // (option A puts the RAW secret on the wire, so TLS is the only thing hiding it, so a
-// `ws://`/`http://` address is refused rather than hinted at). The check is duplicated
-// because this page is loaded raw under the extension_pages CSP and imports nothing;
-// test/options.test.js runs BOTH implementations over the same table so they cannot drift.
+// `ws://`/`http://` address is refused rather than hinted at, and a scheme-less address
+// gets the only scheme that could have been meant). The check is duplicated because this
+// page is loaded raw under the extension_pages CSP and imports nothing;
+// test/options.test.js runs BOTH implementations over the same tables so they cannot drift.
 const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+export function normalizeServiceAddress(raw) {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!value) return "";
+  if (HAS_SCHEME.test(value)) return value; // explicit scheme: never rewritten
+  const bare = value.replace(/^\/+/, "");
+  let hostname;
+  try {
+    hostname = new URL("wss://" + bare).hostname;
+  } catch {
+    return value;
+  }
+  if (!hostname) return value;
+  return (LOOPBACK_HOSTS.includes(hostname) ? "ws://" : "wss://") + bare;
+}
 
 export function serviceAddressError(raw) {
-  const value = typeof raw === "string" ? raw.trim() : "";
+  const value = normalizeServiceAddress(raw);
   if (!value) return "empty";
   let url;
   try {
@@ -60,23 +77,31 @@ export function serviceAddressError(raw) {
   return "malformed";
 }
 
-// The refusal reason, spelled out for the operator. "Saved" is not an option for a
-// rejected address: silently keeping it would leave the field looking accepted.
+// The refusal reason, spelled out for the operator — including what to type INSTEAD,
+// since the field no longer asks for a scheme. "Saved" is not an option for a rejected
+// address: silently keeping it would leave the field looking accepted.
 export function addressErrorText(code) {
   switch (code) {
     case "insecure":
       return (
         "Refused: ws:// is unencrypted, so this instance's secret and the enrollment " +
-        "code would travel in the clear. Use wss:// (ws:// is allowed only for " +
-        "localhost / 127.0.0.1)."
+        "code would travel in the clear. Enter the address without a scheme " +
+        "(curator.example:8443) and wss:// is used automatically — plain ws:// is " +
+        "accepted only for localhost / 127.0.0.1."
       );
     case "http-scheme":
-      return "Refused: this is the WebSocket address of the service — use wss://, not http(s)://.";
+      return (
+        "Refused: http(s):// is the address of a web page, not of this service's " +
+        "socket. Enter just the address (curator.example) — wss:// is added for you."
+      );
     case "empty":
-      return "Enter the service address first (wss://host).";
+      return "Enter the service address first — e.g. curator.example (it becomes wss://curator.example).";
     case "malformed":
     default:
-      return "Refused: the address must look like wss://host[:port].";
+      return (
+        "Refused: this is not an address. Enter a host like curator.example:8443 " +
+        "(it becomes wss://curator.example:8443), or a full wss:// URL."
+      );
   }
 }
 
@@ -163,7 +188,10 @@ export async function init(doc, chromeApi) {
   }
   if (addressInput) {
     addressInput.addEventListener("change", async () => {
-      const value = addressInput.value.trim();
+      // The operator may type just the address; the scheme is derivable, so it is added
+      // here (wss://, or ws:// on loopback) and the STORED value is that full URL — the
+      // SW dials what is stored.
+      const value = normalizeServiceAddress(addressInput.value);
       // An empty field is a legitimate "not configured yet" — store it (clearing the
       // setting) without shouting. Anything else must pass the scheme gate BEFORE it is
       // persisted: a stored ws:// address is not a warning to act on later, it is the
@@ -174,6 +202,9 @@ export async function init(doc, chromeApi) {
         return;
       }
       await chromeApi.storage.local.set({ [SERVICE_ADDRESS_KEY]: value });
+      // Show what was actually stored: the operator typed a host and must be able to
+      // SEE which scheme it was saved with, not have to ask.
+      addressInput.value = value;
       setStatus(value ? "Service address saved" : "Service address cleared");
     });
   }
@@ -201,19 +232,21 @@ export async function init(doc, chromeApi) {
       // Submitting against a refused (or missing) address would send the one-time window
       // code and the fresh secret nowhere — or, without the gate, into the clear. Refuse
       // here too: the address field may hold an unsaved value the change handler rejected.
-      const addressError = serviceAddressError(addressInput ? addressInput.value : "");
+      const address = normalizeServiceAddress(addressInput ? addressInput.value : "");
+      const addressError = serviceAddressError(address);
       if (addressError) {
         setStatus(addressErrorText(addressError));
         return;
       }
       submitBtn.disabled = true;
-      // Persist the (validated) address together with the code: the operator may have
-      // typed both and clicked straight through, and the SW resolves the address from
-      // storage, not from this page.
+      // Persist the (validated, scheme-completed) address together with the code: the
+      // operator may have typed both and clicked straight through, and the SW resolves
+      // the address from storage, not from this page.
       await chromeApi.storage.local.set({
-        [SERVICE_ADDRESS_KEY]: addressInput.value.trim(),
+        [SERVICE_ADDRESS_KEY]: address,
         [ENROLL_CODE_KEY]: code,
       });
+      if (addressInput) addressInput.value = address;
       try {
         const res = await chromeApi.runtime.sendMessage({ type: "submit_enrollment", code });
         // "Submitted" is a claim about US, not about the service: the socket may not have

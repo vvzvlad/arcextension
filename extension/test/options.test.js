@@ -4,9 +4,13 @@ import {
   enrollLabel,
   init,
   installUuidPrefix,
+  normalizeServiceAddress as optionsNormalizeServiceAddress,
   serviceAddressError as optionsServiceAddressError,
 } from "../pages/options.js";
-import { serviceAddressError as swServiceAddressError } from "../src/service-address.js";
+import {
+  normalizeServiceAddress as swNormalizeServiceAddress,
+  serviceAddressError as swServiceAddressError,
+} from "../src/service-address.js";
 import { INSTALL_UUID_PREFIX_LEN } from "../src/constants.js";
 
 const UUID = "d01784bd-a594-4766-a521-b52c4e71c010";
@@ -40,9 +44,16 @@ describe("serviceAddressError", () => {
     ["ws://localhost.evil.example", "insecure"], // a loopback-LOOKING host is not loopback
     ["http://curator.example", "http-scheme"],
     ["https://curator.example", "http-scheme"],
-    ["curator.example:8000", "malformed"], // no scheme: parses as protocol "curator.example:"
-    ["curator.example", "malformed"],
-    ["nonsense", "malformed"],
+    // A SCHEME-LESS address is now the normal way to fill the field: the only scheme
+    // that could have been meant is added by the gate itself, so these are accepted
+    // (they used to be "malformed" — a demand for a prefix that had no alternative).
+    ["curator.example:8000", null],
+    ["curator.example", null],
+    ["localhost:8000", null], // → ws:// (the loopback development exception)
+    ["nonsense", null], // a single-label intranet host is a host
+    // …but "not an address" is still not an address.
+    ["curator example", "malformed"],
+    ["wss://", "malformed"],
     ["", "empty"],
     [null, "empty"],
   ];
@@ -68,6 +79,58 @@ describe("serviceAddressError", () => {
     for (const code of ["insecure", "http-scheme", "malformed", "empty"]) {
       expect(addressErrorText(code)).toMatch(/wss:\/\//);
     }
+  });
+});
+
+// --- the scheme is derived, not demanded (§7) --------------------------------
+describe("normalizeServiceAddress", () => {
+  // The operator used to have to type `wss://` in front of an address where no other
+  // scheme was ever acceptable. The scheme is a decision this module makes (it IS the
+  // security decision), so it makes it — and only for an address that carries none.
+  const NORM = [
+    ["curator.nebula.lc", "wss://curator.nebula.lc"],
+    ["curator.nebula.lc:8443", "wss://curator.nebula.lc:8443"],
+    ["  curator.nebula.lc  ", "wss://curator.nebula.lc"], // trimmed first
+    // Loopback keeps the development exception the gate already makes, so a dev
+    // service with no certificate is reachable by typing exactly what is in the URL bar.
+    ["localhost:8000", "ws://localhost:8000"],
+    ["127.0.0.1:8000", "ws://127.0.0.1:8000"],
+    ["[::1]:8000", "ws://[::1]:8000"],
+    ["LOCALHOST:8000", "ws://LOCALHOST:8000"], // host case is the URL parser's business
+    // An EXPLICIT scheme is never rewritten: backward compatibility for every address
+    // already stored, and the refusals below must keep their reason.
+    ["wss://curator.nebula.lc", "wss://curator.nebula.lc"],
+    ["wss://curator.nebula.lc:8443/ext", "wss://curator.nebula.lc:8443/ext"],
+    ["ws://curator.lan:8000", "ws://curator.lan:8000"],
+    ["http://curator.example", "http://curator.example"],
+    ["", ""],
+    [null, ""],
+  ];
+
+  it("adds the scheme only when the operator left one out", () => {
+    for (const [input, expected] of NORM) {
+      expect(optionsNormalizeServiceAddress(input), String(input)).toBe(expected);
+    }
+  });
+
+  it("the options-page copy and the service-worker copy agree exactly", () => {
+    for (const [input] of NORM) {
+      expect(optionsNormalizeServiceAddress(input), String(input)).toBe(
+        swNormalizeServiceAddress(input),
+      );
+    }
+  });
+
+  it("normalizing never turns a REFUSED address into an accepted one", () => {
+    // The point of normalizing inside the gate: an explicit insecure address keeps its
+    // scheme, so it keeps its refusal. Rewriting `http://` to `wss://` would silently
+    // "fix" a typo into a different service.
+    expect(optionsServiceAddressError("http://curator.example")).toBe("http-scheme");
+    expect(optionsServiceAddressError("ws://curator.lan:8000")).toBe("insecure");
+    // …while the bare form of that same host is accepted, because it says nothing
+    // about the transport and therefore gets the safe one.
+    expect(optionsServiceAddressError("curator.lan:8000")).toBe(null);
+    expect(optionsNormalizeServiceAddress("curator.lan:8000")).toBe("wss://curator.lan:8000");
   });
 });
 
@@ -226,6 +289,67 @@ describe("options: the service address is validated before it is stored (§7)", 
     doc.els["service-address"].value = "ws://localhost:8000";
     await doc.els["service-address"]._handlers.change();
     expect(stored.serviceAddress).toBe("ws://localhost:8000");
+  });
+
+  it("accepts a BARE address and stores it with the scheme it derived", async () => {
+    // What the owner asked for: the field takes what you would read off a browser bar.
+    // The stored value is the full URL the SW dials, and the field shows it back so the
+    // operator can SEE which scheme was applied instead of having to ask.
+    const doc = fakeDoc(IDS);
+    const { chromeApi, stored } = fakeChrome();
+    await init(doc, chromeApi);
+
+    doc.els["service-address"].value = "curator.nebula.lc";
+    await doc.els["service-address"]._handlers.change();
+    expect(stored.serviceAddress).toBe("wss://curator.nebula.lc");
+    expect(doc.els["service-address"].value).toBe("wss://curator.nebula.lc");
+    expect(doc.els.status.textContent).toBe("Service address saved");
+
+    doc.els["service-address"].value = "curator.nebula.lc:8443";
+    await doc.els["service-address"]._handlers.change();
+    expect(stored.serviceAddress).toBe("wss://curator.nebula.lc:8443");
+
+    // Loopback keeps the ws:// development exception, typed the same bare way.
+    doc.els["service-address"].value = "localhost:8000";
+    await doc.els["service-address"]._handlers.change();
+    expect(stored.serviceAddress).toBe("ws://localhost:8000");
+  });
+
+  it("an address ALREADY stored with its scheme keeps working untouched", async () => {
+    // Backward compatibility: the owner's profile holds `wss://…` from before the field
+    // stopped demanding a prefix. It must load, validate and re-save identically.
+    const doc = fakeDoc(IDS);
+    const { chromeApi, stored } = fakeChrome({ serviceAddress: "wss://curator.example:8443" });
+    await init(doc, chromeApi);
+    expect(doc.els["service-address"].value).toBe("wss://curator.example:8443");
+    expect(doc.els.status.textContent).not.toMatch(/Refused/);
+
+    await doc.els["service-address"]._handlers.change();
+    expect(stored.serviceAddress).toBe("wss://curator.example:8443");
+  });
+
+  it("submitting an enrollment stores the BARE address with its derived scheme", async () => {
+    const doc = fakeDoc(IDS);
+    const { chromeApi, sent, stored } = fakeChrome({ installUuid: UUID });
+    await init(doc, chromeApi);
+
+    doc.els["service-address"].value = "curator.nebula.lc";
+    doc.els["enroll-code"].value = "WIN-CODE";
+    await doc.els["submit-enroll"]._handlers.click();
+
+    expect(sent.find((m) => m.type === "submit_enrollment")).toBeTruthy();
+    expect(stored.serviceAddress).toBe("wss://curator.nebula.lc");
+  });
+
+  it("an empty field still clears the setting without shouting", async () => {
+    const doc = fakeDoc(IDS);
+    const { chromeApi, stored } = fakeChrome({ serviceAddress: "wss://curator.example" });
+    await init(doc, chromeApi);
+
+    doc.els["service-address"].value = "   ";
+    await doc.els["service-address"]._handlers.change();
+    expect(stored.serviceAddress).toBe("");
+    expect(doc.els.status.textContent).toBe("Service address cleared");
   });
 
   it("refuses to submit an enrollment against a refused address", async () => {

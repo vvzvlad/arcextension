@@ -79,7 +79,7 @@ import {
   VERDICT_REVOKED,
   VERDICT_UNKNOWN,
 } from "./constants.js";
-import { serviceAddressError } from "./service-address.js";
+import { normalizeServiceAddress, serviceAddressError } from "./service-address.js";
 import { dispatchCommand } from "./commands.js";
 
 // --- bytes -> hex (the 32-byte secret is generated once and stored/sent as hex) ----
@@ -247,12 +247,17 @@ export class Connection {
       (this.config && this.config.serviceUrl) ||
       null;
     if (!raw) return { address: null, error: null };
-    const error = serviceAddressError(raw);
+    // Normalize BEFORE judging and dial the normalized form: the operator may have
+    // entered a bare `curator.example[:8443]` (the scheme is derivable, so the field
+    // does not demand it — see service-address.js), and every consumer downstream
+    // expects a real URL. An address that already carries a scheme is unchanged.
+    const address = normalizeServiceAddress(raw);
+    const error = serviceAddressError(address);
     if (error) {
       this.env.log("service address refused:", error, "—", raw);
       return { address: null, error };
     }
-    return { address: raw, error: null };
+    return { address, error: null };
   }
 
   async _resolveAddress() {

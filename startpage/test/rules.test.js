@@ -96,6 +96,154 @@ describe("rules editor: preview before save (§8/§10)", () => {
   });
 });
 
+// --- the gate must NAME its ground, not print zeros (§8) ----------------------
+describe("rules editor: a gated change explains WHY it is gated", () => {
+  // `_requires_confirm` (src/api/rules.py) fires on three independent grounds and only
+  // one is countable. The editor printed "Переселений: 0, закрытий: 0 — требуется
+  // подтверждение" for all three: zeros, an armed button, no reason.
+  async function gatedSave(confirmBody, { rules = [] } = {}) {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [] } },
+      rules: { status: 200, body: { rules } },
+      rulesSave: (opts) => {
+        const body = JSON.parse(opts.body);
+        if (!body.confirm_impact) return { status: 409, body: confirmBody };
+        return { status: 201, body: { ok: true, id: 1 } };
+      },
+    });
+    const wrapper = mount(App, { props: { deps: { chromeApi: env.chrome, fetchFn, now: () => NOW } } });
+    await flushPromises();
+    const form = wrapper.find('[data-role="rule-form"]');
+    await form.find('input[name="pattern"]').setValue("borneo.lc");
+    await form.find('input[name="instance_id"]').setValue("themed");
+    await form.trigger("submit");
+    await flushPromises();
+    return wrapper;
+  }
+
+  it("ZERO impact + first rule: names the fleet-wide drain, not a bare zero", async () => {
+    // The owner's screenshot. The ground was the empty→non-empty boundary: his FIRST
+    // rule, which switches the "без правила → main" drain on for the whole fleet — far
+    // bigger than any tab count, and the only thing he was not told.
+    const wrapper = await gatedSave({
+      relocations: 0,
+      closures: 0,
+      impact: 0,
+      requires_confirm: true,
+      not_counted: [],
+      enables_drain: true,
+      disables_curation: false,
+    });
+
+    const out = wrapper.find('[data-role="rule-preview-out"]').text();
+    expect(out).toContain("первое активное правило");
+    expect(out).toContain("главный браузер"); // WHAT it turns on
+    // The armed row must not claim an impact it just printed as zero.
+    const ask = wrapper.find('[data-role="rule-preview-ask"]').text();
+    expect(ask).toContain("первое правило");
+    // The button is still armed — the gate itself is untouched.
+    expect(wrapper.find('[data-role="rule-save"]').text()).toContain("Подтвердить");
+  });
+
+  it("ZERO impact + an uncounted instance: names the instance, not the first-rule story", async () => {
+    const wrapper = await gatedSave({
+      relocations: 0,
+      closures: 0,
+      requires_confirm: true,
+      not_counted: [{ id: "old", reason: "disconnected" }],
+      enables_drain: true,
+    });
+
+    const out = wrapper.find('[data-role="rule-preview-out"]').text();
+    expect(out).toContain("old");
+    expect(out).toContain("больше"); // "…реальный масштаб может быть больше"
+    expect(out).not.toContain("первое активное правило");
+    expect(wrapper.find('[data-role="rule-preview-ask"]').text()).toContain("не удалось посчитать");
+  });
+
+  it("NON-ZERO impact: the numbers are the ground and are named as such", async () => {
+    const wrapper = await gatedSave({
+      relocations: 3,
+      closures: 1,
+      requires_confirm: true,
+      not_counted: [],
+      enables_drain: true,
+    });
+
+    const out = wrapper.find('[data-role="rule-preview-out"]').text();
+    expect(out).toContain("Переселений: 3");
+    expect(out).toContain("закрытий: 1");
+    expect(out).not.toContain("первое активное правило"); // not derivable at non-zero
+    expect(wrapper.find('[data-role="rule-preview-ask"]').text()).toContain("3 переселений");
+  });
+
+  it("a zero says 'the next pass', not 'nothing matches the rule'", async () => {
+    // preview.py `_guarded`: a tab that is not idle long enough (pinned / audible / on
+    // screen too) is not counted. The owner read the zero as "the rule does not work".
+    const wrapper = await gatedSave({
+      relocations: 0,
+      closures: 0,
+      requires_confirm: true,
+      enables_drain: true,
+    });
+    const out = wrapper.find('[data-role="rule-preview-out"]').text();
+    expect(out).toContain("ближайший проход");
+    expect(out).toContain("недавно");
+  });
+
+  it("a DELETE is never called 'the first rule' (it is gated unconditionally)", async () => {
+    // DELETE bypasses `_requires_confirm` entirely, so the elimination that identifies
+    // the boundary crossing does not hold for it — claiming "first active rule" over a
+    // delete would be a fresh lie of the same kind.
+    const rules = [{ id: 5, pattern: "big.com", instance_id: "themed", singleton: 0, invalid: 0 }];
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [] } },
+      rules: { status: 200, body: { rules } },
+      rulesSave: (opts) => {
+        const body = opts.body ? JSON.parse(opts.body) : {};
+        if (!body.confirm_impact) {
+          return {
+            status: 409,
+            body: { relocations: 0, closures: 0, enables_drain: true, disables_curation: false },
+          };
+        }
+        return { status: 200, body: { ok: true } };
+      },
+    });
+    const wrapper = mount(App, { props: { deps: { chromeApi: env.chrome, fetchFn, now: () => NOW } } });
+    await flushPromises();
+    await wrapper.find('[data-role="rules-list"] .sp-rule .sp-remove').trigger("click");
+    await flushPromises();
+
+    const out = wrapper.find('[data-role="rule-preview-out"]').text();
+    expect(out).not.toContain("первое активное правило");
+    expect(out).toContain("Удаление подтверждается всегда");
+  });
+
+  it("deleting the LAST rule says curation stops completely", async () => {
+    const rules = [{ id: 5, pattern: "big.com", instance_id: "themed", singleton: 0, invalid: 0 }];
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [] } },
+      rules: { status: 200, body: { rules } },
+      rulesSave: () => ({
+        status: 409,
+        body: { relocations: 0, closures: 0, enables_drain: false, disables_curation: true },
+      }),
+    });
+    const wrapper = mount(App, { props: { deps: { chromeApi: env.chrome, fetchFn, now: () => NOW } } });
+    await flushPromises();
+    await wrapper.find('[data-role="rules-list"] .sp-rule .sp-remove').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('[data-role="rule-preview-out"]').text()).toContain(
+      "курирование выключится",
+    );
+  });
+});
+
 // --- offline-graceful (§10) --------------------------------------------------
 describe("rules editor: offline-graceful (§10)", () => {
   it("with no base/token the editor degrades to an offline note, no throw", async () => {

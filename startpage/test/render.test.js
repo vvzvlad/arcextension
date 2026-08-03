@@ -34,27 +34,55 @@ describe("App renders non-empty offline-first (§10)", () => {
     expect(wrapper.find(".sp-header").text()).toContain("офлайн");
   });
 
-  it("shows the click-wait state when the pause expired but the pass DEFERS (§7)", async () => {
-    // resume_pending: the hour is over (paused_until null/past) but the curator waits
-    // for a confirm — it must NOT read "Автоматика активна" (a forgotten pause here is
-    // otherwise invisible). Drop the resume_pending branch and this reddens.
+  async function clickWaitRow(state) {
     const env = makeChrome({
       tabs: [{ id: 1, windowId: 1, url: "https://own/a", title: "Own A" }],
       messages: { get_identity: { instanceId: "me" } },
     });
-    const { fetchFn } = makeFetch({
-      state: { instances: [], tabs: [], paused_until: null, resume_pending: true },
-    });
+    const { fetchFn } = makeFetch({ state: { instances: [], tabs: [], ...state } });
     const wrapper = mount(App, {
       props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
     });
     await flushPromises();
+    return wrapper;
+  }
+
+  it("shows the click-wait state when the pause EXPIRED but the pass DEFERS (§7)", async () => {
+    // resume_pending: the hour is over (paused_until in the past) but the curator waits
+    // for a confirm — it must NOT read "Автоматика активна" (a forgotten pause here is
+    // otherwise invisible). Drop the resume_pending branch and this reddens.
+    const wrapper = await clickWaitRow({ paused_until: 999_000, resume_pending: true });
 
     expect(wrapper.find('[data-role="pause-pending"]').exists()).toBe(true);
     expect(wrapper.find('[data-role="pause-confirm"]').exists()).toBe(true);
     const rowText = wrapper.find('[data-role="pause-row"]').text();
+    expect(rowText).toContain("Пауза истекла");
     expect(rowText).toContain("ожидание подтверждения");
     expect(rowText).not.toContain("Автоматика активна");
+    // …and it says WHY the pass is not running by itself and what the button does.
+    expect(wrapper.find('[data-role="pause-explain"]').text()).toMatch(/по кнопке/);
+  });
+
+  it("a CONTINUITY BREAK is not labelled as a pause, and says what it is (§7)", async () => {
+    // The same `resume_pending` latch is armed when `is_continuity_break` fires — a new
+    // schema version, a changed IDLE_MINUTES / MAIN_INSTANCE_ID, a restored DB. The
+    // owner had never taken a pause and the row told him one had expired. `paused_until`
+    // is what separates the two grounds (an expired pause keeps its deadline until the
+    // confirming pass shifts it). Label this branch "Пауза истекла" again and this test
+    // reddens.
+    const wrapper = await clickWaitRow({ paused_until: null, resume_pending: true });
+
+    expect(wrapper.find('[data-role="pause-confirm"]').exists()).toBe(true);
+    const rowText = wrapper.find('[data-role="pause-row"]').text();
+    expect(rowText).not.toContain("Пауза истекла");
+    expect(rowText).toContain("Состояние сервиса изменилось");
+    // The row explains itself: what happened, that nothing was touched, and what the
+    // button will do — without anyone having to ask.
+    const explain = wrapper.find('[data-role="pause-explain"]').text();
+    expect(explain).toMatch(/обновления|настроек|восстановления/);
+    expect(explain).toMatch(/ничего не тронул/);
+    expect(explain).toMatch(/подтверждает план/);
+    expect(explain).toMatch(/паузу/i);
   });
 
   it("shows the DEFERRED PASS PLAN next to the confirm button (§7)", async () => {
@@ -84,6 +112,10 @@ describe("App renders non-empty offline-first (§10)", () => {
     expect(plan.text()).toContain("переселений 12");
     expect(plan.text()).toContain("закрытий 40");
     expect(plan.text()).toContain("отложено 2");
+    // A zero in this plan means "nothing to do on the NEXT pass", not "no rules" —
+    // the same misreading the rules editor's zeros caused.
+    expect(plan.text()).toContain("ближайшем проходе");
+    expect(plan.text()).toMatch(/недавно/);
   });
 });
 

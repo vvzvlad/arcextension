@@ -8,7 +8,8 @@
 // init() populates own tabs + cache, then refresh() hits GET /api/state.
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { createStore } from "./lib/store.js";
-import { formatCountdown, formatTime } from "./lib/status.js";
+import { formatCountdown, formatTime, resumePendingNotice } from "./lib/status.js";
+import { confirmHeadline, impactLines } from "./lib/impact.js";
 
 const EMPTY_DRAFT = { id: null, pattern: "", instance_id: "", singleton: false };
 
@@ -47,6 +48,14 @@ export default {
     );
     // A server deadline rendered as a LOCAL wall-clock time (the offset undone).
     const serverTime = (ms) => formatTime(store.localFromServer(ms));
+
+    // WHY the curator is waiting for a click — an expired pause and a continuity break
+    // arm the same latch and are NOT the same event (see status.js). The row has to say
+    // which one happened, what it means and what the button will do; "Пауза истекла"
+    // over a pause nobody took sent the owner asking.
+    const resumeNotice = computed(() =>
+      store.resumePending.value ? resumePendingNotice(store.pausedUntil.value) : null,
+    );
 
     // --- merge windows now (§9) --------------------------------------------
     async function onMergeWindows(instanceId) {
@@ -100,6 +109,23 @@ export default {
       },
     );
 
+    // WHICH op produced the preview currently on screen. The confirm gate has three
+    // independent grounds and one of them (the empty↔non-empty boundary) is derived by
+    // elimination, which only holds for create/update — a DELETE is gated
+    // unconditionally, so it must not be told "this is your first rule". See impact.js.
+    const previewOp = ref("create");
+    const impactBlock = computed(() =>
+      store.rulesPreview.value
+        ? impactLines(store.rulesPreview.value, {
+            op: previewOp.value,
+            requiresConfirm: confirmPending.value || pendingDeleteId.value !== null,
+          })
+        : [],
+    );
+    const impactHeadline = computed(() =>
+      store.rulesPreview.value ? confirmHeadline(store.rulesPreview.value, previewOp.value) : "",
+    );
+
     function resetDraft() {
       Object.assign(draft, EMPTY_DRAFT);
       draftOp.value = "create";
@@ -128,6 +154,7 @@ export default {
     async function onPreview() {
       confirmPending.value = false;
       pendingDeleteId.value = null;
+      previewOp.value = draftOp.value;
       await store.previewRuleDraft(draftOp.value, draft);
     }
 
@@ -141,6 +168,7 @@ export default {
       // arriving 409 re-arms a gate the edit had just cleared, and the next click sends
       // confirm_impact:true for a rule whose impact was never shown (§8).
       const sentRevision = draftRevision.value;
+      previewOp.value = draftOp.value;
       const res = await store.saveRuleDraft(draftOp.value, draft, {
         confirmImpact: confirmPending.value,
       });
@@ -162,6 +190,7 @@ export default {
       // and arms this rule; only a SECOND click on the same rule confirms. Never
       // auto-confirm in one click — the human must see the impact and act again
       // (same contract as onSave; the server gate must not be echo-confirmed).
+      previewOp.value = "delete";
       if (pendingDeleteId.value === rule.id) {
         const done = await store.saveRuleDraft("delete", { id: rule.id }, { confirmImpact: true });
         if (done.ok) pendingDeleteId.value = null;
@@ -205,6 +234,9 @@ export default {
       onDelete,
       pendingDeleteId,
       isPaused,
+      resumeNotice,
+      impactBlock,
+      impactHeadline,
       pauseRemaining,
       serverTime,
       onPause,
@@ -363,17 +395,26 @@ export default {
         </button>
       </form>
 
-      <!-- Impact preview (§8): shown BEFORE the change is committed. -->
-      <p
+      <!-- Impact preview (§8): shown BEFORE the change is committed. The numbers alone
+           are not the answer — the gate fires on three grounds and two of them are not
+           countable, so the block names the one that applies (impact.js). -->
+      <div
         v-if="store.rulesPreview.value"
         class="sp-rule-preview"
         data-role="rule-preview-out"
         :class="{ 'is-confirm': confirmPending }"
       >
-        Переселений: {{ store.rulesPreview.value.relocations }},
-        закрытий: {{ store.rulesPreview.value.closures }}
-        <template v-if="confirmPending"> — требуется подтверждение</template>
-      </p>
+        <p
+          v-for="(line, i) in impactBlock"
+          :key="i"
+          class="sp-rule-preview-line"
+        >{{ line }}</p>
+        <p
+          v-if="confirmPending"
+          class="sp-rule-preview-line sp-rule-preview-ask"
+          data-role="rule-preview-ask"
+        >— {{ impactHeadline }}</p>
+      </div>
       <p v-if="store.rulesError.value && !store.rulesOffline.value" class="sp-fallback">
         {{ store.rulesError.value }}
       </p>
@@ -409,26 +450,15 @@ export default {
             @click="onResume"
           >Возобновить</button>
         </template>
-        <!-- Click-wait (§7): the hour elapsed but the curator DEFERS until confirmed,
-             so it is neither running nor over — show that explicitly (a forgotten pause
-             in this state must not read "active"). Resume clears the latch and runs a
-             pass now. -->
-        <template v-else-if="store.resumePending.value">
+        <!-- Click-wait (§7): the curator DEFERS until confirmed, so it is neither
+             running nor over — show that explicitly. TWO different events arm this
+             latch (an expired pause and a continuity break) and they are labelled
+             differently, because "Пауза истекла" over a pause nobody took is a lie
+             about what happened AND about what the click does (status.js). -->
+        <template v-else-if="resumeNotice">
           <span class="sp-dot paused"></span>
-          <span class="sp-status-name">Пауза истекла</span>
-          <span class="sp-sub" data-role="pause-pending">— ожидание подтверждения</span>
-          <!-- §7: "план выводится в статус-полосу" — the human confirms the salvo
-               SEEING what it will do. A bare boolean asks for a blind click on the
-               largest batch the system ever runs. -->
-          <span
-            v-if="store.pendingPlan.value"
-            class="sp-sub sp-pending-plan"
-            data-role="pending-plan"
-          >— будет сделано: переселений {{ store.pendingPlan.value.relocations }},
-            довершений {{ store.pendingPlan.value.phaseBCompletions }},
-            закрытий {{ store.pendingPlan.value.closures }}<template
-              v-if="store.pendingPlan.value.deferred"
-            >, отложено {{ store.pendingPlan.value.deferred }}</template></span>
+          <span class="sp-status-name" :data-cause="resumeNotice.kind">{{ resumeNotice.title }}</span>
+          <span class="sp-sub" data-role="pause-pending">— {{ resumeNotice.sub }}</span>
           <button
             class="sp-btn"
             type="button"
@@ -436,6 +466,24 @@ export default {
             :disabled="store.offline.value"
             @click="onResume"
           >Запустить сейчас</button>
+          <!-- The screen explains itself: what happened, why nothing was touched, and
+               what this button does. -->
+          <span class="sp-sub sp-pause-explain" data-role="pause-explain">{{ resumeNotice.explain }}</span>
+          <!-- §7: "план выводится в статус-полосу" — the human confirms the salvo
+               SEEING what it will do. A bare boolean asks for a blind click on the
+               largest batch the system ever runs. The zeros carry the same caveat as
+               the rules editor: this is the NEXT pass, not "everything that matches". -->
+          <span
+            v-if="store.pendingPlan.value"
+            class="sp-sub sp-pending-plan"
+            data-role="pending-plan"
+          >Будет сделано на ближайшем проходе: переселений {{ store.pendingPlan.value.relocations }},
+            довершений {{ store.pendingPlan.value.phaseBCompletions }},
+            закрытий {{ store.pendingPlan.value.closures }}<template
+              v-if="store.pendingPlan.value.deferred"
+            >, отложено {{ store.pendingPlan.value.deferred }}</template>. Ноль здесь
+            значит «на этом проходе нечего делать» — вкладки, которыми недавно
+            пользовались, в план не входят.</span>
         </template>
         <template v-else>
           <span class="sp-dot ok"></span>

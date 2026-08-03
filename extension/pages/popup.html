@@ -7,20 +7,63 @@
   </head>
   <body>
     <!--
-      "Rule from this tab" (§8, §10): a one-click way to add a rule
-      `<origin>/*` → <this instance> with a server-side impact preview and a Save
-      button. This is the cold-start path — an empty rules table disables curation
-      entirely (§8), so filling it must be effortless. The script is external
-      (popup.js) because the extension_pages CSP is `script-src 'self'`.
+      "Rule from this tab" (§8, §10): the fast way to add a rule for the site you are
+      looking at. Both halves of the rule are chosen HERE — the host pattern (prefilled
+      from the tab, editable) and the target browser (defaults to this one, picked from
+      the fleet /api/state lists) — because the question this popup answers is "where
+      does this site belong", and answering half of it meant filing a rule and then
+      going somewhere else to edit it. The impact preview is recomputed by the SERVER
+      for whatever is in the form, and saving goes through the §8 two-step confirm gate.
+      This is also the cold-start path — an empty rules table disables curation entirely
+      (§8), so filling it must be effortless. The script is external (popup.js) because
+      the extension_pages CSP is `script-src 'self'`.
     -->
-    <main style="min-width: 20rem; font: 14px system-ui, sans-serif">
+    <main style="min-width: 24rem; max-width: 26rem; font: 14px system-ui, sans-serif">
       <h1 style="font-size: 1rem">Add a rule from this tab</h1>
+      <p style="color: #555">This tab: <code id="origin">…</code></p>
+
       <p>
-        Route <code id="origin">…</code> to
-        <strong id="target">…</strong>.
+        <label for="pattern"><strong>Tabs matching</strong></label><br />
+        <input
+          type="text"
+          id="pattern"
+          data-role="pattern"
+          size="30"
+          spellcheck="false"
+          autocapitalize="off"
+          autocomplete="off"
+          placeholder="example.com[:port]"
+        />
       </p>
-      <p>Pattern: <code id="pattern">…</code></p>
-      <p id="impact" role="status" aria-live="polite">Loading preview…</p>
+      <!--
+        The syntax note is the matcher's ACTUAL semantics (src/rules/matcher.py, §8):
+        `<hostPattern>[:port]`, `*` → `.*`, matched against the WHOLE hostname with
+        fullmatch (no partial matches), a missing port matches any port, the path is
+        not part of matching at all. The `*.example.com` / `*example.com` pair is the
+        consequence people get wrong, so it is the example.
+      -->
+      <p id="hint" style="color: #555; font-size: 12px; margin-top: -0.4rem">
+        Host and optional port — <code>example.com</code> or <code>example.com:8443</code>.
+        It is matched against the <strong>whole</strong> host name, never a part of it,
+        and the path is ignored; without a port it matches any port. <code>*</code>
+        stands for any characters, so <code>*.example.com</code> matches
+        <code>www.example.com</code> but <em>not</em> <code>example.com</code>, while
+        <code>*example.com</code> matches both (and <code>notexample.com</code> too).
+      </p>
+
+      <p>
+        <label for="target"><strong>move to</strong></label><br />
+        <select id="target" data-role="target"></select>
+      </p>
+
+      <p
+        id="impact"
+        role="status"
+        aria-live="polite"
+        style="white-space: pre-line; background: #f4f4f4; padding: 0.5rem; border-radius: 4px"
+      >
+        Loading preview…
+      </p>
       <button id="save" disabled>Save rule</button>
       <p id="status" role="status" aria-live="polite"></p>
     </main>

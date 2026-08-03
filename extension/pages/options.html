@@ -33,21 +33,26 @@
         </p>
         <p>
           <label>
-            Service address (<code>wss://…</code>)<br />
+            Service address<br />
             <input
               type="text"
               id="service-address"
               data-role="service-address"
               size="40"
-              placeholder="wss://curator.example"
+              placeholder="curator.example"
             />
           </label>
           <br />
           <small>
-            <code>wss://</code> only. This instance's secret is sent as-is over this
-            connection, so an unencrypted <code>ws://</code> (or an <code>http://</code>)
-            address is refused — except <code>ws://localhost</code> /
-            <code>ws://127.0.0.1</code> for development.
+            Enter the address of the service — <code>curator.example</code> or
+            <code>curator.example:8443</code>. The scheme is added for you:
+            <code>wss://</code>, or <code>ws://</code> for
+            <code>localhost</code> / <code>127.0.0.1</code> / <code>[::1]</code> in
+            development. An unencrypted address is not accepted, because this instance's
+            secret and the enrollment code travel over this connection as-is and TLS is
+            the only thing hiding them — so an explicit <code>http://</code>, or
+            <code>ws://</code> to anything but loopback, is refused. A full
+            <code>wss://…</code> URL keeps working unchanged.
           </small>
         </p>
         <p>
