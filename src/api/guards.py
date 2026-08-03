@@ -32,6 +32,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -42,6 +43,11 @@ from src.api.auth_metrics import auth_rejections
 # _MAX_SECRET): a real secret is 64 hex chars, so 128 is generous; an oversized token is
 # rejected before it can make the server hash a multi-MB string.
 _MAX_INSTANCE_SECRET = 128
+
+# Verbs that mutate state. A COOKIE-authenticated request using one of these must clear the
+# same-origin CSRF gate (issue #36 acc 3); GET/HEAD reads and Bearer-authenticated requests
+# do not (see :func:`require_same_origin`).
+_MUTATING_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 
 
 def _bearer_ok(request: Request, expected: str) -> bool:
@@ -150,6 +156,41 @@ async def require_api_caller(request: Request) -> Caller:
     # No admin match and no active instance (unknown / revoked / pending secret) → 401.
     auth_rejections.incr("api_token")
     raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+
+def require_same_origin(request: Request) -> None:
+    """CSRF gate for COOKIE-authenticated MUTATING ``/admin`` requests (issue #36 acc 3).
+
+    ``SameSite=Strict`` alone is NOT sufficient here: the service sits behind a SHARED
+    Traefik on ``Host(curator.example.com)``, and any neighbor service on the same
+    registrable domain (``neighbor.example.com``) is SAME-SITE to the browser — so its
+    forged ``POST`` would still carry our cookie. We therefore demand a same-ORIGIN signal:
+
+    * Prefer ``Sec-Fetch-Site`` — a browser-SET (thus unforgeable by page script) fetch
+      metadata header. Only ``same-origin`` passes; ``same-site`` / ``cross-site`` /
+      ``none`` are refused (``same-site`` is precisely the shared-Traefik neighbor threat).
+    * Absent that header (an older client), fall back to matching the ``Origin`` header's
+      host against the request ``Host``. Only an exact host match passes.
+
+    A mutating cookie request with NEITHER a usable ``Sec-Fetch-Site`` nor a matching
+    ``Origin`` is refused with **403**. Only the caller (``require_admin``) knows the auth
+    was by cookie and the method mutates, so it invokes this; a GET or a Bearer request
+    never reaches here.
+    """
+    if request.method.upper() not in _MUTATING_METHODS:
+        return
+    sec_fetch = request.headers.get("sec-fetch-site")
+    if sec_fetch is not None:
+        # Trust the browser's own classification when present. Exactly one value is same
+        # origin; everything else (including the same-site neighbor) is refused.
+        if sec_fetch == "same-origin":
+            return
+        raise HTTPException(status_code=403, detail="cross-origin request refused")
+    origin = request.headers.get("origin")
+    host = request.headers.get("host")
+    if origin and host and urlsplit(origin).netloc == host:
+        return
+    raise HTTPException(status_code=403, detail="cross-origin request refused")
 
 
 def require_metrics_token(request: Request) -> None:
