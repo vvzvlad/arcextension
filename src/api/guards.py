@@ -2,10 +2,11 @@
 
 * :func:`require_api_caller` — the per-caller ``/api/*`` Bearer check (issue #35 §4).
   ADMIN_TOKEN authenticates the human/agent (``Caller("admin")``); any other Bearer is
-  resolved as an ACTIVE instance's ``secretHash`` — the SAME credential the client uses
-  on ``/ext`` hello — yielding ``Caller("instance", id)``. Anything else is a flat 401;
-  a DB failure during the instance lookup is a 503, never a silent pass (revocation must
-  act instantly, so the resolution is NOT cached).
+  the RAW instance secret — the SAME credential the client sends on ``/ext`` hello —
+  hashed server-side and resolved to an ACTIVE instance, yielding
+  ``Caller("instance", id)``. Anything else is a flat 401; a DB failure during the
+  instance lookup is a 503, never a silent pass (revocation must act instantly, so the
+  resolution is NOT cached).
 * :func:`require_metrics_token` — the SEPARATE Bearer ``METRICS_TOKEN`` check for
   ``/metrics`` only (§12: the scrape credential lives in git plaintext, so it must
   never be able to touch anything but ``/metrics``; it must NOT accept ``EXT_TOKEN``).
@@ -37,6 +38,11 @@ from starlette.requests import Request
 
 from src.api.auth_metrics import auth_rejections
 
+# Upper bound on a raw instance secret presented as an /api Bearer (mirrors the /ext
+# _MAX_SECRET): a real secret is 64 hex chars, so 128 is generous; an oversized token is
+# rejected before it can make the server hash a multi-MB string.
+_MAX_INSTANCE_SECRET = 128
+
 
 def _bearer_ok(request: Request, expected: str) -> bool:
     header = request.headers.get("authorization", "")
@@ -65,8 +71,9 @@ class Caller:
 
     ``kind='admin'`` is the human at the startpage OR the MCP agent, both bearing
     ADMIN_TOKEN; ``instance_id`` is None. ``kind='instance'`` is a curated browser
-    instance authenticating with its own ``secretHash`` (the /ext hello credential);
-    ``instance_id`` is the server-assigned id that secret resolved to.
+    instance authenticating with its own RAW secret (the /ext hello credential), which
+    the server hashes and matches; ``instance_id`` is the server-assigned id that secret
+    resolved to.
     """
 
     kind: Literal["instance", "admin"]
@@ -95,9 +102,10 @@ async def require_api_caller(request: Request) -> Caller:
        admin caller — resolved before any DB touch so admin wins even against a token
        that might also happen to hash to an instance secret, and so admin auth never
        depends on the DB being reachable.
-    3. Otherwise the token is treated as an instance ``secretHash`` and resolved to an
-       **active** instances row (the same credential the client sent on /ext hello; the
-       raw 32-byte secret never leaves the client). A match is the instance caller.
+    3. Otherwise the token is the RAW instance secret (the same credential the client
+       sent on /ext hello over TLS); the server hashes it and resolves it to an
+       **active** instances row. Only the sha256 is stored, so a DB-only leak yields no
+       usable credential. A match is the instance caller.
     4. A DB failure during that lookup is a **503, never a silent pass** — a revocation
        we cannot check must not fall through to admin/anon. No caching: revocation is
        instant, so the secret is resolved on every request.
@@ -116,8 +124,13 @@ async def require_api_caller(request: Request) -> Caller:
         request.state.caller = caller
         return caller
 
-    # (3) Resolve the token as an instance secretHash. Leaf import (no cycle):
-    # src.db.queries never imports the api package.
+    # (3) Resolve the token as a RAW instance secret (server hashes it). Leaf import
+    # (no cycle): src.db.queries never imports the api package. Cap the length first so a
+    # hostile Authorization header cannot make the server hash a multi-MB string
+    # (symmetric with the /ext hello + enroll caps); an oversized token matches nothing.
+    if len(token) > _MAX_INSTANCE_SECRET:
+        auth_rejections.incr("api_token")
+        raise HTTPException(status_code=401, detail="missing or invalid bearer token")
     from src.db.queries import resolve_secret
 
     try:

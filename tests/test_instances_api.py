@@ -18,7 +18,7 @@ from conftest import (
     approve_instance,
     instance_headers,
     make_settings,
-    secret_hash_for,
+    secret_for,
 )
 from starlette.testclient import TestClient
 
@@ -61,7 +61,7 @@ def _connect(client, instance_id="prox", session="sess-1", db_path=None):
     ws = client.websocket_connect("/ext").__enter__()
     ws.send_json({
         "type": "hello", "protocolVersion": 1,
-        "secretHash": secret_hash_for(instance_id),
+        "secret": secret_for(instance_id),
         "instanceId": instance_id, "installUuid": f"u-{instance_id}",
         "origin": "chrome-extension://abc", "title": "T",
         "sessionId": session, "allowExecuteJs": False,
@@ -175,7 +175,7 @@ def test_http_and_mcp_share_one_implementation(tmp_path):
             approve_instance(db_path, "prox")
             assert client.post(
                 "/api/instances/prox/merge_windows",
-                headers=instance_headers(secret_hash_for("prox")),
+                headers=instance_headers(secret_for("prox")),
             ).json() == {"merged": 7}
 
             import asyncio
@@ -256,10 +256,10 @@ def test_merge_windows_force_crosses_the_pause_and_is_journaled(tmp_path):
             _set_setting(db_path, "pause_until", str(int(time.time() * 1000) + 3_600_000))
             pool = ThreadPoolExecutor(1)
             # force is honoured only for the INSTANCE caller (the human at the §9 button,
-            # §35 §4) — authenticate as prox with its secretHash, not as admin.
+            # §35 §4) — authenticate as prox with its RAW secret, not as admin.
             fut = pool.submit(lambda: client.post(
                 "/api/instances/prox/merge_windows",
-                headers=instance_headers(secret_hash_for("prox")),
+                headers=instance_headers(secret_for("prox")),
                 json={"force": True},
             ))
             cmd = _recv(ws)                 # the pause did NOT stop it

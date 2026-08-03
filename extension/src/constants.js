@@ -47,9 +47,11 @@ export const INSTALL_UUID_KEY = "installUuid"; // chrome.storage.local — survi
 
 // --- Enrollment (§7, issue #35) --------------------------------------------
 // The per-install SECRET (32 random bytes, stored as hex) lives ONLY in this
-// profile's chrome.storage.local — never in the bundle. Only its sha256 hash
-// (`secretHash`) ever goes on the wire (enroll_request + every hello). Absence of
-// this key is the "needs-enroll" fact. When a quarantined instance re-enrolls, the
+// profile's chrome.storage.local — never in the bundle. The RAW secret hex goes on the
+// wire over TLS (enroll_request + every hello, as `secret`) and as the /api Bearer; the
+// SERVER hashes it into the stored sha256 (option A — a DB-only leak yields no usable
+// credential). Absence of this key is the "needs-enroll" fact. When a quarantined instance
+// re-enrolls, the
 // FRESH secret is generated under INSTANCE_SECRET_PENDING_KEY and promoted over the
 // old one ONLY after the server approves it (unknown_instance never wipes — see
 // connection.js), which is why the two keys are distinct.

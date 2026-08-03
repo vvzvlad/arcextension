@@ -21,6 +21,7 @@ from conftest import (
     approve_instance,
     instance_headers,
     make_settings,
+    secret_for,
     secret_hash_for,
 )
 from starlette.testclient import TestClient
@@ -278,7 +279,7 @@ def test_force_crosses_the_pause_gate_only_for_the_human_verbs(tmp_path):
 
         # The human at the startpage authenticates with the INSTANCE secret (§35 §4), and
         # force is honoured ONLY for that caller — so the forced buttons run as 'main'.
-        instance_auth = instance_headers(secret_hash_for("main"))
+        instance_auth = instance_headers(secret_for("main"))
 
         # Human buttons WITH force: past the gate. They then fail on their own merits
         # (no live socket => 409/502/422), which is the point — the PAUSE no longer
@@ -335,7 +336,7 @@ def test_forced_restore_is_journaled_as_user_and_marked_in_detail(tmp_path):
         try:
             ws.send_json({
                 "type": "hello", "protocolVersion": 1,
-                "secretHash": secret_hash_for("i1"),
+                "secret": secret_for("i1"),
                 "instanceId": "i1", "installUuid": "u", "origin": "chrome-extension://a",
                 "title": "T", "sessionId": "sess-1", "allowExecuteJs": False,
             })
@@ -363,11 +364,11 @@ def test_forced_restore_is_journaled_as_user_and_marked_in_detail(tmp_path):
 
             client.post("/api/pause", headers=AUTH, json={"minutes": 60})
             pool = ThreadPoolExecutor(1)
-            # Authenticate as instance i1 (its secretHash): force crosses the pause and
+            # Authenticate as instance i1 (its RAW secret): force crosses the pause and
             # the row is written initiator='user' (the human), not 'admin' (§35 §4/§5).
             fut = pool.submit(lambda: client.post(
                 f"/api/actions/{aid}/restore",
-                headers=instance_headers(secret_hash_for("i1")),
+                headers=instance_headers(secret_for("i1")),
                 json={"force": True},
             ))
             cmd = _recv(ws)

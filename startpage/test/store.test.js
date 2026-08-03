@@ -862,12 +862,12 @@ describe("enroll status banner (§7)", () => {
     expect(store.enrollStatus.value).toBe(null);
   });
 
-  it("uses the SW secretHash as the /api Bearer (slice C) when a credential is served", async () => {
+  it("uses the SW raw secret as the /api Bearer (slice C / option A) when a credential is served", async () => {
     const env = makeChrome({
       tabs: [],
       messages: {
         get_identity: { instanceId: "me" },
-        get_credential: { serviceUrl: "wss://curator/", secretHash: "deadbeefhash" },
+        get_credential: { serviceUrl: "wss://curator/", secret: "rawsecret" },
         get_connection_state: { enrollState: "approved", hasAddress: true },
       },
     });
@@ -875,7 +875,8 @@ describe("enroll status banner (§7)", () => {
     const { fetchFn } = makeFetch({
       state: (n) => ({ status: 200, body: { instances: [], tabs: [], quick_links: [] } }),
     });
-    // Wrap fetch to capture the Authorization header on /api/state.
+    // Wrap fetch to capture the Authorization header on /api/state. Option A: the Bearer is
+    // the RAW secret (the server hashes it), NOT a client-derived sha256.
     const wrapped = async (url, opts) => {
       if (String(url).includes("/api/state")) seenAuth = opts && opts.headers && opts.headers.Authorization;
       return fetchFn(url, opts);
@@ -883,6 +884,6 @@ describe("enroll status banner (§7)", () => {
     const store = storeWith(env, wrapped);
     await store.init();
     await store.refresh();
-    expect(seenAuth).toBe("Bearer deadbeefhash");
+    expect(seenAuth).toBe("Bearer rawsecret");
   });
 });

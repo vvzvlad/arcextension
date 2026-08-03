@@ -318,15 +318,15 @@ describe("init: build -> preview -> save", () => {
   });
 });
 
-// --- §7: the popup prefers the SW credential (secretHash Bearer) over instance.json ---
+// --- §7: the popup prefers the SW credential (raw secret Bearer) over instance.json ---
 describe("loadPopupContext (§7)", () => {
-  it("uses get_credential + get_identity from the SW (secretHash is the /api Bearer)", async () => {
+  it("uses get_credential + get_identity from the SW (the RAW secret is the /api Bearer)", async () => {
     const { loadPopupContext } = await import("../pages/popup.js");
     const chromeApi = {
       runtime: {
         getURL: (p) => "chrome-extension://mock/" + p,
         sendMessage: async (msg) => {
-          if (msg.type === "get_credential") return { serviceUrl: "wss://curator/", secretHash: "hash-abc" };
+          if (msg.type === "get_credential") return { serviceUrl: "wss://curator/", secret: "raw-abc" };
           if (msg.type === "get_identity") return { instanceId: "srv-7" };
           return null;
         },
@@ -335,7 +335,7 @@ describe("loadPopupContext (§7)", () => {
     // fetch must NOT be consulted when the SW answers.
     const fetchFn = vi.fn();
     const ctx = await loadPopupContext(chromeApi, fetchFn);
-    expect(ctx).toEqual({ base: "https://curator", token: "hash-abc", instanceId: "srv-7" });
+    expect(ctx).toEqual({ base: "https://curator", token: "raw-abc", instanceId: "srv-7" });
     expect(fetchFn).not.toHaveBeenCalled();
   });
 

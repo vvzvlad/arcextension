@@ -375,16 +375,16 @@ def _pass_overdue_seconds(snap: Snapshot, now_ms: int, interval_s: int, paused: 
 
 
 def _enroll_window_seconds_remaining(snap: Snapshot, now_ms: int) -> int:
-    """SIGNED whole seconds until the enrollment window's deadline (§8).
+    """Whole seconds until the enrollment window's deadline, CLAMPED at 0 (§8).
 
     * No window armed (absent/blank/garbage deadline) -> EXACTLY 0.
     * Armed and still open (deadline in the future) -> POSITIVE seconds remaining,
       rounded UP so a sub-second-but-open window still reads >= 1 and never collides
       with the "no window" 0 (matches :func:`src.curator.enroll._ceil_seconds`).
-    * Armed but PAST its deadline and not yet closed -> NEGATIVE seconds overdue
-      (symmetric ceil of the magnitude, so always <= -1) — the §37 alert keys on ``< 0``.
-    * Exactly AT the deadline (remaining == 0) -> 0, deliberately indistinguishable from
-      "no window"; both are benign and neither is the armed-overdue state the alert wants.
+    * Armed and AT-OR-PAST its deadline -> 0. A naturally-expired window is not an
+      anomaly — it simply reads closed, symmetric with the no-window case. (The
+      window-overdue alert was dropped in #37, so the gauge no longer needs to encode a
+      negative "overdue" magnitude; a closed window and no window are both benign 0.)
 
     Read from the DB at scrape time, so a restart re-reads the SAME stored deadline and
     changes nothing; a degraded scrape (no snapshot) leaves ``enroll_window_until`` None
@@ -394,11 +394,9 @@ def _enroll_window_seconds_remaining(snap: Snapshot, now_ms: int) -> int:
     if until is None:
         return 0
     remaining_ms = until - now_ms
-    if remaining_ms == 0:
+    if remaining_ms <= 0:
         return 0
-    if remaining_ms > 0:
-        return (remaining_ms + 999) // 1000
-    return -((-remaining_ms + 999) // 1000)
+    return (remaining_ms + 999) // 1000
 
 
 def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
@@ -568,10 +566,9 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
     # re-reads the same window and a degraded scrape reports 0 (no window), never a 500.
     reg.metric(
         "curator_enroll_window_seconds_remaining",
-        "Signed whole seconds until the enrollment window deadline: >0 while open, <0 "
-        "while armed-but-past-its-deadline-and-not-yet-closed. 0 covers BOTH 'no window "
-        "armed' AND 'exactly at the deadline' — so an alert distinguishes the "
-        "armed-overdue (<0) case from a benign 0.",
+        "Whole seconds until the enrollment window deadline: >0 while open, 0 otherwise "
+        "(no window armed OR the window has reached/passed its deadline — a naturally "
+        "expired window reads closed, not overdue).",
         "gauge",
         [({}, _enroll_window_seconds_remaining(snap, now_ms))],
     )

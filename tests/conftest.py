@@ -105,12 +105,13 @@ def settings_factory():
 
 
 # --- secret-based /ext hello helpers (enrollment, issue #35) -----------------
-# Under enrollment a hello authenticates by a per-install SECRET: the client sends
-# ``secretHash`` = sha256(secret), the server resolves it to an ACTIVE instances row and
-# takes the server-assigned id from that row. A test that wants to drive the hello path
-# must therefore first have an approved (active) row with a known secret_hash — the thing
-# Task E's operator approval creates. These helpers make that a one-liner so every /ext
-# test converges on the same shape instead of hand-rolling INSERTs.
+# Under enrollment a hello authenticates by a per-install SECRET (option A): the client
+# sends the RAW secret over TLS, the server hashes it (sha256) and resolves that to an
+# ACTIVE instances row, taking the server-assigned id from that row. A test that wants to
+# drive the hello path must therefore first have an approved (active) row whose stored
+# ``secret_hash`` is sha256(raw) — the thing Task E's operator approval creates — and then
+# present the RAW secret. These helpers make that a one-liner so every /ext test converges
+# on the same shape instead of hand-rolling INSERTs.
 
 
 def admin_headers() -> dict:
@@ -122,21 +123,24 @@ def admin_headers() -> dict:
     return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
-def instance_headers(secret_hash: str) -> dict:
-    """Authorization for an INSTANCE caller on ``/api/*`` — its ``secretHash`` (issue #35
-    §4), the SAME credential the client sends on /ext hello. Pair with
-    :func:`approve_instance` to have an active row the secret resolves to."""
-    return {"Authorization": f"Bearer {secret_hash}"}
+def instance_headers(raw_secret: str) -> dict:
+    """Authorization for an INSTANCE caller on ``/api/*`` — its RAW secret (issue #35 §4,
+    option A), the SAME credential the client sends on /ext hello; the server hashes it and
+    matches the stored sha256. Pair with :func:`approve_instance` to have an active row the
+    secret resolves to."""
+    return {"Authorization": f"Bearer {raw_secret}"}
 
 
 def secret_for(instance_id: str) -> str:
-    """A deterministic per-instance secret for tests (never a real credential)."""
+    """A deterministic per-instance RAW secret for tests (never a real credential) — the
+    value the client presents on the wire / as the /api Bearer."""
     return f"secret-{instance_id}"
 
 
 def secret_hash_for(instance_id: str) -> str:
-    """sha256 hex of :func:`secret_for` — the value stored in ``instances.secret_hash``
-    and sent by a hello as ``secretHash``."""
+    """sha256 hex of :func:`secret_for` — the value STORED in ``instances.secret_hash``
+    (what the server computes on receipt of the raw secret). Tests seed a row with this and
+    present :func:`secret_for` (the raw) on the wire."""
     return hashlib.sha256(secret_for(instance_id).encode("utf-8")).hexdigest()
 
 

@@ -10,8 +10,21 @@ mutation-testable.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import dataclass
+
+
+def sha256_hex(raw_secret: str) -> str:
+    """sha256 of a RAW secret as lowercase hex — the ONE shared server-side hasher.
+
+    Credential model (issue #35, option A): the client sends its RAW secret over TLS;
+    the server hashes it HERE, both when storing it at enroll and when resolving it at
+    every hello / ``/api`` Bearer. Only the sha256 is ever persisted (``secret_hash``
+    columns), so a DB-only leak yields hashes, not usable credentials. Using the SAME
+    function at store and at resolve is what guarantees they always match.
+    """
+    return hashlib.sha256(raw_secret.encode("utf-8")).hexdigest()
 
 
 class RevokeMainRefused(Exception):
@@ -167,17 +180,22 @@ def record_rejection(
 
 
 def resolve_secret(
-    conn: sqlite3.Connection, secret_hash: str
+    conn: sqlite3.Connection, raw_secret: str
 ) -> tuple[str, str] | None:
-    """Resolve a hello's ``secretHash`` to ``(instance_id, status)`` or ``None``.
+    """Resolve a RAW secret to ``(instance_id, status)`` by hashing it, or ``None``.
 
-    Uses the UNIQUE ``instances_secret_hash`` index (§1). ``None`` means no instance
-    carries this secret at all (the client is unknown / not yet approved). The status is
-    returned raw ('active' / 'revoked' / 'pending') so the channel can map it to the
-    right client-facing verdict (unknown vs revoked, §7).
+    Option A credential model (issue #35): the client sends the RAW secret over TLS; the
+    server hashes it HERE (:func:`sha256_hex`) and matches the stored ``secret_hash`` via
+    the UNIQUE ``instances_secret_hash`` index (§1). Because the DB stores only the sha256,
+    a leak of the DB yields hashes, not usable secrets — presenting the stored hash value
+    itself hashes to something else and matches nothing. ``None`` means no instance carries
+    this secret at all (the client is unknown / not yet approved). The status is returned
+    raw ('active' / 'revoked' / 'pending') so the channel can map it to the right
+    client-facing verdict (unknown vs revoked, §7).
     """
     row = conn.execute(
-        "SELECT id, status FROM instances WHERE secret_hash = ?", (secret_hash,)
+        "SELECT id, status FROM instances WHERE secret_hash = ?",
+        (sha256_hex(raw_secret),),
     ).fetchone()
     if row is None:
         return None

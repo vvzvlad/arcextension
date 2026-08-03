@@ -2,11 +2,12 @@
 
 These drive the real endpoint under the ENROLLMENT contract (issue #35):
 
-* a hello authenticates by a per-install SECRET — the client sends ``secretHash``, the
-  server resolves it to an APPROVED (``status='active'``) instances row and takes the
-  server-assigned id from that row. There is no shared token and no trusted
-  self-reported instanceId. A test therefore ``approve_instance(...)`` (what Task E's
-  operator approval does) before it can drive the hello path.
+* a hello authenticates by a per-install SECRET — the client sends the RAW ``secret``
+  over TLS, the server hashes it (sha256) and resolves that to an APPROVED
+  (``status='active'``) instances row and takes the server-assigned id from that row.
+  There is no shared token and no trusted self-reported instanceId. A test therefore
+  ``approve_instance(...)`` (what Task E's operator approval does) before it can drive the
+  hello path.
 * a not-yet-approved client opens with an ``enroll_request`` carrying the window
   ``code``; the server records the request and answers ``enroll_pending`` — it never
   creates an instances row.
@@ -19,7 +20,7 @@ import sqlite3
 import time
 
 import pytest
-from conftest import _recv, approve_instance, make_settings, secret_hash_for
+from conftest import _recv, approve_instance, make_settings, secret_for
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -34,11 +35,12 @@ def _settings(tmp_path, **over):
 
 
 def _hello(instance_id="i1", **over):
-    # Secret-based hello: the secretHash resolves to the approved row for ``instance_id``.
+    # Secret-based hello: the RAW secret is hashed server-side and resolves to the approved
+    # row for ``instance_id`` (whose stored secret_hash is sha256 of this raw value).
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "secretHash": secret_hash_for(instance_id),
+        "secret": secret_for(instance_id),
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",
         "title": "Themed",
@@ -54,7 +56,7 @@ def _enroll(**over):
         "type": "enroll_request",
         "protocolVersion": 1,
         "installUuid": "install-1",
-        "secretHash": "a" * 64,
+        "secret": "a" * 64,
         "origin": "chrome-extension://abc",
         "title": "My laptop",
     }
@@ -151,12 +153,27 @@ def test_unknown_secret_rejected_unknown_instance(tmp_path):
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
-            ws.send_json(_hello(secretHash="deadbeef" * 8))
+            ws.send_json(_hello(secret="deadbeef" * 8))
             ack = _recv(ws)
             assert ack["ok"] is False
             assert ack["error"]["code"] == "unknown_instance"
         assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
         assert client.app.state.ext_rejections == 1
+
+
+def test_oversized_secret_rejected_auth_no_row(tmp_path):
+    # A hostile peer must not make the server hash a multi-MB `secret` on hello; an
+    # oversized secret is refused (auth) before hashing, and creates no instances row.
+    # Symmetric with the enroll-request cap. Reddens if the hello length cap is removed.
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        with client.websocket_connect("/ext") as ws:
+            ws.send_json(_hello(secret="a" * 5000))
+            ack = _recv(ws)
+            assert ack["ok"] is False
+            assert ack["error"]["code"] == "auth"
+        assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
 def test_revoked_secret_rejected_revoked(tmp_path):
@@ -194,25 +211,25 @@ def test_pending_secret_rejected_unknown_instance(tmp_path):
         ) == (0, 0)
 
 
-def test_blank_secret_hash_rejected_auth(tmp_path):
-    # A missing/blank secretHash cannot authenticate => auth, no row created.
+def test_blank_secret_rejected_auth(tmp_path):
+    # A missing/blank secret cannot authenticate => auth, no row created.
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
-            ws.send_json(_hello(secretHash="   "))
+            ws.send_json(_hello(secret="   "))
             ack = _recv(ws)
             assert ack["ok"] is False
             assert ack["error"]["code"] == "auth"
         assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
 
 
-def test_non_str_secret_hash_rejected_cleanly(tmp_path):
-    # A non-str secretHash must not crash the isinstance/strip check => clean auth reject.
+def test_non_str_secret_rejected_cleanly(tmp_path):
+    # A non-str secret must not crash the isinstance/strip check => clean auth reject.
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
-            ws.send_json(_hello(secretHash=12345))
+            ws.send_json(_hello(secret=12345))
             ack = _recv(ws)
             assert ack["ok"] is False and ack["error"]["code"] == "auth"
 
@@ -230,7 +247,7 @@ def test_anon_hello_with_public_protocol_creates_no_instances_row(tmp_path):
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         with client.websocket_connect("/ext") as ws:
-            ws.send_json(_hello(secretHash="c0ffee" * 10, protocolVersion=1))
+            ws.send_json(_hello(secret="c0ffee" * 10, protocolVersion=1))
             ack = _recv(ws)
             assert ack["ok"] is False
         assert _db_row(db_path, "SELECT COUNT(*) FROM instances") == (0,)
@@ -419,7 +436,9 @@ def test_enroll_request_valid_code_open_window_pending_and_no_first_seen_bump(tm
         assert row1 is not None
         first_seen, last_seen1, title1, sh1, pv = row1
         assert title1 == "First"
-        assert sh1 == "a" * 64
+        # The server hashed the raw wire secret on receipt: the stored secret_hash is
+        # sha256(raw), never the raw value itself (option A — only the hash is persisted).
+        assert sh1 == queries.sha256_hex("a" * 64)
         assert pv == 1
         assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (1,)
 
@@ -459,15 +478,16 @@ def test_enroll_request_at_capacity_rejected_no_row(tmp_path):
         assert _db_row(db_path, "SELECT COUNT(*) FROM enroll_requests") == (0,)
 
 
-def test_enroll_request_overlength_uuid_or_hash_rejected_no_row(tmp_path):
-    # §36: install_uuid (PK) and secret_hash (credential) go verbatim into the operator-
-    # facing pending list, so an overlength value is refused as a malformed frame and
-    # writes NO row (they are NOT truncated — that would corrupt a key/credential).
+def test_enroll_request_overlength_uuid_or_secret_rejected_no_row(tmp_path):
+    # §36: install_uuid (PK) and the raw secret (which becomes the secret_hash credential)
+    # go into the operator-facing pending list, so an overlength value is refused as a
+    # malformed frame and writes NO row (they are NOT truncated — that would corrupt a
+    # key/credential).
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         code = _arm_window(db_path)
-        for over in ({"installUuid": "u" * 201}, {"secretHash": "h" * 129}):
+        for over in ({"installUuid": "u" * 201}, {"secret": "h" * 129}):
             with client.websocket_connect("/ext") as ws:
                 ws.send_json(_enroll(code=code, **over))
                 assert _recv(ws) == {"type": "enroll_rejected", "reason": "protocol"}
@@ -531,7 +551,7 @@ def test_preauth_slot_released_after_hello_and_after_reject(tmp_path):
             assert client.app.state.ext_preauth_count == 0
         # A rejected hello also leaves the counter at 0.
         with client.websocket_connect("/ext") as ws2:
-            ws2.send_json(_hello(secretHash="beef" * 16))
+            ws2.send_json(_hello(secret="beef" * 16))
             _recv(ws2)
         assert client.app.state.ext_preauth_count == 0
 

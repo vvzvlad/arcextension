@@ -68,7 +68,7 @@ export async function saveRule(fetchFn, base, token, rule, { confirmImpact = fal
 }
 
 // Read instance.json via the extension URL. With enrollment (§7) this is only a
-// FALLBACK bootstrap: the credential source moved to the SW (address + secretHash +
+// FALLBACK bootstrap: the credential source moved to the SW (address + raw secret +
 // server-assigned id). Kept for a bundle that still ships a serviceUrl.
 export async function loadConfig(fetchFn, getURL) {
   const resp = await fetchFn(getURL("instance.json"));
@@ -76,18 +76,19 @@ export async function loadConfig(fetchFn, getURL) {
 }
 
 // Resolve the /api base + Bearer + target instanceId (§7). PREFER the SW credential
-// (the instance secretHash is the /api Bearer — slice C — and the id is server-assigned,
-// learned from a successful hello); fall back to instance.json when the SW channel is
-// unavailable or has nothing yet (e.g. before enrollment).
+// (the RAW instance secret is the /api Bearer — slice C / option A, the server hashes it —
+// and the id is server-assigned, learned from a successful hello); fall back to
+// instance.json when the SW channel is unavailable or has nothing yet (e.g. before
+// enrollment).
 export async function loadPopupContext(chromeApi, fetchFn) {
   try {
     if (chromeApi.runtime && chromeApi.runtime.sendMessage) {
       const cred = await chromeApi.runtime.sendMessage({ type: "get_credential" });
       const ident = await chromeApi.runtime.sendMessage({ type: "get_identity" });
-      if (cred && cred.serviceUrl && cred.secretHash && ident && ident.instanceId) {
+      if (cred && cred.serviceUrl && cred.secret && ident && ident.instanceId) {
         return {
           base: httpBaseFromServiceUrl(cred.serviceUrl),
-          token: cred.secretHash,
+          token: cred.secret,
           instanceId: ident.instanceId,
         };
       }

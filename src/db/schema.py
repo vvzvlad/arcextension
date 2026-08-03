@@ -198,7 +198,8 @@ _V2_STATEMENTS: list[str] = [
         origin TEXT,                          -- chrome-extension:// origin of the hello
         suggested_title TEXT,                 -- human-readable name proposed by the client
         protocol_version INTEGER NOT NULL,
-        secret_hash TEXT NOT NULL,            -- hash of the per-install secret, never the secret
+        secret_hash TEXT NOT NULL,            -- sha256 of the raw secret (server-hashed on
+                                              -- receipt); the raw secret is never stored
         first_seen_at INTEGER NOT NULL,       -- NOT bumped by a repeat: else the TTL is never
                                               -- reached and a stale request lives forever
         last_seen_at INTEGER NOT NULL

@@ -45,16 +45,17 @@ const connection = new Connection(chromeEnv(), { buildSnapshot });
 
 // Quick-links queue env (§6/§10): the SW owns the durable offline op queue and its
 // flush. The credential moved off instance.json onto the SW (§7): the `/api/*` Bearer
-// is now the instance secretHash (slice C), and the address is the operator setting in
-// storage.local. quicklinks.js still reads `config.serviceUrl` + `config.token`, so we
-// synthesize that shape from the connection's resolved address + hashed secret.
+// is now the RAW instance secret (slice C / option A — the server hashes it), and the
+// address is the operator setting in storage.local. quicklinks.js still reads
+// `config.serviceUrl` + `config.token`, so we synthesize that shape from the
+// connection's resolved address + raw secret.
 function quickLinksEnv() {
   return {
     getInstanceConfig: async () => {
       await connection.init();
       return {
         serviceUrl: await connection._resolveAddress(),
-        token: await connection._secretHash(), // slice C: the /api credential IS secretHash
+        token: await connection._apiSecret(), // slice C: the /api credential IS the raw secret
       };
     },
     storageLocalGet: (key) => chrome.storage.local.get(key),
@@ -184,18 +185,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message.type === "get_credential") {
     // The startpage/popup ask the SW for the /api base + Bearer (§7): the address
-    // setting + the instance secretHash (slice C). The raw secret never leaves the SW.
+    // setting + the RAW instance secret (slice C / option A). The raw secret crosses only
+    // SW->page in-process, then the TLS'd /api call — the server hashes it on receipt.
     connection
       .init()
       .then(async () => {
         sendResponse({
           serviceUrl: await connection._resolveAddress(),
-          secretHash: await connection._secretHash(),
+          secret: await connection._apiSecret(),
         });
       })
       .catch((e) => {
         console.error("[ext] get_credential failed:", e);
-        sendResponse({ serviceUrl: null, secretHash: null });
+        sendResponse({ serviceUrl: null, secret: null });
       });
     return true; // async response
   }

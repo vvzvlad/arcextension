@@ -2,8 +2,8 @@
 `instancegen bundle` universal-build tool.
 
 Covers:
-  * ``curator_enroll_window_seconds_remaining`` — the SIGNED/zero gauge semantics
-    (no window = 0, open = positive, armed-but-past = negative, exactly-at-deadline = 0)
+  * ``curator_enroll_window_seconds_remaining`` — the clamped gauge semantics
+    (no window = 0, open = positive, armed-but-past = 0, at-deadline = 0)
     at both the pure-helper level and through a real ``/metrics`` scrape, including the
     "survives a restart" acceptance (the gauge is DB-derived, not process memory).
   * ``curator_auth_rejections_total{reason}`` — the newly LABELED counter family, one
@@ -86,7 +86,7 @@ def _scalar(body, name):
 # --------------------------------------------------------------------------- #
 # curator_enroll_window_seconds_remaining — the pure helper (signed / zero edges)
 # --------------------------------------------------------------------------- #
-def test_enroll_window_seconds_remaining_signed_and_zero():
+def test_enroll_window_seconds_remaining_clamped_at_zero():
     now = 1_000_000
     # No window armed -> EXACTLY 0.
     assert _enroll_window_seconds_remaining(Snapshot(), now) == 0
@@ -98,10 +98,11 @@ def test_enroll_window_seconds_remaining_signed_and_zero():
     assert _enroll_window_seconds_remaining(Snapshot(enroll_window_until=now + 400), now) == 1
     # EXACTLY at the deadline -> 0, deliberately indistinguishable from "no window".
     assert _enroll_window_seconds_remaining(Snapshot(enroll_window_until=now), now) == 0
-    # Armed but PAST the deadline and not closed -> NEGATIVE (the §37 alert keys on < 0).
-    # Redden: clamp to 0 like read_enroll_window and the overdue window goes invisible.
-    assert _enroll_window_seconds_remaining(Snapshot(enroll_window_until=now - 5_000), now) == -5
-    assert _enroll_window_seconds_remaining(Snapshot(enroll_window_until=now - 400), now) == -1
+    # Armed but PAST the deadline -> CLAMPED to 0: a naturally-expired window reads closed,
+    # not overdue (symmetric with the no-window case; the overdue alert was dropped in #37).
+    # Redden: return the negative magnitude and a benign expired window reads as an anomaly.
+    assert _enroll_window_seconds_remaining(Snapshot(enroll_window_until=now - 5_000), now) == 0
+    assert _enroll_window_seconds_remaining(Snapshot(enroll_window_until=now - 400), now) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -130,17 +131,17 @@ def test_enroll_window_gauge_open_window_is_positive(tmp_path):
         assert 590.0 < v <= 600.0, v
 
 
-def test_enroll_window_gauge_armed_past_deadline_is_negative(tmp_path):
+def test_enroll_window_gauge_armed_past_deadline_is_zero(tmp_path):
     import time
 
     s = _settings(tmp_path)
     app = create_app(s)
     with TestClient(app) as client:
         # An armed deadline already 5 s in the PAST, not yet closed (the row lingers) ->
-        # the gauge must go NEGATIVE, which is what the future §37 alert keys on.
+        # the gauge CLAMPS to 0: a naturally-expired window reads closed, not overdue.
         _set_setting(s.db_path, ENROLL_WINDOW_UNTIL_KEY, int(time.time() * 1000) - 5_000)
         v = _scalar(_scrape(client), "curator_enroll_window_seconds_remaining")
-        assert v < 0.0, v
+        assert v == 0.0, v
 
 
 def test_enroll_window_gauge_survives_restart(tmp_path):

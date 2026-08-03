@@ -21,7 +21,7 @@ from conftest import (
     approve_instance,
     instance_headers,
     make_settings,
-    secret_hash_for,
+    secret_for,
 )
 from starlette.exceptions import HTTPException
 from starlette.testclient import TestClient
@@ -104,6 +104,20 @@ async def test_missing_or_non_bearer_header_is_401():
 
 
 @pytest.mark.asyncio
+async def test_oversized_bearer_is_401_without_touching_the_db():
+    """A hostile multi-KB Authorization token is rejected on length BEFORE the DB read, so
+    the server never hashes a huge string. db_read raises if called → the 401 (not 503)
+    proves the length check short-circuits it. Reddens if the cap is removed (the read
+    runs, raising → 503)."""
+    def _boom(_fn):
+        raise AssertionError("db.read must not run for an oversized token")
+
+    with pytest.raises(HTTPException) as ei:
+        await require_api_caller(_fake_request("x" * 5000, db_read=_boom))
+    assert ei.value.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_db_error_during_resolution_is_503_never_a_pass():
     """A DB failure in the revocation lookup is 503 — it must NOT fall through to an
     anonymous or admin pass (revocation we cannot check fails CLOSED)."""
@@ -133,14 +147,15 @@ def _arm_pause(db_path, until_ms=None):
 
 
 def test_instance_secret_and_admin_both_open_api_state(tmp_path):
-    """Acc 6: an ACTIVE instance's secretHash opens ``GET /api/state`` (200), and so does
-    ADMIN_TOKEN. The secret is the SAME credential the client sends on /ext hello."""
+    """Acc 6: an ACTIVE instance's RAW secret opens ``GET /api/state`` (200), and so does
+    ADMIN_TOKEN. The secret is the SAME credential the client sends on /ext hello; the
+    server hashes it and matches the stored sha256."""
     app = create_app(make_settings(tmp_path, pass_interval_min=100_000))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
-        approve_instance(db_path, "i1")  # active row with secret_hash_for('i1')
+        approve_instance(db_path, "i1")  # active row storing sha256(secret_for('i1'))
         assert client.get(
-            "/api/state", headers=instance_headers(secret_hash_for("i1"))
+            "/api/state", headers=instance_headers(secret_for("i1"))
         ).status_code == 200
         assert client.get("/api/state", headers=admin_headers()).status_code == 200
 
@@ -153,7 +168,7 @@ def test_revoked_and_unknown_secret_rejected_on_api(tmp_path):
     with TestClient(app) as client:
         approve_instance(db_path, "gone", status="revoked")
         assert client.get(
-            "/api/state", headers=instance_headers(secret_hash_for("gone"))
+            "/api/state", headers=instance_headers(secret_for("gone"))
         ).status_code == 401
         assert client.get(
             "/api/state", headers=instance_headers("deadbeef-never-seen")
@@ -200,7 +215,7 @@ def test_focus_force_crosses_pause_only_for_instance_not_admin(tmp_path):
 
         # The instance caller crosses the gate; with no live socket it 502s, NOT 423.
         inst_resp = client.post(
-            "/api/focus", headers=instance_headers(secret_hash_for("main")),
+            "/api/focus", headers=instance_headers(secret_for("main")),
             json={"instance": "main", "tabId": 1, "force": True},
         )
         assert inst_resp.status_code != 423

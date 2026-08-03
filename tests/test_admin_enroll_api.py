@@ -24,11 +24,17 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from conftest import admin_headers, instance_headers, make_settings, secret_hash_for
+from conftest import (
+    admin_headers,
+    instance_headers,
+    make_settings,
+    secret_for,
+    secret_hash_for,
+)
 from starlette.testclient import TestClient
 
 from src.db.access import Database
-from src.db.queries import ApproveConflict, approve_enroll_request
+from src.db.queries import ApproveConflict, approve_enroll_request, sha256_hex
 
 
 # --- low-level DB helpers ----------------------------------------------------
@@ -84,10 +90,11 @@ def test_every_admin_endpoint_rejects_instance_and_anon(tmp_path):
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
-        # An ACTIVE instance whose secret is a valid /api credential but NOT admin.
+        # An ACTIVE instance whose secret is a valid /api credential but NOT admin. The
+        # stored secret_hash is sha256(raw); the /api Bearer is the RAW secret (option A).
         _seed_instance(db_path, "inst", status="active",
                        secret_hash=secret_hash_for("inst"))
-        inst = instance_headers(secret_hash_for("inst"))
+        inst = instance_headers(secret_for("inst"))
 
         endpoints = [
             ("GET", "/admin/enroll/requests"),
@@ -120,7 +127,10 @@ def test_approve_activates_instance_with_request_secret_and_consumes_request(tmp
     leaves status != 'active'."""
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
-    sh = "hash-of-secret-A"
+    # The request stores sha256(raw); approve copies THAT onto the instance, and a later
+    # hello presenting the RAW secret resolves it (option A — server hashes on receipt).
+    raw = "secret-A"
+    sh = sha256_hex(raw)
     with TestClient(app) as client:
         _seed_request(db_path, "uuid-A", secret_hash=sh, title="Home")
         resp = client.post(
@@ -138,21 +148,22 @@ def test_approve_activates_instance_with_request_secret_and_consumes_request(tmp
         assert install_uuid == "uuid-A" and title == "Home" and enrolled_at is not None
         # The request was consumed.
         assert _q(db_path, "SELECT 1 FROM enroll_requests WHERE install_uuid='uuid-A'") == []
-        # resolve_secret now returns it active — a secret-hello would authenticate.
-        assert asyncio.run(_resolve(db_path, sh)) == ("laptop", "active")
+        # resolve_secret now returns it active — a secret-hello presenting the RAW secret
+        # would authenticate (the server hashes it back to the stored sh).
+        assert asyncio.run(_resolve(db_path, raw)) == ("laptop", "active")
         # admin_audit recorded the approve.
         audit = _q(db_path, "SELECT action, install_uuid, instance_id, initiator "
                             "FROM admin_audit WHERE action='approve'")
         assert audit == [("approve", "uuid-A", "laptop", "admin")]
 
 
-async def _resolve(db_path, secret_hash):
+async def _resolve(db_path, raw_secret):
     from src.db.queries import resolve_secret
     db = Database(db_path, str(db_path) + ".bk")
     # Reuse the existing DB file; open() runs migrations (idempotent) on it.
     await db.open()
     try:
-        return await db.read(lambda c: resolve_secret(c, secret_hash))
+        return await db.read(lambda c: resolve_secret(c, raw_secret))
     finally:
         await db.close()
 

@@ -245,19 +245,18 @@ describe("get_connection_state (§6)", () => {
 
 // --- §7 enrollment message channel (get_credential / submit / enrollState) ---
 describe("enrollment message channel (§7)", () => {
-  const SECRET_HASH = "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793";
   function ask(message) {
     const listener = chrome.runtime.onMessage.listeners[0];
     return new Promise((resolve) => listener(message, {}, resolve));
   }
 
-  it("get_credential returns the address + the instance secretHash (slice C Bearer)", async () => {
+  it("get_credential returns the address + the RAW instance secret (slice C / option A Bearer)", async () => {
     await loadServiceWorker();
     const cred = await ask({ type: "get_credential" });
-    // Address falls back to the instance.json bootstrap serviceUrl; the Bearer is the
-    // sha256 of the seeded secret — the raw secret never leaves the SW.
+    // Address falls back to the instance.json bootstrap serviceUrl; the Bearer is the RAW
+    // seeded secret — the server hashes it on receipt (option A), the client never does.
     expect(cred.serviceUrl).toBe("wss://host.example/");
-    expect(cred.secretHash).toBe(SECRET_HASH);
+    expect(cred.secret).toBe(SECRET_HEX);
   });
 
   it("get_connection_state carries the durable enrollState (approved when seeded)", async () => {

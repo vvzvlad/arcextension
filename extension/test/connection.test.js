@@ -10,21 +10,13 @@ const CONFIG = {
   serviceUrl: "wss://host.example",
 };
 
-// A known 32-byte secret (all 0x01) and its sha256 — the wire `secretHash` (§7). The
-// vector is asserted directly in the secret/hash test below.
+// A known 32-byte secret (all 0x01). Option A: the RAW secret hex is what the wire carries
+// (as `secret`) and what the /api Bearer is — the server hashes it, the client never does.
 const SECRET_HEX = "01".repeat(32);
-const SECRET_HASH = "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793";
 const APPROVED_FACTS = { requestPending: false, approved: true, quarantined: false, lastVerdict: null };
 
-// sha256(hexBytes) -> hex, to derive the secretHash the wire carries for a RANDOM
-// pending secret the code generated (so a quarantine test can assert on it).
-import { createHash } from "node:crypto";
-function sha256hex(hex) {
-  return createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex");
-}
-
-// hello/enroll now read the secret from storage (several async ticks) and hash it, so
-// the opening frame lands a few macrotasks later than the old token-only path.
+// hello/enroll read the secret from storage (several async ticks), so the opening frame
+// lands a few macrotasks later than the old token-only path.
 const flush = () => new Promise((r) => setTimeout(r, 25));
 
 // Seed an ENROLLED profile (secret + approved) so the socket opens and hello is sent.
@@ -95,7 +87,7 @@ describe("hello (§6/§7)", () => {
     expect(ws.sent[0]).toMatchObject({
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
-      secretHash: SECRET_HASH,
+      secret: SECRET_HEX,
       installUuid: conn.installUuid,
       sessionId: conn.sessionId,
       allowExecuteJs: false,
@@ -253,10 +245,9 @@ function bareConn(overrides = {}) {
   return new Connection(env, { buildSnapshot: async () => ({}) });
 }
 
-describe("secret + secretHash (§7)", () => {
-  it("generates a 32-byte secret ONCE, persists it, and derives sha256(secret) — known vector", async () => {
-    // Fresh profile: drop the beforeEach seed. Stub ONLY randomBytes (via the env seam);
-    // sha256Hex stays REAL so the assertion is a genuine known vector.
+describe("secret (§7, option A: raw secret on the wire)", () => {
+  it("generates a 32-byte secret ONCE, persists it as hex, and exposes it RAW as the /api Bearer", async () => {
+    // Fresh profile: drop the beforeEach seed. Stub ONLY randomBytes (via the env seam).
     await chrome.storage.local.remove("instanceSecret");
     await chrome.storage.local.remove("enrollState");
     let rand = 0;
@@ -269,33 +260,16 @@ describe("secret + secretHash (§7)", () => {
     await conn.submitEnrollment("WIN-CODE");
     const got = await chrome.storage.local.get("instanceSecret");
     expect(got.instanceSecret).toBe(SECRET_HEX); // stored as hex, from the env seam
-    expect(await conn._secretHash()).toBe(SECRET_HASH); // = sha256(0x01*32), the vector
+    // Option A: the /api Bearer is the RAW secret hex — no client-side sha256 anymore.
+    expect(await conn._apiSecret()).toBe(SECRET_HEX);
     // Generated ONCE: a second submit reuses the same secret.
     await conn.submitEnrollment("WIN-CODE-2");
     expect(rand).toBe(1);
   });
-
-  it("hashes through the env.sha256Hex seam over the RAW secret bytes (stubbable)", async () => {
-    // If the code hashed via a hardcoded global crypto instead of the seam, the stub
-    // would never be called and _secretHash would not be STUBHASH.
-    await chrome.storage.local.remove("instanceSecret");
-    await chrome.storage.local.remove("enrollState");
-    const seen = [];
-    const conn = bareConn({
-      randomBytes: (n) => new Uint8Array(n).fill(2),
-      sha256Hex: async (bytes) => {
-        seen.push([...bytes]);
-        return "STUBHASH";
-      },
-    });
-    await conn.submitEnrollment("C");
-    expect(await conn._secretHash()).toBe("STUBHASH");
-    expect(seen[seen.length - 1]).toEqual(new Array(32).fill(2)); // the raw 32 secret bytes
-  });
 });
 
 describe("enroll_request frame (§2/§7)", () => {
-  it("sends enroll_request{code, secretHash, installUuid, suggestedTitle} — NOT a hello", async () => {
+  it("sends enroll_request{code, secret, installUuid, suggestedTitle} — NOT a hello", async () => {
     // Keep the seeded secret but make the state not-approved, and stage a browser name.
     await chrome.storage.local.set({
       enrollState: { requestPending: false, approved: false, quarantined: false, lastVerdict: null },
@@ -312,7 +286,7 @@ describe("enroll_request frame (§2/§7)", () => {
       type: "enroll_request",
       protocolVersion: PROTOCOL_VERSION,
       code: "WIN-CODE",
-      secretHash: SECRET_HASH,
+      secret: SECRET_HEX,
       installUuid: conn.installUuid,
       suggestedTitle: "Bob's Chrome", // documented frame field
       title: "Bob's Chrome", // what the server actually reads (wire contract)
@@ -351,7 +325,7 @@ describe("hello_ack{ok:false} verdicts (§7)", () => {
 
   it("a REVOKED instance opens NO idle socket on the next alarm (nothing to send)", async () => {
     // Durable revoked state: the secret is already wiped, so a hello would carry no
-    // secretHash. Connecting anyway would hold/reopen an idle pre-auth socket every alarm
+    // secret. Connecting anyway would hold/reopen an idle pre-auth socket every alarm
     // across the whole revoked fleet. The gate must treat revoked like needs-enroll.
     await chrome.storage.local.remove("instanceSecret");
     await chrome.storage.local.remove("instanceSecretPending");
@@ -407,7 +381,7 @@ describe("hello_ack{ok:false} verdicts (§7)", () => {
     const req = cold.ws.sent.find((m) => m.type === "enroll_request");
     expect(req).toBeDefined();
     expect(req.code).toBe("NEW-CODE");
-    expect(req.secretHash).toBe(sha256hex(pendingHex)); // enrolls the PENDING secret
+    expect(req.secret).toBe(pendingHex); // enrolls the PENDING secret (raw on the wire)
     expect(cold.ws.sent.find((m) => m.type === "hello")).toBeUndefined();
   });
 
@@ -435,7 +409,7 @@ describe("hello_ack{ok:false} verdicts (§7)", () => {
     await flush();
     const hello = conn.ws.sent.find((m) => m.type === "hello");
     expect(hello).toBeDefined();
-    expect(hello.secretHash).toBe(SECRET_HASH); // the OLD secret, not the pending one
+    expect(hello.secret).toBe(SECRET_HEX); // the OLD secret (raw), not the pending one
   });
 
   it("OLD-secret hello succeeding while quarantined = transient recovery: discard pending, keep old (invariant A)", async () => {
@@ -483,7 +457,7 @@ describe("hello_ack{ok:false} verdicts (§7)", () => {
     conn.ws._open();
     await flush();
     const hello = conn.ws.sent.find((m) => m.type === "hello");
-    expect(hello.secretHash).toBe(sha256hex(pendingHex)); // helloed with the PENDING secret
+    expect(hello.secret).toBe(pendingHex); // helloed with the PENDING secret (raw on the wire)
     // The operator approved the re-enrollment => ok:true on the pending hello.
     conn.ws._serverSend({ type: "hello_ack", ok: true, instanceId: "srv-new" });
     await flush();

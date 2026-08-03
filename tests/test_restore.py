@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from conftest import _recv, approve_instance, make_settings, secret_hash_for
+from conftest import _recv, approve_instance, make_settings, secret_for
 from starlette.testclient import TestClient
 
 from src.app import create_app
@@ -39,7 +39,7 @@ def _hello(instance_id="i1", session="sess-1", **over):
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "secretHash": secret_hash_for(instance_id),
+        "secret": secret_for(instance_id),
         "instanceId": instance_id,
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",

@@ -271,13 +271,14 @@ export function createStore(deps = {}) {
     }
 
     // Config (base + token) for the background refresh; a failure keeps us offline.
-    // PREFER the SW credential (§7): the address setting + the instance secretHash
-    // (slice C — the /api Bearer IS the secretHash). Fall back to a bundled
-    // instance.json only when the SW channel has nothing (pre-enrollment / bootstrap).
+    // PREFER the SW credential (§7): the address setting + the RAW instance secret
+    // (slice C / option A — the /api Bearer IS the raw secret; the server hashes it).
+    // Fall back to a bundled instance.json only when the SW channel has nothing
+    // (pre-enrollment / bootstrap).
     const cred = await getCredential(chromeApi);
-    if (cred && cred.serviceUrl && cred.secretHash) {
+    if (cred && cred.serviceUrl && cred.secret) {
       base = httpBaseFromServiceUrl(cred.serviceUrl);
-      token = cred.secretHash;
+      token = cred.secret;
       hasAddress.value = true;
     } else {
       try {

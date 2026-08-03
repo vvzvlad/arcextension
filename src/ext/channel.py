@@ -41,14 +41,15 @@ _FIRST_FRAME_TIMEOUT_S = 10
 # operator-facing pending list.
 _MAX_SUGGESTED_TITLE = 200
 _MAX_ORIGIN = 300
-# install_uuid (the enroll_requests PRIMARY KEY) and secret_hash (its NOT-NULL credential)
-# are written verbatim into the operator-facing pending list, so a hostile peer with a
-# valid window code must not stash megabytes there (§36). These are the LARGEST unbounded
-# fields, so they get their own ceilings. Unlike title/origin they are NOT truncated —
+# install_uuid (the enroll_requests PRIMARY KEY) and the raw secret (which the server
+# hashes into the NOT-NULL secret_hash credential) are the LARGEST unbounded fields a
+# hostile peer with a valid window code could stash in the operator-facing pending list
+# (§36), so they get their own ceilings. Unlike title/origin they are NOT truncated —
 # truncating a key or a credential silently corrupts identity — an overlength value is a
-# malformed frame (REJECT_PROTOCOL). A real sha256 is 64 hex chars, a real UUID 36.
+# malformed frame (REJECT_PROTOCOL). A real raw secret is 64 hex chars (32 bytes), a real
+# UUID 36; the cap stays generous.
 _MAX_INSTALL_UUID = 200
-_MAX_SECRET_HASH = 128
+_MAX_SECRET = 128
 
 
 def _now_ms() -> int:
@@ -211,16 +212,17 @@ async def _handle_enroll(
     if reason is None:
         # Structural check AFTER the code gate (so a wrong code never reveals whether the
         # frame was well-formed, and no row is written for a bad code): a row needs a
-        # non-blank install_uuid (its PRIMARY KEY) and a non-blank secret_hash (NOT NULL).
+        # non-blank install_uuid (its PRIMARY KEY) and a non-blank raw secret (which we
+        # hash into the NOT-NULL secret_hash below).
         install_uuid = msg.get("installUuid")
-        secret_hash = msg.get("secretHash")
+        raw_secret = msg.get("secret")
         if (
             not isinstance(install_uuid, str)
             or not install_uuid.strip()
             or len(install_uuid) > _MAX_INSTALL_UUID
-            or not isinstance(secret_hash, str)
-            or not secret_hash.strip()
-            or len(secret_hash) > _MAX_SECRET_HASH
+            or not isinstance(raw_secret, str)
+            or not raw_secret.strip()
+            or len(raw_secret) > _MAX_SECRET
         ):
             # Missing/blank OR overlength (§36: no megabytes in the operator-facing list).
             reason = protocol.REJECT_PROTOCOL
@@ -240,6 +242,9 @@ async def _handle_enroll(
 
     origin = _clamp(msg.get("origin"), _MAX_ORIGIN)
     suggested_title = _clamp(msg.get("title"), _MAX_SUGGESTED_TITLE)
+    # Hash the raw secret on receipt: only the sha256 is ever stored (option A). The
+    # /admin approve later copies this same secret_hash onto the instance row.
+    secret_hash = queries.sha256_hex(raw_secret)
     # Authoritative capacity gate: count + write under ONE transaction so racing enrolls
     # cannot overshoot enroll_max_pending (the pre-read above is only an early fast-path).
     accepted = await db.write(
@@ -280,18 +285,26 @@ async def _handle_hello(
 
     Returns ``(ConnState, resolved_instance_id)`` on success, else ``None`` (having sent
     a failing ``hello_ack`` and closed the socket). Authentication is by the per-install
-    SECRET: the client sends ``secretHash`` (sha256 of its secret); the channel resolves
-    it to an active ``instances`` row and takes the SERVER-assigned id from that row —
-    the client no longer self-reports a trusted instanceId.
+    SECRET: the client sends the RAW ``secret`` over TLS; the channel hashes it server-side
+    (:func:`queries.resolve_secret`) and matches the stored sha256, taking the
+    SERVER-assigned id from that row — the client no longer self-reports a trusted
+    instanceId, and the DB stores only the sha256, so a DB-only leak yields no usable
+    credential.
     """
-    secret_hash = msg.get("secretHash")
-    if not isinstance(secret_hash, str) or not secret_hash.strip():
-        # No usable secret => auth failure. No row to record against (unknown id).
+    raw_secret = msg.get("secret")
+    if (
+        not isinstance(raw_secret, str)
+        or not raw_secret.strip()
+        or len(raw_secret) > _MAX_SECRET
+    ):
+        # No usable secret (missing/blank, or oversized — a hostile peer must not make the
+        # server hash a multi-MB string; symmetric with the enroll cap) => auth failure.
+        # No row to record against (unknown id).
         await _reject(websocket, app, None, protocol.REJECT_AUTH)
         return None
 
     db = app.state.db
-    resolved = await db.read(lambda c: queries.resolve_secret(c, secret_hash))
+    resolved = await db.read(lambda c: queries.resolve_secret(c, raw_secret))
     if resolved is None:
         # The secret matches no instance at all — never approved, or deleted.
         await _reject(websocket, app, None, protocol.REJECT_UNKNOWN)

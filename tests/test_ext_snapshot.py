@@ -343,17 +343,43 @@ async def test_record_rejection_is_update_only_no_row_created(tmp_path):
         await db.close()
 
 
-async def test_resolve_secret_maps_hash_to_id_and_status(tmp_path):
+async def test_resolve_secret_hashes_raw_and_maps_to_id_and_status(tmp_path):
+    # Option A: resolve_secret takes the RAW secret and hashes it internally, matching the
+    # stored sha256. A row storing sha256(raw) resolves when presented the RAW secret.
     db = await _make_db(tmp_path)
+    raw = "raw-secret-a"
     try:
         await db.write(
             lambda c: c.execute(
-                "INSERT INTO instances (id, status, secret_hash) "
-                "VALUES ('a', 'active', 'H1')"
+                "INSERT INTO instances (id, status, secret_hash) VALUES ('a', 'active', ?)",
+                (queries.sha256_hex(raw),),
             )
         )
-        assert await db.read(lambda c: queries.resolve_secret(c, "H1")) == ("a", "active")
+        assert await db.read(lambda c: queries.resolve_secret(c, raw)) == ("a", "active")
         assert await db.read(lambda c: queries.resolve_secret(c, "nope")) is None
+    finally:
+        await db.close()
+
+
+async def test_resolve_secret_db_leak_resistance(tmp_path):
+    # DB-leak-resistance (option A): the DB stores only sha256(raw). Presenting the RAW
+    # secret authenticates; presenting the STORED sha256 value (what a DB leak would hand
+    # an attacker) hashes to something else and matches NOTHING — so a hash leak is not a
+    # usable credential.
+    db = await _make_db(tmp_path)
+    raw = "raw-secret-leak"
+    stored_hash = queries.sha256_hex(raw)
+    try:
+        await db.write(
+            lambda c: c.execute(
+                "INSERT INTO instances (id, status, secret_hash) VALUES ('leak', 'active', ?)",
+                (stored_hash,),
+            )
+        )
+        # The raw secret authenticates (server hashes it to the stored value).
+        assert await db.read(lambda c: queries.resolve_secret(c, raw)) == ("leak", "active")
+        # The stored hash presented AS the secret does not (it hashes to a different value).
+        assert await db.read(lambda c: queries.resolve_secret(c, stored_hash)) is None
     finally:
         await db.close()
 

@@ -21,7 +21,7 @@ from conftest import (
     approve_instance,
     instance_headers,
     make_settings,
-    secret_hash_for,
+    secret_for,
 )
 from starlette.testclient import TestClient
 
@@ -50,7 +50,7 @@ def _hello(instance_id="src", session="sess-1", **over):
     msg = {
         "type": "hello",
         "protocolVersion": 1,
-        "secretHash": secret_hash_for(instance_id),
+        "secret": secret_for(instance_id),
         "instanceId": instance_id,
         "installUuid": "uuid-A",
         "origin": "chrome-extension://abc",
@@ -554,12 +554,12 @@ def test_undo_copy_close_is_journaled_pending_then_done(tmp_path):
                 tab_id_to=77, session_id_to="sess-9", url="https://a/b", url_norm="https://a/b",
             )
             pool = ThreadPoolExecutor(1)
-            # Authenticate the undo as an instance (src's secretHash) so its rows are
+            # Authenticate the undo as an instance (src's RAW secret) so its rows are
             # attributed to 'user' — the value this test pins on the undo_close row.
             fut = pool.submit(
                 lambda: client.post(
                     "/api/passes/p1/undo",
-                    headers=instance_headers(secret_hash_for("src")),
+                    headers=instance_headers(secret_for("src")),
                     json={"confirm_impact": True},
                 )
             )

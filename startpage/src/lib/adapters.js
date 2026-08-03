@@ -137,9 +137,10 @@ export async function getIdentity(chromeApi) {
   }
 }
 
-// The /api base + Bearer come from the SW now (§7): the address setting + the instance
-// secretHash (slice C — the /api credential IS the secretHash). The raw secret never
-// leaves the SW. Returns { serviceUrl, secretHash } or null when the channel is down.
+// The /api base + Bearer come from the SW now (§7): the address setting + the RAW
+// instance secret (slice C / option A — the /api credential IS the raw secret; the server
+// hashes it on receipt). The raw secret crosses only SW->page in-process, then the TLS'd
+// /api call. Returns { serviceUrl, secret } or null when the channel is down.
 export async function getCredential(chromeApi) {
   try {
     return await chromeApi.runtime.sendMessage({ type: "get_credential" });

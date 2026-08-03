@@ -20,8 +20,8 @@
 import { PROTOCOL_VERSION } from "./constants.js";
 
 // Build the default environment from browser globals. Kept tiny; every capability
-// is overridable in tests. The crypto seam (randomBytes/sha256Hex) is here so vitest
-// can stub it and assert a KNOWN sha256 vector without Web Crypto in node.
+// is overridable in tests. The crypto seam (randomBytes) is here so vitest can stub it
+// without Web Crypto in node.
 export function chromeEnv() {
   return {
     // A bundle MAY still ship an instance.json with an optional serviceUrl default
@@ -48,14 +48,6 @@ export function chromeEnv() {
       const a = new Uint8Array(n);
       crypto.getRandomValues(a);
       return a;
-    },
-    // sha256(bytes) as lowercase hex — the ONLY thing derived from the secret that
-    // ever leaves the client (as `secretHash`).
-    sha256Hex: async (bytes) => {
-      const digest = await crypto.subtle.digest("SHA-256", bytes);
-      return [...new Uint8Array(digest)]
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
     },
     WebSocketImpl: WebSocket,
     now: () => Date.now(),
@@ -85,16 +77,11 @@ import {
 } from "./constants.js";
 import { dispatchCommand } from "./commands.js";
 
-// --- hex <-> bytes (secret is stored as hex; sha256 hashes the RAW 32 bytes) ----
+// --- bytes -> hex (the 32-byte secret is generated once and stored/sent as hex) ----
+// Option A: the RAW secret hex is what goes on the wire (over TLS) and is used as the
+// /api Bearer; the server hashes it. The client never derives a sha256 anymore.
 function bytesToHex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-function hexToBytes(hex) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i += 1) {
-    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
 }
 
 // The durable enroll facts, with defaults for a never-touched profile.
@@ -158,7 +145,6 @@ export class Connection {
     // learn approval — acc 5). In-memory only; the DURABLE requestPending fact survives.
     this._pendingEnrollCode = null;
     this._lastHelloWasPending = false; // which secret the last hello carried (§7 promote/discard)
-    this._hashCache = {}; // secretHex -> secretHash, so we hash each secret once
     // §6 `get_connection_state` facts. In memory for the life of THIS worker and
     // mirrored into storage.session so a resurrected worker still reports them.
     this.lastSeenAt = null; // when the service was last heard from (any frame)
@@ -253,17 +239,11 @@ export class Connection {
     return await this._readSecretHex(INSTANCE_SECRET_PENDING_KEY);
   }
 
-  async _hashOf(secretHex) {
-    if (this._hashCache[secretHex]) return this._hashCache[secretHex];
-    const hash = await this.env.sha256Hex(hexToBytes(secretHex));
-    this._hashCache[secretHex] = hash;
-    return hash;
-  }
-
-  // secretHash to put on the wire, or null when there is no secret (needs-enroll).
-  async _secretHash() {
-    const hex = await this._activeSecretHex();
-    return hex ? await this._hashOf(hex) : null;
+  // The RAW secret hex to use as the /api Bearer, or null when there is no secret
+  // (needs-enroll). Option A: the client sends the raw secret (over TLS); the server
+  // hashes it. This is the SAME value the hello frame carries.
+  async _apiSecret() {
+    return await this._activeSecretHex();
   }
 
   // Compute the enroll state from DURABLE facts only (§7). Order is load-bearing:
@@ -445,7 +425,7 @@ export class Connection {
 
   // Decide the OPENING frame for a freshly opened socket (§7): an enroll_request when
   // the operator has just submitted a code (and we are not already approved), else a
-  // hello authenticated by the secretHash. A hello with no secret (needs-enroll,
+  // hello authenticated by the RAW secret. A hello with no secret (needs-enroll,
   // no code) sends nothing — the socket was opened only because a code is pending.
   async _sendOpening() {
     const facts = await this._loadEnrollFacts();
@@ -510,19 +490,20 @@ export class Connection {
   }
 
   // enroll_request (§2) for the secret under `secretKey`: {type, protocolVersion,
-  // installUuid, code, secretHash, suggestedTitle}. The server reads the browser name
-  // from `title` (src/ext/channel.py `_handle_enroll`), so we send BOTH `suggestedTitle`
-  // (the documented frame field) and `title` (what the wire contract consumes).
+  // installUuid, code, secret, suggestedTitle}. Option A: the RAW secret hex goes on the
+  // wire (over TLS) and the SERVER hashes it into the stored secret_hash. The server reads
+  // the browser name from `title` (src/ext/channel.py `_handle_enroll`), so we send BOTH
+  // `suggestedTitle` (the documented frame field) and `title` (what the wire contract
+  // consumes).
   async _sendEnrollRequest(secretKey, code) {
-    const hex = await this._readSecretHex(secretKey);
-    const secretHash = hex ? await this._hashOf(hex) : null;
+    const secret = await this._readSecretHex(secretKey);
     const suggestedTitle = await this._suggestedTitle();
     this._send({
       type: "enroll_request",
       protocolVersion: PROTOCOL_VERSION,
       installUuid: this.installUuid,
       code,
-      secretHash,
+      secret,
       suggestedTitle,
       title: suggestedTitle,
       origin: await this._origin(),
@@ -531,19 +512,19 @@ export class Connection {
 
   // hello (§2/§7) authenticated by the secret under `secretKey`. The shared `token` is
   // GONE and the client no longer self-reports a trusted `instanceId` — the server
-  // resolves the id from the secret (slice B). `_lastHelloWasPending` records WHICH
-  // secret this hello carried so _onApproved knows whether a subsequent ok:true means
-  // "the re-enrolled secret was approved" (promote) or "the old secret recovered"
-  // (discard the moot re-enroll). A hello with no secret is a no-op (nothing to say).
+  // hashes the RAW secret and resolves the id from it (slice B / option A).
+  // `_lastHelloWasPending` records WHICH secret this hello carried so _onApproved knows
+  // whether a subsequent ok:true means "the re-enrolled secret was approved" (promote) or
+  // "the old secret recovered" (discard the moot re-enroll). A hello with no secret is a
+  // no-op (nothing to say).
   async _sendHello(secretKey = INSTANCE_SECRET_KEY) {
-    const hex = await this._readSecretHex(secretKey);
-    if (!hex) return; // needs-enroll: no secret to authenticate with
-    const secretHash = await this._hashOf(hex);
+    const secret = await this._readSecretHex(secretKey);
+    if (!secret) return; // needs-enroll: no secret to authenticate with
     this._lastHelloWasPending = secretKey === INSTANCE_SECRET_PENDING_KEY;
     this._send({
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
-      secretHash,
+      secret,
       installUuid: this.installUuid,
       origin: await this._origin(),
       title: await this._suggestedTitle(),
@@ -618,7 +599,6 @@ export class Connection {
         quarantined: false,
         lastVerdict: VERDICT_REVOKED,
       });
-      this._hashCache = {};
       this._pendingEnrollCode = null;
       return;
     }
