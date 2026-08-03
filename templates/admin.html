@@ -10,6 +10,12 @@
 <body>
   <header class="topbar">
     <h1>Curator admin</h1>
+    <!-- Running build revision. Substituted SERVER-SIDE (src/api/admin_page.py) from the
+         BUILD_REVISION baked into the image: no fetch, no JS, so it is on screen even when
+         every API call on this page is failing — which is exactly the moment one needs to
+         know whether the console is talking to new code or old. "unknown" = a build that
+         carries no revision (a local run). -->
+    <code id="build-revision" class="muted" title="running build revision">__BUILD_REVISION__</code>
     <button id="logout" type="button">Log out</button>
   </header>
 

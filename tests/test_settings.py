@@ -152,6 +152,42 @@ def test_restore_marker_path_defaults_to_unset(monkeypatch):
     assert Settings(_env_file=None).restore_marker_path == "/app/state/restore-marker"
 
 
+# --- build identity: stamped by the image build, honest when it is not -------
+def test_build_revision_comes_from_the_build_and_defaults_to_unknown(monkeypatch):
+    """BUILD_REVISION is baked by the Dockerfile (`ARG` -> `ENV`, fed by CI from
+    `github.sha`); unset, it must be the word "unknown" and must NOT stop the service.
+
+    The two halves are the whole contract. Unset has to keep working — a local `make run`
+    has no sha to bake, and a build identity is not worth refusing to start over (unlike
+    the tokens, where a missing value is a security hole). Set has to come through
+    verbatim — a revision that is mangled is worse than none, because it is believed.
+    """
+    _base_env(monkeypatch)
+    monkeypatch.delenv("BUILD_REVISION", raising=False)
+    assert Settings(_env_file=None).build_revision == "unknown"
+
+    monkeypatch.setenv("BUILD_REVISION", "0f2c9a1b3d4e5f60718293a4b5c6d7e8f9012345")
+    assert (
+        Settings(_env_file=None).build_revision
+        == "0f2c9a1b3d4e5f60718293a4b5c6d7e8f9012345"
+    )
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_blank_build_revision_reads_as_unknown_not_as_an_empty_string(monkeypatch, value):
+    """A build that declared the ARG but received no value yields `ENV BUILD_REVISION=`.
+
+    That must normalize to the same "unknown" an unset variable gives: `"revision": ""` on
+    /healthz reads as a broken endpoint, and a reader who cannot tell "no revision" from
+    "the endpoint is buggy" is back to guessing — which is the failure this field exists to
+    end. Not a startup failure either: the blank case is a build-pipeline slip, and
+    refusing to start would turn a missing label into an outage.
+    """
+    _base_env(monkeypatch)
+    monkeypatch.setenv("BUILD_REVISION", value)
+    assert Settings(_env_file=None).build_revision == "unknown"
+
+
 # --- enrollment knobs: bounds, not silent subsystem switches -----------------
 @pytest.mark.parametrize(
     "var,value,why",

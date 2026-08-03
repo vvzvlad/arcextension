@@ -72,8 +72,24 @@ __all__ = ["create_app", "healthz", "require_operational"]
 
 
 async def healthz(request: Request) -> JSONResponse:
-    # Liveness ONLY — never reflect curation/migration health here (§12).
-    return JSONResponse({"status": "ok"})
+    """``GET /healthz`` — liveness, plus the identity of the running build.
+
+    Liveness ONLY — never reflect curation/migration health here (§12): the status stays
+    ``ok`` and the code stays 200 in degraded mode, or an orchestrator would stop routing
+    to a container that is merely unhappy.
+
+    ``revision`` is NOT a health signal and does not change that contract. It is the image
+    build identity (``BUILD_REVISION``, baked by the Dockerfile — see src/settings.py), a
+    constant string read from settings, so the status code, the body's shape for a
+    ``curl -f`` probe and the cost of the call are exactly what they were. It lives HERE,
+    on the one route that is public and already polled, because the question it answers —
+    "is the code broken, or is the container still running yesterday's code?" — is asked
+    precisely when credentials are one obstacle too many, and /metrics (METRICS_TOKEN) and
+    /admin (ADMIN_TOKEN) both charge one. Nothing but the build id is disclosed.
+    """
+    return JSONResponse(
+        {"status": "ok", "revision": request.app.state.settings.build_revision}
+    )
 
 
 async def _http_exception(request: Request, exc: HTTPException) -> Response:

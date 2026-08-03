@@ -59,6 +59,10 @@ _DEFAULTS: dict = {
     "enroll_window_min": 10,
     "enroll_preauth_max": 128,
     "admin_session_ttl_min": 720,
+    # Build identity, baked into the image at build time (src/settings.py). "unknown" is
+    # what an un-stamped build reports, and it is the right default here: a test that
+    # cares about the revision passes its own.
+    "build_revision": "unknown",
 }
 
 # Parked far beyond any test's lifetime. ``src.app._curator_driver`` sleeps this long

@@ -138,11 +138,18 @@ jobs:
           echo "tags=ghcr.io/${{ github.repository }}:develop" >> "$GITHUB_OUTPUT"
         fi
 
+    # BUILD_REVISION is the ONE thing the deployed container cannot work out for itself
+    # (no git, no repo inside the image), so it is stamped here, from the commit this run
+    # is building. The image then reports it on /healthz and in the /admin console, which
+    # is what makes "the code is broken" distinguishable from "watchtower has not pulled
+    # the new image yet" — the two failures look identical otherwise. The `:develop` tag is
+    # reused on every push, so the tag itself identifies nothing.
     - name: Build the Docker image
       run: |
         tag_args=""
         for tag in ${{ steps.tags.outputs.tags }}; do tag_args="$tag_args --tag $tag"; done
-        docker build . --file Dockerfile $tag_args
+        docker build . --file Dockerfile \
+          --build-arg BUILD_REVISION=${{ github.sha }} $tag_args
 
     - name: Push Docker images
       run: |

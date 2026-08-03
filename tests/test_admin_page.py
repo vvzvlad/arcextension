@@ -703,3 +703,59 @@ def test_assets_public_with_csp(tmp_path):
             csp = r.headers["content-security-policy"]
             assert "default-src 'none'" in csp
             assert "script-src 'self'" in csp
+
+
+# --- build revision on the console page --------------------------------------
+def test_console_shows_the_running_build_revision(tmp_path):
+    """The authenticated console states which revision it is running, IN THE HTML.
+
+    Server-side substitution, not a `fetch` from app.js: the page must answer "is this the
+    new code?" even when every JSON call behind it is failing — which is exactly when the
+    question gets asked. Reddens if the placeholder stops being replaced (a literal
+    `__BUILD_REVISION__` on screen) or if the value is dropped.
+    """
+    app = create_app_for(tmp_path, build_revision="0f2c9a1b3d4e5f6071")
+    with _tc(app) as client:
+        r = client.get("/admin", headers=admin_headers())
+        assert r.status_code == 200
+        assert "0f2c9a1b3d4e5f6071" in r.text
+        assert "__BUILD_REVISION__" not in r.text
+
+
+def test_console_says_unknown_for_an_unstamped_build(tmp_path):
+    """A build with no revision renders the word, never an empty element — the same
+    "unknown" /healthz reports. An empty slot reads as a broken page, not as a missing
+    stamp."""
+    app = create_app_for(tmp_path, build_revision="unknown")
+    with _tc(app) as client:
+        r = client.get("/admin", headers=admin_headers())
+        assert r.status_code == 200
+        assert "unknown" in r.text
+        assert "__BUILD_REVISION__" not in r.text
+
+
+def test_console_escapes_the_revision_it_renders(tmp_path):
+    """The revision is interpolated into HTML, so it is escaped where it is interpolated.
+
+    The value comes from an environment variable stamped by OUR image build, so this is not
+    a live threat — it is the guard that keeps it from becoming one if that ever stops being
+    true (a hand-built image, an operator who set BUILD_REVISION by hand). Reddens if the
+    substitution is switched to a raw splice.
+    """
+    app = create_app_for(tmp_path, build_revision="<script>alert(1)</script>")
+    with _tc(app) as client:
+        r = client.get("/admin", headers=admin_headers())
+        assert r.status_code == 200
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in r.text
+
+
+def test_the_revision_is_not_leaked_on_the_public_login_page(tmp_path):
+    """GET /admin/login is PUBLIC; the console page is not. The revision belongs on the
+    gated page (and on /healthz, which is a deliberate, documented disclosure) — it must not
+    quietly appear on the login form as a side effect of touching the template pipeline."""
+    app = create_app_for(tmp_path, build_revision="0f2c9a1b3d4e5f6071")
+    with _tc(app) as client:
+        r = client.get("/admin/login")
+        assert r.status_code == 200
+        assert "0f2c9a1b3d4e5f6071" not in r.text

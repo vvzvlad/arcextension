@@ -8,6 +8,10 @@ enrollment window entirely through SAME-ORIGIN ``fetch`` calls against the JSON 
 data is templated into the HTML — the assets are static and contain NO secrets, hence they
 are served WITHOUT the auth guard.
 
+The single exception is the build revision (:func:`_console_html`): one process-constant,
+already public on ``/healthz``, substituted into ``admin.html`` at serve time so the
+console can state which code it is running without a request that could itself fail.
+
 Security posture:
 
 * **CSP by explicit header** (:data:`_CSP`) on every HTML/asset response: ``default-src
@@ -25,6 +29,7 @@ Security posture:
 
 from __future__ import annotations
 
+import html
 import secrets
 from functools import lru_cache
 from pathlib import Path
@@ -119,21 +124,52 @@ def _asset_bytes(name: str) -> bytes:
     return (_TEMPLATES_DIR / name).read_bytes()
 
 
-def _asset_response(name: str, media_type: str) -> Response:
+def _asset_response(name: str, media_type: str, content: bytes | None = None) -> Response:
     """A static asset/HTML response carrying the framing-defense headers. NOT auth-gated
     (no secrets). ``X-Frame-Options: DENY`` backs up ``frame-ancestors 'none'`` for any
     client that predates CSP framing directives — belt-and-suspenders against clickjacking.
     ``X-Content-Type-Options: nosniff`` is added for every /admin response (JSON included) by
     :class:`AdminSecurityHeadersMiddleware`, so it is not repeated here.
+
+    ``content`` overrides the file bytes for the one template that is not served verbatim
+    (:func:`_console_html`); ``name`` still names the source file so the two stay tied.
     """
     return Response(
-        content=_asset_bytes(name),
+        content=_asset_bytes(name) if content is None else content,
         media_type=media_type,
         headers={
             "Content-Security-Policy": _CSP,
             "X-Frame-Options": "DENY",
         },
     )
+
+
+# The single placeholder in templates/admin.html, replaced at serve time by the running
+# build revision. Deliberately NOT a templating engine and NOT data-from-the-DB: the
+# console keeps its "the HTML holds no data, it fetches everything" property (see the
+# module docstring), and this one substitution is a process-CONSTANT that is already public
+# on /healthz.
+_REVISION_PLACEHOLDER = b"__BUILD_REVISION__"
+
+
+@lru_cache(maxsize=1)
+def _console_html(revision: str) -> bytes:
+    """``templates/admin.html`` with the build revision substituted in.
+
+    Server-side substitution rather than a ``fetch`` from ``app.js``: it costs the page no
+    request at all, and — the actual point — it puts the revision on screen even when the
+    JSON API behind this console is refusing every call. A console that can only tell you
+    which code it runs while that code is working is useless for the one question it is
+    there to answer.
+
+    ``html.escape`` because the value reaches here from an environment variable: it is OUR
+    build stamping it (Dockerfile ``ARG``/``ENV``), so this is not a live threat, but a
+    value that lands inside an element must be escaped where it is interpolated — not
+    somewhere up the chain where the next caller will forget. Cached (``maxsize=1``): the
+    revision never changes within a process, so this runs once per start.
+    """
+    escaped = html.escape(revision, quote=False).encode("utf-8")
+    return _asset_bytes("admin.html").replace(_REVISION_PLACEHOLDER, escaped)
 
 
 def _cookie_ttl_seconds(request: Request) -> int:
@@ -218,7 +254,10 @@ async def admin_page(request: Request) -> Response:
         if exc.status_code != 401 or _bearer_token(request) is not None:
             raise
         return RedirectResponse(_LOGIN_PATH, status_code=303)
-    return _asset_response("admin.html", "text/html; charset=utf-8")
+    revision = request.app.state.settings.build_revision
+    return _asset_response(
+        "admin.html", "text/html; charset=utf-8", _console_html(revision)
+    )
 
 
 async def login_page(request: Request) -> Response:

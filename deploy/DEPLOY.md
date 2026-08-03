@@ -60,6 +60,38 @@ A plain rolling pull (stop old → start new; or watchtower's default) is correc
 The short healthcheck `interval`/`start_period` in `docker-compose.yml` exists so
 Traefik re-routes to the new container quickly (see the comment there).
 
+### Which revision is running — ask `/healthz` FIRST
+
+Because the deploy is "watchtower pulls `:develop` whenever it likes", the tag names
+nothing: `:develop` today and `:develop` yesterday are different images. So when a
+button does nothing, there are **two** candidate causes that look identical in the
+logs — *the code is broken* and *the new code is not deployed yet* — and separating
+them is step zero of every diagnosis, before reading a single log line:
+
+```bash
+curl -s https://<host>/healthz
+# {"status":"ok","revision":"0f2c9a1b3d4e5f60718293a4b5c6d7e8f9012345"}
+
+git rev-parse HEAD        # ...the same sha? then you are looking at your code.
+```
+
+- **No token needed** — `/healthz` is the one unauthenticated route (§4 below), which
+  is the point: a diagnostic that first asks for a credential is one that does not get
+  used at 2am. Nothing but the build id is disclosed.
+- **The same string is in the `/admin` console**, top right, rendered into the page
+  itself (no API call) — so it is readable even when the console's own JSON calls are
+  failing.
+- **`revision: "unknown"`** means the image was built without the stamp (a hand-rolled
+  `docker build` with no `--build-arg`, or a local `make run`). It is not an error, but
+  from a ghcr image it means CI did not build it — treat the container as unidentified.
+- **Without HTTP at all** (the container will not start): the same value is the standard
+  OCI label — `docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' curator`.
+
+The value is baked at IMAGE BUILD time (`Dockerfile`: `ARG BUILD_REVISION` → `ENV`, fed
+by CI from `github.sha`). **Do not set `BUILD_REVISION` in compose or `.env`** — there is
+nothing to configure, and a hand-set value makes the service report a revision it is not
+running, which is strictly worse than reporting none.
+
 ---
 
 ## 3. Private network — NOT reachable from the public internet (§12)

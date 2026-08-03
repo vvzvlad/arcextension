@@ -18,6 +18,12 @@ from src.config_errors import load_settings_or_exit
 # a value above the clamp would be silently reduced at arm time, i.e. config that lies.
 from src.curator.enroll import ENROLL_WINDOW_MAX_MIN
 
+# What ``build_revision`` says when the image was built without a revision (a local
+# `make run`, a hand-rolled `docker build` with no `--build-arg`). A word, never an empty
+# string: "unknown" is an answer ("this build cannot tell you"), "" reads as a bug in
+# whoever printed it.
+UNKNOWN_REVISION = "unknown"
+
 
 class Settings(BaseSettings):
     # --- Required tokens: no default; missing OR empty/blank fails at startup ---
@@ -109,6 +115,37 @@ class Settings(BaseSettings):
     backup_dir: str = "data/backups"
     host: str = "0.0.0.0"
     port: int = 8000
+
+    # --- Build identity (NOT a knob) --------------------------------------------
+    # WHICH REVISION IS RUNNING. The service is deployed as a ghcr image and updated by
+    # watchtower, so «кнопка не работает» has two indistinguishable causes — the code is
+    # broken, or the code is still the old one — and neither the logs nor /healthz used to
+    # separate them. This field is that separator, and it is reported by /healthz (public,
+    # no token) and printed in the /admin console.
+    #
+    # It is set ONCE, BY THE IMAGE BUILD: `Dockerfile` declares `ARG BUILD_REVISION` and
+    # bakes it into an `ENV`, CI passes `--build-arg BUILD_REVISION=${{ github.sha }}`.
+    # It cannot be computed at runtime — the container has no git and no repository — and
+    # deriving it from the working tree would describe the CHECKOUT, not the deployed
+    # image, i.e. it would lie exactly when it matters.
+    #
+    # DO NOT set BUILD_REVISION in `.env` or in docker-compose. It is read from the
+    # environment only because that is how the Dockerfile bakes it in; an operator-supplied
+    # value makes the service claim a revision it is not running, which is worse than
+    # having none at all.
+    #
+    # No default/no-start rule here (unlike the tokens): a local `make run` has no sha to
+    # bake and must still start, so the default is the honest :data:`UNKNOWN_REVISION`.
+    build_revision: str = UNKNOWN_REVISION
+
+    @field_validator("build_revision")
+    @classmethod
+    def _blank_revision_is_unknown(cls, v: str) -> str:
+        # A build that declared the ARG but got no value produces `ENV BUILD_REVISION=`,
+        # i.e. an empty string — which would surface as `"revision": ""` and read as a bug
+        # in the endpoint rather than as "this build has no revision". Normalize it (and a
+        # whitespace-only value) to the same word an unset variable gives.
+        return v.strip() or UNKNOWN_REVISION
 
     @field_validator("metrics_token", "admin_token")
     @classmethod
