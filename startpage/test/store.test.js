@@ -796,18 +796,64 @@ describe("enroll status banner (§7)", () => {
   it("acc 13: a fresh profile with NO address shows 'адрес не настроен'", async () => {
     const env = makeChrome({
       tabs: [],
+      credential: null, // nothing enrolled: the SW has no address and no secret
       messages: {
         get_identity: { instanceId: "me" },
         get_connection_state: { enrollState: "needs-enroll", hasAddress: false },
-        // get_credential absent -> null
       },
     });
-    // instance.json carries no serviceUrl either, so the fallback cannot set an address.
     const { fetchFn } = makeFetch({ instance: {}, state: undefined });
     const store = storeWith(env, fetchFn);
     await store.init();
     expect(store.hasAddress.value).toBe(false);
     expect(store.enrollStatus.value).toEqual({ state: "no-address", label: "адрес не настроен" });
+  });
+
+  it("a bundled instance.json serviceUrl can NO LONGER fake 'address configured'", async () => {
+    // The old fallback set hasAddress from `config.serviceUrl` (and took a `config.token`
+    // that has not existed since the shared token was removed). A fleet bundle shipping a
+    // bootstrap address therefore switched the "адрес не настроен" banner OFF on profiles
+    // that had no secret and could talk to nobody. hasAddress now comes from the SW alone.
+    const env = makeChrome({
+      tabs: [],
+      credential: null,
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: { enrollState: "needs-enroll", hasAddress: false },
+      },
+    });
+    // instance.json DOES carry a serviceUrl (and even a legacy token) — it must not matter.
+    const { fetchFn, counts } = makeFetch({
+      instance: { serviceUrl: "wss://bundled.example/", token: "legacy" },
+      state: undefined,
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    expect(store.hasAddress.value).toBe(false);
+    expect(store.enrollStatus.value.state).toBe("no-address");
+    expect(counts.instance).toBeUndefined(); // the page does not even read the file
+  });
+
+  it("a REFUSED address is named, not reported as 'not configured'", async () => {
+    // The SW speaks wss:// only (loopback ws:// aside) because the raw secret rides that
+    // connection. "адрес не настроен" over a field the operator visibly filled in sends
+    // them looking in the wrong place.
+    const env = makeChrome({
+      tabs: [],
+      credential: null,
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: {
+          enrollState: "needs-enroll",
+          hasAddress: false,
+          addressError: "insecure",
+        },
+      },
+    });
+    const store = storeWith(env, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+    expect(store.enrollStatus.value.state).toBe("bad-address");
+    expect(store.enrollStatus.value.label).toMatch(/wss:\/\//);
   });
 
   it("shows 'ожидает одобрения' from the SW enrollState (pending)", async () => {
@@ -834,6 +880,31 @@ describe("enroll status banner (§7)", () => {
     const store = storeWith(env, makeFetch({}).fetchFn);
     await store.init();
     expect(store.enrollStatus.value.label).toBe("заявка отклонена: bad_code");
+  });
+
+  it("a QUARANTINED instance whose re-registration was rejected shows why, and that a new code is needed", async () => {
+    // getEnrollState resolves `quarantined` before `pending` (the old secret is still
+    // active), so this instance NEVER reports `pending` — a reject shown only under
+    // `pending` is invisible exactly here. And here there is no self-healing: the terminal
+    // reject wiped the staged code, so the probe stops asking and the banner would sit on
+    // "требуется повторная регистрация" while the operator waits for an approval that no
+    // request exists for.
+    const env = makeChrome({
+      tabs: [],
+      messages: {
+        get_identity: { instanceId: "me" },
+        get_connection_state: {
+          enrollState: "quarantined",
+          hasAddress: true,
+          enrollReject: "bad_code",
+        },
+      },
+    });
+    const store = storeWith(env, makeFetch({}).fetchFn);
+    await store.init();
+    expect(store.enrollStatus.value.state).toBe("quarantined");
+    expect(store.enrollStatus.value.label).toContain("заявка отклонена: bad_code");
+    expect(store.enrollStatus.value.label).toContain("новый код");
   });
 
   it("shows 'отозван' from the SW enrollState (revoked)", async () => {

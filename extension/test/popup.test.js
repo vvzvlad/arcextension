@@ -7,11 +7,18 @@ import {
   init,
 } from "../pages/popup.js";
 
-const CONFIG = {
-  instanceId: "prox",
-  title: "Prox",
-  serviceUrl: "wss://host.example/",
-  token: "the-token",
+// The popup's context comes from the SERVICE WORKER only (§7): the validated address,
+// the RAW instance secret as the /api Bearer, and the SERVER-assigned id. There is no
+// instance.json credential anywhere in the model, so the fake SW is the whole source.
+const SW_RUNTIME = {
+  getURL: (p) => "chrome-extension://mock/" + p,
+  sendMessage: async (msg) => {
+    if (msg.type === "get_credential") {
+      return { serviceUrl: "wss://host.example/", secret: "the-secret" };
+    }
+    if (msg.type === "get_identity") return { instanceId: "prox", title: "Prox" };
+    return null;
+  },
 };
 
 // --- pure helpers -----------------------------------------------------------
@@ -105,7 +112,10 @@ function routedFetch(preview, save) {
   let saveCalls = 0;
   const fetchFn = vi.fn(async (url, opts) => {
     calls.push({ url, opts });
-    if (url.endsWith("instance.json")) return { json: async () => ({ ...CONFIG }) };
+    if (url.endsWith("instance.json")) {
+      // The popup must never read instance.json again: it carries no token and no id.
+      throw new Error("instance.json must not be fetched by the popup");
+    }
     if (url.endsWith("/api/rules/preview")) {
       if (preview instanceof Error) throw preview;
       return { json: async () => preview };
@@ -124,8 +134,8 @@ describe("init: build -> preview -> save", () => {
   it("builds the <origin>/* rule for THIS instance, previews it, and saves on click", async () => {
     const doc = fakeDoc();
     const chromeApi = {
-      runtime: { getURL: (p) => "chrome-extension://mock/" + p },
-      tabs: { query: async () => [{ id: 1, url: "https://borneo.lc/dashboard" }] },
+      runtime: SW_RUNTIME,
+      tabs: { query: async () => [{ id: 1, url:"https://borneo.lc/dashboard" }] },
     };
     const preview = {
       relocations: 3,
@@ -166,8 +176,8 @@ describe("init: build -> preview -> save", () => {
   it("a 409 shows the server's impact and only a SECOND click confirms it", async () => {
     const doc = fakeDoc();
     const chromeApi = {
-      runtime: { getURL: (p) => "chrome-extension://mock/" + p },
-      tabs: { query: async () => [{ id: 1, url: "https://borneo.lc/dashboard" }] },
+      runtime: SW_RUNTIME,
+      tabs: { query: async () => [{ id: 1, url:"https://borneo.lc/dashboard" }] },
     };
     const { fetchFn, calls } = routedFetch({ relocations: 3, closures: 1 }, (n) =>
       n === 1
@@ -207,8 +217,8 @@ describe("init: build -> preview -> save", () => {
     // saw. The next click would then send confirm_impact:true blind.
     const doc = fakeDoc();
     const chromeApi = {
-      runtime: { getURL: (p) => "chrome-extension://mock/" + p },
-      tabs: { query: async () => [{ id: 1, url: "https://borneo.lc/x" }] },
+      runtime: SW_RUNTIME,
+      tabs: { query: async () => [{ id: 1, url:"https://borneo.lc/x" }] },
     };
     const { fetchFn, calls } = routedFetch({ relocations: 3, closures: 1 }, () => ({
       status: 409,
@@ -233,8 +243,8 @@ describe("init: build -> preview -> save", () => {
     // button disabled forced the human to close and reopen the popup.
     const doc = fakeDoc();
     const chromeApi = {
-      runtime: { getURL: (p) => "chrome-extension://mock/" + p },
-      tabs: { query: async () => [{ id: 1, url: "https://borneo.lc/x" }] },
+      runtime: SW_RUNTIME,
+      tabs: { query: async () => [{ id: 1, url:"https://borneo.lc/x" }] },
     };
     const { fetchFn } = routedFetch({ relocations: 0, closures: 0 }, (n) =>
       n === 1
@@ -256,8 +266,8 @@ describe("init: build -> preview -> save", () => {
   it("a thrown save disarms BOTH the flag and the button label", async () => {
     const doc = fakeDoc();
     const chromeApi = {
-      runtime: { getURL: (p) => "chrome-extension://mock/" + p },
-      tabs: { query: async () => [{ id: 1, url: "https://borneo.lc/x" }] },
+      runtime: SW_RUNTIME,
+      tabs: { query: async () => [{ id: 1, url:"https://borneo.lc/x" }] },
     };
     let n = 0;
     const { fetchFn, calls } = routedFetch({ relocations: 2, closures: 0 }, () => {
@@ -284,8 +294,8 @@ describe("init: build -> preview -> save", () => {
     // server's 409 is what surfaces the impact.
     const doc = fakeDoc();
     const chromeApi = {
-      runtime: { getURL: (p) => "chrome-extension://mock/" + p },
-      tabs: { query: async () => [{ id: 1, url: "https://borneo.lc/dashboard" }] },
+      runtime: SW_RUNTIME,
+      tabs: { query: async () => [{ id: 1, url:"https://borneo.lc/dashboard" }] },
     };
     const { fetchFn, calls } = routedFetch(new Error("preview down"), (n) =>
       n === 1
@@ -308,8 +318,8 @@ describe("init: build -> preview -> save", () => {
   it("disables save when the tab cannot become a rule (non-http)", async () => {
     const doc = fakeDoc();
     const chromeApi = {
-      runtime: { getURL: (p) => "chrome-extension://mock/" + p },
-      tabs: { query: async () => [{ id: 1, url: "chrome://settings" }] },
+      runtime: SW_RUNTIME,
+      tabs: { query: async () => [{ id: 1, url:"chrome://settings" }] },
     };
     const { fetchFn } = routedFetch({ relocations: 0, closures: 0 });
     await init(doc, chromeApi, fetchFn);
@@ -318,7 +328,7 @@ describe("init: build -> preview -> save", () => {
   });
 });
 
-// --- §7: the popup prefers the SW credential (raw secret Bearer) over instance.json ---
+// --- §7: the SW is the ONLY credential source; there is no instance.json fallback ----
 describe("loadPopupContext (§7)", () => {
   it("uses get_credential + get_identity from the SW (the RAW secret is the /api Bearer)", async () => {
     const { loadPopupContext } = await import("../pages/popup.js");
@@ -332,14 +342,16 @@ describe("loadPopupContext (§7)", () => {
         },
       },
     };
-    // fetch must NOT be consulted when the SW answers.
-    const fetchFn = vi.fn();
-    const ctx = await loadPopupContext(chromeApi, fetchFn);
+    const ctx = await loadPopupContext(chromeApi);
     expect(ctx).toEqual({ base: "https://curator", token: "raw-abc", instanceId: "srv-7" });
-    expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it("falls back to instance.json when the SW has no credential yet", async () => {
+  it("REFUSES (with a reason) instead of falling back to instance.json fields that no longer exist", async () => {
+    // The old fallback read `config.token` / `config.instanceId`. Neither field exists in
+    // any bundle under enrollment, so it could only build `{token: undefined,
+    // instanceId: undefined}` — a rule targeted at `undefined`, saved with no credential,
+    // i.e. a guaranteed 401 presented to the human as a working popup. Reverting to a
+    // fallback reddens this.
     const { loadPopupContext } = await import("../pages/popup.js");
     const chromeApi = {
       runtime: {
@@ -347,9 +359,49 @@ describe("loadPopupContext (§7)", () => {
         sendMessage: async () => null, // SW channel empty (pre-enrollment)
       },
     };
-    const fetchFn = vi.fn(async () => ({ json: async () => ({ serviceUrl: "wss://host.example/", token: "tok", instanceId: "prox" }) }));
-    const ctx = await loadPopupContext(chromeApi, fetchFn);
-    expect(ctx).toEqual({ base: "https://host.example", token: "tok", instanceId: "prox" });
-    expect(fetchFn).toHaveBeenCalled();
+    await expect(loadPopupContext(chromeApi)).rejects.toThrow(/service address/i);
+  });
+
+  it("names the not-enrolled-yet case when the address is set but there is no secret/id", async () => {
+    const { loadPopupContext } = await import("../pages/popup.js");
+    const chromeApi = {
+      runtime: {
+        getURL: (p) => "chrome-extension://mock/" + p,
+        sendMessage: async (msg) =>
+          msg.type === "get_credential" ? { serviceUrl: "wss://curator/", secret: null } : null,
+      },
+    };
+    await expect(loadPopupContext(chromeApi)).rejects.toThrow(/not enrolled/i);
+  });
+
+  it("tells a REFUSED address apart from an absent one", async () => {
+    // The TLS gate resolves a refused address to null, exactly like an unset one, so the
+    // popup used to tell an operator who had typed `ws://host` that no address was
+    // configured — over a field they had filled in. `addressError` is what separates the
+    // two, and this is the third surface to read it (options + startpage already do).
+    // Reddens if get_credential stops carrying it or the popup stops branching on it.
+    const { loadPopupContext } = await import("../pages/popup.js");
+    const chromeApi = {
+      runtime: {
+        getURL: (p) => "chrome-extension://mock/" + p,
+        sendMessage: async (msg) =>
+          msg.type === "get_credential"
+            ? { serviceUrl: null, addressError: "insecure", secret: "raw-abc" }
+            : null,
+      },
+    };
+    await expect(loadPopupContext(chromeApi)).rejects.toThrow(/refused/i);
+    await expect(loadPopupContext(chromeApi)).rejects.toThrow(/insecure/);
+    // …and the ABSENT case still says "not configured", not "refused".
+    const unset = {
+      runtime: {
+        getURL: (p) => "chrome-extension://mock/" + p,
+        sendMessage: async (msg) =>
+          msg.type === "get_credential"
+            ? { serviceUrl: null, addressError: null, secret: null }
+            : null,
+      },
+    };
+    await expect(loadPopupContext(unset)).rejects.toThrow(/no service address is configured/i);
   });
 });

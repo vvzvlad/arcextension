@@ -166,7 +166,10 @@ class Snapshot:
     # Default False, and that default is the answer for a brand-new install: "no pass has
     # looked at the marker yet" is not "the marker is broken" (§12).
     restore_marker_unreadable: bool = False
-    main_never_seen: bool = True
+    # "MAIN cannot serve as the stock branch" — see the query in ``_collect``. Named for
+    # what it MEANS rather than for the exported metric (whose name is kept for the alert
+    # rule): a revoked MAIN has been seen plenty and is still unusable.
+    main_unusable: bool = True
 
 
 def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
@@ -238,8 +241,23 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
             except (TypeError, ValueError):
                 snap.deferred[key] = snap.deferred.get(key, 0)
 
+    # ACTIVE instances only (issue #35 §6: the status filter belongs in BOTH read
+    # surfaces or neither — ``rules.access.known_instance_ids`` and
+    # ``rules.preview.load_preview_input`` already carry it, and ``db.state`` now does too).
+    #
+    # This one is load-bearing for ALERTING, not just tidiness. Revocation is a routine
+    # operation (a laptop is retired) and there is no ``DELETE FROM instances`` anywhere in
+    # the project, so an unfiltered family kept exporting the retired instance forever:
+    # ~12h later ``curator-instance-absent`` fires on a machine nobody will ever connect
+    # again, and NOTHING can clear it — not a revoke, not a re-approve under a new id, not
+    # an operator action of any kind. A revoked row is also the one row whose ``connected``
+    # flag is least trustworthy, which is exactly what the half-open-socket rule keys on.
+    # Dropping it from the family makes Prometheus mark those series stale and the alert
+    # resolve on its own. The instance stays fully visible to the operator in
+    # ``/admin/instances``, which deliberately lists every status.
     for iid, connected, last_seen_at, snapshot_at in conn.execute(
-        "SELECT id, connected, last_seen_at, snapshot_at FROM instances ORDER BY id"
+        "SELECT id, connected, last_seen_at, snapshot_at FROM instances "
+        "WHERE status = 'active' ORDER BY id"
     ).fetchall():
         snap.instances.append(
             InstanceRow(
@@ -321,12 +339,24 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
         marker_row is not None and str(marker_row[0]).strip() == "1"
     )
 
-    # main_instance_never_seen: no row for MAIN_INSTANCE_ID, or last_seen_at IS NULL
-    # (§12: the sticky, sleep-independent "stock branch is silently off" fact).
+    # The sticky, sleep-independent "the stock branch is off" fact (§12). MAIN is unusable
+    # when it has NO row, when it has never said hello (last_seen_at IS NULL) — and,
+    # equally, when its row is NOT ``active``.
+    #
+    # The status arm is what makes this metric survive the enrollment upgrade. Migration
+    # step 2 moves every pre-existing row (MAIN included) to ``status='revoked'`` and
+    # touches NEITHER ``last_seen_at`` NOR ``connected``, so on a live install the row
+    # after the upgrade reads (revoked, connected=1, last_seen_at=<yesterday>). Keyed on
+    # last_seen_at alone this gauge therefore reported 0 — "MAIN is fine" — while every
+    # hello was being rejected, the stock branch was dead and the dashboard was green.
+    # That is the precise scenario issue #35 «Совместимость» promises will ring within 15
+    # minutes, and the release note tells the operator to expect it.
     main_row = conn.execute(
-        "SELECT last_seen_at FROM instances WHERE id = ?", (main_instance_id,)
+        "SELECT last_seen_at, status FROM instances WHERE id = ?", (main_instance_id,)
     ).fetchone()
-    snap.main_never_seen = main_row is None or main_row[0] is None
+    snap.main_unusable = (
+        main_row is None or main_row[0] is None or main_row[1] != "active"
+    )
 
     return snap
 
@@ -494,11 +524,15 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         "gauge",
         snapshot_age_samples,
     )
+    # NAME UNCHANGED (deploy/alerts.yml and its series-name guard key on it); the MEANING
+    # is the full "MAIN cannot serve the stock branch" fact — see ``_collect``.
     reg.metric(
         "curator_main_instance_never_seen",
-        "1 iff MAIN_INSTANCE_ID has no instances row or last_seen_at IS NULL.",
+        "1 iff MAIN_INSTANCE_ID cannot serve the stock branch: no instances row, "
+        "last_seen_at IS NULL, or status != 'active' (revoked/pending — e.g. right "
+        "after the enrollment migration, which retires every pre-existing row).",
         "gauge",
-        [({}, 1 if snap.main_never_seen else 0)],
+        [({}, 1 if snap.main_unusable else 0)],
     )
 
     # --- rules / curation state ---------------------------------------------

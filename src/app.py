@@ -134,6 +134,12 @@ def create_app(settings) -> Starlette:
         # counter a later phase's /metrics exports (curator_auth_rejections_total).
         app.state.ext_registry = Registry()
         app.state.ext_rejections = 0
+        # /ext admission counters (§2), initialized here so every reader sees a number
+        # from the first request rather than relying on a getattr default: sockets holding
+        # a pre-auth slot, and the subset of those that have not yet sent a first frame
+        # (which governs the first-frame deadline — see src.ext.channel).
+        app.state.ext_preauth_count = 0
+        app.state.ext_silent_count = 0
         # The server-clock guard (§7) is a persistent monotonic-vs-wall comparator
         # shared by the periodic driver and POST /api/run_pass; the lease is the real
         # single-run guard, so sharing one guard across both callers is safe.

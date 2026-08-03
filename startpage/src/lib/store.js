@@ -19,7 +19,6 @@ import {
   getCredential,
   getIdentity,
   httpBaseFromServiceUrl,
-  loadInstanceConfig,
   postFocus,
   postMergeWindows,
   postPause,
@@ -33,6 +32,16 @@ import {
 import { instanceStatus } from "./status.js";
 import { applyOpToQuickLinks, sortQuickLinks } from "./quicklinks.js";
 import { matchesQuery } from "./search.js";
+
+// The `addressError` codes the SW reports (extension/src/service-address.js), in the
+// language of this page. Only the SW validates — the startpage never re-implements the
+// rule, it only names the verdict.
+const ADDRESS_ERROR_LABELS = {
+  insecure: "адрес без шифрования (ws://) — нужен wss://",
+  "http-scheme": "адрес сайта вместо адреса сокета — нужен wss://",
+  malformed: "адрес записан неверно — нужен wss://хост",
+};
+const ADDRESS_ERROR_FALLBACK = "адрес отклонён — нужен wss://хост";
 
 export function createStore(deps = {}) {
   const chromeApi = deps.chromeApi || (typeof chrome !== "undefined" ? chrome : undefined);
@@ -55,6 +64,10 @@ export function createStore(deps = {}) {
   // these; connectivity itself stays with /api/state (offline/instances).
   const enrollState = ref("needs-enroll");
   const hasAddress = ref(false);
+  // The reason a CONFIGURED address was refused (§7): the client speaks wss:// only
+  // (ws:// on loopback aside), because the raw instance secret rides that connection.
+  // Without this the banner would say "адрес не настроен" over a filled-in field.
+  const addressError = ref(null);
   // The last enroll_rejected reason (bad_code/closed/capacity/…), so a pending banner
   // shows WHY instead of an eternal "ожидает одобрения" (§7).
   const enrollReject = ref(null);
@@ -234,6 +247,15 @@ export function createStore(deps = {}) {
   // /api/state status rows). `null` => no banner. acc 13: a fresh profile with no
   // address → "адрес не настроен", sourced from getConnectionState (not /api/state).
   const enrollStatus = computed(() => {
+    if (addressError.value) {
+      // A REFUSED address, not a missing one. Naming the two apart is the point: the
+      // operator typed something, and every screen would otherwise claim the field is
+      // empty while the instance sits silent.
+      return {
+        state: "bad-address",
+        label: ADDRESS_ERROR_LABELS[addressError.value] || ADDRESS_ERROR_FALLBACK,
+      };
+    }
     if (!hasAddress.value) {
       return { state: "no-address", label: "адрес не настроен" };
     }
@@ -245,7 +267,19 @@ export function createStore(deps = {}) {
       case "revoked":
         return { state: "revoked", label: "отозван" };
       case "quarantined":
-        return { state: "quarantined", label: "неизвестный инстанс — требуется повторная регистрация" };
+        // The reject has to be surfaced HERE too, not only under `pending`: getEnrollState
+        // resolves `quarantined` BEFORE `pending`, so a quarantined instance (it still holds
+        // a valid old secret) never reports `pending` and its rejected re-registration would
+        // show nothing at all. And this is the path with no self-healing — a terminal reject
+        // (bad_code / closed) wipes the staged code, so the probe goes quiet and only a fresh
+        // code from the operator moves it. The label says that instead of leaving the banner
+        // on "требуется повторная регистрация" over an attempt that already failed.
+        return enrollReject.value
+          ? {
+              state: "quarantined",
+              label: "заявка отклонена: " + enrollReject.value + " — введите новый код регистрации",
+            }
+          : { state: "quarantined", label: "неизвестный инстанс — требуется повторная регистрация" };
       case "needs-enroll":
         return { state: "needs-enroll", label: "не зарегистрирован" };
       default:
@@ -267,29 +301,30 @@ export function createStore(deps = {}) {
     if (cs) {
       if (cs.enrollState) enrollState.value = cs.enrollState;
       hasAddress.value = !!cs.hasAddress;
+      addressError.value = cs.addressError ?? null;
       enrollReject.value = cs.enrollReject ?? null;
     }
 
-    // Config (base + token) for the background refresh; a failure keeps us offline.
-    // PREFER the SW credential (§7): the address setting + the RAW instance secret
-    // (slice C / option A — the /api Bearer IS the raw secret; the server hashes it).
-    // Fall back to a bundled instance.json only when the SW channel has nothing
-    // (pre-enrollment / bootstrap).
+    // Config (base + token) for the background refresh; without them the page stays
+    // offline-but-rendered. The SW is the ONLY source (§7): the validated address setting
+    // + the RAW instance secret (slice C / option A — the /api Bearer IS the raw secret;
+    // the server hashes it).
+    //
+    // There is NO instance.json fallback here on purpose. It used to read `config.token`,
+    // a field that does not exist in any bundle anymore (the shared token is gone), so it
+    // could only ever set `token = undefined` — and its `if (config.serviceUrl)
+    // hasAddress = true` actively LIED: a bundle that ships a bootstrap serviceUrl would
+    // switch off the "адрес не настроен" banner on a profile that has no secret and
+    // cannot talk to anything. `hasAddress` now comes from the SW alone, which is also
+    // the only side that can tell a usable address from a refused one.
     const cred = await getCredential(chromeApi);
     if (cred && cred.serviceUrl && cred.secret) {
       base = httpBaseFromServiceUrl(cred.serviceUrl);
       token = cred.secret;
       hasAddress.value = true;
     } else {
-      try {
-        const config = await loadInstanceConfig(chromeApi, fetchFn);
-        base = httpBaseFromServiceUrl(config.serviceUrl);
-        token = config.token;
-        if (config.serviceUrl) hasAddress.value = true;
-      } catch {
-        base = null;
-        token = null;
-      }
+      base = null;
+      token = null;
     }
 
     // FIRST PAINT — local sources only (§10). Own tabs + the cache; never blank.
@@ -678,6 +713,7 @@ export function createStore(deps = {}) {
     // enrollment (§7)
     enrollState,
     hasAddress,
+    addressError,
     enrollReject,
     // clock (§10)
     clockTick,

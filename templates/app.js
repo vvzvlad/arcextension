@@ -6,6 +6,12 @@
 // so a value like `<img src=x onerror=alert(1)>` renders as literal text, never as markup.
 "use strict";
 
+// How many chars of install_uuid this page prints. KEEP IN SYNC with the extension's
+// INSTALL_UUID_PREFIX_LEN (extension/src/constants.js, mirrored in pages/options.js):
+// the operator's job is to compare the string shown on an extension's options page with
+// a row here, and two different prefix lengths cannot be compared at a glance.
+const INSTALL_UUID_PREFIX_LEN = 18;
+
 // --- small DOM helpers (textContent only) ------------------------------------
 function el(tag, text) {
   const node = document.createElement(tag);
@@ -30,13 +36,65 @@ function clearError() {
 // --- fetch wrappers (same-origin, cookie-authenticated) ----------------------
 // credentials:'same-origin' sends the session cookie; the browser adds Origin +
 // Sec-Fetch-Site on mutating requests, which the server's CSRF gate checks (acc 3).
+// Builds the Error a failed response is reported with — used by BOTH wrappers below, so a
+// read (apiGet) shows the operator the same words a write (apiSend) does. The three
+// render* calls all go through apiGet, so leaving it on a bare status meant a degraded
+// service printed "/admin/enroll/requests -> 503" and threw away the sentence the server
+// had already written.
+//
+// The Error carries `.status`: a caller that must react to a SPECIFIC status (the 409 the
+// MAIN-revoke guard answers with) cannot parse it back out of the message.
+//
+// The error TEXT is read from both shapes, and that is not a nicety. `_http_exception`
+// (src/app.py) renders a dict `detail` as JSON and every OTHER `detail` — i.e. nearly all
+// of them — as plain text. Reading only `res.json().error` meant every carefully worded
+// string detail was swallowed by the failed parse and the operator was shown a bare
+// status code. /admin/enroll/approve alone answers 409 with THREE different meanings
+// (window closed / instance id already active / secret already enrolled), and the closed
+// one even spells out the fix ("open it (POST /admin/enroll/window) and approve within
+// it"); a lone "-> 409" tells the operator none of that.
+const ERROR_DETAIL_MAX = 300; // one-line error box: enough for a sentence, not a page
+
+async function responseError(method, path, res) {
+  // The body is read ONCE, as text, and parsed from that string. Calling res.json() first
+  // and res.text() as a fallback cannot work: json() consumes the body even when the parse
+  // fails, so the fallback would only ever throw "body already read" and the plain-text
+  // detail would stay invisible — the exact bug this replaces.
+  let raw = "";
+  try {
+    raw = await res.text();
+  } catch (_e) { /* body unreadable (network cut mid-response): keep the status code */ }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_e) { /* plain-text detail: the raw body IS the message */ }
+  // Only a STRING `error` field is a message. Testing `parsed.error` alone was wrong in
+  // both directions: valid JSON WITHOUT that key (or a bare scalar like `409`) took the
+  // JSON branch and reported `undefined`, while pairing the text branch with `!parsed`
+  // dropped the body for exactly those responses. Anything that is not a string `error`
+  // means the words are in the raw body, so fall back to it — and to the status code only
+  // when there are no words at all.
+  const message =
+    parsed && typeof parsed.error === "string" && parsed.error.trim() ? parsed.error : raw;
+  // Collapse the whitespace (the server wraps long details across source lines) and cap
+  // it — this lands in a single-line error box.
+  const text = message.trim().replace(/\s+/g, " ");
+  let detail = res.status;
+  if (text) {
+    detail = text.length > ERROR_DETAIL_MAX ? text.slice(0, ERROR_DETAIL_MAX) + "…" : text;
+  }
+  const err = new Error(method + " " + path + " -> " + detail);
+  err.status = res.status;
+  return err;
+}
+
 async function apiGet(path) {
   const res = await fetch(path, { credentials: "same-origin" });
   if (res.status === 401) {
     window.location = "/admin/login";
     throw new Error("unauthenticated");
   }
-  if (!res.ok) throw new Error(path + " -> " + res.status);
+  if (!res.ok) throw await responseError("GET", path, res);
   return res.json();
 }
 
@@ -51,14 +109,7 @@ async function apiSend(method, path, body) {
     window.location = "/admin/login";
     throw new Error("unauthenticated");
   }
-  if (!res.ok) {
-    let detail = res.status;
-    try {
-      const j = await res.json();
-      if (j && j.error) detail = j.error;
-    } catch (_e) { /* non-JSON error body: keep the status code */ }
-    throw new Error(method + " " + path + " -> " + detail);
-  }
+  if (!res.ok) throw await responseError(method, path, res);
   return res.json();
 }
 
@@ -87,7 +138,17 @@ async function renderRequests() {
   empty.hidden = rows.length > 0;
   for (const r of rows) {
     const tr = el("tr");
-    tr.appendChild(el("td", r.install_uuid_short)); // first-8, server-provided
+    // NOT `install_uuid_short` (the server's first-8). The operator's only way to tell
+    // their own request from someone else's is to compare this string with the one the
+    // extension's options page shows — and the other two columns do not help: the origin
+    // is uniform fleet-wide and two browsers of the same person carry the same suggested
+    // title. 8 hex chars collide too easily for a decision that grants a credential, so
+    // both places print the same INSTALL_UUID_PREFIX_LEN chars of the same value, and the
+    // full uuid is on the cell as a tooltip. (A property assignment, not markup — the
+    // textContent-only contract for untrusted fields is untouched.)
+    const uuidCell = el("td", (r.install_uuid || "").slice(0, INSTALL_UUID_PREFIX_LEN));
+    uuidCell.title = r.install_uuid || "";
+    tr.appendChild(uuidCell);
     tr.appendChild(el("td", r.suggested_title));    // UNTRUSTED -> textContent
     tr.appendChild(el("td", r.origin));             // UNTRUSTED -> textContent
     tr.appendChild(el("td", r.protocol_version));
@@ -150,16 +211,40 @@ async function renderInstances() {
     const actionCell = el("td");
     const revokeBtn = el("button", "Revoke");
     revokeBtn.type = "button";
+    // Revoking the CONFIGURED MAIN is refused unless the request repeats that id in
+    // `replacement` (src/db/queries.py `revoke_instance`) — a deliberate "say it twice"
+    // guard, not a way to hand MAIN to another instance. This console cannot know WHICH
+    // row is MAIN: /admin/instances does not say, and MAIN_INSTANCE_ID is service ENV. So
+    // the first click always goes without `replacement`; a 409 is what identifies the row
+    // as MAIN, and only then does the button arm and say what revoking MAIN does — and,
+    // just as important, what it does NOT do. Without this the button was simply broken
+    // for MAIN: it could only ever produce a bare "409".
+    let mainConfirmArmed = false;
     revokeBtn.addEventListener("click", async () => {
       try {
         clearError();
         await apiSend(
           "POST",
           "/admin/instances/" + encodeURIComponent(inst.id) + "/revoke",
-          {}
+          mainConfirmArmed ? { replacement: inst.id } : {}
         );
         await refresh();
-      } catch (e) { showError(e.message); }
+      } catch (e) {
+        if (e.status === 409 && !mainConfirmArmed) {
+          mainConfirmArmed = true;
+          revokeBtn.textContent = "Confirm revoke of MAIN";
+          showError(
+            "«" + inst.id + "» is the MAIN instance (MAIN_INSTANCE_ID). Revoking it wipes " +
+            "its credential and it must enrol again; meanwhile the curator still routes " +
+            "drained tabs to this id, because MAIN is service configuration. To make a " +
+            "DIFFERENT instance MAIN, change MAIN_INSTANCE_ID in .env and restart the " +
+            "service — this button cannot do that. Press «Confirm revoke of MAIN» to " +
+            "revoke it anyway."
+          );
+          return;
+        }
+        showError(e.message);
+      }
     });
     actionCell.appendChild(revokeBtn);
     tr.appendChild(actionCell);

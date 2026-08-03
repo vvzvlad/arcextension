@@ -177,8 +177,12 @@ def test_migrate_creates_enrollment_schema(tmp_path):
     try:
         result = migrate(conn, db, backups)
         assert result.ok and not result.degraded
-        # PRAGMA user_version tracks MAX_VERSION, which the enrollment step bumped to 2.
-        assert _version(conn) == MAX_VERSION == 2
+        # PRAGMA user_version tracks MAX_VERSION. NOT compared against a literal 2: the
+        # enrollment step's version is an implementation detail that moves the moment a
+        # step 3 is appended, and a hardcoded number here would redden a change that is
+        # correct — the very hardcoding issue #35 asked to remove (it survived one round in
+        # this same assertion). What this test is ABOUT is the enrollment objects below.
+        assert _version(conn) == MAX_VERSION
 
         tables = _tables(conn)
         assert {"enroll_requests", "admin_audit"} <= tables

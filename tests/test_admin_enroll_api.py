@@ -82,6 +82,27 @@ def _q(db_path, sql, params=()):
         conn.close()
 
 
+def _arm_window(db_path, *, minutes=10, now=None):
+    """Open the enrollment window directly in the DB (what the operator's
+    ``POST /admin/enroll/window`` does) and return its code.
+
+    Approve is GATED on an open window (issue #35 §13 / src.curator.enroll's contract), so
+    every approve test has to stage one — the operator flow is open-window → hand out the
+    code → the client enrolls → approve, all inside the window.
+    """
+    from src.curator.enroll import arm_enroll_window
+
+    now = _now() if now is None else now
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        state = arm_enroll_window(conn, now=now, minutes=minutes)
+        conn.commit()
+        return state.code
+    finally:
+        conn.close()
+
+
 # --- (6) admin-only auth -----------------------------------------------------
 def test_every_admin_endpoint_rejects_instance_and_anon(tmp_path):
     """Acc 6: an INSTANCE secret (and no token) is 401 on EVERY /admin route; ADMIN_TOKEN
@@ -132,6 +153,7 @@ def test_approve_activates_instance_with_request_secret_and_consumes_request(tmp
     raw = "secret-A"
     sh = sha256_hex(raw)
     with TestClient(app) as client:
+        _arm_window(db_path)
         _seed_request(db_path, "uuid-A", secret_hash=sh, title="Home")
         resp = client.post(
             "/admin/enroll/approve", headers=admin_headers(),
@@ -174,15 +196,120 @@ def test_approve_uses_body_title_over_suggested(tmp_path):
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        _arm_window(db_path)
         _seed_request(db_path, "uuid-T", secret_hash="h-T", title="suggested")
         client.post("/admin/enroll/approve", headers=admin_headers(),
                     json={"install_uuid": "uuid-T", "instance_id": "i-T", "title": "chosen"})
         assert _q(db_path, "SELECT title FROM instances WHERE id='i-T'") == [("chosen",)]
 
 
+def test_approve_refused_while_the_window_is_closed(tmp_path):
+    """The gate ``src.curator.enroll``'s docstring and the DEPLOY runbook have always
+    claimed and the code did not have: approval is accepted ONLY while the enrollment
+    window is open.
+
+    The concrete hole: with the shipping ``ENROLL_WINDOW_MIN=10`` /
+    ``ENROLL_REQUEST_TTL_MIN=60`` a request stayed approvable for 50 minutes after the
+    window closed — "at an arbitrary later time", which is exactly what the short window
+    exists to prevent. Reddens if the window read is dropped from ``approve``: the closed
+    -window POST would create the instance.
+    """
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_request(db_path, "uuid-W", secret_hash="h-W")
+
+        # No window armed at all → refused, and NOTHING was written.
+        closed = client.post("/admin/enroll/approve", headers=admin_headers(),
+                             json={"install_uuid": "uuid-W", "instance_id": "lap"})
+        assert closed.status_code == 409
+        assert _q(db_path, "SELECT COUNT(*) FROM instances") == [(0,)]
+        # The request survives — a closed window is a "not now", not a rejection.
+        assert _q(db_path, "SELECT 1 FROM enroll_requests WHERE install_uuid='uuid-W'") == [(1,)]
+
+        # An EXPIRED window is closed too (the deadline row lingers after natural expiry;
+        # read_enroll_window compares it against now). Reddens if the gate tests for the
+        # ROW's presence instead of the window's state.
+        _arm_window(db_path, minutes=10, now=_now() - 11 * 60_000)
+        expired = client.post("/admin/enroll/approve", headers=admin_headers(),
+                              json={"install_uuid": "uuid-W", "instance_id": "lap"})
+        assert expired.status_code == 409
+        assert _q(db_path, "SELECT COUNT(*) FROM instances") == [(0,)]
+
+        # Open one and the very same call succeeds (non-vacuity: the window is the only
+        # thing that changed).
+        _arm_window(db_path)
+        ok = client.post("/admin/enroll/approve", headers=admin_headers(),
+                         json={"install_uuid": "uuid-W", "instance_id": "lap"})
+        assert ok.status_code == 200
+        assert _q(db_path, "SELECT status FROM instances WHERE id='lap'") == [("active",)]
+
+
+def test_reject_and_revoke_are_not_window_gated(tmp_path):
+    """Only APPROVE is gated. Reject (drop a pending request) and revoke (retire an
+    instance) must stay available with the window shut — they only ever REMOVE access, and
+    gating them would mean an operator who wants to kill a credential first has to open the
+    enrollment surface. Reddens if the gate is copied onto the destructive verbs."""
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_request(db_path, "uuid-R", secret_hash="h-R")
+        _seed_instance(db_path, "gone", status="active", secret_hash="s-gone")
+        # No window armed anywhere in this test.
+        assert client.post("/admin/enroll/reject", headers=admin_headers(),
+                           json={"install_uuid": "uuid-R"}).status_code == 200
+        assert client.post("/admin/instances/gone/revoke", headers=admin_headers(),
+                           json={}).status_code == 200
+
+
+def test_admin_api_field_names_are_snake_case(tmp_path):
+    """The /admin JSON contract is snake_case, in BOTH directions — pinned so the drift
+    between code and prose cannot come back silently.
+
+    This service has exactly two naming conventions and they are per-SURFACE, not per-file:
+    the ``/ext`` WIRE protocol is camelCase (``installUuid``, ``sessionId``,
+    ``protocolVersion``), and every JSON API body/response is snake_case — ``/api/rules``
+    has taken ``instance_id`` since long before enrollment, the shipped console
+    (``templates/app.js``) posts ``install_uuid``/``instance_id``, and these very responses
+    return ``install_uuid``/``first_seen_at`` straight from the columns. Reddens if a
+    handler starts accepting camelCase (or answering in it).
+    """
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _arm_window(db_path)
+        _seed_request(db_path, "uuid-N", secret_hash="h-N")
+
+        listed = client.get("/admin/enroll/requests", headers=admin_headers()).json()
+        row = listed["requests"][0]
+        for field in ("install_uuid", "install_uuid_short", "suggested_title",
+                      "protocol_version", "first_seen_at", "last_seen_at", "id_exists"):
+            assert field in row, field
+        assert not any(k in row for k in ("installUuid", "protocolVersion", "firstSeenAt"))
+
+        # camelCase in the REQUEST body is not silently accepted: install_uuid is missing,
+        # so the handler answers 400 rather than enrolling something it guessed.
+        camel = client.post("/admin/enroll/approve", headers=admin_headers(),
+                            json={"installUuid": "uuid-N", "instanceId": "lap"})
+        assert camel.status_code == 400
+        assert _q(db_path, "SELECT COUNT(*) FROM instances") == [(0,)]
+
+        # snake_case works, and the response answers in snake_case too.
+        ok = client.post("/admin/enroll/approve", headers=admin_headers(),
+                         json={"install_uuid": "uuid-N", "instance_id": "lap"})
+        assert ok.status_code == 200 and "instance_id" in ok.json()
+
+        instances = client.get("/admin/instances", headers=admin_headers()).json()
+        for field in ("id", "status", "connected", "last_seen_at", "enrolled_at",
+                      "revoked_at"):
+            assert field in instances["instances"][0], field
+
+
 def test_approve_missing_request_is_404(tmp_path):
     app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        _arm_window(db_path)
         resp = client.post("/admin/enroll/approve", headers=admin_headers(),
                            json={"install_uuid": "ghost", "instance_id": "x"})
         assert resp.status_code == 404
@@ -270,6 +397,7 @@ def test_approve_already_active_id_is_409(tmp_path):
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        _arm_window(db_path)
         _seed_instance(db_path, "taken", status="active", secret_hash="old-secret",
                        install_uuid="old-uuid")
         _seed_request(db_path, "new-uuid", secret_hash="new-secret")
@@ -289,6 +417,7 @@ def test_approve_new_id_with_secret_of_active_instance_is_409_over_http(tmp_path
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        _arm_window(db_path)
         _seed_instance(db_path, "live", status="active", secret_hash="dup-secret",
                        install_uuid="live-uuid")
         _seed_request(db_path, "new-uuid", secret_hash="dup-secret")
@@ -309,6 +438,7 @@ def test_approve_rejects_malformed_instance_id_400(tmp_path):
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
+        _arm_window(db_path)
         _seed_request(db_path, "u1", secret_hash="s1")
         for bad in ("has space", "x" * 65, "bad/slash"):
             resp = client.post("/admin/enroll/approve", headers=admin_headers(),
@@ -363,6 +493,7 @@ def test_revoke_main_409_without_replacement_then_reapprove_restores(tmp_path):
         assert _q(db_path, "SELECT status FROM instances WHERE id='main'") == [("revoked",)]
 
         # Re-approve restores MAIN to active with a fresh secret (the reactivation path).
+        _arm_window(db_path)
         _seed_request(db_path, "main-uuid", secret_hash="main-new")
         restore = client.post("/admin/enroll/approve", headers=admin_headers(),
                               json={"install_uuid": "main-uuid", "instance_id": "main"})

@@ -140,8 +140,14 @@ groups:
         annotations:
           summary: "Service is in degraded mode (a DB migration failed)."
 
-      # MAIN_INSTANCE_ID has never been seen — the stock branch is off (§12), and this
-      # fact is sticky and sleep-independent (unlike live `ready`).
+      # MAIN_INSTANCE_ID cannot serve the stock branch (§12) — sticky and
+      # sleep-independent, unlike live `ready`. The gauge covers all three ways that
+      # happens: no row, never connected, or a row that is not `active`. The last one is
+      # the case the enrollment upgrade creates on EVERY existing install (migration 2
+      # retires every pre-existing row, MAIN included), and issue #35 «Совместимость»
+      # names this alert as the thing that must ring within 15 minutes — so the summary
+      # names the remedy, since "never connected" would send the operator hunting a
+      # network fault that is not there.
       - alert: curator-main-instance-never-seen
         # [A]: curator_main_instance_never_seen   [C]: A == 1
         expr: curator_main_instance_never_seen == 1
@@ -149,7 +155,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "MAIN_INSTANCE_ID has never connected — stock branch disabled."
+          summary: "MAIN_INSTANCE_ID cannot curate — never connected, or not enrolled/revoked (after an enrollment upgrade MAIN needs re-approval in /admin) — stock branch disabled."
 
       # An empty rules table (post-restore / mass edit) disables the whole stock
       # branch by §8.
@@ -173,18 +179,80 @@ groups:
         annotations:
           summary: "Instance {{ $labels.id }} absent for over ~12h."
 
-      # NOTE (§37): there is deliberately NO alert on curator_enroll_window_seconds_remaining
-      # < 0. That gauge returns the raw (enroll_window_until − now), and a window that
-      # closes the NORMAL way — by natural expiry — is never cleared from the settings row
-      # (read_enroll_window just reads it as closed), so the gauge stays negative FOREVER
-      # after any ordinary enrollment session. An alert on `< 0` would therefore fire once
-      # and never resolve — a permanently-stuck warning. The clean fix is to clamp the
-      # gauge to 0 on expiry in the enrollment metric (src/api/metrics.py), which lives in
-      # the enrollment PR (#35); add the window-overdue alert back HERE only once that
-      # clamp lands. The enroll_bad_code brute-force alert below has no such problem (a
-      # counter's increase() decays on its own).
+      # The enrollment window is being HELD open (§6, issue #37 acceptance 5).
+      #
+      # History, because the shape of this rule is not obvious: #37 originally wanted
+      # `curator_enroll_window_seconds_remaining < 0` ("armed and overdue"), and that was
+      # correctly refused — the gauge then returned the raw (until − now) and a naturally
+      # expired window is never cleared from `settings`, so it would have gone negative
+      # forever after every ordinary enrollment and fired an alert that could never
+      # resolve. #35 landed the clamp (commit 56c073a): the gauge is now >0 while open and
+      # exactly 0 otherwise, "no window" and "expired window" being the same benign 0. So
+      # `< 0` is not just unnecessary, it is unreachable — and the metric was left with no
+      # rule at all, i.e. exported and dead.
+      #
+      # What IS alertable on the clamped gauge is the fact §6 actually cares about: the
+      # window is meant to be a SHORT operator-opened interval (that is the whole security
+      # argument for it — it bounds when a stolen hello can be approved), and one arm can
+      # hold the gauge above 0 for at most ENROLL_WINDOW_MIN. A gauge that stays positive
+      # for longer than that therefore means somebody keeps RE-ARMING, i.e. the enrollment
+      # surface is being kept open — the state where an unauthenticated peer with the code
+      # can file requests all day.
+      #
+      # `for:` is set against the CEILING, not the default. ENROLL_WINDOW_MIN is operator
+      # config bounded by `le=ENROLL_WINDOW_MAX_MIN` (60), so it is 10m only by default: at
+      # a perfectly legal ENROLL_WINDOW_MIN=20 a `for: 15m` would page on ONE ordinary
+      # arm — and page with the words "re-armed repeatedly", sending the operator to look
+      # for something that never happened. 65m > the hard 60m ceiling makes ANY single
+      # legal window unable to trip the rule, whatever the deployment configured, and the
+      # thing being alerted on (a window held open all day) is far above either number.
+      # The alert clears by itself the moment the window is closed or lapses.
+      - alert: curator-enroll-window-held-open
+        # [A]: curator_enroll_window_seconds_remaining   [C]: A > 0 for 65m
+        expr: curator_enroll_window_seconds_remaining > 0
+        for: 65m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enrollment window has stayed open for over 65m — longer than any single armed window can last (ENROLL_WINDOW_MAX_MIN=60), so it is being re-armed; close it with DELETE /admin/enroll/window (§10)."
 
-      # Repeated bad enrollment codes — a brute-force against the open window (§13, issue
+      # Someone is guessing ADMIN_TOKEN — the credential that opens /admin (approve,
+      # revoke), /api/* and /mcp. Keyed on the reason a FAILED POST /admin/login writes
+      # (src/api/admin_page.ADMIN_BAD_TOKEN_REASON), which is deliberately NOT the
+      # `admin_session` label: that one also ticks every time a browser opens the console
+      # before logging in, so a rule on it would be pure noise at any threshold a real
+      # brute force could reach. Severity critical rather than warning: unlike a bad
+      # enrollment code (which only buys a place in a list an operator must still approve),
+      # a guessed ADMIN_TOKEN is the whole service. >5 in 10m clears a fat-fingered
+      # operator; increase() over the window is its own smoothing, so no `for:`.
+      - alert: curator-admin-token-bruteforce
+        # [A]: increase(curator_auth_rejections_total{reason="admin_bad_token"}[10m])
+        # [C]: A > 5
+        expr: increase(curator_auth_rejections_total{reason="admin_bad_token"}[10m]) > 5
+        labels:
+          severity: critical
+        annotations:
+          summary: "Repeated failed /admin/login attempts (brute-force on ADMIN_TOKEN)."
+
+      # The /ext pre-auth ceiling is refusing connections (§6) — ENROLL_PREAUTH_MAX, the
+      # LAST line of the pre-auth defence (the silent-socket quota above it only shortens
+      # a socket's first-frame deadline and refuses nobody, so anything counted here means
+      # the ceiling itself was hit). At the shipping 128 a home-scale fleet never comes
+      # near it, so sustained refusals
+      # mean one of two things, and both need a human: a flood of anonymous sockets, or a
+      # slot leak — and the consequence is identical either way, instances being turned
+      # away at the handshake with nothing but this counter to say so (a refused
+      # reconnect leaves no instances row, no reject_reason and no log line for the peer).
+      - alert: curator-ext-preauth-capacity
+        # [A]: increase(curator_auth_rejections_total{reason="capacity"}[10m])
+        # [C]: A > 5
+        expr: increase(curator_auth_rejections_total{reason="capacity"}[10m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "/ext is refusing connections at the pre-auth ceiling — instances cannot reconnect (§6)."
+
+      # Repeated bad enrollment codes — a brute-force against the open window (§6, issue
       # #37). curator_auth_rejections_total is labeled per reason and the
       # {reason="enroll_bad_code"} series exists ONLY once a bad code has been seen, so
       # increase() over the window returns an empty vector on a healthy install and stays
@@ -198,7 +266,75 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Repeated bad enrollment codes (brute-force on the enrollment window, §13)."
+          summary: "Repeated bad enrollment codes (brute-force on the enrollment window, §6)."
+
+      # A pending enroll_request for an install_uuid arrived carrying a DIFFERENT secret
+      # than the one already frozen on that row (src/db/queries `_UPSERT_ENROLL_REQUEST`
+      # freezes the credential at creation). That is precisely the shape of an attempt to
+      # slip a foreign credential in under somebody else's install_uuid and have the
+      # operator approve it: the code is right, the window is open, only the secret has
+      # changed. THRESHOLD 0, not 5 — unlike a bad code, this cannot happen by accident on
+      # a healthy install (a client re-registers with the SAME durable secret), so a single
+      # occurrence is already the whole signal, and increase() over 10m keeps a burst from
+      # one attacker collapsing into one page per scrape. Like every reason series it
+      # exists only once the refusal has been seen, so a healthy install stays silent.
+      - alert: curator-enroll-secret-conflict
+        # [A]: increase(curator_auth_rejections_total{reason="enroll_secret_conflict"}[10m])
+        # [C]: A > 0
+        expr: increase(curator_auth_rejections_total{reason="enroll_secret_conflict"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "An enroll_request tried to replace the frozen secret of a pending install_uuid (credential-substitution attempt, §6)."
+
+      # The PENDING-request ceiling is refusing enrollments — ENROLL_MAX_PENDING (64), the
+      # anti-flood bound on the operator-facing list. Twin of the pre-auth rule above and
+      # for the same reason: `_reject_enroll` writes NO row by construction, so this
+      # counter is the ONLY trace that a browser was turned away. At 64 a human-scale fleet
+      # never reaches it, so sustained refusals mean either a flood of anonymous requests
+      # or a list nobody is draining — and in both cases a legitimate new browser cannot
+      # enroll at all until a human looks.
+      - alert: curator-enroll-pending-capacity
+        # [A]: increase(curator_auth_rejections_total{reason="enroll_capacity"}[10m])
+        # [C]: A > 5
+        expr: increase(curator_auth_rejections_total{reason="enroll_capacity"}[10m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enrollments are being refused at the pending-request ceiling (ENROLL_MAX_PENDING) — a new browser cannot enroll (§6)."
+
+      # /api/* CORS is cutting the startpage off — the §12 «бесшумный отказ», and the ONE
+      # shape of it that no other signal reports.
+      #
+      # EXT_ALLOWED_ORIGINS feeds two checks (§6 `parse_origins`), and they read an EMPTY
+      # list differently on purpose: /ext accepts ANY origin, /api/* CORS allows NONE. So a
+      # deployment that never set the variable keeps every instance connected and green
+      # while every startpage `fetch /api/state` dies at the preflight and the newtab
+      # re-renders yesterday's cache («кэш от <время>») forever. Nothing looks broken.
+      #
+      # The OTHER mismatch — a non-empty list naming the wrong extension id — is already
+      # covered without this rule: /ext rejects the same origin, `reject_reason='origin'`
+      # lands on the instances row and the status bar goes red (deploy/DEPLOY.md §4). It is
+      # exactly the EMPTY case that leaves no row, no reject_reason and no red anything, so
+      # this counter is its only machine-readable trace. src/ext/protocol.parse_origins and
+      # DEPLOY.md §4 both already promise it makes the failure "audible" — that promise is
+      # only true once something alerts on it.
+      #
+      # >5 in 10m, no `for:` (the increase() window is the smoothing). A cut-off startpage
+      # re-preflights on every newtab and on the service worker's quick-links flush, so a
+      # real mismatch produces a steady stream; a stray foreign page — already unlikely on a
+      # network that is not reachable from the internet (DEPLOY.md §3) — does not reach 5.
+      # The series exists only once a client is ACTUALLY being refused, so a fresh host
+      # whose extension is not installed yet stays silent instead of paging through its own
+      # bootstrap.
+      - alert: curator-cors-preflight-rejected
+        # [A]: increase(curator_auth_rejections_total{reason="cors_preflight"}[10m])
+        # [C]: A > 5
+        expr: increase(curator_auth_rejections_total{reason="cors_preflight"}[10m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "/api/* CORS is rejecting preflights — startpages are cut off and serving stale cache while instances look healthy; check EXT_ALLOWED_ORIGINS against the real chrome-extension://<id> (§12, deploy/DEPLOY.md §4)."
 
       # Half-open socket: connected but the mirror snapshot stopped advancing for
       # >6×PASS_INTERVAL (§12 reserves 6× for exactly this). snapshot_age is already 0

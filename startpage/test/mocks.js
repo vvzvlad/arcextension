@@ -1,13 +1,24 @@
 // Minimal chrome + fetch mocks for the store/App tests. No network, no real
 // extension — every capability the startpage touches is faked and recorded.
 
+// The /api base + Bearer come from the SERVICE WORKER only (§7): the validated address
+// setting + the RAW instance secret. There is no instance.json credential in any bundle
+// anymore (the shared token is gone), so an enrolled profile — the normal case these
+// tests describe — is one that ANSWERS get_credential. It is therefore served by default
+// here; a test that needs the un-enrolled / no-address case passes `credential: null`,
+// and an explicit `messages.get_credential` still wins.
+const DEFAULT_CREDENTIAL = { serviceUrl: "wss://host/", secret: "tok" };
+
 export function makeChrome(opts = {}) {
   // `tabs` is MUTABLE per test (via env.setTabs) so a re-query after a failed jump can
   // return a different list — that is the whole point of the "tab closed since the
   // render" case.
   let tabs = opts.tabs || [];
   const local = { ...(opts.local || {}) };
-  const messages = opts.messages || {}; // { type: value | (msg)=>value }
+  const messages = {
+    get_credential: "credential" in opts ? opts.credential : DEFAULT_CREDENTIAL,
+    ...(opts.messages || {}), // { type: value | (msg)=>value }
+  };
   const calls = {
     tabUpdate: [],
     winUpdate: [],

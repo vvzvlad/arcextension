@@ -150,3 +150,82 @@ def test_restore_marker_path_defaults_to_unset(monkeypatch):
     assert Settings(_env_file=None).restore_marker_path == ""
     monkeypatch.setenv("RESTORE_MARKER_PATH", "/app/state/restore-marker")
     assert Settings(_env_file=None).restore_marker_path == "/app/state/restore-marker"
+
+
+# --- enrollment knobs: bounds, not silent subsystem switches -----------------
+@pytest.mark.parametrize(
+    "var,value,why",
+    [
+        # 0 refuses every /ext handshake BEFORE accept(): the whole fleet drops out of
+        # curation and the only trace is a rejections counter.
+        ("ENROLL_PREAUTH_MAX", "0", "kills /ext"),
+        ("ENROLL_PREAUTH_MAX", "-1", "kills /ext"),
+        # 0 refuses every enroll_request with {reason:capacity}: no browser can ever be
+        # added, and nothing in the logs names the cause.
+        ("ENROLL_MAX_PENDING", "0", "kills enrollment"),
+        # 0 expires every request the instant it is filed.
+        ("ENROLL_REQUEST_TTL_MIN", "0", "requests expire immediately"),
+        # 0 arms an already-closed window (arm_enroll_window silently floors it to 1).
+        ("ENROLL_WINDOW_MIN", "0", "window is closed on arrival"),
+        # Above the clamp the configured value is silently reduced at arm time, so the
+        # config says one thing and the service does another.
+        ("ENROLL_WINDOW_MIN", "525600", "silently clamped"),
+        # 0 invalidates every session the moment it is minted.
+        ("ADMIN_SESSION_TTL_MIN", "0", "no session can ever be valid"),
+    ],
+)
+def test_out_of_range_enrollment_knobs_fail_at_startup(monkeypatch, var, value, why):
+    """Each of these values SILENTLY disables a subsystem rather than erring.
+
+    Project convention (AGENTS.md): a misconfigured value fails at startup instead of
+    producing a service that looks healthy and does nothing. These four knobs arrived
+    unbounded, so a typo bought a running curator with /ext shut, enrolment impossible, or
+    every request expiring on arrival — each visible only as an absence. Reddens if a
+    bound is dropped: the Settings object builds and the process starts.
+    """
+    _base_env(monkeypatch)
+    monkeypatch.setenv(var, value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_enroll_window_max_is_the_arming_clamp(monkeypatch):
+    # The upper bound on ENROLL_WINDOW_MIN must BE the clamp arm_enroll_window applies —
+    # one number, imported, not two that drift. Redden: change either side alone.
+    from src.curator.enroll import ENROLL_WINDOW_MAX_MIN
+
+    assert Settings.model_fields["enroll_window_min"].metadata
+    _base_env(monkeypatch)
+    monkeypatch.setenv("ENROLL_WINDOW_MIN", str(ENROLL_WINDOW_MAX_MIN))
+    assert Settings(_env_file=None).enroll_window_min == ENROLL_WINDOW_MAX_MIN
+    monkeypatch.setenv("ENROLL_WINDOW_MIN", str(ENROLL_WINDOW_MAX_MIN + 1))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_request_ttl_must_outlast_the_enrollment_window(monkeypatch):
+    """A request has to survive the window it was filed in — now a HARD requirement.
+
+    Approval is gated on the window being open (src.api.admin.approve), so with
+    ENROLL_REQUEST_TTL_MIN < ENROLL_WINDOW_MIN a request filed at the start of a window
+    expires BEFORE the window closes: the operator's approve answers 404 for a row the
+    console was showing a moment ago (both surfaces apply the same read-time TTL filter).
+    That is a configuration that cannot work, so it fails at startup. Reddens if the
+    cross-field validator is removed.
+    """
+    _base_env(monkeypatch)
+    monkeypatch.setenv("ENROLL_WINDOW_MIN", "30")
+    monkeypatch.setenv("ENROLL_REQUEST_TTL_MIN", "29")
+    with pytest.raises(ValidationError) as ei:
+        Settings(_env_file=None)
+    assert "ENROLL_WINDOW_MIN" in str(ei.value)
+    assert any(err["loc"] == ("enroll_request_ttl_min",) for err in ei.value.errors())
+
+    # Equal is fine (the request lasts exactly as long as the window), and the shipping
+    # defaults are comfortably clear of the boundary.
+    monkeypatch.setenv("ENROLL_REQUEST_TTL_MIN", "30")
+    assert Settings(_env_file=None).enroll_request_ttl_min == 30
+    monkeypatch.delenv("ENROLL_WINDOW_MIN")
+    monkeypatch.delenv("ENROLL_REQUEST_TTL_MIN")
+    defaults = Settings(_env_file=None)
+    assert defaults.enroll_request_ttl_min >= defaults.enroll_window_min

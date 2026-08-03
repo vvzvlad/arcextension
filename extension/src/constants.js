@@ -68,6 +68,20 @@ export const INSTANCE_ID_KEY = "instanceId"; // storage.local — server-assigne
 export const SERVICE_ADDRESS_KEY = "serviceAddress"; // storage.local — wss/ws service URL
 export const BROWSER_NAME_KEY = "browserName"; // storage.local — suggested_title source
 export const ENROLL_CODE_KEY = "enrollCode"; // storage.local — the window code (transient input)
+
+// There is deliberately no re-registration INTERVAL here. A server-CONFIRMED enroll
+// request (an `enroll_pending` frame was seen) is never re-sent on a timer: the staged
+// code belongs to ONE window and `arm_enroll_window` (src/curator/enroll.py) mints a
+// fresh code on every open, so a resend after the window closed can only draw
+// enroll_rejected{closed} — which clears the code and durably paints "заявка отклонена"
+// over a request that is still approvable. Recovery from the service's TTL sweep is an
+// operator step (open a new window, type the new code), not a client retry.
+
+// How many chars of installUuid identify an instance to the operator (§7). NOT 8: the
+// operator matches the value shown on the options page against a row in /admin, and 8
+// hex chars of two same-named browsers collide often enough to approve the WRONG one.
+// The /admin page must render the SAME prefix length or the two cannot be compared.
+export const INSTALL_UUID_PREFIX_LEN = 18;
 // Durable enrollment facts, the SINGLE source getEnrollState reads (the in-memory
 // helloAcked is useless at page open — the worker is cold). Shape:
 //   { requestPending: bool, approved: bool, quarantined: bool, lastVerdict: str|null }

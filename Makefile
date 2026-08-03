@@ -51,6 +51,30 @@ test: install ## Run the test suite (auto-creates .venv if missing)
 run: install ## Run the application (auto-creates .venv if missing)
 	$(PY) main.py
 
+# --- Prometheus alert rules (§12) --------------------------------------------
+# `check rules` validates the SCHEMA (both Prometheus and vmalert unmarshal it
+# strictly — one unknown field rejects the whole file and leaves the curator with
+# NO alerts at all), `test rules` runs the fire/stay-quiet cases in
+# deploy/alerts_test.yml. Both are needed: a rule can be schema-valid and still
+# never fire.
+#
+# A MISSING promtool SKIPS with an explanation and exits 0, but ONLY outside CI.
+# Rationale: promtool is not a Python dep and cannot be installed by `make
+# install`, so hard-failing would make the target unusable on a laptop that has
+# no Prometheus — and an unusable target gets replaced by the ad-hoc command this
+# target exists to abolish. CI is the opposite case: there "skipped" must never
+# pass for "checked", so when CI=true a missing promtool is a hard failure.
+.PHONY: alerts
+alerts: ## Validate deploy/alerts.yml (promtool check + test rules)
+	@command -v promtool >/dev/null 2>&1 || { \
+		echo "promtool not found — alert rules NOT validated."; \
+		echo "  install: brew install prometheus   (or use the prometheus/promtool release tarball)"; \
+		test "$(CI)" != "true" || { echo "CI=true: refusing to skip."; exit 1; }; \
+		exit 0; \
+	}; \
+	promtool check rules deploy/alerts.yml && \
+	promtool test rules deploy/alerts_test.yml
+
 # --- Startpage (Vue 3 + Vite, §10) -------------------------------------------
 # Independent Node toolchain under startpage/, built INTO extension/startpage. The
 # build MUST precede the gates + vitest (the render smoke test loads the built

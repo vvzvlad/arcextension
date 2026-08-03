@@ -2,8 +2,9 @@
 
 This is the ONE step that cannot run in CI: turning the pure-core PNG icon source
 into a proper ``AppIcon.icns`` needs Apple's ``sips`` + ``iconutil``, present only
-on macOS. Everything else about an instance (bundle copy, instance.json, stamped
-manifest, launcher, Info.plist, PNG icon source) is produced by `core` and is
+on macOS. Everything else about an instance (empty profile dir, launcher,
+Info.plist, PNG icon source — there is no per-instance extension copy and no
+``instance.json`` under enrollment) is produced by `core` and is
 identical on Linux and mac — the ``.app`` is already a runnable bundle without the
 ``.icns`` (macOS falls back to the generic app icon), so CI emits every file and
 asserts its content; only the icon polish is deferred to a mac.

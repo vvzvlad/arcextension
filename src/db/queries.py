@@ -50,15 +50,26 @@ class RevokeResult:
 # Revoke in ONE transaction (§5). session_id=NULL is REQUIRED: today mark_disconnected
 # does NOT clear it, so the mirror keeps treating a relocation as live forever
 # (mirror.load_mirror keeps a relocate live only while both endpoints' sessions still
-# match — a NULL session drops it out of live_relocations at once). connected/
-# focused_window_id are LEFT to the caller's best-effort socket close (mark_disconnected),
-# exactly as §5 prescribes; the status='revoked' itself is the retire INTENT the pass
-# scans for.
+# match — a NULL session drops it out of live_relocations at once). The status='revoked'
+# itself is the retire INTENT the pass scans for.
+#
+# connected/focused_window_id are cleared HERE as well, not left to the caller's
+# best-effort socket close: that close is a no-op when there is no registry entry
+# (``admin._close_live_socket`` returns early), so revoking an OFFLINE-but-stale
+# instance — the row was left ``connected=1`` by a process kill, which is exactly the
+# state a crash leaves behind — used to keep the flag set FOREVER. Nothing else ever
+# clears it: ``mark_disconnected`` is epoch-guarded and only ever runs from a socket
+# finalizer, and there is no socket. A revoked instance must never read as connected on
+# any surface (/metrics' half-open-socket rule, /api/state, the console), so the revoke
+# transaction owns the flag. A LIVE socket's own finalizer later runs the epoch-guarded
+# UPDATE against the same (unchanged) epoch and simply writes 0 again — idempotent.
 _REVOKE_UPDATE = """
 UPDATE instances SET
     status = 'revoked',
     revoked_at = ?,
-    session_id = NULL
+    session_id = NULL,
+    connected = 0,
+    focused_window_id = NULL
 WHERE id = ?
 """
 
@@ -203,11 +214,25 @@ def resolve_secret(
 
 
 # Record (or refresh) a pending enrollment request. Keyed by install_uuid so a repeat
-# hello UPSERTs the same row instead of piling up. ``first_seen_at`` is DELIBERATELY NOT
-# updated on conflict (issue §1): a request that keeps re-arriving must still age out
-# against its ORIGINAL first_seen_at, otherwise the TTL is never reached and a stale
-# request lives forever. Everything else (last_seen_at, the client-proposed title,
-# secret_hash, protocol_version, origin) is refreshed to the latest hello.
+# hello UPSERTs the same row instead of piling up. TWO columns are DELIBERATELY NOT
+# updated on conflict:
+#
+# * ``first_seen_at`` (issue §1) — a request that keeps re-arriving must still age out
+#   against its ORIGINAL first_seen_at, otherwise the TTL is never reached and a stale
+#   request lives forever.
+# * ``secret_hash`` — the CREDENTIAL the operator approves. Refreshing it on conflict made
+#   the pending list a TOCTOU surface: anyone who knows a victim's ``install_uuid`` and the
+#   current window code could re-submit the same request with THEIR secret, leaving every
+#   operator-visible field (origin, suggested_title, protocol_version, the first-8 uuid)
+#   untouched — so the operator would click Approve on the row they inspected and enroll the
+#   ATTACKER's credential under the victim's identity. The credential is now frozen at the
+#   value the row was CREATED with; a client that genuinely needs to enroll a different
+#   secret must first have the pending request rejected (or let it age out under TTL), which
+#   is a deliberate operator act. A repeat from the honest client carries the SAME secret it
+#   persisted, so nothing changes for it.
+#
+# Everything else (last_seen_at, the client-proposed title, protocol_version, origin) is
+# refreshed to the latest request.
 _UPSERT_ENROLL_REQUEST = """
 INSERT INTO enroll_requests
     (install_uuid, origin, suggested_title, protocol_version, secret_hash,
@@ -216,10 +241,15 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(install_uuid) DO UPDATE SET
     last_seen_at = excluded.last_seen_at,
     suggested_title = excluded.suggested_title,
-    secret_hash = excluded.secret_hash,
     protocol_version = excluded.protocol_version,
     origin = excluded.origin
 """
+
+# Outcomes of :func:`upsert_enroll_request_capped`. Strings rather than a bool because the
+# caller maps each onto a DIFFERENT client-facing verdict, and a bool cannot carry three.
+ENROLL_ACCEPTED = "accepted"
+ENROLL_AT_CAPACITY = "capacity"
+ENROLL_SECRET_MISMATCH = "secret_conflict"
 
 
 def upsert_enroll_request(
@@ -231,7 +261,12 @@ def upsert_enroll_request(
     secret_hash: str,
     now: int,
 ) -> None:
-    """Insert-or-refresh the pending enroll request for ``install_uuid`` (see SQL)."""
+    """Insert-or-refresh the pending enroll request for ``install_uuid`` (see SQL).
+
+    The uncapped form, kept for direct callers/tests. Like the capped one it never
+    overwrites a stored ``secret_hash`` (see the SQL comment) — the INSERT branch is the
+    only way a credential enters the row.
+    """
     conn.execute(
         _UPSERT_ENROLL_REQUEST,
         (install_uuid, origin, suggested_title, protocol_version, secret_hash, now, now),
@@ -247,37 +282,81 @@ def upsert_enroll_request_capped(
     secret_hash: str,
     now: int,
     max_pending: int,
-) -> bool:
-    """Capacity-check + upsert atomically in ONE write transaction; return acceptance.
+    ttl_ms: int,
+) -> str:
+    """Capacity-check + upsert atomically in ONE write transaction; return the outcome.
 
-    The channel's pre-read capacity gate (:func:`count_enroll_requests`) is only
-    advisory: it runs in a separate read transaction, so N racing enroll_requests could
-    each observe ``pending < max`` and all write, overshooting ``max_pending``. This does
-    the count and the write under the SAME ``Database.write`` BEGIN, so the ceiling is
-    authoritative. An install_uuid that ALREADY has a row is an UPDATE (refresh), never a
-    new row, so it is always accepted regardless of capacity — else a full list could not
-    even refresh ``last_seen_at`` and a pending request would age out under TTL. A genuinely
-    NEW install_uuid is written only when ``count < max_pending``; otherwise nothing is
-    written and ``False`` is returned so the caller replies ``enroll_rejected{capacity}``.
+    Returns one of :data:`ENROLL_ACCEPTED`, :data:`ENROLL_AT_CAPACITY`,
+    :data:`ENROLL_SECRET_MISMATCH`.
+
+    The capacity count and the write run under the SAME ``Database.write`` BEGIN, so the
+    ceiling is authoritative even when N enroll_requests race (each in its own connection):
+    this is the ONLY capacity gate — the channel deliberately does no advisory pre-count,
+    which would be a second unauthenticated DB read per socket.
+
+    An install_uuid that ALREADY has a LIVE row is an UPDATE (refresh), never a new row, so
+    it is always accepted regardless of capacity — else a full list could not even refresh
+    ``last_seen_at`` and a pending request would age out under TTL. A genuinely NEW
+    install_uuid is written only when ``count < max_pending``.
+
+    A repeat whose ``secret_hash`` DIFFERS from the stored one writes NOTHING and returns
+    :data:`ENROLL_SECRET_MISMATCH`: the credential is frozen at creation (see the SQL
+    comment above), and silently answering ``enroll_pending`` would leave the client waiting
+    on the approval of a secret it does not hold. Refusing instead keeps ``last_seen_at``
+    frozen too, so the stale row ages out on schedule and the client's next retry is
+    accepted — the state self-heals within the TTL without an operator, and immediately if
+    the operator rejects the stale request.
+
+    **The frozen-credential rule applies to LIVE rows only, hence ``ttl_ms``.** A row is
+    pending for the reader exactly while ``first_seen_at >= now - ttl_ms`` — that is the
+    filter BOTH read surfaces apply (:func:`list_pending_enroll_requests`,
+    :func:`get_enroll_request`) — and the physical sweep only catches up within a tick. In
+    the gap between the two, an expired row is invisible AND unapprovable, so freezing the
+    credential against it refused a legitimate re-registration with ``secret_conflict``
+    while the operator's list had nothing to reject: an un-fixable state, for a row that
+    was already logically gone. An expired row is therefore treated as ABSENT — deleted and
+    re-INSERTed with the new credential and a fresh ``first_seen_at``, which the plain
+    UPSERT could not do (its DO UPDATE deliberately leaves both columns alone).
+
+    The capacity ``COUNT(*)`` is deliberately NOT TTL-filtered, and the expired row is
+    counted before it is deleted. The ceiling is an anti-flood bound on ROWS, and rows
+    expired-but-not-yet-swept are real rows; counting them is the stricter reading and the
+    one §2 documents. The refusal it can produce is self-clearing — the sweeper runs every
+    ``TICK_MS`` — whereas the secret freeze above was not.
     """
-    exists = conn.execute(
-        "SELECT 1 FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
+    row = conn.execute(
+        "SELECT secret_hash, first_seen_at FROM enroll_requests WHERE install_uuid = ?",
+        (install_uuid,),
     ).fetchone()
-    if exists is None:
+    expired = row is not None and row[1] < now - ttl_ms
+    if row is None or expired:
+        # No LIVE row for this install_uuid: this write adds one to the operator's list, so
+        # it must pass the ceiling. Counted BEFORE the delete below — every row still in the
+        # table counts, TTL or not (docstring).
         n = conn.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()[0]
         if n >= max_pending:
-            return False
+            return ENROLL_AT_CAPACITY
+        if expired:
+            # Clear the tombstone so the UPSERT takes its INSERT branch and the row comes
+            # back with THIS request's secret_hash and a fresh first_seen_at.
+            conn.execute(
+                "DELETE FROM enroll_requests WHERE install_uuid = ?", (install_uuid,)
+            )
+    elif row[0] != secret_hash:
+        return ENROLL_SECRET_MISMATCH
     conn.execute(
         _UPSERT_ENROLL_REQUEST,
         (install_uuid, origin, suggested_title, protocol_version, secret_hash, now, now),
     )
-    return True
+    return ENROLL_ACCEPTED
 
 
-def count_enroll_requests(conn: sqlite3.Connection) -> int:
-    """Number of pending enroll requests — the capacity gate's numerator (§2)."""
-    row = conn.execute("SELECT COUNT(*) FROM enroll_requests").fetchone()
-    return int(row[0])
+# NOTE: there is deliberately no `count_enroll_requests` helper any more. It existed to
+# feed an ADVISORY pre-count in the /ext enroll handler — a second sqlite connection taken
+# from the shared pool on a fully UNAUTHENTICATED socket, before the window code had been
+# checked, whose answer ``upsert_enroll_request_capped`` then recomputed inside the write
+# anyway. Keeping a helper whose docstring calls it "the capacity gate" is an invitation to
+# wire that read back in; the gate is the transaction.
 
 
 def count_active_instances(conn: sqlite3.Connection) -> int:

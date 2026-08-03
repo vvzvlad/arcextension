@@ -37,7 +37,11 @@ from starlette.responses import JSONResponse, Response
 from src.api import admin_session
 from src.api.admin import require_admin
 from src.api.auth_metrics import auth_rejections
-from src.api.guards import require_same_origin
+from src.api.guards import (
+    MAX_UNAUTHENTICATED_BODY_BYTES,
+    read_bounded_body,
+    require_same_origin,
+)
 
 # Explicit Content-Security-Policy for every /admin HTML/asset response. `default-src
 # 'none'` denies everything by default; `script-src 'self'` / `style-src 'self'` permit only
@@ -58,16 +62,31 @@ _CSP = (
 # repo root — and templates/ under it — is two parents up. Resolved once.
 _TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
 
+# The ``curator_auth_rejections_total{reason}`` label for a FAILED ADMIN_TOKEN login — the
+# brute-force signal, kept apart from the ambient ``admin_session`` (see login_submit).
+# deploy/alerts.yml keys ``curator-admin-token-bruteforce`` on this exact string.
+ADMIN_BAD_TOKEN_REASON = "admin_bad_token"
+
 
 class AdminSecurityHeadersMiddleware:
-    """Stamp ``X-Content-Type-Options: nosniff`` on EVERY ``/admin`` response.
+    """Stamp ``X-Content-Type-Options: nosniff`` and ``Cache-Control: no-store`` on EVERY
+    ``/admin`` response.
 
-    One cross-cutting header covering both the HTML/asset responses and the #35 JSON API
-    responses (which serve UNTRUSTED ``suggested_title`` / ``origin`` verbatim) — a defense
-    against a browser MIME-sniffing a JSON/text body into active HTML. Implemented as a
-    pure-ASGI middleware so it adds ONLY a header and never touches the #35 JSON bodies or
-    status codes. Frame defenses (CSP ``frame-ancestors`` + ``X-Frame-Options``) stay on the
-    HTML/asset responses themselves, where framing is the threat.
+    Two cross-cutting headers covering both the HTML/asset responses and the #35 JSON API
+    responses. Implemented as a pure-ASGI middleware so it adds ONLY headers and never
+    touches the #35 JSON bodies or status codes. Frame defenses (CSP ``frame-ancestors`` +
+    ``X-Frame-Options``) stay on the HTML/asset responses themselves, where framing is the
+    threat.
+
+    * ``nosniff`` — the JSON API serves UNTRUSTED ``suggested_title`` / ``origin``
+      verbatim; a browser MIME-sniffing that body into active HTML must not be possible.
+    * ``no-store`` — ``/admin`` is entirely secrets: ``GET /admin/enroll/window`` returns
+      the LIVE window code, the request list carries pending credentials' metadata, and
+      the console page is only meaningful to an authenticated operator. None of it carried
+      any cache directive, so the default heuristics let a browser (or any intermediary)
+      write the live code to the disk cache, where it outlives both the window and the
+      session. ``no-store`` is the only directive that forbids writing it down at all —
+      ``no-cache`` still permits a stored copy.
     """
 
     def __init__(self, app):
@@ -82,9 +101,9 @@ class AdminSecurityHeadersMiddleware:
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 # setdefault: never duplicate a header an inner response already set.
-                MutableHeaders(scope=message).setdefault(
-                    "x-content-type-options", "nosniff"
-                )
+                headers = MutableHeaders(scope=message)
+                headers.setdefault("x-content-type-options", "nosniff")
+                headers.setdefault("cache-control", "no-store")
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
@@ -167,7 +186,15 @@ async def login_js(request: Request) -> Response:
 
 # --- login / logout ----------------------------------------------------------
 async def _submitted_token(request: Request) -> str:
-    """Read the token from a form POST (the login form) or a JSON body (curl/tests)."""
+    """Read the token from a form POST (the login form) or a JSON body (curl/tests).
+
+    The body is read through :func:`read_bounded_body` FIRST (413 past
+    :data:`MAX_UNAUTHENTICATED_BODY_BYTES`). This is the service's only pre-auth body:
+    ``login_submit`` is deliberately not behind ``require_admin`` — it is how one
+    authenticates — so an anonymous peer decides how much this endpoint buffers. The cap
+    runs before the JSON/form parser, which is what makes it a cap and not a post-mortem.
+    """
+    await read_bounded_body(request, MAX_UNAUTHENTICATED_BODY_BYTES)
     ctype = request.headers.get("content-type", "")
     if "application/json" in ctype:
         try:
@@ -176,7 +203,12 @@ async def _submitted_token(request: Request) -> str:
             return ""
         token = data.get("token") if isinstance(data, dict) else None
         return token if isinstance(token, str) else ""
-    form = await request.form()
+    try:
+        form = await request.form()
+    except Exception:
+        # A malformed/undecodable form body is simply "no token" — never a 500 on a
+        # surface anybody may POST to.
+        return ""
     token = form.get("token")
     return token if isinstance(token, str) else ""
 
@@ -189,13 +221,22 @@ async def login_submit(request: Request) -> Response:
     and the endpoint answers 200. A wrong/empty token is a flat 401. Not behind
     ``require_admin`` (this is how you AUTHENTICATE) and not behind ``require_operational``
     (you may log in to read while degraded); it touches only the in-memory store.
+
+    A failure is counted under its OWN reason, :data:`ADMIN_BAD_TOKEN_REASON` — never the
+    generic ``admin_session`` that ``require_admin`` uses. The two events are nothing
+    alike: "someone opened /admin without a session" happens every time a browser hits the
+    console before logging in and is pure background noise, while "someone POSTed a WRONG
+    ADMIN_TOKEN" is a guess at the credential that opens /admin, /api/* and /mcp. Folded
+    into one label the second is unalertable — any threshold that survives the first is far
+    above a real brute force. Split, ``curator-admin-token-bruteforce`` can key on this
+    one (deploy/alerts.yml).
     """
     submitted = await _submitted_token(request)
     expected = request.app.state.settings.admin_token
     if not secrets.compare_digest(
         submitted.encode("utf-8", "ignore"), expected.encode("utf-8")
     ):
-        auth_rejections.incr("admin_session")
+        auth_rejections.incr(ADMIN_BAD_TOKEN_REASON)
         raise HTTPException(status_code=401, detail="invalid admin token")
 
     session_id = admin_session.create(request.app)

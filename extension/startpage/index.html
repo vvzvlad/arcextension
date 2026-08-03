@@ -64,10 +64,15 @@
       .sp-dot.closed { background: #9aa0a6; }
       .sp-dot.never { background: #9aa0a6; }
       .sp-dot.rejected { background: #d64541; }
+      /* The enroll banner reuses .sp-dot with its state as the class. Only the refused
+         address gets a colour: it is the one state that is a SECURITY condition rather
+         than a stage of a normal enrollment, so it must read as an alarm, not as
+         "waiting". */
+      .sp-dot.bad-address { background: #d64541; }
       .sp-offline { font-size: 12px; opacity: 0.7; margin-left: 8px; }
       .sp-fallback { font-size: 12px; color: #d64541; margin-top: 4px; }
     </style>
-    <script type="module" crossorigin src="./assets/index-DZTw2Q7X.js"></script>
+    <script type="module" crossorigin src="./assets/index-BhB_tut4.js"></script>
   </head>
   <body>
     <!-- Offline-first: this root is populated by the SFC-precompiled app; the very

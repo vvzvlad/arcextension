@@ -257,6 +257,17 @@ describe("enrollment message channel (§7)", () => {
     // seeded secret — the server hashes it on receipt (option A), the client never does.
     expect(cred.serviceUrl).toBe("wss://host.example/");
     expect(cred.secret).toBe(SECRET_HEX);
+    expect(cred.addressError).toBe(null);
+  });
+
+  it("get_credential reports a REFUSED address as addressError, not as an absent one", async () => {
+    // The TLS gate resolves a refused address to null. Without this field the popup — the
+    // only consumer that had not been fixed — printed "no service address is configured"
+    // over an address the operator HAD typed. Reddens if the field is dropped again.
+    await loadServiceWorker({ seedLocal: { serviceAddress: "ws://not-loopback.example" } });
+    const cred = await ask({ type: "get_credential" });
+    expect(cred.serviceUrl).toBe(null);
+    expect(cred.addressError).toBe("insecure");
   });
 
   it("get_connection_state carries the durable enrollState (approved when seeded)", async () => {

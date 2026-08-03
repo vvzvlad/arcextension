@@ -3,15 +3,16 @@
 //
 // The stored `pattern` is a HOST pattern (the matcher grammar is hostPattern[:port];
 // a full URL is rejected 422, §8) — the `/*` is how the human reads it, and the
-// matcher ignores the path anyway. The target instance is THIS copy's instanceId,
-// read from instance.json exactly like the service worker does (§6). Preview and
-// save are the SERVER's matcher (§8: the browser never duplicates it). The script is
-// external because the extension_pages CSP forbids inline scripts.
+// matcher ignores the path anyway. The target instance is THIS copy's SERVER-assigned
+// instanceId, obtained from the service worker (§7). Preview and save are the SERVER's
+// matcher (§8: the browser never duplicates it). The script is external because the
+// extension_pages CSP forbids inline scripts.
 //
 // Pure functions are exported for unit tests; DOM wiring runs only in a document.
 
-// Derive the HTTP base from the wss service URL (instance.json carries the socket
-// URL). ws→http, wss→https; trailing slashes trimmed.
+// Derive the HTTP base from the wss service URL the SW resolved. ws→http, wss→https;
+// trailing slashes trimmed. (`ws://` survives only for a loopback dev address — see
+// src/service-address.js, which is what admits it in the first place.)
 export function httpBaseFromServiceUrl(serviceUrl) {
   const base = String(serviceUrl || "").replace(/\/+$/, "");
   if (base.startsWith("wss://")) return "https://" + base.slice("wss://".length);
@@ -67,40 +68,49 @@ export async function saveRule(fetchFn, base, token, rule, { confirmImpact = fal
   return { status: resp.status, body };
 }
 
-// Read instance.json via the extension URL. With enrollment (§7) this is only a
-// FALLBACK bootstrap: the credential source moved to the SW (address + raw secret +
-// server-assigned id). Kept for a bundle that still ships a serviceUrl.
-export async function loadConfig(fetchFn, getURL) {
-  const resp = await fetchFn(getURL("instance.json"));
-  return await resp.json();
-}
-
-// Resolve the /api base + Bearer + target instanceId (§7). PREFER the SW credential
-// (the RAW instance secret is the /api Bearer — slice C / option A, the server hashes it —
-// and the id is server-assigned, learned from a successful hello); fall back to
-// instance.json when the SW channel is unavailable or has nothing yet (e.g. before
-// enrollment).
-export async function loadPopupContext(chromeApi, fetchFn) {
+// Resolve the /api base + Bearer + target instanceId (§7). The SW is the ONLY source:
+// the address setting, the RAW instance secret as the Bearer (slice C / option A — the
+// server hashes it) and the SERVER-assigned instance id, learned from a successful hello.
+//
+// There is deliberately NO instance.json fallback. It used to read `config.token` and
+// `config.instanceId`, and under enrollment neither field exists ANYWHERE anymore — the
+// shared token is gone and the id is not self-reported. The "fallback" could therefore
+// only produce `{token: undefined, instanceId: undefined}`, i.e. a rule targeted at
+// `undefined` saved with no credential: a guaranteed 401 dressed up as a working path.
+// Throwing here instead makes the real condition — this copy is not enrolled yet — the
+// thing the popup shows.
+export async function loadPopupContext(chromeApi) {
+  let cred = null;
+  let ident = null;
   try {
     if (chromeApi.runtime && chromeApi.runtime.sendMessage) {
-      const cred = await chromeApi.runtime.sendMessage({ type: "get_credential" });
-      const ident = await chromeApi.runtime.sendMessage({ type: "get_identity" });
-      if (cred && cred.serviceUrl && cred.secret && ident && ident.instanceId) {
-        return {
-          base: httpBaseFromServiceUrl(cred.serviceUrl),
-          token: cred.secret,
-          instanceId: ident.instanceId,
-        };
-      }
+      cred = await chromeApi.runtime.sendMessage({ type: "get_credential" });
+      ident = await chromeApi.runtime.sendMessage({ type: "get_identity" });
     }
   } catch {
-    // fall through to the instance.json bootstrap
+    throw new Error("the extension service worker is not answering");
   }
-  const config = await loadConfig(fetchFn, chromeApi.runtime.getURL);
+  if (!cred || !cred.serviceUrl) {
+    // Two DIFFERENT conditions collapse into `serviceUrl: null`, because the TLS gate
+    // (src/service-address.js) resolves a REFUSED address to null exactly like an absent
+    // one. Telling an operator who typed `ws://host` that "no service address is
+    // configured" points them at a field they already filled in; the options page and the
+    // startpage were both fixed to read `addressError`, and this was the third surface.
+    if (cred && cred.addressError) {
+      throw new Error(
+        "the configured service address was refused (" + cred.addressError +
+        ") — fix it in the extension options",
+      );
+    }
+    throw new Error("no service address is configured — open the extension options");
+  }
+  if (!cred.secret || !ident || !ident.instanceId) {
+    throw new Error("this browser is not enrolled yet — enroll it in the extension options");
+  }
   return {
-    base: httpBaseFromServiceUrl(config.serviceUrl),
-    token: config.token,
-    instanceId: config.instanceId,
+    base: httpBaseFromServiceUrl(cred.serviceUrl),
+    token: cred.secret,
+    instanceId: ident.instanceId,
   };
 }
 
@@ -141,7 +151,7 @@ export async function init(doc, chromeApi, fetchFn) {
 
   let base, token, rule;
   try {
-    const ctx = await loadPopupContext(chromeApi, fetchFn);
+    const ctx = await loadPopupContext(chromeApi);
     base = ctx.base;
     token = ctx.token;
     const tab = await getActiveTab(chromeApi);
