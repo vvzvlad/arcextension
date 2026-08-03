@@ -1,15 +1,18 @@
-"""CLI for the instance generator (§13): ``generate`` and ``restamp``.
+"""CLI for the instance generator (§13): ``generate`` and ``bundle``.
 
-Secrets are never defaulted in code (AGENTS.md): the token comes from ``$EXT_TOKEN``
-or a ``--token-file`` PATH, and a missing token fails. There is deliberately NO
-``--token`` option — see `_resolve_token`. The signing key is generated/persisted
-under ``<out>/.instancegen/`` (or supplied via ``--key-file``) — never hardcoded.
+Under enrollment (§7/§13, issue #35) the extension build is UNIVERSAL: ``bundle``
+produces the ONE key-pinned bundle the whole fleet loads, and ``generate`` only wraps
+that shared bundle in a per-instance ``.app`` + empty profile. Neither bakes in a
+service address or a secret — both are entered per profile through the enrollment
+settings UI — so ``generate`` needs NO token and NO ``instance.json`` (both are gone).
+The signing key that pins the fleet-wide id is generated/persisted under
+``.instancegen/`` (or supplied via ``bundle --key-file``) — never hardcoded.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -44,28 +47,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_EXTENSION_DIR = _REPO_ROOT / "extension"
 
 
-def _resolve_token(token_file: str | None) -> str:
-    """The EXT_TOKEN, from ``$EXT_TOKEN`` or the file named by ``--token-file``.
-
-    argv is NOT a token source, by design: a command line is world-readable in `ps`
-    output for the whole run and is recorded verbatim in the shell history of every
-    operator who ever rotates a token. ``--token-file`` carries a PATH — the secret
-    itself stays in a file (or the env), never in argv. Nothing is defaulted: a
-    missing token fails loudly (AGENTS.md).
-    """
-    if token_file:
-        token = Path(token_file).read_text(encoding="utf-8").strip()
-    else:
-        token = os.environ.get("EXT_TOKEN", "")
-    if not token:
-        raise SystemExit(
-            "no token: set EXT_TOKEN in the environment (e.g. `EXT_TOKEN=… make "
-            "instance`, with the assignment BEFORE the command so it does not land "
-            "in argv) or pass --token-file PATH"
-        )
-    return token
-
-
 def _resolve_key(out_root: Path, key_file: str | None) -> tuple[str, str]:
     """Return (base64 manifest key, derived extension id).
 
@@ -85,12 +66,31 @@ def _resolve_key(out_root: Path, key_file: str | None) -> tuple[str, str]:
     return key_b64, keys.derive_extension_id(key_b64)
 
 
+def _bundle_extension_id(bundle_dir: Path) -> str | None:
+    """The pinned ``chrome-extension://`` id of the SHARED bundle, for the printout.
+
+    Derived from the ``key`` already pinned in the shared bundle's manifest (by
+    ``instancegen bundle``); ``None`` if the bundle still carries the placeholder key
+    (not yet pinned) OR the manifest is unreadable/malformed. This is a best-effort
+    convenience printout run AFTER the instance is already created, so a broken manifest
+    must NOT crash it with a bare traceback — the instance itself is valid, and the id
+    can be recovered by pinning the shared bundle's key. ``generate`` then prints a hint
+    instead of the id.
+    """
+    try:
+        manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
+        key_b64 = str(manifest.get("key") or "")
+    except (OSError, ValueError):
+        return None
+    if not key_b64 or key_b64 == core.KEY_PLACEHOLDER:
+        return None
+    return keys.derive_extension_id(key_b64)
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     out_root = Path(args.out).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-    _warn_if_inside_git_repo(out_root)
-    token = _resolve_token(args.token_file)
-    key_b64, ext_id = _resolve_key(out_root, args.key_file)
+    bundle_dir = Path(args.bundle_dir).resolve()
     title = args.title or args.instance_id
 
     icon_png = None
@@ -99,16 +99,11 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
     result = core.generate_instance(
         out_root=out_root,
-        source_extension_dir=args.extension_dir,
+        bundle_dir=bundle_dir,
         instance_id=args.instance_id,
         title=title,
-        service_url=args.service_url,
-        token=token,
-        key_b64=key_b64,
-        extension_id=ext_id,
         brave_binary=args.brave_binary,
         icon_source_png=icon_png,
-        allow_execute_js=args.allow_execute_js,
         overwrite=args.overwrite,
     )
 
@@ -117,84 +112,35 @@ def cmd_generate(args: argparse.Namespace) -> int:
     )
 
     p = result.paths
+    ext_id = _bundle_extension_id(bundle_dir)
     print(f"Generated instance {args.instance_id!r} -> {p.root}")
-    print(f"  extension copy : {p.extension_dir}")
+    print(f"  shared bundle  : {bundle_dir}  (--load-extension target; NOT copied)")
     print(f"  profile        : {p.profile_dir}  (empty; install_uuid born here)")
     print(f"  app bundle     : {p.app_dir}")
     print(f"  launcher       : {p.launcher}")
-    print(f"  extension id   : {ext_id}")
-    print(f"  origin (for EXT_ALLOWED_ORIGINS): chrome-extension://{ext_id}")
-    print(f"  icon (.icns)   : {icns.reason}")
-    print("  launch: " + shlex.join(result.launch_command))
-    return 0
-
-
-def cmd_restamp(args: argparse.Namespace) -> int:
-    out_root = Path(args.out).resolve()
-    token = _resolve_token(args.token_file)
-    # The code refresh is ON by default (§13): the bundle is duplicated per instance
-    # and protocolVersion is compared by exact equality, so a rotation that left the
-    # copies on old code would reject every instance on hello — with the failure
-    # visible only in the status bar. --no-code-update is the explicit opt-out.
-    source = None if args.no_code_update else args.extension_dir
-    # Accumulated as each instance lands. A pre-flight makes a mid-apply failure rare,
-    # but an I/O error can still stop the run partway — and the operator has usually
-    # already rotated EXT_TOKEN on the service by then. Printing nothing would leave
-    # them guessing which instances hold which token; that list is the difference
-    # between a two-minute fix and a hunt.
-    applied: list[core.RestampChange] = []
-    try:
-        changes = core.restamp_all(
-            out_root,
-            token=token,
-            service_url=args.service_url,
-            source_extension_dir=source,
-            on_change=applied.append,
-        )
-    except Exception as exc:
-        print(f"FAILED after {len(applied)} instance(s): {exc}", file=sys.stderr)
-        if applied:
-            print("These instances ALREADY carry the NEW token:", file=sys.stderr)
-            for ch in applied:
-                print(f"  {ch.instance_id}  [{ch.instance_json}]", file=sys.stderr)
-            print(
-                "Every other instance still holds the OLD token. Fix the cause and "
-                "re-run the same command — re-stamping an already-rotated instance is "
-                "idempotent.",
-                file=sys.stderr,
-            )
-        else:
-            print("No instance was modified.", file=sys.stderr)
-        # SystemExit, not a re-raise: the operator needs the list above as the LAST
-        # thing on screen, not buried under a traceback. The message already names the
-        # offending file and what to do.
-        raise SystemExit(1) from exc
-
-    print(f"Re-stamped {len(changes)} instance(s) under {out_root}:")
-    for ch in changes:
-        extra = f", serviceUrl -> {ch.new_service_url}" if ch.new_service_url else ""
-        code = "code refreshed" if ch.code_updated else "code UNCHANGED"
-        print(
-            f"  {ch.instance_id}: token {ch.old_token_masked} -> (new){extra}, "
-            f"{code} [{ch.instance_json}]"
-        )
-    if source:
-        print(f"Extension code copied from {source} (pinned key/profile preserved).")
+    if ext_id is not None:
+        print(f"  extension id   : {ext_id}")
+        print(f"  origin (for EXT_ALLOWED_ORIGINS): chrome-extension://{ext_id}")
     else:
-        print(
-            "WARNING: --no-code-update — the copies keep their old code. A bumped "
-            "PROTOCOL_VERSION will be rejected on hello (§13)."
-        )
-    print("Restart each browser so the SW re-reads instance.json and reconnects.")
+        print("  extension id   : (bundle key is the placeholder — pin it via "
+              "`instancegen bundle --key-file`)")
+    print(f"  icon (.icns)   : {icns.reason}")
+    if args.service_url:
+        # The address is NOT stamped anymore — the extension gets it via the enrollment
+        # settings UI (§13). Accepted for compatibility with older invocations; noted so
+        # the operator does not expect it to be baked in.
+        print(f"  note           : --service-url {args.service_url!r} is informational "
+              "only; enter the address in the extension settings during enrollment")
+    print("  launch: " + shlex.join(result.launch_command))
     return 0
 
 
 def cmd_bundle(args: argparse.Namespace) -> int:
     """Build a UNIVERSAL, key-pinned extension bundle (§9).
 
-    Unlike ``generate``/``restamp`` this needs NO token, NO service URL and NO
-    instanceId: with enrollment (§7, issue #35) the build is universal — serviceUrl and
-    the per-install secret are entered per profile, not baked in. It only copies the
+    Like ``generate`` this needs NO token, NO service URL and NO instanceId: with
+    enrollment (§7, issue #35) the build is universal — serviceUrl and the per-install
+    secret are entered per profile, not baked in. It only copies the
     repo ``extension/`` into ``--out`` and pins the manifest ``key`` (the one
     ``chrome-extension://`` id for the whole fleet — predpos. 19). NO ``instance.json``
     is written. Two runs with the same ``--key-file`` are byte-identical (acc 16).
@@ -244,69 +190,46 @@ def cmd_bundle(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="generate_instance",
-        description="Generate/re-stamp per-instance Brave browsers (§13).",
+        description="Build the universal bundle and per-instance Brave .apps (§13).",
         # allow_abbrev=False everywhere, and not as a style choice: with the default
-        # prefix matching, `--token SECRET` silently resolves to the `--token-file`
-        # option — so the removed argv path would quietly come back, putting the
-        # secret in argv (and then failing with a confusing "no such file" instead of
-        # telling the operator what they just did).
+        # prefix matching an operator's typo could silently resolve to a longer option;
+        # `bundle` in particular must keep rejecting --token/--token-file exactly (a
+        # secret must never sit in argv).
         allow_abbrev=False,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    g = sub.add_parser("generate", help="create a new instance", allow_abbrev=False)
-    g.add_argument("--instance-id", required=True, help="immutable instanceId (§13)")
+    g = sub.add_parser(
+        "generate",
+        help="wrap the shared bundle in a per-instance .app + empty profile",
+        allow_abbrev=False,
+    )
+    g.add_argument("--instance-id", required=True, help="names the .app/profile (§13)")
     g.add_argument("--title", default=None, help="display title (default: instanceId)")
-    g.add_argument("--service-url", required=True, help="e.g. wss://host")
-    # No --token: a secret must never sit in argv (ps output, shell history).
+    # OPTIONAL and NOT stamped: the address is entered per profile via the enrollment
+    # settings UI (§13). Accepted only for compatibility with older invocations.
     g.add_argument(
-        "--token-file", default=None, help="file holding EXT_TOKEN (or set $EXT_TOKEN)"
+        "--service-url",
+        default=None,
+        help="informational only (the address is entered during enrollment, not baked in)",
+    )
+    g.add_argument(
+        "--bundle-dir",
+        required=True,
+        help="the SHARED universal bundle built by `instancegen bundle` "
+        "(--load-extension target; every instance loads this same dir)",
     )
     g.add_argument("--out", required=True, help="output root for instances")
-    g.add_argument(
-        "--extension-dir",
-        default=str(_DEFAULT_EXTENSION_DIR),
-        help="source extension bundle (default: repo extension/)",
-    )
-    g.add_argument("--key-file", default=None, help="PEM private key or base64 pubkey")
     g.add_argument("--icon", default=None, help="PNG icon source (default: generated)")
     g.add_argument(
         "--brave-binary", default=core.DEFAULT_BRAVE_BINARY, help="system Brave path"
     )
-    g.add_argument("--allow-execute-js", action="store_true", help="set the default OFF")
     g.add_argument(
         "--overwrite",
         action="store_true",
-        help="rebuild an existing instance's bundle (the profile is KEPT)",
+        help="rebuild an existing instance's .app (the profile is KEPT)",
     )
     g.set_defaults(func=cmd_generate)
-
-    r = sub.add_parser(
-        "restamp",
-        help="rotate the token AND refresh the code across ALL instances",
-        allow_abbrev=False,
-    )
-    r.add_argument("--out", required=True, help="output root holding the instances")
-    # No --token here either — same reason as `generate`.
-    r.add_argument(
-        "--token-file",
-        default=None,
-        help="file holding the new EXT_TOKEN (or set $EXT_TOKEN)",
-    )
-    r.add_argument("--service-url", default=None, help="optionally also change serviceUrl")
-    r.add_argument(
-        "--extension-dir",
-        default=str(_DEFAULT_EXTENSION_DIR),
-        help="source bundle whose code is copied into every instance "
-        "(default: repo extension/)",
-    )
-    r.add_argument(
-        "--no-code-update",
-        action="store_true",
-        help="rotate config only, leaving each copy's code as-is (§13: unsafe after "
-        "a PROTOCOL_VERSION bump)",
-    )
-    r.set_defaults(func=cmd_restamp)
 
     b = sub.add_parser(
         "bundle",

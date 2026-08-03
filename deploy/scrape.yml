@@ -6,9 +6,9 @@
 # without updating alerts.yml).
 #
 # ⚠️ THIS FILE LIVES IN GIT IN PLAINTEXT. That is exactly WHY the scrape credential
-# is METRICS_TOKEN and NOT EXT_TOKEN (§12): METRICS_TOKEN is read-only and opens
+# is METRICS_TOKEN and NOT ADMIN_TOKEN (§12): METRICS_TOKEN is read-only and opens
 # ONLY /metrics, so leaking it here grants nothing but read access to metrics. Never
-# put EXT_TOKEN (which opens /ext, /api/* and /mcp) in a scrape config.
+# put ADMIN_TOKEN (which opens /admin, /api/* and /mcp) in a scrape config.
 #
 # Placeholders below are XXX — replace at deploy time (inject the token from a
 # secret store; do NOT commit the real value):

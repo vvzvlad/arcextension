@@ -1,0 +1,45 @@
+# promtool test harness for deploy/alerts.yml (§12/§13).
+#
+# Run:  promtool test rules deploy/alerts_test.yml
+# (rule_files is resolved relative to THIS file, so `alerts.yml` = deploy/alerts.yml).
+#
+# Focus: the enroll_bad_code brute-force rule added for issue #37 — it must FIRE on the
+# injected rapid rise and stay QUIET on a slow trickle. (There is deliberately no
+# window-overdue alert — see the NOTE in alerts.yml.) The rest of the file is covered
+# structurally by tests/test_deploy_alerts.py; `promtool check rules` validates the whole
+# schema.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- curator-enroll-code-bruteforce: fires on a rapid rise ---------------------
+  - interval: 1m
+    name: enroll bad-code brute-force fires
+    input_series:
+      - series: 'curator_auth_rejections_total{reason="enroll_bad_code"}'
+        # +1 bad code every minute -> increase over 10m >> 5.
+        values: '0+1x12'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-enroll-code-bruteforce
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: enroll_bad_code
+            exp_annotations:
+              summary: "Repeated bad enrollment codes (brute-force on the enrollment window, §13)."
+
+  # --- curator-enroll-code-bruteforce: QUIET on a slow trickle -------------------
+  - interval: 1m
+    name: enroll bad-code trickle is quiet
+    input_series:
+      - series: 'curator_auth_rejections_total{reason="enroll_bad_code"}'
+        # Two stray typos total, then flat — increase over 10m is 0, well under 5.
+        values: '2 2 2 2 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: curator-enroll-code-bruteforce
+        exp_alerts: []

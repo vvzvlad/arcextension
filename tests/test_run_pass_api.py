@@ -6,7 +6,6 @@ from starlette.testclient import TestClient
 
 from src.app import create_app
 
-EXT_TOKEN = "test-ext-token"
 ADMIN_TOKEN = "test-admin-token"
 # /api/* accepts either an admin (ADMIN_TOKEN) or an active-instance secret (issue #35 §4).
 # The generic tests here just need a valid caller, so they use the admin credential;
@@ -20,7 +19,7 @@ def _settings(tmp_path, **over):
         backup_dir=str(tmp_path / "backups"),
         host="0.0.0.0", port=8000,
         heartbeat_ms=600_000, protocol_version=1,
-        ext_token=EXT_TOKEN, metrics_token="m", admin_token=ADMIN_TOKEN,
+        metrics_token="m", admin_token=ADMIN_TOKEN,
         ext_allowed_origins="",
         idle_minutes=60, pass_interval_min=5, tick_ms=60000,
         cmd_timeout_ms=1000, snapshot_timeout_ms=500, lease_ttl_ms=600_000,

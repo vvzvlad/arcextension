@@ -173,6 +173,33 @@ groups:
         annotations:
           summary: "Instance {{ $labels.id }} absent for over ~12h."
 
+      # NOTE (§37): there is deliberately NO alert on curator_enroll_window_seconds_remaining
+      # < 0. That gauge returns the raw (enroll_window_until − now), and a window that
+      # closes the NORMAL way — by natural expiry — is never cleared from the settings row
+      # (read_enroll_window just reads it as closed), so the gauge stays negative FOREVER
+      # after any ordinary enrollment session. An alert on `< 0` would therefore fire once
+      # and never resolve — a permanently-stuck warning. The clean fix is to clamp the
+      # gauge to 0 on expiry in the enrollment metric (src/api/metrics.py), which lives in
+      # the enrollment PR (#35); add the window-overdue alert back HERE only once that
+      # clamp lands. The enroll_bad_code brute-force alert below has no such problem (a
+      # counter's increase() decays on its own).
+
+      # Repeated bad enrollment codes — a brute-force against the open window (§13, issue
+      # #37). curator_auth_rejections_total is labeled per reason and the
+      # {reason="enroll_bad_code"} series exists ONLY once a bad code has been seen, so
+      # increase() over the window returns an empty vector on a healthy install and stays
+      # silent (the per-metric convention above); it fires when bad codes arrive faster
+      # than a fat-fingered operator would produce. No `for:` — the 10m increase window is
+      # itself the smoothing.
+      - alert: curator-enroll-code-bruteforce
+        # [A]: increase(curator_auth_rejections_total{reason="enroll_bad_code"}[10m])
+        # [C]: A > 5
+        expr: increase(curator_auth_rejections_total{reason="enroll_bad_code"}[10m]) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repeated bad enrollment codes (brute-force on the enrollment window, §13)."
+
       # Half-open socket: connected but the mirror snapshot stopped advancing for
       # >6×PASS_INTERVAL (§12 reserves 6× for exactly this). snapshot_age is already 0
       # while paused, so the routine hour-long pause never lights this on every

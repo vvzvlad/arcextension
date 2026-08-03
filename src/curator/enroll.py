@@ -1,6 +1,6 @@
 """Enrollment window — arm / read / close, stored in the ``settings`` TABLE (§13).
 
-Enrollment replaces the shared ``EXT_TOKEN``: an instance says hello with an
+Enrollment replaces the former shared /ext token: an instance says hello with an
 ``install_uuid`` + a per-install secret and waits in ``enroll_requests`` until an
 operator approves it. Approval is only accepted while the enrollment WINDOW is open —
 a short, operator-opened interval so a stolen hello cannot be approved at an arbitrary

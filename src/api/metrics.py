@@ -2,9 +2,9 @@
 
 Design decisions taken straight from §12 "Наблюдаемость":
 
-* A **separate** ``METRICS_TOKEN`` Bearer guards this endpoint (never ``EXT_TOKEN``):
-  the scrape credential lives in git plaintext, so it must never be able to touch
-  ``/ext`` / ``/api/*`` / ``/mcp``.
+* A **separate** ``METRICS_TOKEN`` Bearer guards this endpoint (never ``ADMIN_TOKEN``
+  or a per-instance secret): the scrape credential lives in git plaintext, so it must
+  never be able to touch ``/ext`` / ``/api/*`` / ``/mcp`` / ``/admin``.
 * **Served in degraded mode.** The handler never trusts the schema: a failed DB read
   degrades to defaults and still emits every metric (with ``curator_migration_failed=1``).
 * **Everything about a pass is computed at scrape time from the ``passes`` table** —
@@ -664,7 +664,8 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
 async def metrics(request: Request) -> Response:
     """``GET /metrics`` — the read-only Prometheus scrape (§12).
 
-    Guarded by ``METRICS_TOKEN`` only (never ``EXT_TOKEN``). Serves in degraded mode:
+    Guarded by ``METRICS_TOKEN`` only (never ``ADMIN_TOKEN`` / a per-instance secret).
+    Serves in degraded mode:
     a failed DB read degrades to defaults and still emits every metric, with
     ``curator_migration_failed=1``.
     """

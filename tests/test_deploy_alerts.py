@@ -6,10 +6,11 @@ the one rule that reports the service is gone. A rule file that silently fails t
 is indistinguishable from a healthy system, which is why this is worth a test rather
 than a review comment.
 
-Validated for real with `promtool check rules deploy/alerts.yml` (Prometheus 3.13.2)
-during Фаза 13; promtool is not a project dependency, so the schema check below is the
-CI-portable stand-in. Keep both in mind when editing: this test encodes promtool's
-field sets, not a guess at them.
+Validated for real with `promtool check rules deploy/alerts.yml` and
+`promtool test rules deploy/alerts_test.yml` (Prometheus 2.53.3) during issue #37;
+promtool is not a project dependency, so the schema check below is the CI-portable
+stand-in. Keep both in mind when editing: this test encodes promtool's field sets, not a
+guess at them.
 """
 
 from __future__ import annotations
@@ -172,6 +173,42 @@ def test_every_metric_named_in_a_rule_actually_exists():
     assert referenced, "no curator_* metrics referenced — the regex stopped matching"
     unknown = sorted(n for n in referenced if f'"{n}"' not in metrics_src)
     assert not unknown, f"alert rules reference metrics /metrics never exports: {unknown}"
+
+
+def test_no_window_overdue_alert_until_the_gauge_is_clamped():
+    # §37: there is deliberately NO alert on curator_enroll_window_seconds_remaining. The
+    # gauge stays NEGATIVE forever after a NATURALLY-expired window (the settings row is
+    # never cleared on expiry), so a `< 0` rule would fire once and never resolve. The
+    # clamp-to-0 fix lives in the enrollment PR (#35); the window-overdue alert may be
+    # added back only once it lands. Redden: reintroduce the rule before the clamp exists.
+    alerts = {r["alert"] for r in _rules()}
+    assert "curator-enroll-window-overdue" not in alerts
+    assert not any(
+        "curator_enroll_window_seconds_remaining" in r["expr"] for r in _rules()
+    )
+
+
+def test_enroll_bad_code_bruteforce_rule_scopes_to_the_reason():
+    # §37: the brute-force alert must scope to the {reason="enroll_bad_code"} series (not
+    # the whole auth-rejections family, which counts CORS/metrics/api rejections too) and
+    # rate-limit via increase() so a healthy install's absent series stays silent. Redden:
+    # drop the label matcher and a burst of unrelated rejections would page.
+    rule = next(r for r in _rules() if r["alert"] == "curator-enroll-code-bruteforce")
+    assert 'curator_auth_rejections_total{reason="enroll_bad_code"}' in rule["expr"]
+    assert "increase(" in rule["expr"]
+
+
+def test_enroll_bad_code_metric_has_an_alert_rule():
+    # §37, the metric->rule direction the name-guard does NOT cover: #35 exports the
+    # enroll_bad_code counter, but a series with no rule is DEAD (scraped, never alerted
+    # on). Assert it is referenced by at least one rule here — the reason this rule was
+    # added in #37. Redden: delete the bruteforce rule and this fails.
+    #
+    # (The other #35 gauge, curator_enroll_window_seconds_remaining, is intentionally NOT
+    # alerted on yet — see test_no_window_overdue_alert_until_the_gauge_is_clamped — so it
+    # is deliberately absent from this metric->rule check.)
+    exprs = " ".join(r["expr"] for r in _rules())
+    assert 'curator_auth_rejections_total{reason="enroll_bad_code"}' in exprs
 
 
 def test_scrape_job_name_matches_the_alert_selectors():

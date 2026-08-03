@@ -229,7 +229,7 @@ class _MCPAsgi:
         auth = headers.get(b"authorization", b"").decode("latin-1")
         scheme, _, token = auth.partition(" ")
         # Constant-time compare, as bytes, against ADMIN_TOKEN (issue #35 §4: the MCP
-        # agent authenticates as the human/admin, not with EXT_TOKEN).
+        # agent authenticates as the human/admin, not with a per-instance secret).
         if scheme.lower() != "bearer" or not secrets.compare_digest(
             token.encode("utf-8", "ignore"), settings.admin_token.encode("utf-8")
         ):
