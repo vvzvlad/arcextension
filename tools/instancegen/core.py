@@ -7,9 +7,11 @@ Everything here runs on Linux/CI without a browser or a mac. The macOS-only real
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import struct
+import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -238,6 +240,77 @@ def copy_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path) ->
     if not (src / "manifest.json").is_file():
         raise ValueError(f"{src} is not an extension bundle (no manifest.json)")
     shutil.copytree(src, dst_extension_dir, ignore=_COPY_IGNORE)
+
+
+# Prefix of the staging dir `replace_bundle` builds into. Dotted so it is inconspicuous
+# next to the bundle, and distinctive so a leftover from a crashed rebuild is obvious.
+_REBUILD_STAGING_PREFIX = ".rebuild-"
+
+
+def replace_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path) -> None:
+    """Rebuild an EXISTING bundle dir IN PLACE, keeping its path and never half-writing it.
+
+    The destination path MUST survive the rebuild unchanged, and that is the whole point:
+    Chromium derives the ``chrome-extension://`` id from the absolute path of the loaded
+    directory, so the id — and with it the extension's origin and that profile's
+    ``chrome.storage.local``, where the enrollment secret lives — is a function of THIS
+    path. Rebuilding into a differently-named dir hands the browser a *different*
+    extension and silently drops the instance's enrolment.
+
+    A naive ``rmtree(dst)`` + ``copytree`` would keep the path but is still wrong: an
+    interrupted copy leaves the operator with a directory that is no longer a loadable
+    extension. So the fresh tree is built into a staging dir NEXT TO the target — same
+    parent, hence the same filesystem, hence ``os.replace`` is a rename and not a copy —
+    and only a COMPLETE tree is ever swapped in:
+
+        1. copy src -> <parent>/.rebuild-XXXX/new   (the slow part; dst still intact)
+        2. rename dst -> <staging>/old              (dst is free for an instant)
+        3. rename <staging>/new -> dst              (dst is now the NEW tree, same path)
+        4. rmtree the staging dir                   (drops the previous tree)
+
+    The only lossy window is between (2) and (3) — two renames in one directory — and
+    even there the previous tree still exists under the staging dir until step (4).
+    Anything that fails earlier leaves the existing bundle exactly as it was.
+    """
+    src = Path(src_extension_dir).resolve()
+    dst = Path(dst_extension_dir).resolve()
+    # Step (4) DELETES the previous tree at dst, so a source that is dst — or lives inside
+    # it — would destroy itself. `--out extension` is a plausible typo; refuse it here
+    # rather than eat the repo's own bundle.
+    if src == dst or src.is_relative_to(dst):
+        raise ValueError(
+            f"refusing to rebuild {dst} from a source inside it ({src}) — the rebuild "
+            "replaces that whole directory"
+        )
+    parent = dst.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    # Staging goes in the TARGET's parent on purpose: os.replace cannot rename across
+    # filesystems, and a system temp dir is very often a different one.
+    staging = Path(tempfile.mkdtemp(prefix=_REBUILD_STAGING_PREFIX, dir=parent))
+    new_tree = staging / "new"
+    old_tree = staging / "old"
+
+    try:
+        # Validates the source and does all the copying while dst is still untouched.
+        copy_bundle(src_extension_dir, new_tree)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    moved_away = False
+    if dst.exists() or dst.is_symlink():
+        os.replace(dst, old_tree)
+        moved_away = True
+    try:
+        os.replace(new_tree, dst)
+    except BaseException:
+        # Put the previous bundle back at its path rather than leaving nothing loadable.
+        if moved_away:
+            os.replace(old_tree, dst)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _clear_instance_dir_keeping_profile(root: Path) -> None:

@@ -34,7 +34,7 @@ from src.api.metrics import (
 )
 from src.app import create_app
 from src.curator.enroll import ENROLL_WINDOW_UNTIL_KEY
-from tools.instancegen import cli
+from tools.instancegen import cli, core
 
 REPO_EXTENSION = Path(__file__).resolve().parents[1] / "extension"
 MAUTH = {"Authorization": f"Bearer {METRICS_TOKEN}"}
@@ -271,8 +271,149 @@ def test_bundle_writes_no_secret_material_beside_or_inside_the_output(tmp_path):
 def test_bundle_refuses_an_existing_out_dir(tmp_path):
     out = tmp_path / "dist"
     out.mkdir()
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as excinfo:
         cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)])
+    # The refusal must name --force and say WHY rebuilding in place is the right answer:
+    # without that pointer the only documented way out is a new dir, which changes the
+    # chrome-extension:// id. Redden: drop the hint from cmd_bundle's message.
+    message = str(excinfo.value)
+    assert "--force" in message
+    assert "chrome-extension" in message
+    # …and it must not have touched the dir it refused.
+    assert list(out.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# `bundle --force`: rebuild IN PLACE, because the id is the load path's hash
+# --------------------------------------------------------------------------- #
+def _fake_extension(root: Path, chunk_name: str) -> Path:
+    """A minimal source bundle whose hashed chunk name we control.
+
+    Stands in for `startpage`'s Vite output: every build emits `assets/index-<hash>.js`
+    under a DIFFERENT name, which is exactly the file a merge-instead-of-replace rebuild
+    would leave behind forever.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.json").write_text(json.dumps({"name": "x", "version": "1"}))
+    assets = root / "startpage" / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    (assets / chunk_name).write_text(f"// built chunk {chunk_name}\n")
+    return root
+
+
+def test_bundle_force_rebuilds_the_same_path_byte_for_byte(tmp_path):
+    # --force must leave a tree identical to a FRESH build at the SAME path: same dir, no
+    # merge residue, no staging siblings left over. The path is the whole point — Chromium
+    # hashes it into the chrome-extension:// id. Redden: make --force write elsewhere (or
+    # leave its staging dir behind) and the path/sibling assertions fail.
+    live = tmp_path / "live" / "dist"
+    reference = tmp_path / "ref" / "dist"
+    for d in (live, reference):
+        assert cli.main(
+            ["bundle", "--out", str(d), "--extension-dir", str(REPO_EXTENSION)]
+        ) == 0
+    before_inode = live.stat().st_ino
+
+    assert cli.main(
+        ["bundle", "--out", str(live), "--extension-dir", str(REPO_EXTENSION), "--force"]
+    ) == 0
+
+    assert live.is_dir()
+    assert _content_digest(live) == _content_digest(reference)
+    # The dir is a NEW inode (it was swapped, not merged into) at the SAME path…
+    assert live.stat().st_ino != before_inode
+    # …and nothing was left beside it — a leftover staging dir would sit in this parent.
+    assert [p.name for p in live.parent.iterdir()] == ["dist"]
+
+
+def test_bundle_force_removes_a_renamed_chunk_from_the_previous_build(tmp_path):
+    # THE bug this flag exists for: every startpage build emits a differently-hashed
+    # `assets/index-<hash>.js`. A rebuild that merged on top of the old tree would keep
+    # BOTH chunks forever (and the stale one is the one a cached index.html may load).
+    # Redden: implement --force as copytree(dirs_exist_ok=True) and the old chunk stays.
+    src = _fake_extension(tmp_path / "src", "index-OLDHASH.js")
+    out = tmp_path / "dist"
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(src)]) == 0
+    assert (out / "startpage" / "assets" / "index-OLDHASH.js").is_file()
+
+    # Next build of the same source emits a chunk under a new name.
+    (src / "startpage" / "assets" / "index-OLDHASH.js").unlink()
+    (src / "startpage" / "assets" / "index-NEWHASH.js").write_text("// built chunk new\n")
+
+    assert cli.main(
+        ["bundle", "--out", str(out), "--extension-dir", str(src), "--force"]
+    ) == 0
+
+    assert (out / "startpage" / "assets" / "index-NEWHASH.js").is_file()
+    assert not (out / "startpage" / "assets" / "index-OLDHASH.js").exists()
+    assert sorted(p.name for p in (out / "startpage" / "assets").iterdir()) == [
+        "index-NEWHASH.js"
+    ]
+
+
+def test_bundle_force_on_a_missing_out_dir_just_builds_it(tmp_path):
+    # --force is "rebuild THIS path", not "there must already be something here": passing
+    # it on a first build must succeed, so the make target does not need two code paths.
+    out = tmp_path / "dist"
+    assert cli.main(
+        ["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION), "--force"]
+    ) == 0
+    assert (out / "manifest.json").is_file()
+    assert [p.name for p in out.parent.iterdir()] == ["dist"]
+
+
+def test_a_failed_force_rebuild_leaves_the_previous_bundle_loadable(tmp_path, monkeypatch):
+    # The reason --force stages the copy instead of rmtree'ing the target: if the build
+    # blows up halfway, the operator must still have a LOADABLE extension at that path —
+    # the browser has it loaded unpacked right now. Redden: implement --force as
+    # `shutil.rmtree(out); copy_bundle(...)` and the old manifest is gone after the raise.
+    src = _fake_extension(tmp_path / "src", "index-OLDHASH.js")
+    out = tmp_path / "dist"
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(src)]) == 0
+    previous = _content_digest(out)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("copy died halfway")
+
+    monkeypatch.setattr(core, "copy_bundle", boom)
+    with pytest.raises(RuntimeError, match="copy died halfway"):
+        cli.main(["bundle", "--out", str(out), "--extension-dir", str(src), "--force"])
+
+    # Same path, same intact tree, and no staging dir left rotting beside it.
+    assert (out / "manifest.json").is_file()
+    assert _content_digest(out) == previous
+    assert sorted(p.name for p in out.parent.iterdir()) == ["dist", "src"]
+
+
+def test_replace_bundle_validates_the_source_before_touching_the_target(tmp_path):
+    # A wrong --extension-dir must fail BEFORE the existing bundle is disturbed (same
+    # invariant `generate` has for a bad --bundle-dir). Redden: move the manifest check
+    # after the swap and the live bundle is destroyed by a typo.
+    src = _fake_extension(tmp_path / "src", "index-OLDHASH.js")
+    out = tmp_path / "dist"
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(src)]) == 0
+    previous = _content_digest(out)
+
+    not_a_bundle = tmp_path / "empty"
+    not_a_bundle.mkdir()
+    with pytest.raises(ValueError, match="manifest.json"):
+        core.replace_bundle(not_a_bundle, out)
+
+    assert _content_digest(out) == previous
+
+
+def test_force_refuses_to_rebuild_a_dir_that_contains_the_source(tmp_path):
+    # `--out extension` (or any parent of it) is a plausible typo, and the rebuild
+    # REPLACES that whole directory — i.e. it would delete the very source it copies from.
+    # Redden: drop the src-inside-dst guard in replace_bundle and the repo bundle can be
+    # eaten by one wrong --out.
+    src = _fake_extension(tmp_path / "workspace" / "extension", "index-OLDHASH.js")
+    workspace = tmp_path / "workspace"
+    with pytest.raises(ValueError, match="refusing"):
+        core.replace_bundle(src, workspace)
+    with pytest.raises(ValueError, match="refusing"):
+        core.replace_bundle(src, src)
+    assert (src / "manifest.json").is_file()
 
 
 def test_bundle_rejects_token_service_url_and_instance_id_options(tmp_path):

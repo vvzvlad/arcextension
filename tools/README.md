@@ -45,6 +45,12 @@ make bundle OUT=dist
 #   …or the CLI directly:
 .venv/bin/python -m tools.generate_instance bundle --out dist
 
+# 1a. Rebuild it after a code change — SAME dir, so the id (and every profile's
+#     storage) survives. `make dev-bundle` also rebuilds the startpage first.
+make dev-bundle OUT=dist
+#   …or the CLI directly:
+.venv/bin/python -m tools.generate_instance bundle --out dist --force
+
 # 2. Wrap it in per-instance .apps. The launcher loads the SHARED bundle — no copy.
 make instance INSTANCE_ID=main BUNDLE_DIR=dist \
     OUT=~/Applications TITLE="Curator Main"
@@ -63,8 +69,16 @@ that both look like "the name", so: `--title` is what the Dock shows, the extens
 Neither step prints an extension id, because nothing consumes one. All instances load
 the same shared bundle and therefore share one `chrome-extension://<id>` — Chromium's
 hash of that dir's absolute path — but no origin is checked anywhere: `/ext` does not vet
-`hello.origin` and `/api/*` CORS accepts any origin (`src/api/cors.py`). Moving or
-renaming the bundle changes the id and breaks nothing.
+`hello.origin` and `/api/*` CORS accepts any origin (`src/api/cors.py`).
+
+⚠️ **The SERVICE does not care about the id; the BROWSER does.** Moving or renaming a
+bundle a browser already loads gives it a new id, hence a new origin and an EMPTY
+`chrome.storage.local` — the profile's enrolment (service address + per-install secret)
+is gone and that instance has to enrol again. So ship code updates by rebuilding the SAME
+directory: `bundle --force` (or `make dev-bundle`) does exactly that — it stages the copy
+next to the target and swaps it in, so the path never changes and an interrupted rebuild
+cannot leave a half-written, unloadable bundle. Without `--force` an existing `--out` is
+still refused.
 
 `--service-url` on `generate` is accepted for backward-compatibility but is
 **informational only**: the address is entered per profile during enrollment, never

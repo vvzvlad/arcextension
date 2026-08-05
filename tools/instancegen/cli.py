@@ -78,27 +78,53 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     manifest carries no ``key`` and no ``<host>``, so the whole build is
     ``copy_bundle`` and nothing else. NO ``instance.json`` is written, and any two runs
     are byte-identical because a copy has no inputs to vary (acc 16).
+
+    An existing ``--out`` is refused unless ``--force``, which rebuilds THAT SAME PATH via
+    :func:`core.replace_bundle` (staged copy + swap). In place is the only correct way to
+    refresh a bundle a browser already loads unpacked: the ``chrome-extension://`` id is
+    the hash of the load path, so a different path is a different extension.
     """
     out_dir = Path(args.out).resolve()
-    if out_dir.exists():
+    rebuilt_in_place = out_dir.exists()
+    if rebuilt_in_place and not args.force:
         # copy_bundle (shutil.copytree) requires a fresh destination; refusing an
         # existing dir also keeps the byte-identical guarantee honest — each build lands
         # in a clean tree, never merged on top of a previous one.
         raise SystemExit(
             f"{out_dir} already exists — `bundle` writes a fresh dir; remove it or "
-            "choose another --out"
+            "choose another --out, or pass --force to rebuild THIS dir in place. "
+            "In place is what you want for a dir a browser already loads: the "
+            "chrome-extension:// id is the hash of this path, so a new path means a new "
+            "id, a new origin and an empty chrome.storage.local (enrolment lost)."
         )
     # Copy the repo bundle into --out (dev cruft + any stray instance.json skipped).
     # NOTE: --out IS the extension bundle root — manifest.json + all code land here and
     # this whole tree ships to Chrome fleet-wide.
-    core.copy_bundle(args.extension_dir, out_dir)
+    if rebuilt_in_place:
+        # Staged build + swap: the path never changes and the dir is never a half-copy
+        # (see core.replace_bundle). Files from the previous build that this one does not
+        # emit — a renamed hashed chunk, say — are gone, because it is a replace and not
+        # a merge.
+        core.replace_bundle(args.extension_dir, out_dir)
+    else:
+        core.copy_bundle(args.extension_dir, out_dir)
 
-    print(f"Built universal bundle -> {out_dir}")
+    if rebuilt_in_place:
+        print(f"Rebuilt universal bundle IN PLACE -> {out_dir}")
+        print(
+            "  Reload the extension on brave://extensions (chrome://extensions) to pick "
+            "it up; if the manifest's permissions changed, confirm the new permissions "
+            "there too or those capabilities stay silently dead."
+        )
+    else:
+        print(f"Built universal bundle -> {out_dir}")
     print("  NO instance.json written (universal build — serviceUrl/token are per-profile)")
     print(
         "  The chrome-extension:// id is Chromium's hash of this dir's absolute path, so "
-        "it changes if you move or rename it. Nothing depends on it: no origin is checked "
-        "on /ext and /api/* CORS accepts any origin."
+        "it changes if you move or rename it. The SERVICE does not care: no origin is "
+        "checked on /ext and /api/* CORS accepts any origin. The BROWSER does — a new id "
+        "is a new origin with an empty chrome.storage.local, i.e. a re-enrolment. Rebuild "
+        "in place (--force) instead of moving the dir."
     )
     return 0
 
@@ -161,6 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--extension-dir",
         default=str(_DEFAULT_EXTENSION_DIR),
         help="source extension bundle (default: repo extension/)",
+    )
+    # --force does NOT mean "clobber": it means "rebuild THIS path", which is the only
+    # way to refresh a dir a browser already loads unpacked (the chrome-extension:// id
+    # is that path's hash). The swap is staged, so an interrupted rebuild cannot leave a
+    # half-copied, unloadable bundle behind (core.replace_bundle).
+    b.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild an existing --out IN PLACE (same path, so the same "
+        "chrome-extension:// id); the swap is staged, never a half-written dir",
     )
     b.set_defaults(func=cmd_bundle)
 

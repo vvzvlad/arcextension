@@ -98,6 +98,27 @@ startpage: ## Build the startpage, run the §10 build gates, then the vitest sui
 bundle: install ## Build the shared universal bundle (vars: OUT)
 	$(PY) -m tools.generate_instance bundle --out "$(OUT)"
 
+# 1a) REBUILD the bundle the browser is already loading, in one command:
+#     startpage build + §10 gates + vitest, then the bundle copy on top of it.
+#       make dev-bundle            # OUT defaults to dist/ — the dir loaded unpacked
+#       make dev-bundle OUT=~/dist
+#
+#     Why in place and not into a fresh dir: the chrome-extension:// id is Chromium's
+#     hash of the loaded dir's ABSOLUTE PATH. A new path is a new id, hence a new origin
+#     and an empty chrome.storage.local — the profile's enrolment (serviceUrl + the
+#     per-install secret) is gone and the instance has to enroll again. So `--force`
+#     rewrites THIS path; the copy is staged and swapped in, so an interrupted run cannot
+#     leave a half-written bundle (tools/instancegen/core.py: replace_bundle).
+#
+#     AFTER this target the browser still runs the OLD code: press «Обновить» / "Reload"
+#     on the extension's card at brave://extensions (chrome://extensions). And if the
+#     manifest's permission set changed, the browser holds the NEW permissions back until
+#     they are confirmed there by hand — until then those capabilities silently do nothing.
+dev-bundle: OUT ?= dist
+.PHONY: dev-bundle
+dev-bundle: startpage install ## Rebuild the bundle the browser loads, in place (vars: OUT, default dist)
+	$(PY) -m tools.generate_instance bundle --out "$(OUT)" --force
+
 # 2) Wrap that shared bundle in a per-instance .app + empty profile. NO extension copy
 #    and NO instance.json are written — the launcher's --load-extension points at the
 #    shared BUNDLE_DIR, so every instance loads the same dir (one id/origin).
