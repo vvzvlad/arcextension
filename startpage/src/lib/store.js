@@ -11,6 +11,7 @@ import { computed, ref, shallowRef, toRaw } from "vue";
 
 import {
   STATE_CACHE_KEY,
+  createBookmark,
   deletePause,
   enqueueQuickLinkOp,
   fetchRules,
@@ -23,15 +24,21 @@ import {
   postMergeWindows,
   postPause,
   previewRule,
+  queryBookmarks,
+  queryHistory,
   queryOwnTabs,
   readCache,
   readQueuedOps,
+  removeBookmark,
   saveRule,
+  updateBookmark,
+  watchBookmarks,
   writeCache,
 } from "./adapters.js";
 import { instanceStatus } from "./status.js";
 import { applyOpToQuickLinks, sortQuickLinks } from "./quicklinks.js";
 import { matchesQuery } from "./search.js";
+import { groupHistoryByDay, groupTabsByWindow, windowOrdinals } from "./bookmarks.js";
 
 // The `addressError` codes the SW reports (extension/src/service-address.js), in the
 // language of this page. Only the SW validates — the startpage never re-implements the
@@ -67,6 +74,14 @@ export function createStore(deps = {}) {
   const instances = ref([]);
   const foreignTabs = ref([]);
   const quickLinks = ref([]);
+  // Browser bookmarks + recent history: LOCAL sources, like own tabs (§10). They feed
+  // the favourites and history columns and are read once in init(); neither needs the
+  // network, so both are on screen at the first paint even on a fresh profile.
+  // `bookmarks` holds the leaves (real links), `bookmarkFolders` the folder nodes the
+  // column groups them under.
+  const bookmarks = ref([]);
+  const bookmarkFolders = ref([]);
+  const history = ref([]);
   const cachedAt = ref(null);
   const offline = ref(false);
   const search = ref("");
@@ -209,6 +224,42 @@ export function createStore(deps = {}) {
   const filteredQuickLinks = computed(() =>
     quickLinks.value.filter((q) => matchesQuery(q, search.value)),
   );
+  // The two new columns use the SAME local substring filter as the tabs (§10): one
+  // search box over everything on the page, no second search language to learn.
+  const filteredBookmarks = computed(() =>
+    bookmarks.value.filter((b) => matchesQuery(b, search.value)),
+  );
+  const filteredHistory = computed(() =>
+    history.value.filter((h) => matchesQuery(h, search.value)),
+  );
+  // Bookmarks under their folder headers. Folders whose every child is filtered out
+  // disappear with their children — an empty section header is noise while searching.
+  const bookmarkGroups = computed(() => {
+    const titleById = new Map(bookmarkFolders.value.map((f) => [f.id, f.title]));
+    const byFolder = new Map();
+    for (const b of filteredBookmarks.value) {
+      const key = b.parentId == null ? "" : b.parentId;
+      if (!byFolder.has(key)) byFolder.set(key, []);
+      byFolder.get(key).push(b);
+    }
+    return [...byFolder.entries()].map(([id, items]) => ({
+      id,
+      title: titleById.get(id) || "Закладки",
+      items,
+    }));
+  });
+  // Own tabs as WINDOW sections (§9): the window is the unit the curator merges and
+  // the human recognises, so the tab column is a list of windows, not one flat pile.
+  // The window NUMBER comes from the unfiltered list, so it does not move while the
+  // human types in the search box (see windowOrdinals).
+  const tabWindowOrdinals = computed(() => windowOrdinals(ownTabs.value));
+  const tabWindowGroups = computed(() =>
+    groupTabsByWindow(filteredOwnTabs.value, tabWindowOrdinals.value),
+  );
+  // History as day sections. DELIBERATELY not reading `clockTick`: the day labels
+  // change once a day, and depending on the 1 s tick would rebuild the whole history
+  // list every second (the same trap foreignTabGroups documents above).
+  const historyGroups = computed(() => groupHistoryByDay(filteredHistory.value, now()));
   // The GROUPED TAB LISTS — deliberately free of the ticking clock. This computed is
   // the expensive one (§10 promises hundreds of rows, and every invalidation makes Vue
   // re-diff the whole v-for), so it must depend only on data that actually changes:
@@ -348,12 +399,43 @@ export function createStore(deps = {}) {
       token = null;
     }
 
-    // FIRST PAINT — local sources only (§10). Own tabs + the cache; never blank.
-    ownTabs.value = await queryOwnTabs(chromeApi).catch(() => []);
-    // Read the SW's queue BEFORE applying anything, so the very first paint already
-    // shows an offline-added link even if the cache write lost the race.
-    pendingOps.value = await readQueuedOps(chromeApi).catch(() => []);
-    const cache = await readCache(chromeApi).catch(() => null);
+    // FIRST PAINT — local sources only (§10). Own tabs + bookmarks + history + the
+    // cache; never blank.
+    //
+    // All five reads go out AT ONCE. They are INDEPENDENT local reads (chrome.tabs,
+    // chrome.bookmarks, chrome.history, two storage.local gets) and awaiting them one
+    // after another simply adds their latencies together — on the one code path whose
+    // entire purpose is a populated page in the first frame. Each carries its OWN
+    // `.catch`, so Promise.all can never reject: a browser that refuses one source
+    // (permission removed, older Chrome) still paints everything else, which is the
+    // offline-first contract, not a nicety.
+    //
+    // ORDER OF EFFECTS IS UNCHANGED: nothing is assigned until every read has landed,
+    // and the queue is still applied BEFORE the cache is rendered — so the very first
+    // paint shows an offline-added quick link even if the SW's cache write lost the
+    // race.
+    //
+    // TODO: assign each source AS IT LANDS instead of waiting for Promise.all. Today the
+    // SLOWEST of the five gates all the others — a large bookmark tree (getTree walks the
+    // whole profile) or chrome.history.search holds back the tab list, which is the one
+    // thing that is always ready first and the one the human actually looks at. Left as
+    // is deliberately for now: progressive assignment means five independent first paints
+    // to reason about instead of one.
+    const [tabs, bookmarkNodes, historyItems, queuedOps, cache] = await Promise.all([
+      queryOwnTabs(chromeApi).catch(() => []),
+      queryBookmarks(chromeApi).catch(() => []),
+      queryHistory(chromeApi, { now }).catch(() => []),
+      readQueuedOps(chromeApi).catch(() => []),
+      readCache(chromeApi).catch(() => null),
+    ]);
+    ownTabs.value = tabs;
+    // Bookmarks + history are local too: no network, available immediately, and the
+    // adapters answer [] when the permission/API is absent, so a browser without them
+    // renders two empty columns instead of throwing the first paint away.
+    bookmarks.value = bookmarkNodes.filter((n) => !n.folder);
+    bookmarkFolders.value = bookmarkNodes.filter((n) => n.folder);
+    history.value = historyItems;
+    pendingOps.value = queuedOps;
     if (cache && cache.state) {
       applyState(cache.state);
       cachedAt.value = cache.cached_at ?? null;
@@ -440,6 +522,143 @@ export function createStore(deps = {}) {
     const op = link.id != null ? { op: "remove", id: link.id } : { op: "remove", url: link.url };
     quickLinks.value = sortQuickLinks(applyOpToQuickLinks(quickLinks.value, op));
     enqueue(op);
+  }
+
+  // --- bookmarks (optimistic, like quick links) -----------------------------
+  // The list on screen is edited FIRST and the browser is told after, so a rename
+  // never waits on an API round-trip. Unlike a quick link there is no durable queue
+  // behind this: chrome.bookmarks either takes the edit or it does not, so a failed
+  // call ROLLS THE OPTIMISTIC EDIT BACK rather than leaving a change on screen that
+  // does not exist in the browser.
+  async function addBookmark(url, title, parentId = null) {
+    if (!url) return null;
+    const tempId = "pending:" + url + ":" + now();
+    const entry = { id: tempId, parentId, folder: false, title: title || "", url };
+    bookmarks.value = [...bookmarks.value, entry];
+    const node = await createBookmark(chromeApi, { parentId, title: entry.title, url });
+    if (!node || node.id == null) {
+      bookmarks.value = bookmarks.value.filter((b) => b.id !== tempId);
+      return null;
+    }
+    // Adopt the real id/parent so a later rename or delete addresses the right node.
+    bookmarks.value = bookmarks.value.map((b) =>
+      b.id === tempId
+        ? {
+            ...b,
+            id: String(node.id),
+            parentId: node.parentId != null ? String(node.parentId) : b.parentId,
+          }
+        : b,
+    );
+    return node;
+  }
+
+  async function renameBookmark(bookmark, title) {
+    if (!bookmark || bookmark.id == null) return false;
+    const id = String(bookmark.id);
+    const previous = bookmarks.value.find((b) => b.id === id);
+    const before = previous ? previous.title : "";
+    const next = String(title == null ? "" : title);
+    bookmarks.value = bookmarks.value.map((b) => (b.id === id ? { ...b, title: next } : b));
+    const node = await updateBookmark(chromeApi, id, { title: next });
+    if (!node) {
+      bookmarks.value = bookmarks.value.map((b) => (b.id === id ? { ...b, title: before } : b));
+      return false;
+    }
+    return true;
+  }
+
+  async function deleteBookmark(bookmark) {
+    if (!bookmark || bookmark.id == null) return false;
+    const id = String(bookmark.id);
+    // Remember the NODE and WHERE it sat — never a snapshot of the whole array. The
+    // await below is long enough for other writers to touch the list (a rename, an add,
+    // and now the chrome.bookmarks listener re-reading the tree), and restoring a
+    // wholesale snapshot would silently roll THOSE back too: rename a bookmark while a
+    // failing delete is in flight and the new title vanishes with no error anywhere.
+    // The rollback must be as narrow as the edit was — the same discipline
+    // renameBookmark and addBookmark already follow.
+    const index = bookmarks.value.findIndex((b) => b.id === id);
+    if (index < 0) return false;
+    const node = bookmarks.value[index];
+    bookmarks.value = bookmarks.value.filter((b) => b.id !== id);
+    const ok = await removeBookmark(chromeApi, id);
+    if (!ok) {
+      // The browser still has it — so must the screen. Splice it back into the CURRENT
+      // list at its old position, clamped: concurrent edits may have made the list
+      // shorter than it was.
+      //
+      // …unless it is ALREADY back. reloadBookmarks() is a macrotask (a debounced
+      // timer behind the chrome.bookmarks listeners) and can fire INSIDE this await:
+      // the delete did not go through, so the re-read tree still contains this node and
+      // puts it back on its own. Splicing then inserts a SECOND copy with the same id —
+      // a duplicate row plus Vue's duplicate-`:key` warning, from a rollback whose whole
+      // job was to leave the list exactly as it was.
+      if (bookmarks.value.some((b) => b.id === id)) return false;
+      const restored = [...bookmarks.value];
+      restored.splice(Math.min(index, restored.length), 0, node);
+      bookmarks.value = restored;
+      return false;
+    }
+    return true;
+  }
+
+  // --- the bookmark tree changes under an open page -------------------------
+  // A newtab lives for hours. Bookmarks added or deleted through Chrome's own UI must
+  // land here too, or the column drifts into a list of rows that lead nowhere and whose
+  // rename/delete buttons address ids the browser has already forgotten.
+  //
+  // DEBOUNCED: a folder deletion, a drag, or a bookmark import fires one event PER NODE,
+  // and re-reading the whole tree per event turns a routine tidy-up into a re-read storm.
+  // The listeners are deliberately dumb — they do not try to patch the list from the
+  // event payload, they just say "the tree moved"; one authoritative re-read is cheaper
+  // to get right than four incremental mutation paths.
+  let stopBookmarkWatch = null;
+  let bookmarkReloadTimer = null;
+  // Bumped by unwatchBookmarkChanges(). A re-read that was ALREADY IN FLIGHT cannot be
+  // cancelled — chrome.bookmarks.getTree has no abort — so it is fenced instead: the
+  // read snapshots the generation, and a bump while it was awaiting means the page is
+  // gone and its answer must be dropped. Without this the tree lands in a store nothing
+  // owns anymore, and every remount pays for a write into the previous page's state.
+  let bookmarkWatchGeneration = 0;
+
+  async function reloadBookmarks() {
+    const generation = bookmarkWatchGeneration;
+    const nodes = await queryBookmarks(chromeApi).catch(() => null);
+    if (!nodes) return; // a failed re-read keeps what is on screen; never blanks it
+    if (generation !== bookmarkWatchGeneration) return; // unwatched mid-read: drop it
+    bookmarks.value = nodes.filter((n) => !n.folder);
+    bookmarkFolders.value = nodes.filter((n) => n.folder);
+  }
+
+  function watchBookmarkChanges({ debounceMs = 250 } = {}) {
+    unwatchBookmarkChanges();
+    const schedule = () => {
+      if (typeof setTimeout !== "function") {
+        reloadBookmarks();
+        return;
+      }
+      if (bookmarkReloadTimer != null) clearTimeout(bookmarkReloadTimer);
+      bookmarkReloadTimer = setTimeout(() => {
+        bookmarkReloadTimer = null;
+        reloadBookmarks();
+      }, debounceMs);
+    };
+    stopBookmarkWatch = watchBookmarks(chromeApi, schedule);
+    return unwatchBookmarkChanges;
+  }
+
+  // MUST be called when the page goes away (App.vue's onUnmounted): a live listener
+  // holds this whole store alive, and a pending timer would re-read into a dead one.
+  function unwatchBookmarkChanges() {
+    // Fences any re-read that is already awaiting getTree (see reloadBookmarks).
+    bookmarkWatchGeneration += 1;
+    if (bookmarkReloadTimer != null && typeof clearTimeout === "function") {
+      clearTimeout(bookmarkReloadTimer);
+    }
+    bookmarkReloadTimer = null;
+    if (stopBookmarkWatch) stopBookmarkWatch();
+    stopBookmarkWatch = null;
   }
 
   // --- jump (§10) -----------------------------------------------------------
@@ -727,6 +946,9 @@ export function createStore(deps = {}) {
     instances,
     foreignTabs,
     quickLinks,
+    bookmarks,
+    bookmarkFolders,
+    history,
     cachedAt,
     offline,
     search,
@@ -760,6 +982,11 @@ export function createStore(deps = {}) {
     // views
     filteredOwnTabs,
     filteredQuickLinks,
+    filteredBookmarks,
+    filteredHistory,
+    bookmarkGroups,
+    tabWindowGroups,
+    historyGroups,
     foreignTabGroups,
     foreignGroups,
     statusRows,
@@ -771,6 +998,12 @@ export function createStore(deps = {}) {
     applyState,
     addQuickLink,
     removeQuickLink,
+    addBookmark,
+    renameBookmark,
+    deleteBookmark,
+    reloadBookmarks,
+    watchBookmarkChanges,
+    unwatchBookmarkChanges,
     jumpOwn,
     jumpForeign,
     setSearch,

@@ -9,12 +9,50 @@
 // and an explicit `messages.get_credential` still wins.
 const DEFAULT_CREDENTIAL = { serviceUrl: "wss://host/", secret: "tok" };
 
+// --- bookmark tree helpers (the mock keeps a real tree so edits are observable) ---
+function walkNodes(nodes, visit) {
+  for (const n of nodes || []) {
+    visit(n);
+    if (n.children) walkNodes(n.children, visit);
+  }
+}
+
+function findNode(nodes, id) {
+  let found = null;
+  walkNodes(nodes, (n) => {
+    if (String(n.id) === String(id)) found = n;
+  });
+  return found;
+}
+
+function dropNode(nodes, id) {
+  for (let i = 0; i < (nodes || []).length; i += 1) {
+    if (String(nodes[i].id) === String(id)) {
+      nodes.splice(i, 1);
+      return true;
+    }
+    if (nodes[i].children && dropNode(nodes[i].children, id)) return true;
+  }
+  return false;
+}
+
 export function makeChrome(opts = {}) {
   // `tabs` is MUTABLE per test (via env.setTabs) so a re-query after a failed jump can
   // return a different list — that is the whole point of the "tab closed since the
   // render" case.
   let tabs = opts.tabs || [];
   const local = { ...(opts.local || {}) };
+  // chrome.bookmarks / chrome.history are OPTIONAL capabilities of the startpage
+  // (§10): the two extra columns are local sources, and the page must still render
+  // when they are absent — an older Chrome, or a manifest without the two
+  // permissions. `withoutOptionalApis: true` reproduces exactly that, so the
+  // offline-first promise is tested against a browser that offers less, not more.
+  //
+  // `opts.bookmarks` is the list of nodes UNDER chrome's unnamed root (folders carry
+  // `children`, links carry `url`), mirroring what getTree() really answers.
+  const bookmarkRoot = { id: "0", title: "", children: structuredClone(opts.bookmarks || []) };
+  const historyItems = structuredClone(opts.history || []);
+  let nextBookmarkId = 1000;
   const messages = {
     get_credential: "credential" in opts ? opts.credential : DEFAULT_CREDENTIAL,
     ...(opts.messages || {}), // { type: value | (msg)=>value }
@@ -25,6 +63,35 @@ export function makeChrome(opts = {}) {
     tabRemove: [],
     sendMessage: [],
     storageSet: [],
+    bookmarkCreate: [],
+    bookmarkUpdate: [],
+    bookmarkRemove: [],
+    bookmarkGetTree: 0,
+    historySearch: [],
+  };
+
+  // chrome.events, faked with real add/removeListener bookkeeping: the point of the
+  // bookmark-watch tests is that the page ATTACHES listeners and DETACHES them again on
+  // unmount, so the mock has to be able to answer "how many are still attached".
+  const makeEvent = () => {
+    const listeners = [];
+    return {
+      listeners,
+      addListener: (fn) => listeners.push(fn),
+      removeListener: (fn) => {
+        const i = listeners.indexOf(fn);
+        if (i >= 0) listeners.splice(i, 1);
+      },
+      emit: (...args) => {
+        for (const fn of [...listeners]) fn(...args);
+      },
+    };
+  };
+  const bookmarkEvents = {
+    onCreated: makeEvent(),
+    onChanged: makeEvent(),
+    onRemoved: makeEvent(),
+    onMoved: makeEvent(),
   };
 
   const chrome = {
@@ -72,10 +139,70 @@ export function makeChrome(opts = {}) {
       },
     },
   };
+  if (!opts.withoutOptionalApis) {
+    chrome.bookmarks = {
+      ...bookmarkEvents,
+      getTree: async () => {
+        calls.bookmarkGetTree += 1;
+        return structuredClone([bookmarkRoot]);
+      },
+      create: async (node) => {
+        calls.bookmarkCreate.push(node);
+        if (opts.bookmarkWritesFail) throw new Error("bookmarks.create failed");
+        const created = {
+          id: String(nextBookmarkId++),
+          parentId: node.parentId != null ? String(node.parentId) : "1",
+          title: node.title || "",
+          url: node.url,
+        };
+        const parent = findNode([bookmarkRoot], created.parentId) || bookmarkRoot;
+        parent.children = parent.children || [];
+        parent.children.push(created);
+        return structuredClone(created);
+      },
+      update: async (id, changes) => {
+        calls.bookmarkUpdate.push([id, changes]);
+        if (opts.bookmarkWritesFail) throw new Error("bookmarks.update failed");
+        const node = findNode([bookmarkRoot], id);
+        if (!node) throw new Error("no bookmark " + id);
+        Object.assign(node, changes);
+        return structuredClone(node);
+      },
+      remove: async (id) => {
+        calls.bookmarkRemove.push(id);
+        if (opts.bookmarkWritesFail) throw new Error("bookmarks.remove failed");
+        if (!dropNode(bookmarkRoot.children, id)) throw new Error("no bookmark " + id);
+      },
+    };
+    chrome.history = {
+      search: async (query = {}) => {
+        calls.historySearch.push(query);
+        const { text = "", startTime = 0, maxResults = 100 } = query;
+        const needle = String(text).toLowerCase();
+        return historyItems
+          .filter((h) => (h.lastVisitTime ?? 0) >= startTime)
+          .filter(
+            (h) =>
+              !needle ||
+              String(h.title || "").toLowerCase().includes(needle) ||
+              String(h.url || "").toLowerCase().includes(needle),
+          )
+          .slice(0, maxResults)
+          .map((h) => ({ ...h }));
+      },
+    };
+  }
+
   return {
     chrome,
     calls,
     local,
+    bookmarkRoot,
+    bookmarkEvents,
+    // How many listeners the page currently holds on the bookmark tree. A leak test
+    // asserts this is back to 0 after unmount.
+    bookmarkListenerCount: () =>
+      Object.values(bookmarkEvents).reduce((n, e) => n + e.listeners.length, 0),
     setTabs: (next) => {
       tabs = next;
     },

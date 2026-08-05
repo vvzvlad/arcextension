@@ -105,11 +105,20 @@ jobs:
     # what is committed — otherwise editing startpage/src/* without rebuilding ships a
     # stale newtab and no gate above catches it (the gates run over whatever was built,
     # not over the committed artifact). The Vite build is byte-reproducible on the
-    # pinned toolchain (verified), so a plain diff is the gate; a drift means "run
-    # `npm --prefix startpage run build` and commit the result".
+    # pinned toolchain (verified), so comparing the tree against HEAD is the gate; a
+    # drift means "run `npm --prefix startpage run build` and commit the result".
+    #
+    # `git status --porcelain`, NOT `git diff --exit-code`: THE CHUNK FILENAME CARRIES A
+    # CONTENT HASH (assets/index-<hash>.js), so a changed bundle is never a modification
+    # of a tracked file — it is a DELETED old chunk plus a brand new UNTRACKED one. `git
+    # diff` does not look at untracked files at all, so it would report the new chunk as
+    # nothing and pass; a forgotten `git add` would then ship an index.html pointing at a
+    # chunk that is not in the repo — an empty newtab on a green CI run. Do not
+    # "simplify" this back to git diff.
     - name: Fail if the committed startpage bundle is stale (drift from a fresh build)
       run: |
-        if ! git diff --exit-code -- extension/startpage; then
+        if [ -n "$(git status --porcelain -- extension/startpage)" ]; then
+          git status --porcelain -- extension/startpage
           echo "::error::extension/startpage is out of date vs a fresh build — run 'npm --prefix startpage run build' and commit extension/startpage."
           exit 1
         fi

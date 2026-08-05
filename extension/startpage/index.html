@@ -9,80 +9,417 @@
       built bundle pure JS so the render smoke test can import the entry without a
       CSS asset, and inline styles are allowed under the extension_pages CSP
       (`script-src 'self'` governs scripts, not styles). All assets stay local.
+
+      NOTHING here may reach the network: no @font-face, no CDN stylesheet, no
+      background-image url(). The page is offline-first and runs under a strict CSP —
+      the only typefaces are the ones already installed, and every decoration is a
+      CSS shape or an inline colour.
     -->
     <style>
-      :root { color-scheme: light dark; }
+      /* --- tokens -------------------------------------------------------------
+         One palette, two themes. Light is the measured reference (a cool violet
+         gradient behind translucent cards); dark keeps the same character and the
+         same contrast ranking (text > secondary > muted) on a near-black ground.
+
+         EVERY TEXT TOKEN CLEARS WCAG AA (4.5:1). This is not decoration: --sp-muted
+         paints 10-10.5px text (row hosts, section counts, the search placeholder,
+         "кэш от …"), which is where a grey that "looks fine" stops being readable.
+
+         The ratios are COMPUTED, not eyeballed, and against the real COMPOSITED
+         backdrop — the cards are translucent, so the effective background is
+         card-over-gradient (and hover/sticky/field/accent-soft over that), never the
+         flat token colour. The claim below covers EVERY stack a token can actually land
+         on, including the ones that stack twice: an icon button paints --sp-accent on
+         its own --sp-accent-soft over a HOVERED row over the card, and it is only ever
+         visible while that row IS hovered. Worst case over all three gradient stops and
+         all of those layers:
+           light  text #23212b 12.9 · secondary #66617a 4.8 · muted #726d82 4.7
+                  accent #544ccc 4.7 (ghost/icon text on its own soft) · #fff on it 6.4
+                  danger #c2255c 4.7 ("подтвердить ×") · red #bd2c28 4.8 (fallback 5.7)
+           dark   text #ece9f5  8.3 · secondary #c4c0ce 4.5 · muted #b5b1c2 4.7
+                  accent #c1bdf9 4.6 · #17161f on it 10.2
+                  danger #fdb8ce 5.0 · red #f49b98 5.0 (fallback 5.8)
+         The three greys were fixed in an earlier pass (they measured 2.4:1 light muted,
+         3.0:1 dark muted, 3.0:1 white-on-accent in dark). THIS pass fixed the three that
+         the old claim silently did not cover, all of them small text carrying the most
+         load-bearing words on the page:
+           * --sp-red on --sp-chip — .sp-fallback, i.e. every error line and "Куратор на
+             паузе" — measured 4.25 light / 3.73 dark at 11.5px;
+           * --sp-danger — the armed "подтвердить ×", the last thing a human reads before
+             a bookmark leaves the browser for good — 4.71 light / 2.69 dark at 11px
+             (2.69 is over the button's OWN hover: accent-soft over the hovered row);
+           * --sp-accent as ghost/icon-button TEXT on --sp-accent-soft — 4.29 light (the
+             footer's "Правила N" sits straight on the gradient) / 2.67 dark.
+         In dark the accent had to move a long way up in L and its --sp-accent-soft alpha
+         down (0.16 -> 0.10): the soft IS the accent at that alpha, so lightening the text
+         lightened its own backdrop with it and the ratio barely moved — at 0.16 even a
+         near-white violet capped at ~4.3.
+         Two more places were failing and are fixed in the rules below, not in the tokens:
+         the "невалидно" flag painted --sp-red on a red chip on a red row (2.8 light /
+         3.05 dark — the flag's own fill is gone now, the row tint is the signal), and the
+         status bar's .sp-empty was --sp-muted straight on the gradient (4.23 light — it
+         now sits on a --sp-chip like every other row in that strip).
+         Re-measure if any gradient stop or any card/chip/field/hover/soft alpha changes. */
+      :root {
+        color-scheme: light dark;
+
+        --sp-bg: radial-gradient(120% 90% at 12% 0%, #e8ecff 0%, #f6f4fb 42%, #fdf3f0 100%);
+        --sp-text: #23212b;
+        --sp-secondary: #66617a;
+        --sp-muted: #726d82;
+        --sp-accent: #544ccc;
+        --sp-accent-soft: rgba(84, 76, 204, 0.1);
+        /* Text ON --sp-accent (the filled buttons). A separate token because the two
+           themes need OPPOSITE answers: the light accent is dark enough to carry white
+           (6.4:1), the dark accent is a pale violet and white on it measures 1.7:1.
+           Darkening the dark accent instead would have broken the ghost buttons, which
+           paint the SAME token as TEXT on --sp-accent-soft — that constraint is what set
+           the dark accent's lightness, and this token then follows it. */
+        --sp-on-accent: #fff;
+        --sp-danger: #c2255c;
+
+        --sp-card: rgba(255, 255, 255, 0.72);
+        --sp-chip: rgba(255, 255, 255, 0.8);
+        --sp-field: rgba(255, 255, 255, 0.85);
+        --sp-hover: rgba(255, 255, 255, 0.95);
+        --sp-line: rgba(40, 30, 80, 0.06);
+        /* Sticky section headers sit ON TOP of scrolling rows, so they need their own
+           opaque-enough backdrop or the text underneath shows through. */
+        --sp-sticky: linear-gradient(rgba(250, 249, 252, 0.97), rgba(250, 249, 252, 0.88));
+
+        --sp-shadow: 0 1px 2px rgba(40, 30, 80, 0.06), 0 14px 30px -22px rgba(40, 30, 80, 0.5);
+        --sp-shadow-soft: 0 1px 2px rgba(40, 30, 80, 0.07);
+
+        /* Status dots (§10): four distinguishable instance states + the pause.
+           --sp-red is NOT dot-only: it also paints .sp-fallback (error lines, "Куратор
+           на паузе") and the "невалидно" flag, so it is a TEXT token and carries the
+           4.5:1 duty the dots alone would not have imposed. */
+        --sp-ok: #57b894;
+        --sp-warn: #e8a13a;
+        --sp-grey: #9aa0a6;
+        --sp-red: #bd2c28;
+
+        --sp-font: "Avenir Next", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+        --sp-mono: ui-monospace, Menlo, Consolas, monospace;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --sp-bg: radial-gradient(120% 90% at 12% 0%, #23243a 0%, #17161f 46%, #1e1719 100%);
+          --sp-text: #ece9f5;
+          --sp-secondary: #c4c0ce;
+          --sp-muted: #b5b1c2;
+          /* A LIGHTER accent than the light theme's, and a THINNER soft behind it: the
+             ghost/icon buttons paint this token as TEXT on --sp-accent-soft, which is
+             this same token at that alpha — the two chase each other, so the fix is both
+             a higher L and a lower alpha (see the header comment: 2.67 -> 4.58). */
+          --sp-accent: #c1bdf9;
+          --sp-accent-soft: rgba(193, 189, 249, 0.1);
+          /* Dark text on the pastel accent (10.2:1); white on it is only 1.7:1. */
+          --sp-on-accent: #17161f;
+          --sp-danger: #fdb8ce;
+
+          --sp-card: rgba(255, 255, 255, 0.05);
+          --sp-chip: rgba(255, 255, 255, 0.07);
+          --sp-field: rgba(255, 255, 255, 0.08);
+          --sp-hover: rgba(255, 255, 255, 0.09);
+          --sp-line: rgba(255, 255, 255, 0.07);
+          --sp-sticky: linear-gradient(rgba(28, 28, 40, 0.97), rgba(28, 28, 40, 0.86));
+
+          --sp-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 14px 30px -22px rgba(0, 0, 0, 0.9);
+          --sp-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.25);
+
+          --sp-ok: #5cc9a1;
+          --sp-warn: #edb054;
+          --sp-grey: #7c8085;
+          --sp-red: #f49b98;
+        }
+      }
+
       * { box-sizing: border-box; }
+
+      /* --- the board ----------------------------------------------------------
+         The app owns the viewport: header, search, columns, status bar, rules panel.
+         Only the COLUMNS scroll — the page itself must never move, or the sticky
+         section headers and the status bar walk off the screen. */
+      html, body { height: 100%; }
       body {
         margin: 0;
-        font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-        background: Canvas;
-        color: CanvasText;
+        overflow: hidden;
+        font: 13px/1.45 var(--sp-font);
+        background: var(--sp-bg);
+        color: var(--sp-text);
       }
-      #app { max-width: 900px; margin: 0 auto; padding: 24px 20px 64px; }
-      .sp-header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
-      .sp-title { font-size: 20px; font-weight: 600; }
-      .sp-sub { opacity: 0.6; font-size: 13px; }
+      #app { height: 100vh; }
+      .sp-app {
+        height: 100%;
+        display: grid;
+        gap: 10px;
+        padding: 16px 18px 10px;
+        grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+      }
+
+      /* --- header + search ---------------------------------------------------- */
+      .sp-header { display: flex; align-items: center; gap: 10px; }
+      .sp-title { font-size: 14.5px; font-weight: 600; }
+      .sp-pill {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 11px; padding: 4px 10px; border-radius: 999px;
+        background: var(--sp-chip); color: var(--sp-secondary); box-shadow: var(--sp-shadow-soft);
+      }
+      .sp-conn { margin-left: auto; font-size: 11px; color: var(--sp-secondary); }
       .sp-search {
-        width: 100%; padding: 10px 12px; font-size: 15px;
-        border: 1px solid rgba(128,128,128,0.4); border-radius: 8px;
-        background: Field; color: FieldText; margin-bottom: 20px;
+        width: 100%; height: 38px; padding: 0 14px;
+        border: 0; border-radius: 12px;
+        background: var(--sp-field); color: var(--sp-text); font: 13px/1 var(--sp-font);
+        box-shadow: var(--sp-shadow-soft), 0 10px 24px -16px rgba(40, 30, 80, 0.4);
       }
-      .sp-group { margin-bottom: 22px; }
-      .sp-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-      .sp-group-name { font-weight: 600; }
-      .sp-cache-note { font-size: 12px; opacity: 0.6; }
-      .sp-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+      .sp-search::placeholder { color: var(--sp-muted); }
+      .sp-search:focus { outline: 2px solid var(--sp-accent-soft); outline-offset: 1px; }
+
+      /* --- columns ------------------------------------------------------------
+         1.5fr favourites : 4fr tabs : 1fr history — the tab column is the working
+         surface, favourites is ~1.5x history. `min-height:0` on the track AND on the
+         cards is what lets the inner bodies scroll instead of stretching the grid. */
+      .sp-cols {
+        display: grid; grid-template-columns: 1.5fr 4fr 1fr; gap: 10px; min-height: 0;
+      }
+      .sp-card {
+        display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+        border-radius: 13px; background: var(--sp-card); box-shadow: var(--sp-shadow);
+      }
+      .sp-card-head {
+        display: flex; align-items: center; gap: 7px; flex: none;
+        padding: 9px 11px 7px;
+        font: 600 10px/1 var(--sp-font); letter-spacing: 0.1em; text-transform: uppercase;
+        color: var(--sp-secondary); border-bottom: 1px solid var(--sp-line);
+      }
+      .sp-card-count {
+        margin-left: auto; flex: none;
+        font: 600 10px/1 var(--sp-mono); color: var(--sp-muted); letter-spacing: 0;
+      }
+      /* Each column scrolls on its own (see .sp-app above). */
+      .sp-col-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 6px 8px; }
+
+      /* --- sections + rows ---------------------------------------------------- */
+      .sp-sec { margin-bottom: 2px; }
+      .sp-sec-head {
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px 5px 4px;
+        font: 400 10.5px/1 var(--sp-font); color: var(--sp-secondary);
+      }
+      .sp-sec-head b { font-weight: 600; flex: none; }
+      /* The window / day / instance header stays put while its rows scroll under it. */
+      .sp-sec-head.is-sticky {
+        position: sticky; top: 0; z-index: 1;
+        background: var(--sp-sticky); backdrop-filter: blur(4px);
+      }
+      .sp-sec-sub {
+        font-size: 10px; color: var(--sp-muted);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .sp-sec-count {
+        margin-left: auto; flex: none;
+        font: 600 9.5px/1 var(--sp-mono); color: var(--sp-muted);
+      }
+
+      .sp-list { list-style: none; margin: 0; padding: 0; }
       .sp-item {
-        display: flex; align-items: center; gap: 8px; padding: 6px 8px;
-        border-radius: 6px; cursor: pointer;
+        display: flex; align-items: center; gap: 8px;
+        padding: 4px 6px; border-radius: 7px; cursor: pointer;
       }
-      .sp-item:hover { background: rgba(128,128,128,0.12); }
-      .sp-item.is-inactive { cursor: default; opacity: 0.55; }
-      .sp-item-title { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .sp-item-url { opacity: 0.5; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .sp-fav { width: 16px; height: 16px; flex: 0 0 16px; }
-      .sp-empty { opacity: 0.5; font-size: 13px; padding: 4px 8px; }
-      .sp-ql-add { display: flex; gap: 8px; margin-top: 8px; }
-      .sp-ql-add input { flex: 1; padding: 6px 8px; border: 1px solid rgba(128,128,128,0.4); border-radius: 6px; background: Field; color: FieldText; }
-      .sp-btn { padding: 6px 10px; border: 1px solid rgba(128,128,128,0.4); border-radius: 6px; background: ButtonFace; color: ButtonText; cursor: pointer; }
-      .sp-remove { margin-left: auto; border: none; background: none; color: inherit; opacity: 0.4; cursor: pointer; font-size: 16px; }
-      .sp-remove:hover { opacity: 0.9; }
-      .sp-remove.is-confirm { opacity: 1; color: #c0392b; font-size: 13px; font-weight: 600; }
-      .sp-rule.is-invalid { background: rgba(192,57,43,0.14); border-left: 3px solid #c0392b; padding-left: 6px; }
-      .sp-rule-flag { margin-left: 6px; font-size: 11px; padding: 0 6px; border-radius: 8px; background: rgba(128,128,128,0.2); }
-      .sp-rule-flag.sp-rule-invalid { background: rgba(192,57,43,0.25); color: #c0392b; }
-      .sp-rule-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0; }
-      .sp-rule-singleton { display: flex; align-items: center; gap: 4px; font-size: 12px; }
-      .sp-rule-preview { margin: 6px 0; font-size: 13px; opacity: 0.85; max-width: 60ch; }
-      .sp-rule-preview.is-confirm { color: #c0392b; opacity: 1; }
-      .sp-rule-preview-line { margin: 2px 0; }
-      .sp-rule-preview-ask { font-weight: 600; }
-      .sp-status { margin-top: 28px; border-top: 1px solid rgba(128,128,128,0.25); padding-top: 12px; }
-      .sp-status-row { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; }
+      .sp-item:hover { background: var(--sp-hover); }
+      /* A foreign instance's rows while the page is offline: not clickable, and it must
+         SHOW. It used to be `opacity: .55` on the whole row, which is the one dimming
+         technique that cannot be made readable: opacity multiplies the text AND the
+         background it sits on, so every token in the row loses contrast together —
+         measured 3.62:1 for the title and 2.13:1 for the 10.5px host in light (3.74 /
+         2.53 dark), and even at .85 the host is still 3.56:1. There is no value that
+         both dims and stays legible.
+         So the dimming happens where it costs nothing: the SWATCH (a decoration, not
+         text) fades, and the title drops to --sp-secondary — a token that is measured,
+         one step quieter than --sp-text, and clears AA on its own (5.65:1 light /
+         5.54:1 dark; the host keeps --sp-muted at 4.75 / 4.72). */
+      .sp-item.is-inactive { cursor: default; color: var(--sp-secondary); }
+      .sp-item.is-inactive .sp-swatch { opacity: 0.45; }
+      .sp-item-title {
+        flex: 0 1 auto; font-size: 12px; color: inherit; text-decoration: none;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      /* The host gives way before the title does: in a narrow column "Anthropic Docs"
+         is worth more than "docs.anthropic.com" (shrink factor 3 vs the title's 1). */
+      .sp-item-host {
+        margin-left: auto; flex: 0 3 auto; min-width: 0; max-width: 45%; padding-left: 8px;
+        font-size: 10.5px; color: var(--sp-muted);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      /* A row's edit/delete buttons stay out of the way — a dense list must not be a
+         wall of icons — but "out of the way" must not mean UNREACHABLE:
+           * :focus-within — tabbing to the button reveals it. Without this the buttons
+             are keyboard-focusable yet invisible while focused, so a keyboard user
+             cannot see where they are and cannot tell rename from delete.
+           * (hover: none) — a touch/pen device has no hover state AT ALL, so the
+             actions would simply never appear. There they are always visible.
+           * .is-armed — a delete WAITING FOR ITS SECOND CLICK (App.vue sets the class on
+             the row). Without it the one thing that says "the next click deletes" lived
+             inside `opacity: 0`: move the mouse off the row and the only indicator is
+             gone, come back and the button is already armed under the pointer. The rules
+             list has no such hole because its "×" is visible at all times — that is what
+             lets its gate speak between the clicks, and this makes the favourites column
+             speak the same way.
+           * pointer-events — `opacity: 0` hides a button but keeps its HIT AREA, so an
+             invisible ✎/× still answers clicks. The hidden state now refuses them; every
+             state that reveals the buttons takes them back. */
+      .sp-item-actions { display: flex; gap: 3px; flex: none; opacity: 0; pointer-events: none; }
+      .sp-item:hover .sp-item-actions,
+      .sp-item:focus-within .sp-item-actions,
+      .sp-item.is-armed .sp-item-actions { opacity: 1; pointer-events: auto; }
+      @media (hover: none) {
+        .sp-item-actions { opacity: 1; pointer-events: auto; }
+      }
+      /* Favicons are CSS swatches (App.vue swatchColor), never remote images: an
+         <img src=favIconUrl> per row would fire hundreds of network requests from a
+         page that promises to work offline. */
+      .sp-swatch { width: 14px; height: 14px; flex: none; border-radius: 4px; display: block; }
+      .sp-time { flex: none; width: 34px; font: 500 10.5px/1 var(--sp-mono); color: var(--sp-muted); }
+      .sp-empty { padding: 4px 6px; font-size: 11px; color: var(--sp-muted); }
+
+      /* --- controls ----------------------------------------------------------- */
+      .sp-btn {
+        padding: 5px 13px; border: 0; border-radius: 999px;
+        background: var(--sp-accent); color: var(--sp-on-accent);
+        font: 600 11px/1 var(--sp-font); cursor: pointer;
+      }
+      .sp-btn:disabled { opacity: 0.45; cursor: default; }
+      .sp-btn-ghost { background: var(--sp-accent-soft); color: var(--sp-accent); }
+      .sp-icon-btn {
+        width: 18px; height: 18px; flex: none;
+        border: 0; border-radius: 5px;
+        background: var(--sp-accent-soft); color: var(--sp-accent);
+        font: 600 10px/1 var(--sp-font); cursor: pointer;
+      }
+      .sp-remove {
+        flex: none; border: 0; background: none; color: var(--sp-muted);
+        font: 400 14px/1 var(--sp-font); padding: 2px 3px; border-radius: 5px; cursor: pointer;
+      }
+      .sp-remove:hover { color: var(--sp-danger); background: var(--sp-accent-soft); }
+      .sp-remove.is-confirm { color: var(--sp-danger); font-size: 11px; font-weight: 600; }
+      .sp-ql-add, .sp-rule-form input, .sp-inline-input { font: 12px/1 var(--sp-font); }
+      .sp-ql-add { display: flex; gap: 6px; margin: 6px 5px 2px; }
+      .sp-ql-add input, .sp-rule-form input[type="text"], .sp-rule-form input:not([type]),
+      .sp-inline-input {
+        flex: 1; min-width: 0; padding: 6px 8px;
+        border: 1px solid var(--sp-line); border-radius: 7px;
+        background: var(--sp-field); color: var(--sp-text);
+      }
+      /* Panels COLLAPSE through this class and nothing else — no v-if/v-show on any
+         node carrying a data-role (App.vue explains why: the tests address those nodes
+         straight after mount, with the panel closed). */
+      .is-collapsed { display: none; }
+
+      /* --- status bar --------------------------------------------------------- */
+      .sp-status {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+        padding: 2px 2px 4px; font-size: 11.5px; color: var(--sp-secondary);
+      }
+      .sp-status-row {
+        display: flex; align-items: center; gap: 6px;
+        padding: 4px 10px; border-radius: 14px;
+        background: var(--sp-chip); box-shadow: var(--sp-shadow-soft);
+      }
+      .sp-status-name { font-weight: 600; color: var(--sp-text); }
+      .sp-sub { color: var(--sp-secondary); }
       /* The click-wait row explains itself in full sentences (what happened, what the
          button does), so it wraps and its explanation takes a line of its own. */
-      .sp-pause-row { flex-wrap: wrap; }
-      .sp-pause-explain, .sp-pending-plan { flex-basis: 100%; max-width: 70ch; line-height: 1.45; }
-      .sp-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 9px; }
-      .sp-dot.ok { background: #3aa657; }
-      .sp-dot.stale { background: #d4a017; }
-      .sp-dot.closed { background: #9aa0a6; }
-      .sp-dot.never { background: #9aa0a6; }
-      .sp-dot.rejected { background: #d64541; }
+      .sp-pause-row { flex-wrap: wrap; max-width: 100%; }
+      .sp-pause-explain, .sp-pending-plan {
+        flex-basis: 100%; max-width: 70ch; line-height: 1.45; font-size: 11px;
+      }
+      /* "Других инстансов пока нет" is the ONE .sp-empty that does not live inside a
+         card: it sits in the status strip, straight on the page gradient, where
+         --sp-muted measured 4.23:1. It joins the chips it stands among — which is both
+         where it belongs visually and what puts it back over 4.5:1. */
+      .sp-status > .sp-empty {
+        padding: 4px 10px; border-radius: 14px;
+        background: var(--sp-chip); box-shadow: var(--sp-shadow-soft);
+      }
+      .sp-push { margin-left: auto; }
+      .sp-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; background: var(--sp-muted); }
+      .sp-dot.ok { background: var(--sp-ok); }
+      .sp-dot.stale { background: var(--sp-warn); }
+      .sp-dot.paused { background: var(--sp-warn); }
+      .sp-dot.closed { background: var(--sp-grey); }
+      .sp-dot.never { background: var(--sp-grey); }
+      .sp-dot.no-address, .sp-dot.needs-enroll { background: var(--sp-grey); }
+      .sp-dot.rejected { background: var(--sp-red); }
       /* The enroll banner reuses .sp-dot with its state as the class. Only the refused
          address gets a colour: it is the one state that is a SECURITY condition rather
          than a stage of a normal enrollment, so it must read as an alarm, not as
          "waiting". */
-      .sp-dot.bad-address { background: #d64541; }
-      .sp-offline { font-size: 12px; opacity: 0.7; margin-left: 8px; }
-      .sp-fallback { font-size: 12px; color: #d64541; margin-top: 4px; }
+      .sp-dot.bad-address { background: var(--sp-red); }
+      .sp-dot.revoked, .sp-dot.quarantined { background: var(--sp-red); }
+      .sp-fallback {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        margin: 0; padding: 4px 10px; border-radius: 14px;
+        font-size: 11.5px; color: var(--sp-red);
+        background: var(--sp-chip); box-shadow: var(--sp-shadow-soft);
+      }
+
+      /* --- rules editor (collapsible panel under the status bar) --------------- */
+      .sp-rules {
+        max-height: 38vh; overflow-y: auto;
+        padding: 4px 11px 11px; border-radius: 13px;
+        background: var(--sp-card); box-shadow: var(--sp-shadow);
+      }
+      .sp-rule.is-invalid {
+        background: rgba(214, 69, 65, 0.12);
+        border-left: 3px solid var(--sp-red);
+        padding-left: 6px;
+      }
+      /* The rule's own buttons sit at the right edge of the row, away from the text. */
+      .sp-rule > .sp-btn { margin-left: auto; }
+      .sp-rule-flag {
+        flex: none; margin-left: 6px; padding: 1px 6px; border-radius: 8px;
+        font-size: 10px; background: var(--sp-accent-soft); color: var(--sp-secondary);
+      }
+      /* NO red fill of its own: the flag sits inside a row that is ALREADY tinted red and
+         carries a red left border, and red-on-red-on-red measured 2.8:1 light / 3.05:1
+         dark for a 10px word. The row tint is the signal; the flag only has to be
+         readable on it (4.8:1 light / 5.7:1 dark). */
+      .sp-rule-flag.sp-rule-invalid { background: none; color: var(--sp-red); font-weight: 600; }
+      .sp-rule-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 0; }
+      .sp-rule-form input[name="pattern"], .sp-rule-form input[name="instance_id"] {
+        flex: 0 1 200px; padding: 6px 8px;
+        border: 1px solid var(--sp-line); border-radius: 7px;
+        background: var(--sp-field); color: var(--sp-text);
+      }
+      .sp-rule-singleton { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+      .sp-rule-preview { margin: 8px 0 0; font-size: 11.5px; max-width: 80ch; color: var(--sp-secondary); }
+      .sp-rule-preview.is-confirm { color: var(--sp-danger); }
+      .sp-rule-preview-line { margin: 2px 0; }
+      .sp-rule-preview-ask { font-weight: 600; }
+
+      /* Narrow windows keep all three columns and just give the tabs less room. Below
+         ~860px three columns stop being readable at all (a 12px title in a 150px
+         column is a column of ellipses), so the narrowest one — history — steps aside
+         rather than making the other two unusable.
+         TODO: rework the < 860px behaviour — history is HIDDEN outright there, with no
+         way to reach it (a tab strip / an accordion would keep it available). Left as
+         is deliberately for now. */
+      @media (max-width: 1180px) {
+        .sp-cols { grid-template-columns: 1.3fr 3fr 1.1fr; }
+      }
+      @media (max-width: 860px) {
+        .sp-cols { grid-template-columns: 1fr 1.7fr; }
+        .sp-cols > .sp-card:last-child { display: none; }
+      }
     </style>
-    <script type="module" crossorigin src="./assets/index-BXHSU16U.js"></script>
+    <script type="module" crossorigin src="./assets/index-ESuwzr1u.js"></script>
   </head>
   <body>
     <!-- Offline-first: this root is populated by the SFC-precompiled app; the very
-         first paint uses only local sources (own tabs + cache), never the network. -->
+         first paint uses only local sources (own tabs + bookmarks + history + cache),
+         never the network. -->
     <div id="app"></div>
   </body>
 </html>

@@ -38,6 +38,165 @@ export async function queryOwnTabs(chromeApi) {
   }));
 }
 
+// Bookmarks are a LOCAL source too (§10 offline-first): they come from the browser's
+// own tree, need no network and are there on the very first paint — same contract as
+// queryOwnTabs above. Returned FLAT with `parentId` kept, so the folder hierarchy
+// survives without the page having to walk a tree: a node without a `url` IS a folder.
+//
+// A missing `chrome.bookmarks` (permission removed from the manifest, an older Chrome,
+// or a test mock that does not fake it) is not an error — the column simply renders
+// empty. The page must never go blank over an absent optional capability.
+//
+// TODO: bound the list on a large profile (virtualise or cap + "показать все"). A
+// profile with thousands of bookmarks renders every leaf into the DOM today.
+// TODO: render the folder HIERARCHY (nested paths / indentation). The tree is flattened
+// to one section per parent folder, so two same-named folders in different branches are
+// indistinguishable.
+export async function queryBookmarks(chromeApi) {
+  const api = chromeApi && chromeApi.bookmarks;
+  if (!api || typeof api.getTree !== "function") return [];
+  const tree = await api.getTree();
+  const out = [];
+  const walk = (nodes, parentId) => {
+    for (const n of nodes || []) {
+      if (!n) continue;
+      const isFolder = !n.url;
+      // `javascript:` bookmarklets are DROPPED, not listed. They cannot run from here:
+      // this page is an extension page under `script-src 'self'`, so the CSP kills the
+      // navigation and the click does nothing at all — a row that silently no-ops is
+      // worse than an absent one. (They also carry no host, so they would render as a
+      // wall of identical url-fallback rows.) Chrome's own bookmark manager is where
+      // they still work.
+      //
+      // The scheme is compared AFTER stripping C0 controls and spaces from the whole
+      // string, not just from its ends. The URL parser removes tabs and newlines from
+      // ANYWHERE in the input and trims leading/trailing control characters, so
+      // "java\nscript:…" and "javascript:…" are the same scheme to the browser
+      // while a `.trim()` + `^javascript:` test sees neither — and the row comes back,
+      // dead. (Not an XSS hole: the page's CSP is what stops such a url from doing
+      // anything. The filter exists so the column does not draw rows that cannot work.)
+      if (!isFolder && /^javascript:/i.test(String(n.url).replace(/[\u0000-\u0020]/g, ""))) {
+        continue;
+      }
+      // The tree's unnamed root(s) are plumbing, not a folder anyone put anything in:
+      // descend through them without emitting a nameless section header.
+      if (isFolder && !n.title && parentId === null) {
+        walk(n.children, null);
+        continue;
+      }
+      out.push({
+        id: String(n.id),
+        parentId: parentId !== null ? parentId : n.parentId != null ? String(n.parentId) : null,
+        folder: isFolder,
+        title: n.title || "",
+        url: n.url || null,
+      });
+      if (n.children) walk(n.children, String(n.id));
+    }
+  };
+  walk(tree, null);
+  return out;
+}
+
+// Recent history — the third column. Local, offline-first and deliberately BOUNDED:
+// the newtab shows what the human was just doing, not the whole archive, so it asks
+// for a week's worth capped at a screenful-plus. Same missing-API tolerance as
+// queryBookmarks.
+//
+// `now` is INJECTED, never read from the global clock: the same page then computes the
+// history window and the "Сегодня"/"Вчера" day labels (groupHistoryByDay) from ONE
+// source of time. Two clocks here means a test can fix one and not the other, and the
+// suite silently stops describing the shipped behaviour.
+export async function queryHistory(chromeApi, { maxResults = 60, days = 7, now = Date.now } = {}) {
+  const api = chromeApi && chromeApi.history;
+  if (!api || typeof api.search !== "function") return [];
+  const startTime = now() - days * 24 * 60 * 60 * 1000;
+  const items = await api.search({ text: "", startTime, maxResults });
+  return (items || []).map((h) => ({
+    url: h.url,
+    title: h.title || "",
+    lastVisitTime: typeof h.lastVisitTime === "number" ? h.lastVisitTime : null,
+  }));
+}
+
+// --- bookmark edits ------------------------------------------------------------
+// Thin best-effort wrappers: the favourites column edits in place, and a click handler
+// must never be handed a rejected promise (same discipline as enqueueQuickLinkOp).
+// They answer the created/updated node — or null/false on failure, which is what lets
+// the store roll its optimistic edit back instead of showing a change that never
+// happened.
+export async function createBookmark(chromeApi, { parentId, title, url }) {
+  const api = chromeApi && chromeApi.bookmarks;
+  if (!api || typeof api.create !== "function") return null;
+  try {
+    const payload = { title: title || "", url };
+    if (parentId != null) payload.parentId = String(parentId);
+    return (await api.create(payload)) || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateBookmark(chromeApi, id, changes) {
+  const api = chromeApi && chromeApi.bookmarks;
+  if (!api || typeof api.update !== "function") return null;
+  try {
+    return (await api.update(String(id), changes)) || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function removeBookmark(chromeApi, id) {
+  const api = chromeApi && chromeApi.bookmarks;
+  if (!api || typeof api.remove !== "function") return false;
+  try {
+    await api.remove(String(id));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The bookmark tree CHANGES UNDER AN OPEN NEWTAB. This page stays open for hours while
+// the human adds and deletes bookmarks through Chrome's own UI, the bookmark bar, or
+// another newtab — and a list read once at init() then drifts: a deleted bookmark keeps
+// a clickable row that leads nowhere, and a rename/delete issued from here addresses an
+// id the browser no longer has. Subscribe to the four mutation events and re-read.
+//
+// Returns an UNSUBSCRIBE function, and the caller MUST call it on unmount: listeners
+// registered against a page-lifetime handler outlive the component otherwise, and every
+// remount adds another one (a re-read storm plus a retained closure per mount).
+// A browser without chrome.bookmarks (no permission / older Chrome) yields a no-op
+// unsubscribe — the same tolerance queryBookmarks has.
+const BOOKMARK_EVENTS = ["onCreated", "onChanged", "onRemoved", "onMoved"];
+
+export function watchBookmarks(chromeApi, handler) {
+  const api = chromeApi && chromeApi.bookmarks;
+  if (!api || typeof handler !== "function") return () => {};
+  const attached = [];
+  for (const name of BOOKMARK_EVENTS) {
+    const event = api[name];
+    if (!event || typeof event.addListener !== "function") continue;
+    try {
+      event.addListener(handler);
+      attached.push(event);
+    } catch {
+      // A revoked permission can make addListener throw; the rest still attach.
+    }
+  }
+  return () => {
+    for (const event of attached) {
+      try {
+        if (typeof event.removeListener === "function") event.removeListener(handler);
+      } catch {
+        // Nothing to do — the page is going away either way.
+      }
+    }
+    attached.length = 0;
+  };
+}
+
 export async function readCache(chromeApi) {
   const got = await chromeApi.storage.local.get(STATE_CACHE_KEY);
   return (got && got[STATE_CACHE_KEY]) || null;

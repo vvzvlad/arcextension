@@ -978,3 +978,337 @@ describe("enroll status banner (§7)", () => {
     expect(seenAuth).toBe("Bearer rawsecret");
   });
 });
+
+// --- bookmarks + history: local sources, optimistic edits ---------------------
+describe("bookmarks and history are LOCAL sources (§10)", () => {
+  const TREE = [
+    {
+      id: "1",
+      title: "Панель закладок",
+      children: [
+        { id: "11", title: "Хабр / Habr", url: "https://habr.com/" },
+        { id: "12", title: "MDN", url: "https://developer.mozilla.org/" },
+      ],
+    },
+    { id: "2", title: "Другие закладки", children: [] },
+  ];
+
+  function env(extra = {}) {
+    return makeChrome({
+      tabs: [],
+      messages: { get_identity: { instanceId: "me" } },
+      bookmarks: structuredClone(TREE),
+      // ONE clock: the store passes its injected `now` into queryHistory, so the "last N
+      // days" window chrome is asked for and the "Сегодня"/"Вчера" labels are computed
+      // from the same source of time. These stamps are therefore relative to NOW, not to
+      // the wall clock — read the history window off a raw Date.now() again and this
+      // test's items fall outside it.
+      history: [
+        { url: "https://a.example/1", title: "A", lastVisitTime: NOW - 1000 },
+        { url: "https://b.example/1", title: "B", lastVisitTime: NOW - 2000 },
+      ],
+      ...extra,
+    });
+  }
+
+  it("init() reads the bookmark tree and history with NO network", async () => {
+    const e = env();
+    const { fetchFn } = makeFetch({ state: undefined }); // offline throughout
+    const store = storeWith(e, fetchFn);
+    await store.init();
+
+    // Leaves and folders are separated; the unnamed chrome root is not a folder.
+    expect(store.bookmarks.value.map((b) => b.id)).toEqual(["11", "12"]);
+    expect(store.bookmarkFolders.value.map((f) => f.title)).toEqual([
+      "Панель закладок",
+      "Другие закладки",
+    ]);
+    expect(store.bookmarks.value[0].parentId).toBe("1");
+    // The column groups the leaves under their folder's title.
+    expect(store.bookmarkGroups.value[0].title).toBe("Панель закладок");
+    expect(store.bookmarkGroups.value[0].items).toHaveLength(2);
+    // History is there too, newest first, grouped by day.
+    expect(store.history.value).toHaveLength(2);
+    expect(store.historyGroups.value[0].items[0].url).toBe("https://a.example/1");
+  });
+
+  it("a missing chrome.bookmarks / chrome.history is not an error — the lists stay empty", async () => {
+    const e = env({ withoutOptionalApis: true });
+    const { fetchFn } = makeFetch({ state: undefined });
+    const store = storeWith(e, fetchFn);
+    await store.init();
+
+    expect(store.bookmarks.value).toEqual([]);
+    expect(store.history.value).toEqual([]);
+    expect(store.bookmarkGroups.value).toEqual([]);
+  });
+
+  it("the search box filters bookmarks and history with the same local filter", async () => {
+    const e = env();
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    store.setSearch("mdn");
+    expect(store.filteredBookmarks.value.map((b) => b.id)).toEqual(["12"]);
+    store.setSearch("b.example");
+    expect(store.filteredHistory.value.map((h) => h.title)).toEqual(["B"]);
+  });
+
+  it("addBookmark shows the link IMMEDIATELY and then adopts the real chrome id", async () => {
+    const e = env();
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    const pending = store.addBookmark("https://new.example/", "New", "1");
+    // Optimistic: on screen before the API call resolves.
+    expect(store.bookmarks.value.map((b) => b.url)).toContain("https://new.example/");
+    await pending;
+    const added = store.bookmarks.value.find((b) => b.url === "https://new.example/");
+    expect(added.id).not.toMatch(/^pending:/); // the real id replaced the temp one
+    expect(e.calls.bookmarkCreate).toHaveLength(1);
+  });
+
+  it("a failed create is ROLLED BACK — the page never shows a link the browser lacks", async () => {
+    const e = env({ bookmarkWritesFail: true });
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    const before = store.bookmarks.value.length;
+    const res = await store.addBookmark("https://new.example/", "New", "1");
+    expect(res).toBe(null);
+    expect(store.bookmarks.value).toHaveLength(before);
+  });
+
+  it("renameBookmark edits the row first and restores the old title if chrome refuses", async () => {
+    const ok = env();
+    const okStore = storeWith(ok, makeFetch({ state: undefined }).fetchFn);
+    await okStore.init();
+    expect(await okStore.renameBookmark({ id: "11" }, "Хабр")).toBe(true);
+    expect(okStore.bookmarks.value.find((b) => b.id === "11").title).toBe("Хабр");
+    expect(ok.calls.bookmarkUpdate[0]).toEqual(["11", { title: "Хабр" }]);
+
+    const bad = env({ bookmarkWritesFail: true });
+    const badStore = storeWith(bad, makeFetch({ state: undefined }).fetchFn);
+    await badStore.init();
+    expect(await badStore.renameBookmark({ id: "11" }, "Хабр")).toBe(false);
+    expect(badStore.bookmarks.value.find((b) => b.id === "11").title).toBe("Хабр / Habr");
+  });
+
+  it("deleteBookmark removes the row and puts it back if chrome refuses", async () => {
+    const ok = env();
+    const okStore = storeWith(ok, makeFetch({ state: undefined }).fetchFn);
+    await okStore.init();
+    expect(await okStore.deleteBookmark({ id: "11" })).toBe(true);
+    expect(okStore.bookmarks.value.map((b) => b.id)).toEqual(["12"]);
+
+    const bad = env({ bookmarkWritesFail: true });
+    const badStore = storeWith(bad, makeFetch({ state: undefined }).fetchFn);
+    await badStore.init();
+    expect(await badStore.deleteBookmark({ id: "11" })).toBe(false);
+    // Back in its OWN place, not appended to the end.
+    expect(badStore.bookmarks.value.map((b) => b.id)).toEqual(["11", "12"]);
+  });
+
+  // The delete rollback must undo THE DELETE, nothing else. A snapshot of the whole
+  // array taken before the await and restored after it silently reverts every other
+  // edit made in the meantime — and chrome.bookmarks.remove is an await long enough for
+  // a rename (or the tree-change listener) to land inside it.
+  it("a failed delete does NOT roll back edits made while it was in flight", async () => {
+    const e = env({ bookmarkWritesFail: true });
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    const failing = store.deleteBookmark({ id: "11" }); // will be refused by chrome
+    // …and while it is in flight, another bookmark is renamed and a third appears
+    // (exactly what the chrome.bookmarks listener does when the tree moves).
+    store.bookmarks.value = [
+      ...store.bookmarks.value.map((b) => (b.id === "12" ? { ...b, title: "MDN Web Docs" } : b)),
+      { id: "13", parentId: "1", folder: false, title: "Новая", url: "https://new.example/" },
+    ];
+    expect(await failing).toBe(false);
+
+    // The deleted row is back…
+    expect(store.bookmarks.value.map((b) => b.id)).toEqual(["11", "12", "13"]);
+    // …and the concurrent rename + addition SURVIVED.
+    expect(store.bookmarks.value.find((b) => b.id === "12").title).toBe("MDN Web Docs");
+    expect(store.bookmarks.value.find((b) => b.id === "13").title).toBe("Новая");
+  });
+
+  // A rollback must put the row back ONCE. The debounced tree re-read is a macrotask and
+  // can fire inside the remove() await — and since the delete FAILED, that re-read still
+  // finds the node and restores it on its own.
+  it("a failed delete does not duplicate a row the tree re-read already restored", async () => {
+    const e = env();
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    // Park the refusal so the re-read demonstrably completes INSIDE the await — that is
+    // the window the debounced chrome.bookmarks listener fires in.
+    let refuse;
+    e.chrome.bookmarks.remove = async () => {
+      await new Promise((r) => {
+        refuse = r;
+      });
+      throw new Error("bookmarks.remove failed");
+    };
+
+    const failing = store.deleteBookmark({ id: "11" });
+    expect(store.bookmarks.value.map((b) => b.id)).toEqual(["12"]); // optimistic removal
+    // The re-read lands while the refusal is still in flight, and since the delete did
+    // NOT go through it puts "11" back on its own.
+    await store.reloadBookmarks();
+    expect(store.bookmarks.value.map((b) => b.id)).toEqual(["11", "12"]);
+    refuse();
+    expect(await failing).toBe(false);
+
+    const ids = store.bookmarks.value.map((b) => b.id);
+    expect(ids).toEqual(["11", "12"]); // ONE "11", not two
+    expect(ids.filter((id) => id === "11")).toHaveLength(1);
+  });
+
+  // An in-flight getTree cannot be cancelled, so it must be FENCED: a page that went away
+  // mid-read must not have the answer written into its store.
+  it("drops a tree re-read that lands after unwatchBookmarkChanges()", async () => {
+    const e = env();
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+    const before = store.bookmarks.value.map((b) => b.id);
+
+    // Park getTree in flight, then tear the watch down before it answers.
+    let release;
+    const parked = new Promise((r) => {
+      release = r;
+    });
+    e.chrome.bookmarks.getTree = async () => {
+      await parked;
+      return [{ id: "0", title: "", children: [{ id: "9", title: "Позже", children: [] }] }];
+    };
+    store.watchBookmarkChanges({ debounceMs: 1 });
+    const reading = store.reloadBookmarks();
+    store.unwatchBookmarkChanges();
+    release();
+    await reading;
+
+    // The store belongs to a page that is gone: its lists are untouched.
+    expect(store.bookmarks.value.map((b) => b.id)).toEqual(before);
+    expect(store.bookmarkFolders.value.map((f) => f.title)).toEqual([
+      "Панель закладок",
+      "Другие закладки",
+    ]);
+  });
+
+  // `javascript:` bookmarklets cannot run from this page — it is an extension page under
+  // `script-src 'self'`, so the click is killed by the CSP and does nothing at all.
+  it("drops javascript: bookmarklets instead of drawing dead rows", async () => {
+    const e = makeChrome({
+      tabs: [],
+      messages: { get_identity: { instanceId: "me" } },
+      bookmarks: [
+        {
+          id: "1",
+          title: "Панель закладок",
+          children: [
+            { id: "11", title: "Хабр", url: "https://habr.com/" },
+            { id: "12", title: "Читалка", url: "javascript:void(document.body.style)" },
+            { id: "13", title: "Тоже букмарклет", url: "JavaScript:alert(1)" },
+            // The browser strips ASCII whitespace and control characters from INSIDE a
+            // url before parsing it, so all three of these are the `javascript:` scheme
+            // to Chrome — while a `.trim()` + `^javascript:` test sees none of them and
+            // draws three rows that cannot do anything.
+            { id: "14", title: "С переводом строки", url: "java\nscript:alert(1)" },
+            { id: "15", title: "С табом", url: "java\tscript:alert(1)" },
+            { id: "16", title: "С ведущим пробелом", url: "  javascript:alert(1)" },
+          ],
+        },
+      ],
+    });
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    expect(store.bookmarks.value.map((b) => b.id)).toEqual(["11"]);
+    expect(store.bookmarkGroups.value[0].items).toHaveLength(1);
+  });
+
+  // The tree changes under an open newtab: a bookmark deleted through Chrome's own UI
+  // must leave this list too, or its row stays clickable and its id stays addressable.
+  it("re-reads the tree when chrome reports a bookmark change, and debounces a burst", async () => {
+    const e = env();
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+    const readsAfterInit = e.calls.bookmarkGetTree;
+
+    store.watchBookmarkChanges({ debounceMs: 1 });
+    expect(e.bookmarkListenerCount()).toBe(4); // onCreated/onChanged/onRemoved/onMoved
+
+    // Somebody deletes a bookmark in Chrome's bookmark manager…
+    e.bookmarkRoot.children[0].children.splice(0, 1); // drop "11"
+    // …which fires a BURST of events (a folder delete fires one per node).
+    e.bookmarkEvents.onRemoved.emit();
+    e.bookmarkEvents.onRemoved.emit();
+    e.bookmarkEvents.onChanged.emit();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(store.bookmarks.value.map((b) => b.id)).toEqual(["12"]);
+    // Debounced: three events, ONE re-read of the whole tree.
+    expect(e.calls.bookmarkGetTree - readsAfterInit).toBe(1);
+  });
+
+  it("unwatchBookmarkChanges detaches every listener (no leak across remounts)", async () => {
+    const e = env();
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    store.watchBookmarkChanges({ debounceMs: 1 });
+    store.watchBookmarkChanges({ debounceMs: 1 }); // a second call must not double up
+    expect(e.bookmarkListenerCount()).toBe(4);
+
+    store.unwatchBookmarkChanges();
+    expect(e.bookmarkListenerCount()).toBe(0);
+
+    // A detached page must not react to anything anymore.
+    const reads = e.calls.bookmarkGetTree;
+    e.bookmarkEvents.onCreated.emit();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(e.calls.bookmarkGetTree).toBe(reads);
+  });
+
+  it("a browser with no chrome.bookmarks can still be watched (no throw, no listeners)", async () => {
+    const e = env({ withoutOptionalApis: true });
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    expect(() => store.watchBookmarkChanges({ debounceMs: 1 })).not.toThrow();
+    expect(() => store.unwatchBookmarkChanges()).not.toThrow();
+  });
+
+  // One clock for the whole page: the history WINDOW and the day LABELS must come from
+  // the same source of time, or a test can pin one and not the other.
+  it("asks chrome for history against the INJECTED clock, not Date.now()", async () => {
+    const e = env();
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    expect(e.calls.historySearch).toHaveLength(1);
+    const { startTime } = e.calls.historySearch[0];
+    expect(startTime).toBe(NOW - 7 * 24 * 60 * 60 * 1000);
+  });
+
+  it("own tabs are grouped into the windows they live in", async () => {
+    const e = makeChrome({
+      tabs: [
+        { id: 1, windowId: 5, url: "https://a.com/1", title: "A1" },
+        { id: 2, windowId: 5, url: "https://a.com/2", title: "A2" },
+        { id: 3, windowId: 6, url: "https://b.com/1", title: "B1" },
+      ],
+      messages: { get_identity: { instanceId: "me" } },
+    });
+    const store = storeWith(e, makeFetch({ state: undefined }).fetchFn);
+    await store.init();
+
+    expect(store.tabWindowGroups.value.map((g) => g.windowId)).toEqual([5, 6]);
+    // The grouping follows the SEARCH, not the raw tab list.
+    store.setSearch("B1");
+    expect(store.tabWindowGroups.value).toHaveLength(1);
+    expect(store.tabWindowGroups.value[0].windowId).toBe(6);
+  });
+});

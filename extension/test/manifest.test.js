@@ -7,6 +7,30 @@ const manifest = JSON.parse(
   readFileSync(fileURLToPath(new URL("../manifest.json", import.meta.url)), "utf8"),
 );
 
+// The permission list is an INSTALL-TIME PROMPT, not an implementation detail: adding an
+// entry changes what Chrome asks every operator for on update ("Читать и изменять
+// закладки", "Читать историю просмотров"), and a permission that quietly disappears
+// takes a whole feature down with it (the startpage's two side columns render empty, and
+// nothing anywhere says why). Assert the EXACT set — a subset check would let both
+// accidents through.
+describe("manifest permissions (§10 startpage columns)", () => {
+  it("is exactly the documented set — nothing added, nothing dropped", () => {
+    expect([...manifest.permissions].sort()).toEqual(
+      ["alarms", "bookmarks", "history", "idle", "scripting", "storage", "tabs"].sort(),
+    );
+  });
+
+  it("the //permissions comment says why bookmarks/history are here and what they cost", () => {
+    // Whoever tightens this list next must be able to read, in place, that these two are
+    // the startpage's LOCAL sources (§10) and that they widen the install-time warning.
+    const comment = manifest["//permissions"];
+    expect(comment).toMatch(/bookmarks/);
+    expect(comment).toMatch(/history/);
+    expect(comment).toMatch(/§10/);
+    expect(comment).toMatch(/install-time warning/i); // says what the operator will see
+  });
+});
+
 describe("manifest host_permissions (§7)", () => {
   it("drops the two per-<host> patterns and keeps ONLY <all_urls>", () => {
     const hp = manifest.host_permissions;

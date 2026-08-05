@@ -4,12 +4,15 @@
   "version": "0.1.0",
   "description": "Curator client: reports tab activity snapshots and executes curator commands (§5, §6).",
 
+  "//permissions": "`bookmarks` and `history` are READ-MOSTLY startpage permissions (§10): the newtab renders three columns — favourites (quick links + chrome.bookmarks), tabs, and history — and both are LOCAL sources, available on the very first paint with no network (offline-first). `bookmarks` is also written: the favourites column renames/removes/adds entries in place. They are NOT used by the service worker and nothing from them is ever reported to the curator service. Note for the operator: adding them WIDENS the install-time warning — Chrome now asks for «Читать и изменять закладки» and «Читать историю просмотров» on top of the tab permissions. Removing them does not break the extension; the two columns just render empty (the adapters tolerate a missing API, see startpage/src/lib/adapters.js).",
   "permissions": [
     "tabs",
     "scripting",
     "alarms",
     "storage",
-    "idle"
+    "idle",
+    "bookmarks",
+    "history"
   ],
 
   "//host_permissions": "ONLY <all_urls> now. The two per-host patterns (https://<host>/* and wss://<host>/*) are REMOVED: with enrollment (§7, issue #35) the build is UNIVERSAL — there is no generator to stamp a concrete <host> at package time, and the service address is an operator setting entered per profile. <all_urls> IS requested — SECURITY-SENSITIVE, deliberate — and now carries TWO paths, not one: (1) execute_js runs curator-supplied JS in the arbitrary http/https tabs this instance manages (§6), and (2) the startpage's fetch to the service /api/* is a cross-origin request whose CORS host-permission is <all_urls> (slice C / §12). Both are gated (execute_js by the per-copy options checkbox default OFF + the server kill-switch + commands.js's http/https-only edge guard; /api by a Bearer carrying the RAW per-install instance secret — option A, the server hashes it on receipt — over a wss:// address the client refuses to downgrade, src/service-address.js). A future tightening of <all_urls> to a fixed host list must therefore account for BOTH the execute_js origins AND the /api fetch host, or the startpage goes offline fleet-wide.",
