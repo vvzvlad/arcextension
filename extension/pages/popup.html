@@ -4,8 +4,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>arcextension — Rule from this tab</title>
+    <!--
+      Styling lives in pages/ui.css, shared with the options page. An external
+      stylesheet is fine under the extension_pages CSP (`script-src 'self'` governs
+      scripts, not styles) and it loads from the bundle, never from the network.
+    -->
+    <link rel="stylesheet" href="ui.css" />
   </head>
-  <body>
+  <body class="ui-popup">
     <!--
       "Rule from this tab" (§8, §10): the fast way to add a rule for the site you are
       looking at. Both halves of the rule are chosen HERE — the host pattern (prefilled
@@ -17,55 +23,57 @@
       This is also the cold-start path — an empty rules table disables curation entirely
       (§8), so filling it must be effortless. The script is external (popup.js) because
       the extension_pages CSP is `script-src 'self'`.
-    -->
-    <main style="min-width: 24rem; max-width: 26rem; font: 14px system-ui, sans-serif">
-      <h1 style="font-size: 1rem">Add a rule from this tab</h1>
-      <p style="color: #555">This tab: <code id="origin">…</code></p>
 
-      <p>
-        <label for="pattern"><strong>Tabs matching</strong></label><br />
+      The ids are the contract with popup.js: origin, pattern, target, impact, save,
+      status (plus data-role on the two inputs). Nothing here may be renamed alone.
+    -->
+    <main class="ui-page">
+      <h1 class="ui-title">Add a rule from this tab</h1>
+      <p class="ui-subtitle">This tab: <code id="origin">…</code></p>
+
+      <div class="ui-field">
+        <label class="ui-label" for="pattern">Tabs matching</label>
         <input
+          class="ui-input"
           type="text"
           id="pattern"
           data-role="pattern"
-          size="30"
           spellcheck="false"
           autocapitalize="off"
           autocomplete="off"
           placeholder="example.com[:port]"
+          aria-describedby="hint"
         />
-      </p>
+        <!--
+          One line, not a paragraph. The matcher's full semantics (src/rules/matcher.py,
+          §8: `<hostPattern>[:port]`, fullmatch against the WHOLE host, path ignored, a
+          missing port matches any port) used to be spelled out here, and the one case
+          people actually get wrong — a rule that matches more tabs than expected — is
+          answered better by the impact block below, which shows what THIS pattern would
+          really do. A refused pattern comes back from the server with its own reason
+          (422, shown verbatim in the status row), so the hint carries only what you need
+          before typing.
+        -->
+        <p class="ui-hint" id="hint">
+          Whole host name, path ignored. <code>*</code> = any characters.
+        </p>
+      </div>
+
+      <div class="ui-field">
+        <label class="ui-label" for="target">move to</label>
+        <select class="ui-select" id="target" data-role="target"></select>
+      </div>
+
       <!--
-        The syntax note is the matcher's ACTUAL semantics (src/rules/matcher.py, §8):
-        `<hostPattern>[:port]`, `*` → `.*`, matched against the WHOLE hostname with
-        fullmatch (no partial matches), a missing port matches any port, the path is
-        not part of matching at all. The `*.example.com` / `*example.com` pair is the
-        consequence people get wrong, so it is the example.
+        The server's impact preview, written by popup.js as ONE multi-line string
+        (textContent — every server string reaches the DOM that way). `white-space:
+        pre-line` in ui.css is what keeps those line breaks; the accent bar is not red
+        because "0 tabs" is a normal answer here, not a warning.
       -->
-      <p id="hint" style="color: #555; font-size: 12px; margin-top: -0.4rem">
-        Host and optional port — <code>example.com</code> or <code>example.com:8443</code>.
-        It is matched against the <strong>whole</strong> host name, never a part of it,
-        and the path is ignored; without a port it matches any port. <code>*</code>
-        stands for any characters, so <code>*.example.com</code> matches
-        <code>www.example.com</code> but <em>not</em> <code>example.com</code>, while
-        <code>*example.com</code> matches both (and <code>notexample.com</code> too).
-      </p>
+      <p class="ui-impact" id="impact" role="status" aria-live="polite">Loading preview…</p>
 
-      <p>
-        <label for="target"><strong>move to</strong></label><br />
-        <select id="target" data-role="target"></select>
-      </p>
-
-      <p
-        id="impact"
-        role="status"
-        aria-live="polite"
-        style="white-space: pre-line; background: #f4f4f4; padding: 0.5rem; border-radius: 4px"
-      >
-        Loading preview…
-      </p>
-      <button id="save" disabled>Save rule</button>
-      <p id="status" role="status" aria-live="polite"></p>
+      <button class="ui-button" id="save" disabled>Save rule</button>
+      <p class="ui-status" id="status" role="status" aria-live="polite"></p>
     </main>
     <script src="popup.js" type="module"></script>
   </body>

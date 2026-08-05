@@ -87,11 +87,12 @@ export const ENROLL_CODE_KEY = "enrollCode"; // storage.local — the window cod
 // enrolled, which the alarm already covers; recovery from a closed window is an operator
 // step (open a new one, type the new code), not a client retry.
 
-// How many chars of installUuid identify an instance to the operator (§7). Shown on the
-// options page as the durable identity of THIS install — the /admin console no longer
-// prints it (there is no request list to match against), so this is a diagnostic the
-// operator can quote, not a value to compare screen-to-screen.
-export const INSTALL_UUID_PREFIX_LEN = 18;
+// There is no INSTALL_UUID_PREFIX_LEN anymore. It sized the installUuid prefix the
+// options page printed as "this install's identity", and that row is gone: /admin stopped
+// printing the uuid when the pending-request list went away (§6), so the prefix had
+// nothing left to be compared against and was one more line between the operator and the
+// four fields that actually do something. installUuid itself is untouched — the SW still
+// mints it (INSTALL_UUID_KEY above) and enroll_request still carries it.
 // Durable enrollment facts, the SINGLE source getEnrollState reads (the in-memory
 // helloAcked is useless at page open — the worker is cold). Shape:
 //   { requestPending: bool, approved: bool, quarantined: bool, lastVerdict: str|null }

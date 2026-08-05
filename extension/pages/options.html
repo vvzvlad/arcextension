@@ -4,96 +4,112 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>arcextension — Options</title>
-  </head>
-  <body>
     <!--
-      Options page (§7, §12). It carries the enrollment settings — the service
-      address, the NAME this browser enrols under (which becomes its instance id, so it
-      is validated here against the same charset the service enforces), the ~10-min
-      window code the operator reads off /admin, and a submit-enrollment action — plus
-      an installUuid prefix as a diagnostic. Enrolment is ONE step: submitting a valid
-      code into an open window enrols this browser immediately, and a refusal shows its
-      reason right here (this is the only place a human sees it). The execute_js opt-in
-      checkbox (§12) is the "stop" button for the most dangerous operation. All settings
-      live in chrome.storage.local (per-profile; NEVER in the bundle) — the shared token
-      is gone. The script is external (options.js) because the extension_pages CSP is
-      `script-src 'self'`.
+      Styling lives in pages/ui.css, shared with the popup. An external stylesheet is
+      fine under the extension_pages CSP (`script-src 'self'` governs scripts, not
+      styles) and it loads from the bundle, never from the network.
     -->
-    <main style="max-width: 34rem; font: 14px system-ui, sans-serif">
-      <h1>arcextension options</h1>
+    <link rel="stylesheet" href="ui.css" />
+  </head>
+  <body class="ui-options">
+    <!--
+      Options page (§7, §12). It carries the enrollment settings — the service address,
+      the NAME this browser enrols under (which becomes its instance id, so it is
+      validated here against the same charset the service enforces), the ~10-min window
+      code the operator reads off /admin, and a submit-enrollment action — plus the
+      execute_js opt-in (§12), the "stop" button for the most dangerous operation.
+      Enrolment is ONE step: submitting a valid code into an open window enrols this
+      browser immediately, and a refusal shows its reason right here (this is the only
+      place a human sees it). All settings live in chrome.storage.local (per-profile;
+      NEVER in the bundle) — the shared token is gone. The script is external
+      (options.js) because the extension_pages CSP is `script-src 'self'`.
 
-      <section>
-        <h2 style="font-size: 1rem">Enrollment (§7)</h2>
-        <p>
-          This install's identity:
-          <code id="install-uuid" data-role="install-uuid">…</code>
-          — quote it when reporting a problem with this copy.
+      WHAT THE RULES OF THIS FORM ARE IS NOT WRITTEN HERE ANYMORE. The address schemes
+      and the instance-name charset used to be two paragraphs of prose above the fields;
+      they are now shown as a refusal AT the field that broke them (a red border and one
+      red line under it, written by options.js from the very gate that decides whether
+      the value may be stored). Prose that describes a check nobody reads until it fires
+      is worse than the check saying it itself.
+
+      The ids are the contract with options.js: enroll-state, service-address,
+      browser-name, enroll-code, submit-enroll, allow-execute-js, status — plus the
+      "<field>-error" line each input names in aria-describedby.
+    -->
+    <main class="ui-page">
+      <h1 class="ui-title">arcextension options</h1>
+
+      <section class="ui-card">
+        <h2 class="ui-card-title">Enrollment</h2>
+
+        <p class="ui-pill-row">
+          <span class="ui-pill" id="enroll-state" data-role="enroll-state" role="status" aria-live="polite">…</span>
         </p>
-        <p>
-          Status: <strong id="enroll-state" data-role="enroll-state">…</strong>
-        </p>
-        <p>
-          <label>
-            Service address<br />
-            <input
-              type="text"
-              id="service-address"
-              data-role="service-address"
-              size="40"
-              placeholder="curator.example"
-            />
-          </label>
-          <br />
-          <small>
-            Enter the address of the service — <code>curator.example</code> or
-            <code>curator.example:8443</code>. The scheme is added for you:
-            <code>wss://</code>, or <code>ws://</code> for
-            <code>localhost</code> / <code>127.0.0.1</code> / <code>[::1]</code> in
-            development. An unencrypted address is not accepted, because this instance's
-            secret and the enrollment code travel over this connection as-is and TLS is
-            the only thing hiding them — so an explicit <code>http://</code>, or
-            <code>ws://</code> to anything but loopback, is refused. A full
-            <code>wss://…</code> URL keeps working unchanged.
-          </small>
-        </p>
-        <p>
-          <label>
-            Browser name — this becomes the instance id<br />
-            <input type="text" id="browser-name" data-role="browser-name" size="40" />
-          </label>
-          <br />
-          <small>
-            1–64 characters of <code>A–Z a–z 0–9 . _ -</code> — no spaces. This is the
-            name the service knows this browser by: it appears in the admin console, in
-            curation rules and in metrics. It must not be taken by another live browser;
-            a name freed by revoking a browser can be reused.
-          </small>
-        </p>
-        <p>
-          <label>
-            Enrollment code (from the admin page, valid ~10 min)<br />
-            <input type="text" id="enroll-code" data-role="enroll-code" size="20" />
-          </label>
-          <button type="button" id="submit-enroll" data-role="submit-enroll">
-            Submit enrollment
-          </button>
-        </p>
+
+        <div class="ui-field">
+          <label class="ui-label" for="service-address">Service address</label>
+          <input
+            class="ui-input"
+            type="text"
+            id="service-address"
+            data-role="service-address"
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+            placeholder="curator.example"
+            aria-describedby="service-address-error"
+          />
+          <p class="ui-error" id="service-address-error" role="status" aria-live="polite"></p>
+        </div>
+
+        <div class="ui-field">
+          <label class="ui-label" for="browser-name">Browser name</label>
+          <input
+            class="ui-input"
+            type="text"
+            id="browser-name"
+            data-role="browser-name"
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+            placeholder="work-laptop"
+            aria-describedby="browser-name-error"
+          />
+          <p class="ui-error" id="browser-name-error" role="status" aria-live="polite"></p>
+        </div>
+
+        <div class="ui-field">
+          <label class="ui-label" for="enroll-code">Enrollment code</label>
+          <input
+            class="ui-input"
+            type="text"
+            id="enroll-code"
+            data-role="enroll-code"
+            spellcheck="false"
+            autocapitalize="off"
+            autocomplete="off"
+            placeholder="from /admin, valid ~10 min"
+            aria-describedby="enroll-code-error"
+          />
+          <p class="ui-error" id="enroll-code-error" role="status" aria-live="polite"></p>
+        </div>
+
+        <button class="ui-button" type="button" id="submit-enroll" data-role="submit-enroll">
+          Submit enrollment
+        </button>
       </section>
 
-      <section>
-        <h2 style="font-size: 1rem">Dangerous operations (§12)</h2>
-        <label>
-          <input type="checkbox" id="allow-execute-js" />
-          Allow <code>execute_js</code> on this copy
-        </label>
-        <p>
-          When off, the service cannot run arbitrary JavaScript through this
-          extension: every <code>execute_js</code> command is refused with
-          <code>js_disabled</code> and nothing is executed. Default: off.
-        </p>
-      </section>
+      <!--
+        execute_js (§12) is one checkbox in the page flow, deliberately without a card,
+        a warning stripe or a paragraph of its own: the danger is in what it ALLOWS, and
+        the switch that allows it is off by default and refuses every execute_js with
+        `js_disabled` while it stays off.
+      -->
+      <label class="ui-checkbox" for="allow-execute-js">
+        <input type="checkbox" id="allow-execute-js" />
+        <span>Allow <code>execute_js</code> on this copy</span>
+      </label>
 
-      <p id="status" role="status" aria-live="polite"></p>
+      <p class="ui-status" id="status" role="status" aria-live="polite"></p>
     </main>
     <script src="options.js" type="module"></script>
   </body>

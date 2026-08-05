@@ -3,7 +3,6 @@ import {
   addressErrorText,
   enrollLabel,
   init,
-  installUuidPrefix,
   instanceNameError,
   instanceNameErrorText,
   normalizeServiceAddress as optionsNormalizeServiceAddress,
@@ -13,22 +12,10 @@ import {
   normalizeServiceAddress as swNormalizeServiceAddress,
   serviceAddressError as swServiceAddressError,
 } from "../src/service-address.js";
-import { INSTALL_UUID_PREFIX_LEN } from "../src/constants.js";
 
-const UUID = "d01784bd-a594-4766-a521-b52c4e71c010";
-
-describe("installUuidPrefix (§7 — this install's identity, for the operator to quote)", () => {
-  it("shows enough of installUuid to tell two installs apart, '—' when absent", () => {
-    // It used to be compared char-for-char against a row in the /admin pending list; that
-    // list is gone (§6), so this is now a diagnostic rather than a decision input. The
-    // length is kept: two browsers of one person still have to be distinguishable in a
-    // support conversation, and 8 hex chars collide too easily for that.
-    expect(installUuidPrefix(UUID)).toBe("d01784bd-a594-4766");
-    expect(installUuidPrefix(UUID)).toHaveLength(INSTALL_UUID_PREFIX_LEN);
-    expect(installUuidPrefix("")).toBe("—");
-    expect(installUuidPrefix(undefined)).toBe("—");
-  });
-});
+// There is no installUuidPrefix test anymore, and no installUuid row on the page to test:
+// the "this install's identity" line was removed with the redesign (see constants.js —
+// /admin stopped printing the uuid, so the prefix had nothing left to be compared with).
 
 // --- the service address gate (§7) ------------------------------------------
 describe("serviceAddressError", () => {
@@ -210,12 +197,26 @@ describe("instanceNameError (the name IS the instance id, §6)", () => {
 });
 
 // --- DOM wiring: the settings UI feeds the enroll_request -------------------
+// The fake element carries `classList` and `setAttribute` because the page marks a
+// refused field with them (the red border + aria-invalid, ui.css `.is-invalid`): a stub
+// without them would let the page break in the browser and stay green here.
 function fakeEl(extra = {}) {
+  const classes = new Set();
   return {
     value: "",
     textContent: "",
     checked: false,
     disabled: false,
+    attrs: {},
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      contains: (c) => classes.has(c),
+      toggle: (c, on) => (on ? classes.add(c) : classes.delete(c)),
+    },
+    setAttribute(name, value) {
+      this.attrs[name] = value;
+    },
     _handlers: {},
     addEventListener(type, fn) {
       this._handlers[type] = fn;
@@ -234,10 +235,12 @@ const IDS = [
   "status",
   "allow-execute-js",
   "service-address",
+  "service-address-error",
   "browser-name",
+  "browser-name-error",
   "enroll-code",
+  "enroll-code-error",
   "submit-enroll",
-  "install-uuid",
   "enroll-state",
 ];
 
@@ -270,14 +273,15 @@ function fakeChrome(stored = {}, connectionState = { enrollState: "needs-enroll"
 }
 
 describe("options init (§7)", () => {
-  it("renders the installUuid prefix + enroll state, and submit sends submit_enrollment with the code", async () => {
+  it("renders the enroll state, and submit sends submit_enrollment with the code", async () => {
     const doc = fakeDoc(IDS);
-    const { chromeApi, sent, stored } = fakeChrome({ installUuid: UUID });
+    const { chromeApi, sent, stored } = fakeChrome();
 
     await init(doc, chromeApi);
-    // The identity the operator quotes to the admin — the same prefix /admin prints.
-    expect(doc.els["install-uuid"].textContent).toBe("d01784bd-a594-4766");
     expect(doc.els["enroll-state"].textContent).toBe("не зарегистрирован");
+    // The pill's dot follows the state: grey until this browser IS enrolled, or it would
+    // read green over the words "не зарегистрирован".
+    expect(doc.els["enroll-state"].classList.contains("is-enrolled")).toBe(false);
 
     // The operator types the address + the window code and presses submit → the code
     // feeds the enroll_request via the SW message (and both are persisted).
@@ -306,7 +310,10 @@ describe("options init (§7)", () => {
     doc.els["enroll-code"].value = "WIN-CODE";
     await doc.els["submit-enroll"]._handlers.click();
     expect(sent.find((m) => m.type === "submit_enrollment")).toBeUndefined();
-    expect(doc.els.status.textContent).toMatch(/A-Z a-z 0-9/);
+    // The reason is shown AT the field it is about (the page-level status row is for
+    // outcomes), together with the red-border marker ui.css paints.
+    expect(doc.els["browser-name-error"].textContent).toMatch(/A-Z a-z 0-9/);
+    expect(doc.els["browser-name"].classList.contains("is-invalid")).toBe(true);
     expect(stored.enrollCode).toBeUndefined(); // the code is not spent
   });
 
@@ -318,12 +325,19 @@ describe("options init (§7)", () => {
     doc.els["browser-name"].value = "Bob's Chrome";
     await doc.els["browser-name"]._handlers.change();
     expect(stored.browserName).toBeUndefined(); // never persisted
-    expect(doc.els.status.textContent).toMatch(/no spaces/i);
+    expect(doc.els["browser-name-error"].textContent).toMatch(/no spaces/i);
+    expect(doc.els["browser-name"].classList.contains("is-invalid")).toBe(true);
+    expect(doc.els["browser-name"].attrs["aria-invalid"]).toBe("true");
 
     doc.els["browser-name"].value = "  bobs-chrome  ";
     await doc.els["browser-name"]._handlers.change();
     expect(stored.browserName).toBe("bobs-chrome"); // trimmed and saved
     expect(doc.els.status.textContent).toBe("Browser name saved");
+    // Fixing the value clears BOTH halves of the refusal — a red border left behind over
+    // an accepted name is the same lie as a green dot over a refusal.
+    expect(doc.els["browser-name-error"].textContent).toBe("");
+    expect(doc.els["browser-name"].classList.contains("is-invalid")).toBe(false);
+    expect(doc.els["browser-name"].attrs["aria-invalid"]).toBe("false");
   });
 
   it("repaints the state when the SW records a verdict (storage.onChanged)", async () => {
@@ -354,6 +368,13 @@ describe("options init (§7)", () => {
     await listeners[0]({ enrollState: {} }, "sync");
     await new Promise((r) => setTimeout(r, 0));
     expect(doc.els["enroll-state"].textContent).toContain("имя уже занято");
+    expect(doc.els["enroll-state"].classList.contains("is-enrolled")).toBe(false);
+
+    // …and the repaint that DOES happen carries the dot with it.
+    await listeners[0]({ enrollState: {} }, "local");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(doc.els["enroll-state"].textContent).toBe("активен");
+    expect(doc.els["enroll-state"].classList.contains("is-enrolled")).toBe(true);
   });
 
   it("refuses to submit an empty code (no message sent)", async () => {
@@ -365,7 +386,8 @@ describe("options init (§7)", () => {
     doc.els["enroll-code"].value = "   ";
     await doc.els["submit-enroll"]._handlers.click();
     expect(sent.find((m) => m.type === "submit_enrollment")).toBeUndefined();
-    expect(doc.els.status.textContent).toMatch(/code/i);
+    expect(doc.els["enroll-code-error"].textContent).toMatch(/code/i);
+    expect(doc.els["enroll-code"].classList.contains("is-invalid")).toBe(true);
   });
 });
 
@@ -380,8 +402,14 @@ describe("options: the service address is validated before it is stored (§7)", 
     await doc.els["service-address"]._handlers.change();
 
     expect(stored.serviceAddress).toBeUndefined(); // never persisted
-    expect(doc.els.status.textContent).toMatch(/wss:\/\//);
-    expect(doc.els.status.textContent).toMatch(/clear/i); // "…would travel in the clear"
+    // The refusal is red, under the field, and it names both the problem and the fix.
+    // (It used to be a sentence in the page-level status row saying the secret "would
+    // travel in the clear"; the wording moved to the field with the paragraph about
+    // schemes that used to sit above it.)
+    expect(doc.els["service-address-error"].textContent).toMatch(/wss:\/\//);
+    expect(doc.els["service-address-error"].textContent).toMatch(/unencrypted/i);
+    expect(doc.els["service-address"].classList.contains("is-invalid")).toBe(true);
+    expect(doc.els["service-address"].attrs["aria-invalid"]).toBe("true");
   });
 
   it("stores a wss:// address, and a loopback ws:// one (development)", async () => {
@@ -393,6 +421,8 @@ describe("options: the service address is validated before it is stored (§7)", 
     await doc.els["service-address"]._handlers.change();
     expect(stored.serviceAddress).toBe("wss://curator.example"); // trimmed
     expect(doc.els.status.textContent).toBe("Service address saved");
+    expect(doc.els["service-address-error"].textContent).toBe("");
+    expect(doc.els["service-address"].classList.contains("is-invalid")).toBe(false);
 
     doc.els["service-address"].value = "ws://localhost:8000";
     await doc.els["service-address"]._handlers.change();
@@ -431,6 +461,8 @@ describe("options: the service address is validated before it is stored (§7)", 
     await init(doc, chromeApi);
     expect(doc.els["service-address"].value).toBe("wss://curator.example:8443");
     expect(doc.els.status.textContent).not.toMatch(/Refused/);
+    expect(doc.els["service-address-error"].textContent).toBe("");
+    expect(doc.els["service-address"].classList.contains("is-invalid")).toBe(false);
 
     await doc.els["service-address"]._handlers.change();
     expect(stored.serviceAddress).toBe("wss://curator.example:8443");
@@ -438,7 +470,7 @@ describe("options: the service address is validated before it is stored (§7)", 
 
   it("submitting an enrollment stores the BARE address with its derived scheme", async () => {
     const doc = fakeDoc(IDS);
-    const { chromeApi, sent, stored } = fakeChrome({ installUuid: UUID });
+    const { chromeApi, sent, stored } = fakeChrome();
     await init(doc, chromeApi);
 
     doc.els["service-address"].value = "curator.nebula.lc";
@@ -474,7 +506,8 @@ describe("options: the service address is validated before it is stored (§7)", 
     await doc.els["submit-enroll"]._handlers.click();
 
     expect(sent.find((m) => m.type === "submit_enrollment")).toBeUndefined();
-    expect(doc.els.status.textContent).toMatch(/wss:\/\//);
+    expect(doc.els["service-address-error"].textContent).toMatch(/wss:\/\//);
+    expect(doc.els["service-address"].classList.contains("is-invalid")).toBe(true);
   });
 
   it("surfaces an address the SW has already refused (a profile predating the gate)", async () => {
@@ -485,8 +518,9 @@ describe("options: the service address is validated before it is stored (§7)", 
     );
     await init(doc, chromeApi);
     // The field shows the stored value, so "адрес не настроен" would be a lie; the page
-    // must name the refusal instead.
+    // must name the refusal instead — on the very field holding the refused value.
     expect(doc.els["service-address"].value).toBe("ws://curator.lan:8000");
-    expect(doc.els.status.textContent).toMatch(/wss:\/\//);
+    expect(doc.els["service-address-error"].textContent).toMatch(/wss:\/\//);
+    expect(doc.els["service-address"].classList.contains("is-invalid")).toBe(true);
   });
 });

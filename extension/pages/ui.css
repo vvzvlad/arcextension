@@ -1,0 +1,382 @@
+/* Shared styling for the two extension pages: pages/popup.html + pages/options.html.
+   An EXTERNAL stylesheet is allowed under the extension_pages CSP — `script-src 'self';
+   object-src 'self'` governs scripts and plugins, not styles — while the scripts stay
+   external modules. Nothing here may reach the network: no @font-face, no CDN import,
+   no url() image. The only typefaces are the ones already installed and every decoration
+   is a CSS shape.
+
+   KEEP IN SYNC with the <style> block in startpage/index.html: the `:root` and
+   `@media (prefers-color-scheme: dark)` token blocks below are that file's blocks,
+   copied verbatim (dedented). The startpage cannot link this file — its CSS is inline on
+   purpose, so the built bundle stays pure JS and the render smoke test can import the
+   entry without a CSS asset (the reason is spelled out in startpage/index.html itself).
+   So the tokens are duplicated, not shared: any change to a token — value, name or the
+   contrast note above it — MUST be mirrored in the other file. The same paired-marker
+   convention is used by extension/src/quicklinks.js <-> startpage/src/lib/adapters.js.
+
+   The contrast claim comes with the tokens: EVERY TEXT TOKEN CLEARS WCAG AA (4.5:1) on
+   the real composited backdrop (card/chip/field over the gradient), in both themes. The
+   measured ratios and the derivation live in the startpage comment; the worst cases are
+   light  text 12.9 · secondary 4.8 · muted 4.7 · accent 4.7 · red 4.8
+   dark   text  8.3 · secondary 4.5 · muted 4.7 · accent 4.6 · red 5.0
+   These pages paint --sp-muted and --sp-red at 11px (field hints and refusals), which is
+   exactly where a grey that "looks fine" stops being readable — do not darken/lighten a
+   token here without re-measuring it there. */
+
+/* --- tokens (copy of startpage/index.html) ---------------------------------- */
+:root {
+  color-scheme: light dark;
+
+  --sp-bg: radial-gradient(120% 90% at 12% 0%, #e8ecff 0%, #f6f4fb 42%, #fdf3f0 100%);
+  --sp-text: #23212b;
+  --sp-secondary: #66617a;
+  --sp-muted: #726d82;
+  --sp-accent: #544ccc;
+  --sp-accent-soft: rgba(84, 76, 204, 0.1);
+  /* Text ON --sp-accent (the filled buttons). A separate token because the two
+     themes need OPPOSITE answers: the light accent is dark enough to carry white
+     (6.4:1), the dark accent is a pale violet and white on it measures 1.7:1.
+     Darkening the dark accent instead would have broken the ghost buttons, which
+     paint the SAME token as TEXT on --sp-accent-soft — that constraint is what set
+     the dark accent's lightness, and this token then follows it. */
+  --sp-on-accent: #fff;
+  --sp-danger: #c2255c;
+
+  --sp-card: rgba(255, 255, 255, 0.72);
+  --sp-chip: rgba(255, 255, 255, 0.8);
+  --sp-field: rgba(255, 255, 255, 0.85);
+  --sp-hover: rgba(255, 255, 255, 0.95);
+  --sp-line: rgba(40, 30, 80, 0.06);
+  /* Sticky section headers sit ON TOP of scrolling rows, so they need their own
+     opaque-enough backdrop or the text underneath shows through. */
+  --sp-sticky: linear-gradient(rgba(250, 249, 252, 0.97), rgba(250, 249, 252, 0.88));
+
+  --sp-shadow: 0 1px 2px rgba(40, 30, 80, 0.06), 0 14px 30px -22px rgba(40, 30, 80, 0.5);
+  --sp-shadow-soft: 0 1px 2px rgba(40, 30, 80, 0.07);
+
+  /* Status dots (§10): four distinguishable instance states + the pause.
+     --sp-red is NOT dot-only: it also paints .sp-fallback (error lines, "Куратор
+     на паузе") and the "невалидно" flag, so it is a TEXT token and carries the
+     4.5:1 duty the dots alone would not have imposed. */
+  --sp-ok: #57b894;
+  --sp-warn: #e8a13a;
+  --sp-grey: #9aa0a6;
+  --sp-red: #bd2c28;
+
+  --sp-font: "Avenir Next", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --sp-mono: ui-monospace, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sp-bg: radial-gradient(120% 90% at 12% 0%, #23243a 0%, #17161f 46%, #1e1719 100%);
+    --sp-text: #ece9f5;
+    --sp-secondary: #c4c0ce;
+    --sp-muted: #b5b1c2;
+    /* A LIGHTER accent than the light theme's, and a THINNER soft behind it: the
+       ghost/icon buttons paint this token as TEXT on --sp-accent-soft, which is
+       this same token at that alpha — the two chase each other, so the fix is both
+       a higher L and a lower alpha (see the header comment: 2.67 -> 4.58). */
+    --sp-accent: #c1bdf9;
+    --sp-accent-soft: rgba(193, 189, 249, 0.1);
+    /* Dark text on the pastel accent (10.2:1); white on it is only 1.7:1. */
+    --sp-on-accent: #17161f;
+    --sp-danger: #fdb8ce;
+
+    --sp-card: rgba(255, 255, 255, 0.05);
+    --sp-chip: rgba(255, 255, 255, 0.07);
+    --sp-field: rgba(255, 255, 255, 0.08);
+    --sp-hover: rgba(255, 255, 255, 0.09);
+    --sp-line: rgba(255, 255, 255, 0.07);
+    --sp-sticky: linear-gradient(rgba(28, 28, 40, 0.97), rgba(28, 28, 40, 0.86));
+
+    --sp-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 14px 30px -22px rgba(0, 0, 0, 0.9);
+    --sp-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.25);
+
+    --sp-ok: #5cc9a1;
+    --sp-warn: #edb054;
+    --sp-grey: #7c8085;
+    --sp-red: #f49b98;
+  }
+}
+
+/* Tokens these two pages need and the startpage has no use for, kept OUT of the copied
+   blocks above so those stay a byte-comparable mirror. The invalid ring is the red at a
+   low alpha; it is written per theme rather than derived with color-mix() so the pages
+   do not depend on a Chromium version newer than the manifest requires. */
+:root {
+  --ui-invalid-ring: rgba(189, 44, 40, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ui-invalid-ring: rgba(244, 155, 152, 0.16);
+  }
+}
+
+/* --- page frame ------------------------------------------------------------ */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  font: 13px/1.5 var(--sp-font);
+  background: var(--sp-bg);
+  color: var(--sp-text);
+}
+
+/* The toolbar popup has no viewport of its own: Chrome measures the CONTENT and crops
+   anything wider than the panel it is willing to draw, so the width is stated here and
+   nothing inside may exceed it (this replaces the old inline min-width:24rem /
+   max-width:26rem on <main>). 380px is the approved width — widening it is a redesign,
+   not a tweak. */
+body.ui-popup {
+  width: 380px;
+}
+
+/* The options page IS a full tab, so it centres a column instead of filling the screen —
+   and the gradient has to reach the bottom of that tab, not stop under the last field.
+   (The popup gets no min-height on purpose: Chrome sizes the panel from the content, and
+   a viewport-relative height there would make the popup measure itself.) */
+body.ui-options {
+  padding: 20px 16px 28px;
+  min-height: 100vh;
+}
+
+.ui-page {
+  margin: 0 auto;
+}
+
+body.ui-options .ui-page {
+  max-width: 520px;
+}
+
+.ui-title {
+  margin: 0 0 12px;
+  font: 600 15px/1.3 var(--sp-font);
+}
+
+.ui-subtitle {
+  margin: -8px 0 14px;
+  color: var(--sp-muted);
+  font-size: 11.5px;
+}
+
+code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--sp-accent-soft);
+  color: var(--sp-accent);
+  font: 11.5px/1.4 var(--sp-mono);
+}
+
+/* A tab's origin can be arbitrarily long (and has no spaces to break at). It must wrap
+   inside the popup instead of widening it — a cropped popup hides the Save button. Each
+   wrapped fragment keeps the chip's padding and corners (box-decoration-break), or the
+   break looks like the chip was sliced. */
+.ui-subtitle code {
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* --- fields ---------------------------------------------------------------- */
+.ui-field {
+  margin: 0 0 13px;
+}
+
+.ui-label {
+  display: block;
+  margin: 0 0 5px;
+  font: 600 11px/1.2 var(--sp-font);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sp-secondary);
+}
+
+.ui-input,
+.ui-select {
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--sp-line);
+  border-radius: 8px;
+  outline: 0;
+  background: var(--sp-field);
+  color: var(--sp-text);
+  font: 13px/1.2 var(--sp-font);
+}
+
+.ui-select {
+  padding-right: 6px; /* leave the native arrow its room */
+}
+
+.ui-input::placeholder {
+  color: var(--sp-muted);
+}
+
+.ui-input:focus,
+.ui-select:focus,
+.ui-button:focus-visible,
+.ui-checkbox input:focus-visible {
+  outline: 2px solid var(--sp-accent);
+  outline-offset: 1px;
+}
+
+/* The refusal is shown AT the field: the border is the flag, the line under it is the
+   reason. Both are driven by the SAME gate the value has to pass to be stored
+   (options.js serviceAddressError / instanceNameError) — there is no second validation. */
+.ui-input.is-invalid {
+  border-color: var(--sp-red);
+  box-shadow: 0 0 0 3px var(--ui-invalid-ring);
+}
+
+.ui-hint {
+  margin: 5px 0 0;
+  color: var(--sp-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ui-error {
+  margin: 6px 0 0;
+  color: var(--sp-red);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* No error, no gap: the field keeps its compact spacing until something is refused. */
+.ui-error:empty {
+  display: none;
+}
+
+/* --- the impact block (popup) ---------------------------------------------- */
+/* The server's preview text, verbatim. It is MULTI-LINE (popup.js `summarize` joins its
+   lines with \n) and reaches the DOM as textContent, one text node — so `pre-line` is
+   what keeps the line breaks, and ::first-line is the only way to lift the headline out
+   of the block without a second element that popup.js would have to write into. The bar
+   is the accent, never red: "0 tabs" is a perfectly normal answer here.
+
+   ::first-line paints the first VISUAL line, not the first sentence, so the emphasis is
+   weight + full-contrast colour at the SAME size as the rest. A size jump was measured
+   and rejected: the headline is 299px wide at 380px popup width with single-digit counts
+   and 319px is all there is, so "Would relocate 300 tab(s) and close 120 tab(s)…" takes
+   two lines — and a size that changes mid-sentence looks broken, while a weight that
+   does not carry to the second line only looks less emphatic. */
+.ui-impact {
+  margin: 2px 0 13px;
+  padding: 10px 12px;
+  border: 1px solid var(--sp-line);
+  border-left: 3px solid var(--sp-accent);
+  border-radius: 9px;
+  background: var(--sp-card);
+  box-shadow: var(--sp-shadow);
+  color: var(--sp-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+.ui-impact::first-line {
+  color: var(--sp-text);
+  font-weight: 600;
+}
+
+/* --- buttons, checkbox, status --------------------------------------------- */
+.ui-button {
+  width: 100%;
+  height: 34px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--sp-accent);
+  color: var(--sp-on-accent);
+  font: 600 12.5px/1.2 var(--sp-font);
+  cursor: pointer;
+}
+
+.ui-button:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.ui-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.ui-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 4px 2px;
+  font-size: 12.5px;
+  color: var(--sp-text);
+  cursor: pointer;
+}
+
+.ui-checkbox input {
+  margin: 0;
+  accent-color: var(--sp-accent);
+}
+
+.ui-status {
+  margin: 8px 0 0;
+  color: var(--sp-secondary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.ui-status:empty {
+  display: none;
+}
+
+/* --- cards + the enrollment pill (options) --------------------------------- */
+.ui-card {
+  margin: 0 0 12px;
+  padding: 14px;
+  border: 1px solid var(--sp-line);
+  border-radius: 12px;
+  background: var(--sp-card);
+  box-shadow: var(--sp-shadow);
+}
+
+.ui-card-title {
+  margin: 0 0 11px;
+  font: 600 11px/1.2 var(--sp-font);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sp-secondary);
+}
+
+.ui-pill-row {
+  margin: 0 0 12px;
+}
+
+/* The enroll state (options.js `enrollLabel`) reads as a pill. Its dot is a
+   pseudo-element, so writing textContent into #enroll-state never touches it — and it is
+   GREY until options.js marks the pill enrolled, because a permanently green dot over
+   "не зарегистрирован" would be a lie. */
+.ui-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--sp-chip);
+  font-size: 11.5px;
+  color: var(--sp-text);
+}
+
+.ui-pill::before {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sp-grey);
+}
+
+.ui-pill.is-enrolled::before {
+  background: var(--sp-ok);
+}
