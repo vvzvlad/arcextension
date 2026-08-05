@@ -5,14 +5,17 @@
    no url() image. The only typefaces are the ones already installed and every decoration
    is a CSS shape.
 
-   KEEP IN SYNC with the <style> block in startpage/index.html: the `:root` and
-   `@media (prefers-color-scheme: dark)` token blocks below are that file's blocks,
-   copied verbatim (dedented). The startpage cannot link this file — its CSS is inline on
+   KEEP IN SYNC with the <style> block in startpage/index.html AND with templates/app.css
+   (the service's /admin console): the `:root` and `@media (prefers-color-scheme: dark)`
+   token blocks below are the startpage's blocks, copied verbatim (dedented), and app.css
+   carries the same copy. The startpage cannot link this file — its CSS is inline on
    purpose, so the built bundle stays pure JS and the render smoke test can import the
-   entry without a CSS asset (the reason is spelled out in startpage/index.html itself).
-   So the tokens are duplicated, not shared: any change to a token — value, name or the
-   contrast note above it — MUST be mirrored in the other file. The same paired-marker
-   convention is used by extension/src/quicklinks.js <-> startpage/src/lib/adapters.js.
+   entry without a CSS asset (the reason is spelled out in startpage/index.html itself) —
+   and the console is served by the Python service off its own route, out of a directory
+   the .crx does not ship. So the tokens are duplicated three ways, not shared: any change
+   to a token — value, name or the contrast note above it — MUST be mirrored in BOTH other
+   files. The same paired-marker convention is used by extension/src/quicklinks.js <->
+   startpage/src/lib/adapters.js.
 
    The contrast claim comes with the tokens: EVERY TEXT TOKEN CLEARS WCAG AA (4.5:1) on
    the real composited backdrop (card/chip/field over the gradient), in both themes. The

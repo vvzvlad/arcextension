@@ -22,12 +22,14 @@ window.addEventListener("DOMContentLoaded", () => {
         window.location = "/admin";
         return;
       }
+      // The refusal is shown at the form, in the page's language — this is the only thing
+      // on the page and there is nowhere else for it to go.
       errorBox.textContent = res.status === 401
-        ? "Invalid admin token."
-        : "Login failed (" + res.status + ").";
+        ? "Неверный токен."
+        : "Войти не удалось (" + res.status + ").";
       errorBox.hidden = false;
     } catch (_e) {
-      errorBox.textContent = "Network error.";
+      errorBox.textContent = "Сеть недоступна.";
       errorBox.hidden = false;
     }
   });

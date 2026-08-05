@@ -18,7 +18,11 @@ specific invariant it guards (noted inline).
       exists, and takes precedence over an ambient cookie (no CSRF).
 * (8) degraded: GET /admin (and a JSON read) still respond; a mutating verb → 503.
 * session expiry (past TTL → invalid) and login with a wrong token → 401 (no cookie).
+* the page and its JS keep their end of the CSP bargain: no inline style/script survives in
+  the templates, and every element the JS binds to exists in the HTML.
 """
+
+import re
 
 from conftest import ADMIN_TOKEN, admin_headers, make_settings, secret_hash_for
 from starlette.testclient import TestClient
@@ -316,6 +320,93 @@ def test_error_detail_reaches_the_console_not_just_the_status(tmp_path):
             assert "responseError(" in wrapper, signature
             assert "res.text()" not in wrapper, signature
             assert "JSON.parse(" not in wrapper, signature
+
+
+# --- the page and its JS have to agree about the DOM -------------------------
+def _strip_html_comments(text):
+    return re.sub(r"<!--.*?-->", "", text, flags=re.S)
+
+
+def _strip_js_line_comments(text):
+    return "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("//")
+    )
+
+
+def test_every_element_the_console_js_binds_to_exists_in_the_page(tmp_path):
+    """Every id ``app.js`` looks up is really in ``admin.html``.
+
+    The console builds its whole surface by id: one missing id is a ``getElementById``
+    returning ``null`` and a TypeError the next line, and because the page logic runs from a
+    separately-served asset, NOTHING on the server side would notice — the page would render
+    its shell and simply stay empty. There is no JS harness for these templates (they are
+    served static assets, not modules), so the two files are checked against each other at
+    the source level, which is the only place the mismatch is visible.
+
+    The second half pins the ids that are load-bearing by contract rather than by accident:
+    the build stamp, the session control, the page-wide error slot, and the sections the
+    console is made of. Reddens if one is renamed on one side only — or dropped from the
+    page while the JS still reaches for it.
+    """
+    app = create_app_for(tmp_path)
+    with _tc(app) as client:
+        html = client.get("/admin", headers=admin_headers()).text
+        js = client.get("/admin/app.js").text
+
+    # `byId` is app.js's own one-line wrapper over getElementById; both spellings count.
+    wanted = set(re.findall(r'(?:getElementById|byId)\(\s*"([^"]+)"\s*\)', js))
+    present = set(re.findall(r'id="([^"]+)"', html))
+    assert wanted, "no id lookups found in app.js — the pattern stopped matching"
+    assert wanted <= present, f"app.js binds to ids the page lacks: {sorted(wanted - present)}"
+    assert {
+        "build-revision", "logout", "error",
+        "window-section", "window-status", "open-window", "close-window",
+        "instances-section", "instances-body", "instances-empty",
+    } <= present
+
+
+def test_console_assets_carry_no_inline_style_or_script(tmp_path):
+    """The CSP is ``default-src 'none'; script-src 'self'; style-src 'self'`` — so an inline
+    ``<style>``, an inline ``<script>`` or a ``style=`` attribute is not "slightly wrong",
+    it is DEAD: the browser drops it and the page silently loses whatever it expressed.
+
+    The trap this guards is the countdown bar. Drawing a drain bar wants a width, and a
+    width wants ``el.style.width`` or a ``style=`` attribute — both refused under this
+    policy, and refused SILENTLY as far as the server is concerned. The page therefore
+    states progress with a ``<progress>`` element, whose ``value``/``max`` are content
+    attributes. Reddens if any template grows an inline block or attribute, or if app.js
+    starts writing styles (comments are stripped first, so the policy may still be
+    discussed in prose).
+    """
+    app = create_app_for(tmp_path)
+    with _tc(app) as client:
+        for path in ("/admin", "/admin/login"):
+            body = _strip_html_comments(
+                client.get(path, headers=admin_headers()).text
+            )
+            assert "<style" not in body, path
+            assert "<script>" not in body, path  # <script src=…> is the allowed shape
+            assert not re.search(r"<[^>]*\sstyle\s*=", body), path
+        for path in ("/admin/app.js", "/admin/login.js"):
+            code = _strip_js_line_comments(client.get(path).text)
+            assert ".style" not in code, path
+            assert "setAttribute" not in code, path
+
+
+def test_the_countdown_timer_is_cleared_and_never_doubled(tmp_path):
+    """The registration countdown ticks client-side, so it owns an interval — and an
+    interval that is started without being cleared runs forever behind a card that is no
+    longer on screen, redrawing a countdown for a window that closed.
+
+    There is exactly ONE place that arms it, and the code clears before it arms. Reddens if
+    a second ``setInterval`` appears (two tickers racing on the same element) or if
+    ``clearInterval`` is dropped.
+    """
+    app = create_app_for(tmp_path)
+    with _tc(app) as client:
+        code = _strip_js_line_comments(client.get("/admin/app.js").text)
+    assert code.count("setInterval(") == 1
+    assert "clearInterval(" in code
 
 
 # --- (7) Bearer still opens everything, and beats an ambient cookie ----------

@@ -113,10 +113,25 @@ async def list_instances(request: Request) -> JSONResponse:
 
     Unlike the curator's active-only reads, this shows revoked rows too so the operator
     can see a revoked MAIN awaiting re-enrolment or a retired browser.
+
+    The body also names the configured MAIN (``main_instance_id``). It is not a property of
+    any row — MAIN is service configuration (``MAIN_INSTANCE_ID``), and the id it names may
+    have no row at all — so a caller cannot derive it from the list, and the console could
+    do neither of the two things it needs it for: MARK the MAIN row, and explain a MAIN
+    revoke BEFORE it is sent. Without it the console's only way to discover that a row was
+    MAIN was to fire the revoke and read the 409 back, i.e. to find out by attempting the
+    thing it was supposed to warn about. Disclosing it costs nothing: this endpoint is
+    ADMIN-only, and the same id is already in every ``/admin/instances`` row an operator
+    can revoke.
     """
     await require_admin(request)
     rows = await request.app.state.db.read(queries.list_instances)
-    return JSONResponse({"instances": rows})
+    return JSONResponse(
+        {
+            "instances": rows,
+            "main_instance_id": request.app.state.settings.main_instance_id,
+        }
+    )
 
 
 async def _close_live_socket(app, instance_id: str) -> None:
@@ -222,13 +237,23 @@ async def open_enroll_window(request: Request) -> JSONResponse:
 async def get_enroll_window(request: Request) -> JSONResponse:
     """``GET /admin/enroll/window`` — read-time window state (read-only, degraded-ok).
 
-    Returns ``{open, seconds_remaining}`` plus ``code`` ONLY while open (a closed/expired
-    window never surfaces a dead code — slice A's symmetric state).
+    Returns ``{open, seconds_remaining, window_minutes}`` plus ``code`` ONLY while open (a
+    closed/expired window never surfaces a dead code — slice A's symmetric state).
+
+    ``window_minutes`` is the CONFIGURED length (``ENROLL_WINDOW_MIN``), not a property of
+    the current window — it is what the next open will arm. A CLOSED window carries no
+    duration at all (``seconds_remaining`` is 0 and there is no deadline to subtract from),
+    so without it the console's "Открыть регистрацию на N минут" button could only name a
+    hard-coded 10 and would quietly lie on any deployment that set the variable.
     """
     await require_admin(request)
     now = _now_ms()
     state = await request.app.state.db.read(lambda c: read_enroll_window(c, now=now))
-    body = {"open": state.open, "seconds_remaining": state.seconds_remaining}
+    body = {
+        "open": state.open,
+        "seconds_remaining": state.seconds_remaining,
+        "window_minutes": request.app.state.settings.enroll_window_min,
+    }
     if state.open:
         body["code"] = state.code
     return JSONResponse(body)

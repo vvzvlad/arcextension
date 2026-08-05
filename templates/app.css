@@ -1,89 +1,638 @@
-/* Curator admin console styling. Loaded via <link> under style-src 'self' (no inline). */
+/* Curator admin console styling — templates/admin.html + templates/login.html.
+   Loaded via <link> under `style-src 'self'`: there is NO inline <style> and NO `style=`
+   attribute anywhere on these pages, so EVERY visual state must be expressible as a class
+   or as a content attribute the browser styles itself. That is why the enrollment
+   countdown is a <progress> (its `value`/`max` are content attributes, not style) rather
+   than a div whose width JS would have to set — an inline style is exactly what the policy
+   forbids, and a CSP violation would leave the bar frozen with no visible cause.
+   Nothing here may reach the network: no @font-face, no CDN import, no url() image.
+
+   KEEP IN SYNC — the `:root` and `@media (prefers-color-scheme: dark)` token blocks below
+   are the THIRD copy of one palette. The other two are:
+
+     * extension/pages/ui.css       (popup + options page)
+     * startpage/index.html <style> (the new-tab page; the ORIGINAL, where the contrast
+                                     derivation and the measured ratios are written out)
+
+   Any change to a token — value, name, or the contrast note above it — MUST be mirrored in
+   BOTH. The copies exist because the three surfaces cannot share a file: the startpage's
+   CSS is inline on purpose (so the built bundle stays pure JS), the extension pages are a
+   separate build context that ships inside the .crx, and this console is served by the
+   Python service off its own route under its own CSP. The same paired-marker convention is
+   used by extension/src/quicklinks.js <-> startpage/src/lib/adapters.js.
+
+   The contrast claim travels with the tokens: EVERY TEXT TOKEN CLEARS WCAG AA (4.5:1) on
+   the real composited backdrop (card/chip/field over the gradient), in both themes. The
+   measured ratios and the derivation live in the startpage comment; the worst cases are
+   light  text 12.9 · secondary 4.8 · muted 4.7 · accent 4.7 · red 4.8
+   dark   text  8.3 · secondary 4.5 · muted 4.7 · accent 4.6 · red 5.0
+   This page paints --sp-muted at 11-11.5px (the relative-time columns, the revision), which
+   is where a grey that "looks fine" stops being readable — do not darken/lighten a token
+   here without re-measuring it there. A REVOKED row is dimmed with a token swap
+   (--sp-muted), never with `opacity`: dimming multiplies a measured ratio by the alpha and
+   would quietly drop those rows below AA. */
+
+/* --- tokens (copy of startpage/index.html) ---------------------------------- */
 :root {
   color-scheme: light dark;
-  --line: #cccccc;
-  --muted: #666666;
-  --danger: #b00020;
+
+  --sp-bg: radial-gradient(120% 90% at 12% 0%, #e8ecff 0%, #f6f4fb 42%, #fdf3f0 100%);
+  --sp-text: #23212b;
+  --sp-secondary: #66617a;
+  --sp-muted: #726d82;
+  --sp-accent: #544ccc;
+  --sp-accent-soft: rgba(84, 76, 204, 0.1);
+  /* Text ON --sp-accent (the filled buttons). A separate token because the two
+     themes need OPPOSITE answers: the light accent is dark enough to carry white
+     (6.4:1), the dark accent is a pale violet and white on it measures 1.7:1.
+     Darkening the dark accent instead would have broken the ghost buttons, which
+     paint the SAME token as TEXT on --sp-accent-soft — that constraint is what set
+     the dark accent's lightness, and this token then follows it. */
+  --sp-on-accent: #fff;
+  --sp-danger: #c2255c;
+
+  --sp-card: rgba(255, 255, 255, 0.72);
+  --sp-chip: rgba(255, 255, 255, 0.8);
+  --sp-field: rgba(255, 255, 255, 0.85);
+  --sp-hover: rgba(255, 255, 255, 0.95);
+  --sp-line: rgba(40, 30, 80, 0.06);
+  /* Sticky section headers sit ON TOP of scrolling rows, so they need their own
+     opaque-enough backdrop or the text underneath shows through. */
+  --sp-sticky: linear-gradient(rgba(250, 249, 252, 0.97), rgba(250, 249, 252, 0.88));
+
+  --sp-shadow: 0 1px 2px rgba(40, 30, 80, 0.06), 0 14px 30px -22px rgba(40, 30, 80, 0.5);
+  --sp-shadow-soft: 0 1px 2px rgba(40, 30, 80, 0.07);
+
+  /* Status dots (§10): four distinguishable instance states + the pause.
+     --sp-red is NOT dot-only: it also paints .sp-fallback (error lines, "Куратор
+     на паузе") and the "невалидно" flag, so it is a TEXT token and carries the
+     4.5:1 duty the dots alone would not have imposed. */
+  --sp-ok: #57b894;
+  --sp-warn: #e8a13a;
+  --sp-grey: #9aa0a6;
+  --sp-red: #bd2c28;
+
+  --sp-font: "Avenir Next", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --sp-mono: ui-monospace, Menlo, Consolas, monospace;
 }
 
-* { box-sizing: border-box; }
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sp-bg: radial-gradient(120% 90% at 12% 0%, #23243a 0%, #17161f 46%, #1e1719 100%);
+    --sp-text: #ece9f5;
+    --sp-secondary: #c4c0ce;
+    --sp-muted: #b5b1c2;
+    /* A LIGHTER accent than the light theme's, and a THINNER soft behind it: the
+       ghost/icon buttons paint this token as TEXT on --sp-accent-soft, which is
+       this same token at that alpha — the two chase each other, so the fix is both
+       a higher L and a lower alpha (see the header comment: 2.67 -> 4.58). */
+    --sp-accent: #c1bdf9;
+    --sp-accent-soft: rgba(193, 189, 249, 0.1);
+    /* Dark text on the pastel accent (10.2:1); white on it is only 1.7:1. */
+    --sp-on-accent: #17161f;
+    --sp-danger: #fdb8ce;
+
+    --sp-card: rgba(255, 255, 255, 0.05);
+    --sp-chip: rgba(255, 255, 255, 0.07);
+    --sp-field: rgba(255, 255, 255, 0.08);
+    --sp-hover: rgba(255, 255, 255, 0.09);
+    --sp-line: rgba(255, 255, 255, 0.07);
+    --sp-sticky: linear-gradient(rgba(28, 28, 40, 0.97), rgba(28, 28, 40, 0.86));
+
+    --sp-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 14px 30px -22px rgba(0, 0, 0, 0.9);
+    --sp-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.25);
+
+    --sp-ok: #5cc9a1;
+    --sp-warn: #edb054;
+    --sp-grey: #7c8085;
+    --sp-red: #f49b98;
+  }
+}
+
+/* Tokens this console needs and the other two surfaces have no use for, kept OUT of the
+   copied blocks above so those stay a byte-comparable mirror. The danger fill is the one
+   button on the page that destroys access, so it is a SOLID red rather than red text: it
+   needs a background that carries white in light and near-black in dark. */
+:root {
+  --ad-danger-fill: #bd2c28;
+  --ad-on-danger: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ad-danger-fill: #f49b98;
+    --ad-on-danger: #17161f;
+  }
+}
+
+/* --- page frame ------------------------------------------------------------- */
+* {
+  box-sizing: border-box;
+}
+
+/* `hidden` has to WIN. The UA stylesheet's `[hidden] { display: none }` is an ordinary
+   rule, so ANY class here that sets `display` outranks it — and this page hides flex
+   containers (the two registration states, the MAIN revoke block). Without this the
+   attribute silently did nothing and both states of the card were on screen at once. */
+[hidden] {
+  display: none !important;
+}
 
 body {
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   margin: 0;
-  padding: 1rem 1.25rem 3rem;
-  line-height: 1.4;
+  padding: 22px 20px 48px;
+  min-height: 100vh;
+  background: var(--sp-bg);
+  color: var(--sp-text);
+  font: 13.5px/1.5 var(--sp-font);
+}
+
+.page {
+  max-width: 1120px;
+  margin: 0 auto;
 }
 
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 0.5rem;
-  margin-bottom: 1rem;
+  gap: 12px;
+  margin: 0 0 16px;
 }
 
-h1 { font-size: 1.3rem; margin: 0; }
-h2 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+h1 {
+  margin: 0;
+  font: 600 16px/1.3 var(--sp-font);
+}
 
-section { max-width: 70rem; }
+/* The running build revision. Small and quiet — it is a diagnostic, read once when
+   something looks wrong; `margin-left: auto` pushes it next to the logout button so it does
+   not sit in the middle of the header. A long sha wraps rather than widening the bar. */
+.revision {
+  margin-left: auto;
+  color: var(--sp-muted);
+  font: 10.5px/1.4 var(--sp-mono);
+  overflow-wrap: anywhere;
+}
 
-table {
+/* --- cards ------------------------------------------------------------------ */
+.card {
+  margin: 0 0 14px;
+  padding: 16px 18px;
+  border: 1px solid var(--sp-line);
+  border-radius: 12px;
+  background: var(--sp-card);
+  box-shadow: var(--sp-shadow);
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  font: 600 11px/1.2 var(--sp-font);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sp-secondary);
+}
+
+/* The instance id inside a card title (the MAIN revoke block names its target). */
+.card-title code {
+  font: 600 13px/1.2 var(--sp-mono);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--sp-text);
+}
+
+.card-count {
+  margin-left: auto;
+  font: 500 10.5px/1.2 var(--sp-font);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--sp-muted);
+}
+
+.lead {
+  margin: 0;
+  max-width: 74ch;
+  color: var(--sp-secondary);
+  font-size: 12.5px;
+}
+
+.hint {
+  margin: 8px 0 0;
+  color: var(--sp-muted);
+  font-size: 12px;
+}
+
+/* --- enrollment card -------------------------------------------------------- */
+/* One state at a time: templates/admin.html carries BOTH blocks and app.js unhides
+   exactly one (see its `showWindowState`). "Окно" is an API word (`enroll window`) and
+   appears nowhere in the interface — the operator opens and closes РЕГИСТРАЦИЮ. */
+.enroll {
+  display: flex;
+  align-items: center;
+  gap: 26px;
+}
+
+.enroll-body {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The card is accented ONLY while registration is open: a live code is the one thing on
+   this page a bystander could use, so the state has to be visible from across the room
+   rather than read off a label. app.js toggles the class with the state blocks. */
+.card.is-open {
+  border-color: var(--sp-accent);
+}
+
+/* The code is typed on ANOTHER machine, off this screen — that is the whole job of this
+   page, so it is the largest thing on it. Monospace, wide tracking, and the two triads are
+   separated by a MARGIN rather than a space character: a space would be copied along with
+   the code by a text selection, and the extension only trims the ends of what is pasted
+   into its field, so an inner space would be sent to the server and refused. */
+.code-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.code {
+  display: flex;
+  align-items: baseline;
+  gap: 18px;
+  font: 600 40px/1 var(--sp-mono);
+  letter-spacing: 0.1em;
+  color: var(--sp-text);
+}
+
+.code-empty {
+  color: var(--sp-muted);
+}
+
+.countdown {
+  flex: none;
+  width: 190px;
+  text-align: right;
+}
+
+.countdown-value {
+  display: block;
+  font: 600 22px/1.2 var(--sp-mono);
+  color: var(--sp-text);
+}
+
+.countdown-label {
+  font-size: 10.5px;
+  color: var(--sp-muted);
+}
+
+/* A <progress>, not a styled div: `value`/`max` are content attributes, so app.js can drive
+   the bar without ever writing a `style` attribute the CSP would refuse. */
+.countdown-bar {
+  appearance: none;
+  -webkit-appearance: none;
+  display: block;
+  width: 100%;
+  height: 3px;
+  margin-top: 8px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--sp-line);
+  color: var(--sp-accent); /* Firefox <progress> fill */
+  overflow: hidden;
+}
+
+.countdown-bar::-webkit-progress-bar {
+  background: var(--sp-line);
+}
+
+.countdown-bar::-webkit-progress-value {
+  background: var(--sp-accent);
+}
+
+.countdown-bar::-moz-progress-bar {
+  background: var(--sp-accent);
+}
+
+/* The one-line "загрузка / состояние неизвестно" slot. It carries the card while the first
+   read is in flight and whenever neither state can be shown; app.js hides it as soon as it
+   knows whether registration is open. */
+.window-status {
+  margin: 0;
+  color: var(--sp-muted);
+  font-size: 12.5px;
+}
+
+/* --- the MAIN revoke block -------------------------------------------------- */
+.card-revoke {
+  border-left: 3px solid var(--sp-red);
+}
+
+.revoke-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+/* --- fleet table ------------------------------------------------------------ */
+/* `table-layout: fixed` + an explicit <colgroup>, and every column stated as a PERCENTAGE.
+   Auto layout fed every spare pixel to the widest text column and left half a screen of air
+   between "состояние" and "последний контакт"; a mix of percentages and rem widths is no
+   better, because whatever the two sets do not add up to is redistributed in proportion to
+   them — the shares have to sum to 100% for the layout to be the one that was designed.
+   The two columns that hold sentences (the name, the state word) get the slack, the three
+   that hold a date, a stamp or a button get only what they need. */
+.fleet {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.9rem;
+  table-layout: fixed;
+  font-size: 13px;
 }
 
-th, td {
+.fleet col.c-name { width: 26%; }
+.fleet col.c-state { width: 24%; }
+.fleet col.c-seen { width: 17%; }
+.fleet col.c-enrolled { width: 15%; }
+.fleet col.c-act { width: 18%; }
+
+.fleet th {
+  padding: 0 8px 8px;
   text-align: left;
-  padding: 0.4rem 0.5rem;
-  border-bottom: 1px solid var(--line);
-  vertical-align: top;
+  font: 600 9.5px/1.2 var(--sp-font);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--sp-muted);
 }
 
-th { color: var(--muted); font-weight: 600; }
+.fleet td {
+  padding: 10px 8px;
+  border-top: 1px solid var(--sp-line);
+  vertical-align: middle;
+  overflow-wrap: anywhere;
+}
 
-code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.fleet th.num,
+.fleet td.num {
+  text-align: right;
+  white-space: nowrap;
+  color: var(--sp-muted);
+  font-size: 12px;
+}
 
-button {
-  font: inherit;
-  padding: 0.3rem 0.7rem;
+/* The VALUES must never wrap ("2 мин назад" broken across lines is unreadable), but the
+   two-word column HEADINGS may: on a narrow window a nowrap heading does not shrink, it
+   overlaps its neighbour. */
+.fleet th.num {
+  white-space: normal;
+}
+
+.fleet th.act,
+.fleet td.act {
+  text-align: right;
+}
+
+.fleet .name {
+  font-weight: 600;
+}
+
+/* A revoked row is quieter but stays legible: the whole row is repainted in --sp-muted (a
+   token measured at 4.7:1) instead of being faded with `opacity`, which would multiply that
+   ratio by the alpha. The server returns these rows on purpose — a revoked MAIN waiting to
+   re-enrol has to be visible. */
+.fleet tr.is-revoked td,
+.fleet tr.is-revoked .name {
+  color: var(--sp-muted);
+  font-weight: 400;
+}
+
+.dot {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-right: 9px;
+  border-radius: 50%;
+  background: var(--sp-grey);
+}
+
+/* The same dictionary the startpage status bar uses: green = on the wire, amber = enrolled
+   but silent, grey = revoked. */
+.dot.ok { background: var(--sp-ok); }
+.dot.warn { background: var(--sp-warn); }
+.dot.grey { background: var(--sp-grey); }
+
+.tag {
+  margin-left: 9px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--sp-accent-soft);
+  color: var(--sp-accent);
+  font: 600 9px/1.4 var(--sp-font);
+  letter-spacing: 0.08em;
+}
+
+.gone {
+  color: var(--sp-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* The in-place confirm / refusal that belongs to ONE row, spanning the full width under
+   it — there is room here for a sentence, and it stays attached to the row it is about. */
+.fleet tr.row-panel td {
+  padding: 0 8px 12px;
+  border-top: 0;
+}
+
+.row-panel-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--sp-line);
+  border-left: 3px solid var(--sp-red);
+  border-radius: 9px;
+  background: var(--sp-chip);
+}
+
+.row-panel-text {
+  flex: 1;
+  min-width: 14rem;
+  margin: 0;
+  color: var(--sp-secondary);
+  font-size: 12px;
+}
+
+/* --- buttons ---------------------------------------------------------------- */
+.btn {
+  flex: none;
+  height: 36px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--sp-accent);
+  color: var(--sp-on-accent);
+  font: 600 12.5px/1.2 var(--sp-font);
+  white-space: nowrap;
   cursor: pointer;
 }
 
-.actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
-
-input[type="text"] { font: inherit; padding: 0.25rem 0.4rem; min-width: 8rem; }
-
-.error {
-  color: var(--danger);
-  border: 1px solid var(--danger);
-  border-radius: 4px;
-  padding: 0.5rem 0.75rem;
+.btn:hover:not(:disabled) {
+  filter: brightness(1.06);
 }
 
-.badge {
-  display: inline-block;
-  padding: 0.05rem 0.4rem;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  font-size: 0.75rem;
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
-.muted { color: var(--muted); }
+.btn-ghost {
+  border: 1px solid var(--sp-line);
+  background: var(--sp-field);
+  color: var(--sp-accent);
+}
 
-/* One-line explanation under the enrollment window: what the code does now that
-   enrolment has no second step. */
-.hint { color: var(--muted); font-size: 0.85rem; margin-top: 0.5rem; }
+.btn-danger {
+  background: var(--ad-danger-fill);
+  color: var(--ad-on-danger);
+}
 
-/* The running build revision in the topbar. Small and quiet — it is a diagnostic, read
-   once when something looks wrong; `margin-left: auto` pushes it next to the button so it
-   does not sit in the middle of the header. A long sha wraps rather than widening the bar
-   on a narrow window. */
-#build-revision {
-  margin-left: auto;
-  margin-right: 0.75rem;
-  font-size: 0.75rem;
-  overflow-wrap: anywhere;
+.btn-icon {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--sp-line);
+  border-radius: 8px;
+  background: var(--sp-field);
+  color: var(--sp-accent);
+  font-size: 15px;
+}
+
+/* The row-level and topbar buttons: quiet until they are the thing you came for. */
+.btn-mini {
+  height: auto;
+  padding: 5px 11px;
+  border: 1px solid var(--sp-line);
+  border-radius: 7px;
+  background: var(--sp-field);
+  color: var(--sp-text);
+  font: 500 11.5px/1.35 var(--sp-font);
+}
+
+.btn-mini.btn-danger {
+  border-color: transparent;
+  background: var(--ad-danger-fill);
+  color: var(--ad-on-danger);
+  font-weight: 600;
+}
+
+.btn-mini.is-revoke {
+  color: var(--sp-red);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--sp-accent);
+  outline-offset: 1px;
+}
+
+/* --- errors ----------------------------------------------------------------- */
+/* Two levels, on purpose. `.alert` is the page-wide slot and carries ONLY what belongs to
+   no button (the initial load failing). Everything a button causes is written into an
+   `.inline-error` next to that button, because an operator who pressed «Закрыть сейчас»
+   should not have to look at the top of the page to find out that it did not happen. */
+.alert {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--sp-red);
+  border-radius: 9px;
+  background: var(--sp-card);
+  color: var(--sp-red);
+  font-size: 12.5px;
+}
+
+.inline-error {
+  margin: 10px 0 0;
+  color: var(--sp-red);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.row-panel-box .inline-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/* --- login page ------------------------------------------------------------- */
+.login {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 70px);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 340px;
+}
+
+.login-card .card-title {
+  margin-bottom: 14px;
+}
+
+.field-label {
+  display: block;
+  margin: 0 0 5px;
+  font: 600 10px/1.2 var(--sp-font);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sp-secondary);
+}
+
+.field-input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--sp-line);
+  border-radius: 8px;
+  outline: 0;
+  background: var(--sp-field);
+  color: var(--sp-text);
+  font: 13px/1.2 var(--sp-font);
+}
+
+.field-input:focus {
+  outline: 2px solid var(--sp-accent);
+  outline-offset: 1px;
+}
+
+.login-card .btn {
+  width: 100%;
+  margin-top: 14px;
+}
+
+/* --- narrow windows --------------------------------------------------------- */
+/* The console is a desktop tool, but the enrollment card must not squeeze the code out of
+   view on a half-width window: below this width it stacks instead of sitting in one row. */
+@media (max-width: 860px) {
+  .enroll {
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+
+  .enroll-body {
+    flex-basis: 100%;
+  }
+
+  .countdown {
+    width: auto;
+    flex: 1;
+    text-align: left;
+  }
+
+  .code {
+    font-size: 34px;
+  }
 }

@@ -1,57 +1,113 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Curator — Admin console</title>
-  <!-- No inline styles/scripts: CSP is default-src 'none' with script-src/style-src 'self'. -->
+  <title>Curator — консоль</title>
+  <!-- No inline styles/scripts: CSP is default-src 'none' with script-src/style-src 'self'.
+       That bans the `style=` attribute too, so every state below is a class or a content
+       attribute (see the <progress> countdown) — never a width JS writes into a style. -->
   <link rel="stylesheet" href="/admin/app.css">
 </head>
 <body>
-  <header class="topbar">
-    <h1>Curator admin</h1>
-    <!-- Running build revision. Substituted SERVER-SIDE (src/api/admin_page.py) from the
-         BUILD_REVISION baked into the image: no fetch, no JS, so it is on screen even when
-         every API call on this page is failing — which is exactly the moment one needs to
-         know whether the console is talking to new code or old. "unknown" = a build that
-         carries no revision (a local run). -->
-    <code id="build-revision" class="muted" title="running build revision">__BUILD_REVISION__</code>
-    <button id="logout" type="button">Log out</button>
-  </header>
+  <div class="page">
+    <header class="topbar">
+      <h1>Curator</h1>
+      <!-- Running build revision. Substituted SERVER-SIDE (src/api/admin_page.py) from the
+           BUILD_REVISION baked into the image: no fetch, no JS, so it is on screen even when
+           every API call on this page is failing — which is exactly the moment one needs to
+           know whether the console is talking to new code or old. "unknown" = a build that
+           carries no revision (a local run). -->
+      <code id="build-revision" class="revision" title="работающая сборка">__BUILD_REVISION__</code>
+      <button id="logout" class="btn btn-mini" type="button">Выйти</button>
+    </header>
 
-  <p id="error" class="error" hidden></p>
+    <!-- The page-wide refusal slot. It carries ONLY what belongs to no button — the initial
+         load failing. Everything a button causes is reported next to that button. -->
+    <p id="error" class="alert" hidden></p>
 
-  <!-- Enrollment window -->
-  <section id="window-section">
-    <h2>Enrollment window</h2>
-    <p id="window-status">Loading…</p>
-    <div class="actions">
-      <button id="open-window" type="button">Open window</button>
-      <button id="close-window" type="button">Close window</button>
-    </div>
-    <!-- While the window is open, a browser that submits this code in its extension
-         settings enrols itself under the id typed there. There is no approval step and
-         so no pending list: a refused attempt (name taken, bad name, wrong code) shows
-         its reason in that browser's settings and is counted in /metrics. -->
-    <p class="hint">A browser enrols itself with this code, under the name set in its extension settings. Close the window when you are done.</p>
-  </section>
+    <!-- Registration. ONE state at a time: both blocks live here and app.js unhides exactly
+         one of them. The word "окно" (the API's `enroll window`) appears nowhere in the
+         interface — an operator opens and closes РЕГИСТРАЦИЮ. -->
+    <section id="window-section" class="card">
+      <!-- Shown while the first read is in flight, and whenever neither state is known. -->
+      <p id="window-status" class="window-status">Загрузка…</p>
 
-  <!-- Instances -->
-  <section id="instances-section">
-    <h2>Instances</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>id</th>
-          <th>status</th>
-          <th>connected</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody id="instances-body"></tbody>
-    </table>
-    <p id="instances-empty" hidden>No instances.</p>
-  </section>
+      <div id="window-closed" class="enroll" hidden>
+        <div class="enroll-body">
+          <p class="card-title">Регистрация закрыта</p>
+          <p class="lead">Новый браузер сейчас войти не может. Откройте регистрацию —
+            браузер введёт код у себя в настройках и зарегистрируется сам, под тем именем,
+            которое там задано. Одобрять никого не нужно.</p>
+        </div>
+        <!-- The label is completed by app.js with the window length the server reports. -->
+        <button id="open-window" class="btn" type="button">Открыть регистрацию</button>
+      </div>
+
+      <div id="window-open" class="enroll" hidden>
+        <div class="enroll-body">
+          <p class="card-title">Регистрация открыта</p>
+          <div class="code-row">
+            <!-- The largest element on the page: this code is read off THIS screen and
+                 typed on another machine. -->
+            <span id="window-code" class="code"></span>
+            <button id="copy-code" class="btn btn-icon" type="button" title="Скопировать код">⧉</button>
+          </div>
+          <p id="copy-hint" class="hint">Введите этот код в настройках браузера, который регистрируете.</p>
+        </div>
+        <div class="countdown">
+          <b id="window-countdown" class="countdown-value">—</b>
+          <span class="countdown-label">до автоматического закрытия</span>
+          <progress id="window-bar" class="countdown-bar" max="1" value="1"></progress>
+        </div>
+        <button id="close-window" class="btn btn-ghost" type="button">Закрыть сейчас</button>
+      </div>
+
+      <p id="window-error" class="inline-error" hidden></p>
+    </section>
+
+    <!-- Revoking MAIN. Opened in place by the MAIN row's button (app.js), because this is
+         the one revoke whose consequences have to be read BEFORE it is sent, not explained
+         by a 409 afterwards. -->
+    <section id="revoke-main-section" class="card card-revoke" hidden>
+      <p class="card-title">Отозвать <code id="revoke-main-id"></code></p>
+      <p class="lead">Это главный браузер: в него куратор сводит всё, что не разложено
+        правилами. Отзыв стирает его доступ — браузер отключится и вернётся только новой
+        регистрацией под тем же именем. Главным он при этом быть не перестанет: какой
+        браузер главный, задаёт MAIN_INSTANCE_ID в настройках сервиса, и пока эта настройка
+        не изменена и сервис не перезапущен, куратор продолжит сгонять вкладки на это
+        имя.</p>
+      <div class="revoke-row">
+        <button id="revoke-main-confirm" class="btn btn-danger" type="button">Отозвать доступ</button>
+        <button id="revoke-main-cancel" class="btn btn-ghost" type="button">Отмена</button>
+      </div>
+      <p id="revoke-main-error" class="inline-error" hidden></p>
+    </section>
+
+    <section id="instances-section" class="card">
+      <p class="card-title">Браузеры<span id="instances-count" class="card-count"></span></p>
+      <table class="fleet">
+        <colgroup>
+          <col class="c-name">
+          <col class="c-state">
+          <col class="c-seen">
+          <col class="c-enrolled">
+          <col class="c-act">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>имя</th>
+            <th>состояние</th>
+            <th class="num">последний контакт</th>
+            <th class="num">зарегистрирован</th>
+            <th class="act"></th>
+          </tr>
+        </thead>
+        <tbody id="instances-body"></tbody>
+      </table>
+      <p id="instances-empty" class="window-status" hidden>Ни один браузер ещё не зарегистрирован.</p>
+    </section>
+  </div>
 
   <script src="/admin/app.js"></script>
 </body>

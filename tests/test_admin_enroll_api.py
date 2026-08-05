@@ -137,6 +137,54 @@ def test_list_instances_reports_revoked_as_not_connected(tmp_path):
         assert row["status"] == "revoked" and row["connected"] is False
 
 
+def test_list_instances_names_the_configured_main(tmp_path):
+    """The list says WHICH id is MAIN, and says it even when that id has no row.
+
+    MAIN is service configuration (``MAIN_INSTANCE_ID``), not a column: nothing in a row
+    distinguishes it, so a client reading this endpoint could not mark the MAIN row nor warn
+    about a MAIN revoke BEFORE sending it — its only way to discover the fact was to fire
+    the revoke and read the 409 back, i.e. to find out by doing the thing it was meant to
+    warn about. Reddens if the key is dropped from the body, or if it is derived from the
+    rows (the second half below: a configured MAIN that has not enrolled yet — the state
+    every fresh deployment starts in — still has to be named).
+    """
+    app = create_app_for(tmp_path, main_instance_id="chief")
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        _seed_instance(db_path, "chief", status="active", secret_hash="s-chief")
+        _seed_instance(db_path, "work", status="active", secret_hash="s-work")
+        body = client.get("/admin/instances", headers=admin_headers()).json()
+        assert body["main_instance_id"] == "chief"
+        assert {i["id"] for i in body["instances"]} == {"chief", "work"}
+
+    # …and with no row for it at all, the configuration is still reported.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    app2 = create_app_for(empty, main_instance_id="chief")
+    with TestClient(app2) as client:
+        body = client.get("/admin/instances", headers=admin_headers()).json()
+        assert body["instances"] == []
+        assert body["main_instance_id"] == "chief"
+
+
+def test_window_read_reports_the_configured_length(tmp_path):
+    """A CLOSED window still reports how long the next one will last.
+
+    ``seconds_remaining`` is 0 while closed and there is no deadline to subtract from, so
+    the configured length is not derivable from this body — yet it is exactly what the
+    console's "Открыть регистрацию на N минут" button has to name. Reddens if
+    ``window_minutes`` is dropped or stops following ENROLL_WINDOW_MIN (the button would go
+    back to a hard-coded 10 and lie on any deployment that set the variable).
+    """
+    app = create_app_for(tmp_path, enroll_window_min=25)
+    with TestClient(app) as client:
+        closed = client.get("/admin/enroll/window", headers=admin_headers()).json()
+        assert closed["open"] is False and closed["window_minutes"] == 25
+        client.post("/admin/enroll/window", headers=admin_headers())
+        opened = client.get("/admin/enroll/window", headers=admin_headers()).json()
+        assert opened["open"] is True and opened["window_minutes"] == 25
+
+
 def test_list_instances_shows_all_statuses_and_no_title(tmp_path):
     """Every status is listed — and the row carries NO ``title`` field.
 
