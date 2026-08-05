@@ -36,10 +36,22 @@
 
   "options_page": "pages/options.html",
 
+  "//icons": "Rendered from icons/icon.svg (the source of truth) with `rsvg-convert -w N -h N`. Chrome does NOT accept SVG for extension icons, so the PNGs are the shipped artefact and the SVG is kept only to re-render them. The 16px toolbar size is what the design was chosen for: it carries three bars, the last one detached to the right — a tab that moved elsewhere. Anything with more than three shapes turned to mush at 16px (measured, not guessed).",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+
   "//action": "The toolbar popup is 'Rule from this tab' (§8, §10): one click to add a rule <origin>/* -> this instance with a server-side impact preview.",
   "action": {
     "default_title": "arcextension",
-    "default_popup": "pages/popup.html"
+    "default_popup": "pages/popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
   },
 
   "incognito": "not_allowed"
