@@ -124,10 +124,16 @@ async def _freshen_fleet(app) -> dict:
         ),
         return_exceptions=True,
     )
-    # snapshot_at read after the waits so a just-landed snapshot is reflected.
-    snapshot_at = {
-        i["id"]: i["snapshot_at"] for i in await db.read(state_read._read_instances)
-    }
+    # Mirror rows read after the waits so a just-landed snapshot is reflected.
+    #
+    # The WHOLE row is kept, not just ``snapshot_at``: this envelope REPLACED the
+    # former list-of-mirror-rows, so anything dropped here loses its only MCP
+    # surface. ``last_seen_at`` / ``reject_reason`` / ``reject_at`` answer "when did
+    # this instance last speak" and "why was it cut off", and nothing else on the MCP
+    # side answers them. ``focused_window_id`` is the one field deliberately NOT
+    # carried over — ``list_windows`` (#46) reports the focused window per window,
+    # which is strictly more useful than a bare id.
+    rows = {i["id"]: i for i in await db.read(state_read._read_instances)}
     # session_id per active instance (#47): the epoch stamped alongside freshness so the
     # agent can pin it as expected_session on a later mutating verb.
     sessions = await db.read(state_read._read_active_sessions)
@@ -142,11 +148,17 @@ async def _freshen_fleet(app) -> dict:
             fresh, reason = False, ERROR
         else:
             fresh, reason, _conn_state = res
+        row = rows.get(iid) or {}
         envelope[iid] = {
-            "snapshot_at": snapshot_at.get(iid),
+            "snapshot_at": row.get("snapshot_at"),
             "fresh": fresh,
             "reason": reason,
             "session_id": sessions.get(iid),
+            # Carried over from the mirror row this envelope replaced (see above).
+            "connected": row.get("connected"),
+            "last_seen_at": row.get("last_seen_at"),
+            "reject_reason": row.get("reject_reason"),
+            "reject_at": row.get("reject_at"),
         }
     return envelope
 

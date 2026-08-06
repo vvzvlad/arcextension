@@ -164,8 +164,11 @@ async def test_list_instances_returns_freshness_envelope_and_paused_until(tmp_pa
     # list of mirror rows. No live socket for "main" => ensure_fresh reports disconnected.
     main = out["instances"]["main"]
     # session_id rides the envelope (#47); "main" was inserted with no session_id.
+    # The mirror-row fields the envelope replaced ride along too: dropping them would
+    # leave `last_seen_at` / `reject_reason` / `reject_at` with no MCP surface at all.
     assert main == {"snapshot_at": 1234, "fresh": False, "reason": "disconnected",
-                    "session_id": None}
+                    "session_id": None, "connected": False, "last_seen_at": None,
+                    "reject_reason": None, "reject_at": None}
 
     # A paused curator surfaces paused_until so an agent does not read pause as a break.
     now = tools._now_ms()
@@ -186,7 +189,9 @@ async def test_list_tabs_returns_tabs_and_per_instance_freshness(tmp_path):
     out = await tools.list_tabs(_app(db, reg))
     assert [t["tab_id"] for t in out["tabs"]] == [1]
     assert out["instances"] == {
-        "main": {"snapshot_at": now, "fresh": True, "reason": "fresh", "session_id": "sess-1"}
+        "main": {"snapshot_at": now, "fresh": True, "reason": "fresh",
+                 "session_id": "sess-1", "connected": True, "last_seen_at": None,
+                 "reject_reason": None, "reject_at": None}
     }
 
 
@@ -205,11 +210,97 @@ async def test_list_tabs_freshens_and_flags_a_disconnected_sibling(tmp_path):
     inst = out["instances"]
     assert set(inst) == {"main", "media"}
     assert inst["main"] == {"snapshot_at": now, "fresh": True, "reason": "fresh",
-                            "session_id": "sess-1"}
+                            "session_id": "sess-1", "connected": True,
+                            "last_seen_at": None, "reject_reason": None, "reject_at": None}
     assert inst["media"] == {"snapshot_at": None, "fresh": False, "reason": "disconnected",
-                             "session_id": "sess-2"}
+                             "session_id": "sess-2", "connected": False,
+                             "last_seen_at": None, "reject_reason": None, "reject_at": None}
     # The disconnected sibling did not drop the fresh instance's tab.
     assert [t["tab_id"] for t in out["tabs"]] == [1]
+
+
+async def test_list_tabs_reflects_a_snapshot_that_lands_during_the_call(tmp_path):
+    """Acceptance 1 of #44: the tab a human opened is in the SAME response.
+
+    This is the whole point of the issue — `list_tabs` used to kick a refresh and
+    return the mirror it already had, so a freshly opened tab appeared only on the
+    NEXT call. The test drives the real path: the mirror is stale, `ensure_fresh`
+    sends a `snapshot_request`, the extension answers by applying a snapshot that
+    carries a new tab, and the tool must return that tab.
+
+    It is deliberately written to fail if the tabs are read BEFORE the fan-out —
+    the exact shape of the original bug.
+    """
+    db = await _make_db(tmp_path)
+    now = tools._now_ms()
+    # Stale: snapshot_at far older than STATE_FRESH_MS, so ensure_fresh must ask.
+    await _insert_instance(db, "main", session_id="sess-1", snapshot_at=now - 600_000,
+                           connected=1)
+    await _insert_tab(db, "main", 1, url="https://already-there")
+
+    class LandingWS(FakeWS):
+        """Answers a snapshot_request the way the channel does: applies the snapshot
+        (new tab + refreshed snapshot_at) and frees the pending slot."""
+
+        def __init__(self):
+            super().__init__()
+            self.conn_state = None
+
+        async def send_json(self, frame):
+            await super().send_json(frame)
+            if frame.get("type") != protocol.TYPE_SNAPSHOT_REQUEST:
+                return
+            landed = tools._now_ms()
+
+            def _apply(c):
+                c.execute(
+                    "INSERT INTO tabs (instance_id, tab_id, window_id, url, title, "
+                    "pinned, active, audible, opened_at, last_active_at, age_unknown, "
+                    "updated_at) VALUES (?,?,?,?,?,0,0,0,?,?,0,?)",
+                    ("main", 2, 1, "https://opened-by-a-human", "new", landed, landed,
+                     landed),
+                )
+                c.execute(
+                    "UPDATE instances SET snapshot_at = ?, last_seen_at = ? WHERE id = ?",
+                    (landed, landed, "main"),
+                )
+
+            await db.write(_apply)
+            self.conn_state.pending_snapshot_id = None
+
+    ws = LandingWS()
+    reg = Registry()
+    cs, _ = _put_conn(reg, "main", session_id="sess-1", ws=ws)
+    ws.conn_state = cs
+
+    out = await tools.list_tabs(_app(db, reg))
+
+    # The request actually went out...
+    assert any(f.get("type") == protocol.TYPE_SNAPSHOT_REQUEST for f in ws.sent)
+    # ...and the tab that landed during the call is in THIS response.
+    assert sorted(t["tab_id"] for t in out["tabs"]) == [1, 2]
+    assert out["instances"]["main"]["fresh"] is True
+    assert out["instances"]["main"]["reason"] == "fresh"
+
+
+async def test_freshen_fleet_spends_the_snapshot_timeout_budget(tmp_path, monkeypatch):
+    """The budget is SETTINGS.snapshot_timeout_ms — the owner's «10 с», not a literal.
+
+    Pins the value so shrinking it (or hard-coding a small one) is a red test rather
+    than a silently impatient tool.
+    """
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "main", session_id="sess-1", snapshot_at=None, connected=0)
+    seen: list = []
+
+    async def _spy(registry, db_, iid, settings, *, budget_ms=None):
+        seen.append(budget_ms)
+        return (False, "disconnected", None)
+
+    monkeypatch.setattr(tools, "ensure_fresh", _spy)
+    app = _app(db)
+    await tools.list_tabs(app)
+    assert seen == [app.state.settings.snapshot_timeout_ms]
 
 
 async def test_list_tabs_reader_error_maps_to_error_and_isolates_siblings(tmp_path, monkeypatch):
@@ -240,7 +331,8 @@ async def test_list_tabs_reader_error_maps_to_error_and_isolates_siblings(tmp_pa
     # The faulting instance is reported, not lost; snapshot_at still comes from the
     # (separate, working) mirror read.
     assert inst["bad"] == {"snapshot_at": 42, "fresh": False, "reason": "error",
-                           "session_id": "sess-2"}
+                           "session_id": "sess-2", "connected": True,
+                           "last_seen_at": None, "reject_reason": None, "reject_at": None}
     # The sibling with a working reader is returned normally.
     assert inst["main"]["reason"] == "fresh" and inst["main"]["fresh"] is True
 
