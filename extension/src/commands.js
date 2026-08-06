@@ -940,6 +940,12 @@ async function openTabBulk(params, nowFn, map) {
   const windowId = await pickNormalWindowId();
 
   const results = [];
+  // Seeds are collected and written ONCE after the loop (§5 clock inheritance): the
+  // whole point of one frame per list is not paying per-element costs, and a per-item
+  // seed is a full map load+save each. Deferring the write does not race onCreated any
+  // worse than the single path already does — both land on the same mutation chain,
+  // and the seed is what wins either way.
+  const seeds = [];
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index] || {};
     if (!isHttpUrl(item.url)) {
@@ -973,9 +979,10 @@ async function openTabBulk(params, nowFn, map) {
       results.push({ index, ok: false, error: ERR_NO_WINDOW, message: "could not create tab" });
       continue;
     }
-    await map.seedCuratorTab(tab.id, item, nowFn());
+    seeds.push({ tabId: tab.id, seed: item });
     results.push({ index, ok: true, tabId: tab.id, windowId: tab.windowId });
   }
+  if (seeds.length) await map.seedCuratorTabs(seeds, nowFn());
   return ok({ results });
 }
 

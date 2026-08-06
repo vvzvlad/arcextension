@@ -532,21 +532,25 @@ def test_undo_pass_with_both_halves_reverses_once(tmp_path):
 
 
 # --- #48: a synchronous MCP relocation is undoable by its mcp- pass_id -------
-def _seed_sync_reloc_pair(db_path, pass_id):
+def _seed_sync_reloc_pair(db_path, pass_id, *, ts=1_000_000, tab_id=5, tab_id_to=77,
+                          url="https://a/b"):
     """Seed the exact pair the synchronous relocate_tab verb (#48) writes: relocate(done)
     + relocate_close(done) under a synthetic ``mcp-<uuid>`` pass_id, linked by
-    origin_action_id, and DELIBERATELY no ``passes`` row."""
+    origin_action_id, and DELIBERATELY no ``passes`` row.
+
+    The keyword arguments exist so a BATCH (#49) can be seeded as several pairs sharing
+    one pass_id — the shape the bulk verb writes."""
     reloc = _seed_action(
-        db_path, ts=1_000_000, pass_id=pass_id, kind="relocate", status="done",
-        initiator="mcp", instance_from="src", instance_to="dst", tab_id=5,
-        session_id_from="sess-1", tab_id_to=77, session_id_to="sess-9",
-        url="https://a/b", url_norm="https://a/b",
+        db_path, ts=ts, pass_id=pass_id, kind="relocate", status="done",
+        initiator="mcp", instance_from="src", instance_to="dst", tab_id=tab_id,
+        session_id_from="sess-1", tab_id_to=tab_id_to, session_id_to="sess-9",
+        url=url, url_norm=url,
     )
     _seed_action(
-        db_path, ts=1_000_001, pass_id=pass_id, kind="relocate_close", status="done",
+        db_path, ts=ts + 1, pass_id=pass_id, kind="relocate_close", status="done",
         initiator="mcp", origin_action_id=reloc, instance_from="src", instance_to="dst",
-        tab_id=5, session_id_from="sess-1", tab_id_to=77, session_id_to="sess-9",
-        url="https://a/b", url_norm="https://a/b",
+        tab_id=tab_id, session_id_from="sess-1", tab_id_to=tab_id_to,
+        session_id_to="sess-9", url=url, url_norm=url,
     )
     return reloc
 
@@ -584,6 +588,55 @@ def test_undo_sync_mcp_relocation_without_passes_row(tmp_path):
             assert done["relocate_id"] == reloc and done["copy_closed"] is True
             assert _db_row(db_path, "SELECT restored_at FROM actions WHERE id=?", (reloc,))[0] is not None
             assert _db_row(db_path, "SELECT COUNT(*) FROM passes") == (0,)  # never invented
+        finally:
+            ws_dst.__exit__(None, None, None)
+            ws_src.__exit__(None, None, None)
+
+
+def test_undo_bulk_mcp_relocation_reverses_the_whole_batch(tmp_path):
+    # #49 acceptance 7, the half that classification cannot prove: the batch's ONE
+    # undo_pass_id is RUN, not just classified — two sources reopened, two copies closed,
+    # in one call. Reverse-(ts,id) order means the batch unwinds newest pair first.
+    app = create_app(_settings(tmp_path, cmd_timeout_ms=2000))
+    db_path = str(tmp_path / "curator.db")
+    pass_id = "mcp-33333333"
+    with TestClient(app) as client:
+        ws_src = _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=[])
+        ws_dst = _connect_fresh(client, db_path, instance_id="dst", session="sess-9", tabs=[])
+        try:
+            first = _seed_sync_reloc_pair(db_path, pass_id, ts=1_000_000, tab_id=5,
+                                          tab_id_to=77, url="https://a/b")
+            second = _seed_sync_reloc_pair(db_path, pass_id, ts=1_000_010, tab_id=6,
+                                           tab_id_to=78, url="https://c/d")
+            assert _db_row(db_path, "SELECT COUNT(*) FROM passes") == (0,)
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(lambda: client.post(
+                f"/api/passes/{pass_id}/undo", headers=AUTH, json={"confirm_impact": True}))
+            reopened_urls, closed_copies = [], []
+            for _ in range(2):  # one reopen + one copy-close per pair
+                open_cmd = _recv(ws_src)
+                assert open_cmd["command"] == "open_tab"
+                reopened_urls.append(open_cmd["params"]["url"])
+                ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
+                                  "result": {"tabId": 500 + len(reopened_urls), "windowId": 1}})
+                close_cmd = _recv(ws_dst)
+                assert close_cmd["command"] == "close_tab"
+                closed_copies.append(close_cmd["params"]["tabId"])
+                ws_dst.send_json({"type": "response", "id": close_cmd["id"], "ok": True,
+                                  "result": {}})
+            resp = fut.result(timeout=10)
+            assert resp.status_code == 200
+            body = resp.json()
+            # BOTH pairs really reversed — the assertion classification could not make.
+            assert body["counts"]["reopened"] == 2
+            assert body["counts"]["copies_closed"] == 2
+            assert sorted(reopened_urls) == ["https://a/b", "https://c/d"]
+            assert sorted(closed_copies) == [77, 78]
+            for rid in (first, second):
+                assert _db_row(
+                    db_path, "SELECT restored_at FROM actions WHERE id=?", (rid,)
+                )[0] is not None
+            assert _db_row(db_path, "SELECT COUNT(*) FROM passes") == (0,)
         finally:
             ws_dst.__exit__(None, None, None)
             ws_src.__exit__(None, None, None)

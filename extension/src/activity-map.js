@@ -262,24 +262,49 @@ export function onRemoved(tabId) {
 // Curator open_tab seed (§5): the record is stamped from the command's seed ages
 // so the freshly opened copy inherits the source's age rather than looking new.
 // Wired by the command layer in the NEXT phase; the seed path lives here.
+// Batch form of seedCuratorTab: ONE runExclusive for the whole list.
+//
+// The bulk verbs (#49) send one frame per list, and the point of that is to stop
+// paying per-element costs. seedCuratorTab is the most expensive per-element call
+// there is on this side — runExclusive means loadMap() + saveMap() of the ENTIRE map
+// under the shared promise chain — so seeding N copies one at a time re-imports the
+// very cost the single frame was bought to remove: on a 200-tab map a 20-item bulk
+// relocate would pay 20 full map round-trips inside one CMD_TIMEOUT_MS budget.
+//
+// `entries` is [{tabId, seed}]; `now` is stamped once for the whole batch, which is
+// also more honest than N drifting timestamps for copies opened in one operation.
+export function seedCuratorTabs(entries, now) {
+  return runExclusive((map) => {
+    for (const { tabId, seed } of entries) {
+      map.tabs[tabId] = _seedRecord(seed, now);
+    }
+  });
+}
+
+// The ONE definition of a seeded record; both the single and the batch seed build it
+// here so the two forms cannot drift.
+function _seedRecord(seed, now) {
+  const ageMs = Number(seed?.seed_age_ms) || 0;
+  const openedAgoMs = Number(seed?.seed_opened_ago_ms) || 0;
+  return {
+    lastActive: now - ageMs,
+    openedAt: now - openedAgoMs,
+    ageUnknown: !!seed?.seed_age_unknown,
+    // Churn is RESET for a genuinely new tab (open_tab's copy). But move_tab's
+    // extract-to-new-window (#45) reuses the SAME tab id, so it must CARRY the
+    // pre-move churn through — otherwise a self-navigating tab (an auto-refresh
+    // dashboard) loses `selfNavigating` and its next doc change re-juvenates it,
+    // undoing the §5 clock-preservation. When the caller supplies `carry_*` those
+    // are used (mirroring onReplaced's `{...old}`); otherwise the fresh-copy reset.
+    docChanges: seed?.carry_doc_changes ? [...seed.carry_doc_changes] : [],
+    lastDocKey: seed?.carry_last_doc_key,
+    selfNavigating: !!seed?.carry_self_navigating,
+  };
+}
+
 export function seedCuratorTab(tabId, seed, now) {
   return runExclusive((map) => {
-    const ageMs = Number(seed?.seed_age_ms) || 0;
-    const openedAgoMs = Number(seed?.seed_opened_ago_ms) || 0;
-    map.tabs[tabId] = {
-      lastActive: now - ageMs,
-      openedAt: now - openedAgoMs,
-      ageUnknown: !!seed?.seed_age_unknown,
-      // Churn is RESET for a genuinely new tab (open_tab's copy). But move_tab's
-      // extract-to-new-window (#45) reuses the SAME tab id, so it must CARRY the
-      // pre-move churn through — otherwise a self-navigating tab (an auto-refresh
-      // dashboard) loses `selfNavigating` and its next doc change re-juvenates it,
-      // undoing the §5 clock-preservation. When the caller supplies `carry_*` those
-      // are used (mirroring onReplaced's `{...old}`); otherwise the fresh-copy reset.
-      docChanges: seed?.carry_doc_changes ? [...seed.carry_doc_changes] : [],
-      lastDocKey: seed?.carry_last_doc_key,
-      selfNavigating: !!seed?.carry_self_navigating,
-    };
+    map.tabs[tabId] = _seedRecord(seed, now);
   });
 }
 

@@ -21,6 +21,7 @@ const SID = "session-1";
 function spyMap(readValue = { tabs: {} }) {
   return {
     seedCuratorTab: vi.fn(async () => {}),
+    seedCuratorTabs: vi.fn(async () => {}),
     markCuratorCause: vi.fn(async () => {}),
     clearCuratorCause: vi.fn(async () => {}),
     readMap: vi.fn(async () => readValue),
@@ -1545,7 +1546,34 @@ describe("#49 bulk open_tab {items} + hoisted-out-of-loop work", () => {
     expect(res.result.results[0]).toMatchObject({ index: 0, ok: true, windowId: 7 });
     expect(res.result.results[1]).toMatchObject({ index: 1, ok: false, error: "precondition_failed" });
     expect(res.result.results[2]).toMatchObject({ index: 2, ok: true, windowId: 7 });
-    expect(map.seedCuratorTab).toHaveBeenCalledTimes(2); // only the two valid urls
+    // ONE batched seed for the whole list, carrying only the two valid urls.
+    expect(map.seedCuratorTab).not.toHaveBeenCalled();
+    expect(map.seedCuratorTabs).toHaveBeenCalledTimes(1);
+    expect(map.seedCuratorTabs.mock.calls[0][0]).toHaveLength(2);
+  });
+
+  it("acceptance 10 (open): a 20-item open seeds the map ONCE, not per item", async () => {
+    // The sibling of the close-path budget test, for the path bulk RELOCATE actually
+    // uses. seedCuratorTab is a full map load+save each; doing it per item re-imports
+    // the per-element cost that one frame per list was bought to remove. Reddens if the
+    // seed goes back inside the loop.
+    globalThis.chrome = createChromeMock({
+      tabs: [],
+      windows: [{ id: 7, type: "normal", state: "normal" }],
+      lastFocused: { id: 7, focused: true },
+    });
+    const map = spyMap();
+    const items = [];
+    for (let i = 0; i < 20; i += 1) items.push({ url: `https://x/${i}`, seed_age_ms: i });
+
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { items }), ctx({ map }));
+
+    expect(res.ok).toBe(true);
+    expect(res.result.results).toHaveLength(20);
+    expect(res.result.results.every((r) => r.ok)).toBe(true);
+    expect(map.seedCuratorTab).not.toHaveBeenCalled();
+    expect(map.seedCuratorTabs).toHaveBeenCalledTimes(1);
+    expect(map.seedCuratorTabs.mock.calls[0][0]).toHaveLength(20);
   });
 
   it("acceptance 10: a 20-item close on a 200-tab map does O(1) hoisted work, not O(n)", async () => {
