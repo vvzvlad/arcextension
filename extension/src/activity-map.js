@@ -270,9 +270,15 @@ export function seedCuratorTab(tabId, seed, now) {
       lastActive: now - ageMs,
       openedAt: now - openedAgoMs,
       ageUnknown: !!seed?.seed_age_unknown,
-      docChanges: [],
-      lastDocKey: undefined,
-      selfNavigating: false,
+      // Churn is RESET for a genuinely new tab (open_tab's copy). But move_tab's
+      // extract-to-new-window (#45) reuses the SAME tab id, so it must CARRY the
+      // pre-move churn through — otherwise a self-navigating tab (an auto-refresh
+      // dashboard) loses `selfNavigating` and its next doc change re-juvenates it,
+      // undoing the §5 clock-preservation. When the caller supplies `carry_*` those
+      // are used (mirroring onReplaced's `{...old}`); otherwise the fresh-copy reset.
+      docChanges: seed?.carry_doc_changes ? [...seed.carry_doc_changes] : [],
+      lastDocKey: seed?.carry_last_doc_key,
+      selfNavigating: !!seed?.carry_self_navigating,
     };
   });
 }

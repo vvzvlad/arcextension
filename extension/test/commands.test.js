@@ -1279,6 +1279,29 @@ describe("move_tab", () => {
     const map = await activityMap.readMap();
     expect(map.tabs[100].lastActive).toBe(NOW - 100_000); // preserved, NOT rejuvenated to NOW
   });
+
+  it("#45: extraction PRESERVES self-navigation churn — an auto-refresh tab keeps selfNavigating", async () => {
+    // The extracted tab keeps its id across windows.create, so its churn (docChanges/
+    // lastDocKey/selfNavigating) must be CARRIED, not reset. Otherwise a self-navigating
+    // tab (an auto-refresh dashboard) loses the flag and its next doc change re-juvenates
+    // it, undoing §5 clock-preservation. Reddens if seedCuratorTab resets the churn.
+    chromeTwoNormalWindows();
+    await activityMap.onCreated(100, NOW - 100_000);
+    // Drive it self-navigating: more than SELF_NAV_LIMIT distinct document changes.
+    for (let k = 0; k <= 10; k += 1) {
+      await activityMap.onDocumentChange(100, `https://dash.test/${k}`, NOW);
+    }
+    let m = await activityMap.readMap();
+    expect(m.tabs[100].selfNavigating).toBe(true); // precondition
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: null }),
+      { sessionId: SID, now: () => NOW }, // real activityMap
+    );
+    expect(res.ok).toBe(true);
+    m = await activityMap.readMap();
+    expect(m.tabs[100].selfNavigating).toBe(true); // carried through, not reset to false
+    expect(m.tabs[100].docChanges.length).toBeGreaterThan(10); // churn ring preserved
+  });
 });
 
 // --- execute_js: the checkbox gate ------------------------------------------

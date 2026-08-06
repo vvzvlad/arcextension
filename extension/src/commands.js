@@ -597,9 +597,12 @@ async function extractTabToNewWindow(tab, nowFn, map) {
   // one Chrome already delivered BEFORE it (during windows.create) is corrected by the
   // seed below. Together they preserve the clock in every enqueue order.
   await map.markCuratorCause(newWindowId, nowFn());
-  // Restore the pre-move clock (§5): re-seed lastActive/openedAt from the record read
-  // above so the extracted tab stays exactly as old as it was — the next pass must not
-  // see it as freshly touched. A tab with no prior record has nothing to preserve.
+  // Restore the pre-move clock AND churn (§5): re-seed lastActive/openedAt from the
+  // record read above so the extracted tab stays exactly as old as it was, and CARRY its
+  // docChanges/lastDocKey/selfNavigating — the tab keeps its id across windows.create, so
+  // losing its self-navigation state would let its next doc change re-juvenate it (the
+  // next pass must not see it as freshly touched). A tab with no prior record has nothing
+  // to preserve.
   if (rec) {
     const nowMs = nowFn();
     await map.seedCuratorTab(
@@ -608,6 +611,9 @@ async function extractTabToNewWindow(tab, nowFn, map) {
         seed_age_ms: nowMs - rec.lastActive,
         seed_opened_ago_ms: nowMs - rec.openedAt,
         seed_age_unknown: !!rec.ageUnknown,
+        carry_doc_changes: rec.docChanges,
+        carry_last_doc_key: rec.lastDocKey,
+        carry_self_navigating: rec.selfNavigating,
       },
       nowMs,
     );
