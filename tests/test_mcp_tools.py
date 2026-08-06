@@ -1044,6 +1044,46 @@ async def test_relocate_precondition_failed_on_close_is_half(tmp_path):
     assert len((await db.read(load_mirror)).live_relocations) == 1
 
 
+async def test_relocate_connection_class_close_stays_pending_half(tmp_path):
+    # Step-6 close returns a CONNECTION-class code (no_connection/timeout/stale_session):
+    # the close is UNKNOWN, so the relocate_close stays PENDING (NOT failed, NOT done) and
+    # the response is half — reconcile finishes it. This is the data-loss-adjacent branch:
+    # a regression that dropped the source, marked done, or set failed would pass every
+    # other test. The source row must remain, and the PENDING close excludes the relocate
+    # from live_relocations (so phase B does not double-close it before reconcile).
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    def responder(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            return {"tabId": 99, "windowId": 1}
+        if cmd == protocol.CMD_GET_TAB:
+            return {"ok": True}
+        return ("err", protocol.ERR_NO_CONNECTION)  # source close: UNKNOWN
+
+    out, _ = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)}, responder,
+    )
+    assert out["status"] == "half" and out["reason"] == protocol.ERR_NO_CONNECTION
+    close = await db.read(lambda c: c.execute(
+        "SELECT status FROM actions WHERE kind='relocate_close'").fetchone())
+    assert close == ("pending",)  # NOT failed, NOT done — reconcile will resolve it
+    # The source tab was NOT dropped (its close is uncertain).
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed' AND tab_id=5").fetchone()) == (1,)
+    # A PENDING relocate_close excludes the relocation from live_relocations — phase B will
+    # not double-close it; reconcile (read_pending_closes) picks the row up later.
+    from src.curator.mirror import load_mirror
+    assert len((await db.read(load_mirror)).live_relocations) == 0
+
+
 async def test_relocate_refused_while_paused_sends_nothing(tmp_path):
     # Acceptance 11: the verb refuses while the stop switch (pause) is armed and sends no
     # frames. (The codebase's stop switch is the pause gate; its code is "paused".)
