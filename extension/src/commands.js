@@ -107,7 +107,7 @@ export async function dispatchCommand(frame, ctx = {}) {
       case CMD_CLOSE_TAB:
         return await closeTab(params, nowFn, map);
       case CMD_GET_TAB:
-        return await getTab(params);
+        return Array.isArray(params.items) ? await getTabBulk(params) : await getTab(params);
       case CMD_FOCUS_TAB:
         return await focusTab(params);
       case CMD_NAVIGATE_TAB:
@@ -222,6 +222,12 @@ async function pickNormalWindowId() {
 // macOS the browser lives with none daily) we CREATE one unfocused instead of
 // failing: a failure would push the relocation to `deferred` and on to quarantine.
 async function openTab(params, nowFn, map) {
+  // #49 bulk: an `items` array is the LIST form — the extension loops it item by item
+  // (native array forms are fail-fast and report nothing per element) and answers ONE
+  // frame carrying a per-item `results` array. See openTabBulk.
+  if (Array.isArray(params.items)) {
+    return await openTabBulk(params, nowFn, map);
+  }
   if (!isHttpUrl(params.url)) {
     return fail(ERR_PRECONDITION_FAILED, "open_tab accepts only http/https urls");
   }
@@ -288,6 +294,10 @@ async function openTab(params, nowFn, map) {
 // Only when every guard still holds do we mark the curator cause (AWAITED, so the
 // mark is durably written before Chrome activates a neighbour) and remove.
 async function closeTab(params, nowFn, map) {
+  // #49 bulk: an `items` array is the LIST form — loop item by item, ONE frame back.
+  if (Array.isArray(params.items)) {
+    return await closeTabBulk(params, nowFn, map);
+  }
   const tabId = params.tabId;
   const expect = params.expect || {};
 
@@ -353,6 +363,26 @@ async function getTab(params) {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
   return ok({ tab });
+}
+
+// get_tab {items:[{tabId}]} -> {results:[{index, ok, tabId, error?}]}. The bulk copy-check
+// for #49 relocate: each item is its OWN chrome.tabs.get in a try/catch, so one gone tab
+// (ERR_NO_SUCH_TAB) does not sink the whole frame — a present copy answers ok:true, a
+// vanished one ok:false + error, matched back by index. No mutation, purely a read.
+async function getTabBulk(params) {
+  const items = params.items || [];
+  const results = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index] || {};
+    const tabId = item.tabId;
+    try {
+      await chrome.tabs.get(tabId);
+      results.push({ index, ok: true, tabId });
+    } catch {
+      results.push({ index, ok: false, tabId, error: ERR_NO_SUCH_TAB });
+    }
+  }
+  return ok({ results });
 }
 
 // focus_tab {tabId} -> activate the tab and focus its window. The resulting
@@ -625,6 +655,10 @@ async function extractTabToNewWindow(tab, nowFn, map) {
 }
 
 async function moveTab(params, nowFn, map) {
+  // #49 bulk: an `items` array is the LIST form — loop item by item, ONE frame back.
+  if (Array.isArray(params.items)) {
+    return await moveTabBulk(params, nowFn, map);
+  }
   const tabId = params.tabId;
   const targetWindowId = params.windowId;
   // #45: `windowId: null` is the "extract into a NEW window" address — the one legal
@@ -701,6 +735,234 @@ async function moveTab(params, nowFn, map) {
     return fail(ERR_INTERNAL, msg);
   }
   return ok({ tabId, windowId: targetWindowId, index });
+}
+
+// --- #49 bulk verbs (ONE frame per list, looped item by item) ----------------
+//
+// The owner chose "one command for the whole list": the socket carries ONE `command`
+// frame whose params hold an `items` array, the extension LOOPS it in its own
+// try/catch, and answers ONE `response` carrying `{results:[{index, ok, ...}]}`. The
+// match key is `index` (position in the input) — an open item has no id before it
+// opens. The native array forms (chrome.tabs.move/remove accept arrays) are NOT used:
+// they are fail-fast and report nothing per element.
+//
+// PERF (§6 command budget): everything that is not per-item is hoisted OUT of the loop —
+// ONE chrome.tabs.query({}), ONE chrome.windows.getLastFocused(), ONE activity-map read
+// (only when an item actually needs it), and ONE markCuratorCause([...affected windows])
+// BEFORE the loop. Else a 20-item list would do 20× runExclusive (loadMap+saveMap of the
+// WHOLE map) and a 200-tab map can blow the cmd_timeout_ms budget.
+
+// close_tab {items:[{tabId, expect?}]}. Loop, per-item guard re-check + remove, ONE
+// frame back. The per-item `expect` is the SAME guard set as the single form (§6):
+// today the pure bulk close sends none (behaves exactly like single close); only the
+// bulk RELOCATE close carries url/notAudible/notPinned per item. The volatile guards
+// are re-checked live against the ONE hoisted tab query / focus read / map read.
+async function closeTabBulk(params, nowFn, map) {
+  const items = params.items;
+  // ONE tab query (id -> live tab), ONE focused-window read — hoisted out of the loop.
+  const allTabs = await chrome.tabs.query({});
+  const tabById = new Map(allTabs.map((t) => [t.id, t]));
+  const focused = await chrome.windows.getLastFocused();
+  // ONE map read, and only when an item actually needs the idle guard (none does today).
+  const needMap = items.some(
+    (it) => it && it.expect && typeof it.expect.minIdleMs === "number" && it.expect.minIdleMs > 0,
+  );
+  const mapSnapshot = needMap ? await map.readMap() : null;
+
+  // Mark EVERY affected window ONCE before the loop (a close activates a neighbour in
+  // each). Affected = windows of the items whose tab actually exists.
+  const affected = [
+    ...new Set(
+      items
+        .map((it) => tabById.get(it && it.tabId))
+        .filter((t) => t && t.windowId !== undefined && t.windowId !== null)
+        .map((t) => t.windowId),
+    ),
+  ];
+  await map.markCuratorCause(affected, nowFn());
+
+  const results = [];
+  let removed = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index] || {};
+    const tabId = item.tabId;
+    const expect = item.expect || {};
+    const tab = tabById.get(tabId);
+    if (!tab) {
+      results.push({ index, ok: false, tabId, error: ERR_NO_SUCH_TAB });
+      continue;
+    }
+    // The SAME volatile guards the single close re-checks (§6) — live, per item.
+    if (expect.url !== undefined && tab.url !== expect.url) {
+      results.push({ index, ok: false, tabId, error: ERR_PRECONDITION_FAILED, message: "url diverged" });
+      continue;
+    }
+    if (expect.notAudible && tab.audible) {
+      results.push({ index, ok: false, tabId, error: ERR_PRECONDITION_FAILED, message: "became audible" });
+      continue;
+    }
+    if (expect.notPinned && tab.pinned) {
+      results.push({ index, ok: false, tabId, error: ERR_PRECONDITION_FAILED, message: "was pinned" });
+      continue;
+    }
+    if (tab.active && focused && focused.focused && focused.id === tab.windowId) {
+      results.push({ index, ok: false, tabId, error: ERR_PRECONDITION_FAILED, message: "active in focused window" });
+      continue;
+    }
+    if (typeof expect.minIdleMs === "number" && expect.minIdleMs > 0) {
+      const rec = mapSnapshot && mapSnapshot.tabs ? mapSnapshot.tabs[tabId] : undefined;
+      const idleMs = rec ? nowFn() - rec.lastActive : -1;
+      if (idleMs < expect.minIdleMs) {
+        results.push({ index, ok: false, tabId, error: ERR_PRECONDITION_FAILED, message: "idle below minIdleMs" });
+        continue;
+      }
+    }
+    try {
+      await chrome.tabs.remove(tabId);
+      removed += 1;
+      results.push({ index, ok: true, tabId });
+    } catch (e) {
+      results.push({ index, ok: false, tabId, error: ERR_INTERNAL, message: String((e && e.message) || e) });
+    }
+  }
+  // Whole-batch failure: no neighbour was ever activated, so undo the marks (as moveTab
+  // does on a failed move). A partial success keeps them — a real close DID happen.
+  if (removed === 0 && affected.length > 0) {
+    await map.clearCuratorCause(affected);
+  }
+  return ok({ results });
+}
+
+// move_tab {items:[{tabId}], windowId, index?}. ONE shared target window + position for
+// the whole list (windowId:null extract-to-new is refused at the MCP door — "one new
+// window for all" is a different, unrequested op — so it never reaches here as a list).
+async function moveTabBulk(params, nowFn, map) {
+  const items = params.items;
+  const targetWindowId = params.windowId;
+  const index = params.index === undefined || params.index === null ? -1 : params.index;
+
+  // Shared validation, hoisted: a bad index or an ineligible/vanished target fails EVERY
+  // item identically and sends nothing to the browser.
+  if (!Number.isInteger(index) || index < -1) {
+    return ok({
+      results: items.map((it, i) => ({
+        index: i, ok: false, tabId: it && it.tabId,
+        error: ERR_PRECONDITION_FAILED, message: "index must be an integer >= -1",
+      })),
+    });
+  }
+  const windows = await chrome.windows.getAll();
+  const target = windows.find((w) => w.id === targetWindowId);
+  const allTabs = await chrome.tabs.query({});
+  const tabById = new Map(allTabs.map((t) => [t.id, t]));
+  if (!isMergeableWindow(target)) {
+    return ok({
+      results: items.map((it, i) => ({
+        index: i, ok: false, tabId: it && it.tabId,
+        error: ERR_NO_WINDOW, message: `no eligible target window: ${targetWindowId}`,
+      })),
+    });
+  }
+
+  // Mark the target and every source window ONCE (a move re-activates in the target and
+  // activates a neighbour in each emptied source).
+  const affected = [
+    ...new Set(
+      [targetWindowId].concat(
+        items
+          .map((it) => tabById.get(it && it.tabId))
+          .filter((t) => t && t.windowId !== undefined && t.windowId !== null)
+          .map((t) => t.windowId),
+      ),
+    ),
+  ];
+  await map.markCuratorCause(affected, nowFn());
+
+  const results = [];
+  let moved = 0;
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i] || {};
+    const tabId = item.tabId;
+    const tab = tabById.get(tabId);
+    if (!tab) {
+      results.push({ index: i, ok: false, tabId, error: ERR_NO_SUCH_TAB });
+      continue;
+    }
+    // §9's pinned shield: a cross-window move silently strips `pinned`, so a pinned tab
+    // is refused and stays put — exactly the single move's behaviour, per item.
+    if (tab.windowId !== targetWindowId && tab.pinned) {
+      results.push({ index: i, ok: false, tabId, error: ERR_PINNED_CROSS_WINDOW, message: "pinned cross-window" });
+      continue;
+    }
+    try {
+      await chrome.tabs.move(tabId, { windowId: targetWindowId, index });
+      moved += 1;
+      results.push({ index: i, ok: true, tabId, windowId: targetWindowId });
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (/drag/i.test(msg)) {
+        results.push({ index: i, ok: false, tabId, error: ERR_BUSY_DRAGGING, message: msg });
+      } else if (/no tab with id|no such tab/i.test(msg)) {
+        results.push({ index: i, ok: false, tabId, error: ERR_NO_SUCH_TAB, message: msg });
+      } else {
+        results.push({ index: i, ok: false, tabId, error: ERR_INTERNAL, message: msg });
+      }
+    }
+  }
+  if (moved === 0 && affected.length > 0) {
+    await map.clearCuratorCause(affected);
+  }
+  return ok({ results });
+}
+
+// open_tab {items:[{url, pinned, active, seed_age_ms, seed_opened_ago_ms, seed_age_unknown}]}.
+// The §9 target window is picked ONCE (hoisted) and every copy lands there; each item is
+// still opened + seeded in its own try/catch so one bad url never aborts the list. This
+// list form (not the MCP open_tab verb) is what the bulk relocate opens its copies with.
+async function openTabBulk(params, nowFn, map) {
+  const items = params.items;
+  // ONE window pick for the whole list (null => zero normal windows: each item then
+  // creates its own background window, exactly as the single path does).
+  const windowId = await pickNormalWindowId();
+
+  const results = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index] || {};
+    if (!isHttpUrl(item.url)) {
+      results.push({ index, ok: false, error: ERR_PRECONDITION_FAILED, message: "only http/https urls" });
+      continue;
+    }
+    let tab;
+    try {
+      tab = await createCuratorTab(item, windowId);
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (/drag/i.test(msg)) {
+        results.push({ index, ok: false, error: ERR_BUSY_DRAGGING, message: msg });
+        continue;
+      }
+      if (windowId !== null && /no window/i.test(msg)) {
+        // The chosen window vanished mid-list — retry this item in a fresh window (the
+        // auto-select fallback the single path uses; never for a caller-named window).
+        try {
+          tab = await createCuratorTab(item, null);
+        } catch (e2) {
+          results.push({ index, ok: false, error: ERR_INTERNAL, message: String((e2 && e2.message) || e2) });
+          continue;
+        }
+      } else {
+        results.push({ index, ok: false, error: ERR_INTERNAL, message: msg });
+        continue;
+      }
+    }
+    if (!tab || tab.id === undefined) {
+      results.push({ index, ok: false, error: ERR_NO_WINDOW, message: "could not create tab" });
+      continue;
+    }
+    await map.seedCuratorTab(tab.id, item, nowFn());
+    results.push({ index, ok: true, tabId: tab.id, windowId: tab.windowId });
+  }
+  return ok({ results });
 }
 
 // execute_js {code, tabId?, world?}. Gated on the options checkbox in

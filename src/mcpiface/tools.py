@@ -426,6 +426,51 @@ async def _command(app, instance, command, params, *, auth_ctx, expected_session
         raise ToolError(exc.code, exc.message)
 
 
+# --- #49 bulk plumbing -------------------------------------------------------
+def _require_exactly_one_target(tab_id, tab_ids) -> None:
+    """The tab_id / tab_ids XOR gate shared by close_tab / move_tab / relocate_tab (#49).
+
+    EXACTLY ONE of the two must be given: both or neither -> ``invalid_args``. An empty
+    ``tab_ids`` is ``invalid_args`` (a list form with nothing to do), and a DUPLICATE id
+    inside ``tab_ids`` is ``invalid_args`` too — a duplicate would make the extension's
+    per-item loop act on one tab twice (and duplicate the per-item ``actions`` row for
+    relocate), so it is refused BEFORE any frame leaves."""
+    if (tab_id is None) == (tab_ids is None):
+        raise ToolError(
+            "invalid_args", "exactly one of tab_id / tab_ids is required (not both, not neither)"
+        )
+    if tab_ids is not None:
+        if len(tab_ids) == 0:
+            raise ToolError("invalid_args", "tab_ids must be non-empty")
+        if len(set(tab_ids)) != len(tab_ids):
+            raise ToolError("invalid_args", "tab_ids contains duplicate ids")
+
+
+def _reconcile_bulk_results(raw_results, items: list) -> list:
+    """Match the extension's per-item ``results`` back to the input by ``index`` (#49).
+
+    The extension answers ONE frame carrying ``{results:[{index, ok, ...}]}``; the match
+    key is the ``index`` (position in the input list) because an ``open_tab`` item has no
+    id before it opens. A SHORT/missing result — an item the extension never reported —
+    is filled with ``{ok:false, error:"no_result"}`` (annotated with the requested
+    ``tabId`` when the input item carried one, for cross-checking)."""
+    by_index: dict = {}
+    for r in raw_results or []:
+        if isinstance(r, dict) and isinstance(r.get("index"), int):
+            by_index.setdefault(r["index"], r)
+    out: list = []
+    for i, item in enumerate(items):
+        r = by_index.get(i)
+        if r is None:
+            fill = {"index": i, "ok": False, "error": "no_result"}
+            if isinstance(item, dict) and "tabId" in item:
+                fill["tabId"] = item["tabId"]
+            out.append(fill)
+        else:
+            out.append(r)
+    return out
+
+
 async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
                    active: bool = False, window_id: int | None = None,
                    auth_ctx: str | None = None,
@@ -464,15 +509,36 @@ async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
     return {"ok": True, "result": result}
 
 
-async def close_tab(app, *, instance: str, tab_id: int,
+async def close_tab(app, *, instance: str, tab_id: int | None = None,
+                    tab_ids: list[int] | None = None,
                     auth_ctx: str | None = None,
                     expected_session: str | None = None) -> dict:
+    """Close ONE tab (``tab_id``, unchanged response shape) or a LIST (``tab_ids``, #49).
+
+    Bulk sends ONE ``close_tab {items}`` frame; the extension loops it and answers a
+    per-item ``results`` array. The bulk close sends the SAME ``expect`` as the single
+    form — i.e. today NONE: hardening only the bulk path would be a hole (a bulk call
+    that refused an audible tab, retried single, would close it — the guard bypassed by
+    one retry). Tightening the single-close guards is a separate decision, not made here.
+
+    ``timeout`` / ``no_connection`` on the LIST form is UNKNOWN — the extension answers one
+    frame at the very end, so a connection-class failure says nothing about which items
+    were closed. Do NOT blindly retry the whole list; the truth comes from the next
+    ``list_tabs`` (blocking-fresh)."""
     await _ensure_not_paused(app)
+    _require_exactly_one_target(tab_id, tab_ids)
+    if tab_ids is None:
+        result = await _command(
+            app, instance, protocol.CMD_CLOSE_TAB, {"tabId": tab_id}, auth_ctx=auth_ctx,
+            expected_session=expected_session,
+        )
+        return {"ok": True, "result": result}
+    items = [{"tabId": t} for t in tab_ids]  # no `expect` — behaves like single close
     result = await _command(
-        app, instance, protocol.CMD_CLOSE_TAB, {"tabId": tab_id}, auth_ctx=auth_ctx,
+        app, instance, protocol.CMD_CLOSE_TAB, {"items": items}, auth_ctx=auth_ctx,
         expected_session=expected_session,
     )
-    return {"ok": True, "result": result}
+    return {"ok": True, "results": _reconcile_bulk_results(result.get("results"), items)}
 
 
 async def focus_tab(app, *, instance: str, tab_id: int,
@@ -486,7 +552,8 @@ async def focus_tab(app, *, instance: str, tab_id: int,
     return {"ok": True, "result": result}
 
 
-async def move_tab(app, *, instance: str, tab_id: int, window_id: int | None,
+async def move_tab(app, *, instance: str, tab_id: int | None = None,
+                   tab_ids: list[int] | None = None, window_id: int | None = None,
                    index: int | None = None, auth_ctx: str | None = None,
                    expected_session: str | None = None) -> dict:
     """Move one tab to a window/position INSIDE one browser (§6/§9), or — with
@@ -521,12 +588,30 @@ async def move_tab(app, *, instance: str, tab_id: int, window_id: int | None,
     writer with the HTTP button.)
     """
     await _ensure_not_paused(app)
-    params: dict = {"tabId": tab_id, "windowId": window_id}
+    _require_exactly_one_target(tab_id, tab_ids)
+    if tab_ids is None:
+        params: dict = {"tabId": tab_id, "windowId": window_id}
+        if index is not None:
+            params["index"] = index
+        result = await _command(app, instance, protocol.CMD_MOVE_TAB, params, auth_ctx=auth_ctx,
+                                expected_session=expected_session)
+        return {"ok": True, "result": result}
+    # #49 bulk: ONE shared target window for the whole list. ``window_id=None`` (extract
+    # into a NEW window) is refused for a list — ``windows.create`` takes ONE tabId, so
+    # "one new window for all" vs "N windows" is a different, unrequested op.
+    if window_id is None:
+        raise ToolError(
+            "invalid_args",
+            "tab_ids with window_id:null (extract-to-new) is not supported — that is a "
+            "different, unrequested op",
+        )
+    items = [{"tabId": t} for t in tab_ids]
+    params = {"items": items, "windowId": window_id}
     if index is not None:
         params["index"] = index
     result = await _command(app, instance, protocol.CMD_MOVE_TAB, params, auth_ctx=auth_ctx,
                             expected_session=expected_session)
-    return {"ok": True, "result": result}
+    return {"ok": True, "results": _reconcile_bulk_results(result.get("results"), items)}
 
 
 async def merge_windows(app, *, instance: str, params: dict | None = None,
@@ -615,7 +700,53 @@ def _read_relocate_inputs(instance_from: str, tab_id: int, instance_to: str):
     return _fn
 
 
-async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str,
+def _read_bulk_relocate_inputs(instance_from: str, tab_ids: list[int], instance_to: str):
+    """Reader ``fn(conn)`` for the BULK relocate (#49): every source tab row keyed by
+    ``tab_id``, both instances' sessions, the source's focused window id, AND the set of
+    FULL url strings the TARGET already holds (for the batch dedup).
+
+    Returns ``(tabs_by_id, session_from, session_to, focused_window_id_from, target_urls)``.
+    One read for the whole list — the per-item work in the loop touches no DB."""
+    import sqlite3
+
+    def _fn(conn: sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" for _ in tab_ids)
+        tab_rows = conn.execute(
+            "SELECT instance_id, tab_id, window_id, url, title, opened_at, "
+            "last_active_at, age_unknown, pinned, audible, active "
+            f"FROM tabs WHERE instance_id = ? AND tab_id IN ({placeholders})",
+            (instance_from, *tab_ids),
+        ).fetchall()
+        tabs_by_id = {r["tab_id"]: r for r in tab_rows}
+        rows = {
+            r["id"]: r
+            for r in conn.execute(
+                "SELECT id, session_id, focused_window_id FROM instances WHERE id IN (?, ?)",
+                (instance_from, instance_to),
+            ).fetchall()
+        }
+        src = rows.get(instance_from)
+        dst = rows.get(instance_to)
+        target_urls = {
+            r["url"]
+            for r in conn.execute(
+                "SELECT url FROM tabs WHERE instance_id = ?", (instance_to,)
+            ).fetchall()
+        }
+        return (
+            tabs_by_id,
+            src["session_id"] if src is not None else None,
+            dst["session_id"] if dst is not None else None,
+            src["focused_window_id"] if src is not None else None,
+            target_urls,
+        )
+
+    return _fn
+
+
+async def relocate_tab(app, *, instance_from: str, tab_id: int | None = None,
+                       tab_ids: list[int] | None = None, instance_to: str,
                        auth_ctx: str | None = None,
                        expected_session_from: str | None = None) -> dict:
     """MCP-initiated relocation, completed SYNCHRONOUSLY in one call (#48).
@@ -636,8 +767,20 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
     The curator pass stays two-phase; nothing in ``src/curator/`` changes. Undo works
     through a synthetic ``pass_id`` (``mcp-<uuid>``) stamped on both halves and returned
     as ``undo_pass_id`` — no ``passes`` row is written, so metrics and ``_read_last_pass``
-    never see it and a double undo is safe (``restored_at`` → ``already_undone``)."""
+    never see it and a double undo is safe (``restored_at`` → ``already_undone``).
+
+    ``tab_ids`` (#49) relocates a LIST as one unit: ONE ``open_tab {items}`` frame to the
+    target then ONE ``close_tab {items}`` frame to the source, each item running the #48
+    machinery independently and getting its own ``status`` (done/half). The whole call
+    shares ONE ``pass_id`` so ``undo_pass_id`` reverses the batch as a unit. See
+    :func:`_relocate_bulk`."""
     await _ensure_not_paused(app)  # guard 1: the stop switch — a paused curator refuses.
+    _require_exactly_one_target(tab_id, tab_ids)
+    if tab_ids is not None:
+        return await _relocate_bulk(
+            app, instance_from=instance_from, tab_ids=tab_ids, instance_to=instance_to,
+            auth_ctx=auth_ctx, expected_session_from=expected_session_from,
+        )
     db, registry = app.state.db, app.state.ext_registry
 
     tab, db_session_from, db_session_to, focused_window_id_from = await db.read(
@@ -842,6 +985,266 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
 
     await db.write(_done)
     return {**base, "status": "done"}
+
+
+async def _relocate_bulk(app, *, instance_from: str, tab_ids: list[int], instance_to: str,
+                         auth_ctx: str | None, expected_session_from: str | None) -> dict:
+    """Relocate a LIST from ``instance_from`` to ``instance_to`` in THREE frames (#49).
+
+    ONE ``open_tab {items}`` to the target, ONE ``get_tab {items}`` copy-check to the target,
+    then ONE ``close_tab {items}`` to the source; each item runs #48's synchronous machinery
+    independently. The whole call shares ONE ``pass_id = mcp-<uuid>``, so undo reverses the
+    batch as a unit.
+
+    Per-item outcome (``results[i]`` keyed by position in ``tab_ids``):
+
+    * a source that phase B could NEVER close — pinned / audible / active-in-focus — is
+      refused BEFORE its copy opens: ``ok:false`` (opening an un-closeable copy would
+      strike the pair toward quarantine on every refused close, as in #48 guard 4);
+    * DEDUP is required: ``decide`` protects a pass from opening two copies of one address,
+      but this ``open_tab {items}`` frame has no such guard — five sources with one url
+      would make five permanent copies. Items are deduped by FULL url string against BOTH
+      what the target already holds AND earlier kept items in this batch; a dropped item
+      gets ``ok:false, error:"duplicate"``;
+    * an item whose phase A (open) failed gets ``ok:false``;
+    * an opened copy whose source closed is ``ok:true, status:"done"``; one whose source
+      close could not complete is ``ok:true, status:"half"`` — today's normal state, the
+      pass's phase B finishes it later;
+    * an opened copy that VANISHED before the source close (a target restart caught by the
+      get_tab copy-check) is ``ok:true, status:"half", reason:"copy_gone"`` — its source is
+      NOT closed and its relocate_close is left ``pending`` (reconcile abandons it once it
+      finds the source present), never an irrecoverable loss.
+
+    ``timeout`` / ``no_connection`` on either frame is UNKNOWN. On the OPEN frame nothing is
+    written and the ToolError propagates; on the CLOSE frame the copies are already open
+    and the ``pending`` rows written, so every live item is reported ``half`` (the pass's
+    reconcile completes them) rather than raising — but the caller must still treat the
+    connection-class ``reason`` as UNKNOWN and re-read ``list_tabs``, never blind-retry."""
+    db, registry = app.state.db, app.state.ext_registry
+
+    tabs_by_id, db_session_from, db_session_to, focused_window_id_from, target_urls = await db.read(
+        _read_bulk_relocate_inputs(instance_from, tab_ids, instance_to)
+    )
+    cs_from = registry.get(instance_from)
+    cs_to = registry.get(instance_to)
+    session_from = cs_from.session_id if cs_from is not None else db_session_from
+    session_to = cs_to.session_id if cs_to is not None else db_session_to
+
+    # Source-session pre-check for the WHOLE call (as the single form does): a restarted
+    # source means every tab_id is from a dead epoch — refuse the batch, touch nothing.
+    if expected_session_from is not None and expected_session_from != session_from:
+        raise ToolError(
+            protocol.ERR_STALE_SESSION,
+            f"source session for {instance_from} is not {expected_session_from!r} "
+            "(the source browser restarted); bulk relocation refused",
+        )
+
+    now = _now_ms()
+    results: list = [None] * len(tab_ids)
+    plan: list = []  # (orig_index, tab_row) for items that will get a copy opened
+    seen_urls: set = set()  # urls already kept in THIS batch (within-batch dedup)
+    for i, tid in enumerate(tab_ids):
+        tab = tabs_by_id.get(tid)
+        if tab is None:
+            results[i] = {"index": i, "ok": False, "error": "no_such_tab", "tab_id": tid}
+            continue
+        # #48 guard 4, per item: a pinned/audible/active-in-focus source can never be
+        # closed by phase B — do not open an un-closeable copy for it.
+        if tab["pinned"]:
+            results[i] = {"index": i, "ok": False, "error": protocol.ERR_PRECONDITION_FAILED,
+                          "reason": "pinned", "tab_id": tid}
+            continue
+        if tab["audible"]:
+            results[i] = {"index": i, "ok": False, "error": protocol.ERR_PRECONDITION_FAILED,
+                          "reason": "audible", "tab_id": tid}
+            continue
+        if (tab["active"] and tab["window_id"] is not None
+                and tab["window_id"] == focused_window_id_from):
+            results[i] = {"index": i, "ok": False, "error": protocol.ERR_PRECONDITION_FAILED,
+                          "reason": "active_in_focus", "tab_id": tid}
+            continue
+        url = tab["url"]
+        if url in target_urls or url in seen_urls:
+            results[i] = {"index": i, "ok": False, "error": "duplicate", "tab_id": tid}
+            continue
+        seen_urls.add(url)
+        plan.append((i, tab))
+
+    if not plan:  # everything failed a guard or deduped — no pass, no rows.
+        return {"ok": True, "undo_pass_id": None, "results": results}
+
+    pass_id = f"mcp-{uuid4()}"
+
+    # Phase A: ONE open_tab {items} frame to the target. A frame-level failure
+    # (no_connection/timeout) raises here with nothing written — UNKNOWN, agent re-reads.
+    open_items = [
+        {
+            "url": tab["url"], "pinned": False, "active": False,
+            "seed_age_ms": now - tab["last_active_at"],
+            "seed_opened_ago_ms": now - tab["opened_at"],
+            "seed_age_unknown": bool(tab["age_unknown"]),
+        }
+        for (_i, tab) in plan
+    ]
+    open_result = await _command(
+        app, instance_to, protocol.CMD_OPEN_TAB, {"items": open_items}, auth_ctx=auth_ctx
+    )
+    opened = _reconcile_bulk_results(open_result.get("results"), open_items)
+
+    live: list = []  # (orig_index, tab, tab_id_to, window_id_to)
+    for j, (i, tab) in enumerate(plan):
+        r = opened[j]
+        tid_to = r.get("tabId")
+        if not r.get("ok") or not isinstance(tid_to, int) or isinstance(tid_to, bool):
+            results[i] = {"index": i, "ok": False, "error": r.get("error") or "open_failed",
+                          "message": r.get("message"), "tab_id": tab["tab_id"]}
+            continue
+        live.append((i, tab, tid_to, r.get("windowId")))
+
+    if not live:  # every copy failed to open — nothing to close, no rows to write.
+        return {"ok": True, "undo_pass_id": None, "results": results}
+
+    # Steps 3+4 for every live item in ONE transaction: the copy's mirror row + the live
+    # ``relocate``(done) + the ``relocate_close``(pending) marker (the at-least-once
+    # discipline of #48, all under the shared pass_id).
+    def _write_pairs(conn):
+        from src.curator.phases import _insert_copy_tab
+
+        out: dict = {}
+        for (i, tab, tid_to, win_to) in live:
+            seed = SimpleNamespace(
+                url=tab["url"], title=tab["title"], opened_at=tab["opened_at"],
+                last_active_at=tab["last_active_at"], age_unknown=tab["age_unknown"],
+            )
+            _insert_copy_tab(
+                conn, instance_id=instance_to, tab_id=tid_to, window_id=win_to,
+                tab=seed, now=now,
+            )
+            url = tab["url"]
+            url_norm = normalize_url(url)
+            relocate_id = insert_action(
+                conn, ts=now, kind="relocate", status="done", initiator="mcp",
+                pass_id=pass_id, instance_from=instance_from, instance_to=instance_to,
+                tab_id=tab["tab_id"], session_id_from=session_from,
+                tab_id_to=tid_to, session_id_to=session_to, decision="mcp_relocate",
+                src_opened_at=tab["opened_at"], src_last_active_at=tab["last_active_at"],
+                src_age_unknown=tab["age_unknown"], url=url, url_norm=url_norm,
+                title=tab["title"], pinned=0,
+            )
+            close_id = insert_action(
+                conn, ts=now, kind="relocate_close", status="pending", initiator="mcp",
+                pass_id=pass_id, origin_action_id=relocate_id,
+                instance_from=instance_from, instance_to=instance_to,
+                tab_id=tab["tab_id"], session_id_from=session_from,
+                tab_id_to=tid_to, session_id_to=session_to,
+                url=url, url_norm=url_norm, title=tab["title"],
+            )
+            out[i] = (relocate_id, close_id)
+        return out
+
+    pair_ids = await db.write(_write_pairs)
+
+    def _base(i, tab, tid_to):
+        return {"index": i, "ok": True, "tab_id_to": tid_to, "instance_to": instance_to,
+                "undo_pass_id": pass_id, "tab_id": tab["tab_id"]}
+
+    # COPY CHECK (#48's guard, per item, over the batch): before closing any source,
+    # confirm every copy still exists on the target. A target restart between phase A and
+    # now would have destroyed the copies; the phase B close still matches
+    # expect{url,notAudible,notPinned} and would delete the sources — an IRRECOVERABLE loss
+    # with no pending row left to reconcile. ONE get_tab {items} to the target, NO
+    # ``expected_session`` (reading a restarted target is fine, as #48 single does). This
+    # makes bulk relocate 3 frames (open, get_tab, close) — consistent with #48's 3 commands;
+    # correctness over the 2-frame budget.
+    check_items = [{"tabId": tid_to} for (_i, _tab, tid_to, _win) in live]
+    try:
+        check_result = await _command(
+            app, instance_to, protocol.CMD_GET_TAB, {"items": check_items}, auth_ctx=auth_ctx,
+        )
+    except ToolError as exc:
+        # Frame-level failure (no_connection / timeout to the target) — UNKNOWN for the whole
+        # frame. Sources untouched, ``pending`` rows left; mark every live item ``half`` and
+        # return (mirror of the close-frame-failure branch below).
+        for (i, tab, tid_to, _win) in live:
+            results[i] = {**_base(i, tab, tid_to), "status": "half", "reason": exc.code}
+        return {"ok": True, "undo_pass_id": pass_id, "results": results}
+
+    checked = _reconcile_bulk_results(check_result.get("results"), check_items)
+    present: list = []  # (orig_index, tab, tab_id_to, window_id_to) whose copy is confirmed
+    for j, (i, tab, tid_to, win_to) in enumerate(live):
+        if checked[j].get("ok"):
+            present.append((i, tab, tid_to, win_to))
+        else:
+            # The copy vanished (target restart): degrade to half/copy_gone, DO NOT close the
+            # source, and LEAVE its relocate_close pending — reconcile finds the source present
+            # and abandons it. Only confirmed copies proceed to phase B.
+            results[i] = {**_base(i, tab, tid_to), "status": "half", "reason": "copy_gone"}
+
+    if not present:  # every copy vanished — no source to close, pending rows left for reconcile.
+        return {"ok": True, "undo_pass_id": pass_id, "results": results}
+
+    # Phase B: ONE close_tab {items} frame to the SOURCE, stamped with the pinned #47
+    # epoch. The step-4 guards (url/notAudible/notPinned, deliberately NO minIdleMs — the
+    # agent explicitly chose these tabs) ride per item.
+    close_items = []
+    close_map = []  # (orig_index, tab, close_id, tab_id_to)
+    for (i, tab, tid_to, _win_to) in present:
+        close_items.append({
+            "tabId": tab["tab_id"],
+            "expect": {"url": tab["url"], "notAudible": True, "notPinned": True},
+        })
+        close_map.append((i, tab, pair_ids[i][1], tid_to))
+
+    try:
+        close_result = await _command(
+            app, instance_from, protocol.CMD_CLOSE_TAB, {"items": close_items},
+            auth_ctx=auth_ctx, expected_session=expected_session_from,
+        )
+    except ToolError as exc:
+        # Frame-level failure (no_connection / timeout / stale_session): the source close
+        # is UNKNOWN for the whole frame. Leave the ``pending`` rows for the pass's
+        # reconcile and report every live item ``half`` with the code.
+        for (i, tab, _cid, tid_to) in close_map:
+            results[i] = {**_base(i, tab, tid_to), "status": "half", "reason": exc.code}
+        return {"ok": True, "undo_pass_id": pass_id, "results": results}
+
+    closed = _reconcile_bulk_results(close_result.get("results"), close_items)
+
+    # Resolve each live item and apply ALL pending-row transitions in one transaction.
+    resolutions: list = []  # ("done"|"done_gone"|"failed", close_id[, iid, tab_id][, reason])
+    for k, (i, tab, close_id, tid_to) in enumerate(close_map):
+        cr = closed[k]
+        if cr.get("ok"):
+            resolutions.append(("done", close_id, instance_from, tab["tab_id"]))
+            results[i] = {**_base(i, tab, tid_to), "status": "done"}
+        elif cr.get("error") == protocol.ERR_NO_SUCH_TAB:
+            # The source is already gone: the goal is reached — complete it.
+            resolutions.append(("done_gone", close_id, instance_from, tab["tab_id"]))
+            results[i] = {**_base(i, tab, tid_to), "status": "done"}
+        elif cr.get("error") == protocol.ERR_PRECONDITION_FAILED:
+            resolutions.append(("failed", close_id, protocol.ERR_PRECONDITION_FAILED))
+            results[i] = {**_base(i, tab, tid_to), "status": "half",
+                          "reason": protocol.ERR_PRECONDITION_FAILED}
+        else:  # no_result / connection-class / any other UNKNOWN per-item code: uncertain.
+            # Report ``half`` but LEAVE the row ``pending`` (append NO resolution) — reconcile
+            # checks the mirror. Never ``failed``, which a later pass would blindly retry; this
+            # mirrors #48 single's UNKNOWN/connection-class close.
+            reason = cr.get("error") or "no_result"
+            results[i] = {**_base(i, tab, tid_to), "status": "half", "reason": reason}
+
+    def _apply(conn):
+        for res in resolutions:
+            if res[0] == "done":
+                set_action_status(conn, res[1], "done")
+                _delete_source_tab(conn, res[2], res[3])
+            elif res[0] == "done_gone":
+                set_action_status(conn, res[1], "done", reason=protocol.ERR_NO_SUCH_TAB)
+                _delete_source_tab(conn, res[2], res[3])
+            else:  # failed
+                set_action_status(conn, res[1], "failed", reason=res[2])
+
+    await db.write(_apply)
+    return {"ok": True, "undo_pass_id": pass_id, "results": results}
 
 
 def _delete_source_tab(conn, instance_id: str, tab_id: int) -> None:

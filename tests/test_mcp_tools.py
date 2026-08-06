@@ -1450,3 +1450,346 @@ async def test_mcp_tools_refuse_in_degraded_mode(tmp_path):
         assert n[0] == 0
     finally:
         await db.close()
+
+
+# --- #49 bulk verbs: ONE frame per list, per-item results --------------------
+async def test_close_tab_bulk_three_ids_is_ONE_frame_with_per_item_results(tmp_path):
+    # Acceptance 1 + 2: three tab_ids, one already closed -> array of three (two ok, the
+    # gone one no_such_tab); and the whole call puts EXACTLY ONE frame on the socket.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="s1")
+    app = _app(db, reg)
+    ext = {"results": [
+        {"index": 0, "ok": True, "tabId": 10},
+        {"index": 1, "ok": False, "tabId": 11, "error": "no_such_tab"},
+        {"index": 2, "ok": True, "tabId": 12},
+    ]}
+    out, frame = await _run_with_response(
+        lambda: tools.close_tab(app, instance="main", tab_ids=[10, 11, 12], auth_ctx="s"),
+        cs, ws, ext,
+    )
+    assert len(ws.sent) == 1  # acceptance 2: the core proof — ONE frame, not three
+    assert frame["command"] == protocol.CMD_CLOSE_TAB
+    assert frame["params"] == {"items": [{"tabId": 10}, {"tabId": 11}, {"tabId": 12}]}
+    assert out == {"ok": True, "results": ext["results"]}
+
+
+async def test_close_tab_bulk_short_result_array_filled_with_no_result(tmp_path):
+    # The extension answered fewer results than items -> the missing index is filled
+    # with {ok:false, error:"no_result"} (annotated with the requested tabId).
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="s1")
+    app = _app(db, reg)
+    ext = {"results": [{"index": 0, "ok": True, "tabId": 10}]}  # index 1 missing
+    out, _ = await _run_with_response(
+        lambda: tools.close_tab(app, instance="main", tab_ids=[10, 11], auth_ctx="s"),
+        cs, ws, ext,
+    )
+    assert out["results"] == [
+        {"index": 0, "ok": True, "tabId": 10},
+        {"index": 1, "ok": False, "error": "no_result", "tabId": 11},
+    ]
+
+
+async def test_close_tab_single_form_keeps_prior_response_shape(tmp_path):
+    # Acceptance 8: the single form (tab_id) is byte-for-byte the prior contract.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="s1")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.close_tab(app, instance="main", tab_id=5, auth_ctx="s"),
+        cs, ws, {"ok": True},
+    )
+    assert frame["params"] == {"tabId": 5}  # single frame form unchanged
+    assert out == {"ok": True, "result": {"ok": True}}
+
+
+async def test_move_tab_single_form_keeps_prior_response_shape(tmp_path):
+    # Acceptance 8: move_tab single form unchanged.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="s1")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.move_tab(app, instance="main", tab_id=7, window_id=3, index=0, auth_ctx="s"),
+        cs, ws, {"tabId": 7, "windowId": 3, "index": 0},
+    )
+    assert frame["params"] == {"tabId": 7, "windowId": 3, "index": 0}
+    assert out == {"ok": True, "result": {"tabId": 7, "windowId": 3, "index": 0}}
+
+
+async def test_move_tab_bulk_is_one_frame_with_shared_window(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="s1")
+    app = _app(db, reg)
+    ext = {"results": [
+        {"index": 0, "ok": True, "tabId": 1, "windowId": 3},
+        {"index": 1, "ok": False, "tabId": 2, "error": "pinned_cross_window"},
+    ]}
+    out, frame = await _run_with_response(
+        lambda: tools.move_tab(app, instance="main", tab_ids=[1, 2], window_id=3, auth_ctx="s"),
+        cs, ws, ext,
+    )
+    assert len(ws.sent) == 1
+    assert frame["params"] == {"items": [{"tabId": 1}, {"tabId": 2}], "windowId": 3}
+    assert out == {"ok": True, "results": ext["results"]}
+
+
+async def test_bulk_invalid_args_gates_send_no_frame(tmp_path):
+    # Acceptance 9: all the invalid_args shapes refuse BEFORE the send.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="s1")
+    app = _app(db, reg)
+    bad = [
+        lambda: tools.close_tab(app, instance="main", tab_id=1, tab_ids=[1]),  # both
+        lambda: tools.close_tab(app, instance="main"),                          # neither
+        lambda: tools.close_tab(app, instance="main", tab_ids=[]),              # empty
+        lambda: tools.close_tab(app, instance="main", tab_ids=[1, 1]),          # duplicate
+        lambda: tools.move_tab(app, instance="main", tab_id=1, tab_ids=[1], window_id=2),  # both
+        lambda: tools.move_tab(app, instance="main", tab_ids=[1, 2], window_id=None),  # tab_ids+null
+        lambda: tools.relocate_tab(app, instance_from="a", instance_to="b",
+                                   tab_id=1, tab_ids=[1]),                        # both
+        lambda: tools.relocate_tab(app, instance_from="a", instance_to="b", tab_ids=[]),  # empty
+        lambda: tools.relocate_tab(app, instance_from="a", instance_to="b", tab_ids=[1, 1]),  # dup
+    ]
+    for call in bad:
+        with pytest.raises(tools.ToolError) as ei:
+            await call()
+        assert ei.value.code == "invalid_args"
+    assert ws.sent == []  # not one frame left, for any of them
+
+
+async def test_bulk_verbs_refused_while_paused_send_nothing(tmp_path):
+    # Acceptance 11: the pause gate refuses every bulk verb and sends no frame.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="s1")
+    app = _app(db, reg)
+    await db.write(lambda c: pause_ops.pause(c, now=tools._now_ms(), minutes=30))
+    calls = [
+        lambda: tools.close_tab(app, instance="main", tab_ids=[1, 2]),
+        lambda: tools.move_tab(app, instance="main", tab_ids=[1, 2], window_id=3),
+        lambda: tools.relocate_tab(app, instance_from="main", instance_to="main", tab_ids=[1, 2]),
+    ]
+    for call in calls:
+        with pytest.raises(tools.ToolError) as ei:
+            await call()
+        assert ei.value.code == "paused"
+    assert ws.sent == []
+
+
+# --- #49 bulk relocate: two frames, dedup, one pass_id -----------------------
+def _bulk_reloc_responder(open_ids):
+    """Answer the bulk relocate's THREE frames: open_tab {items} assigns each opened copy a
+    tabId from ``open_ids`` (in item order); get_tab {items} copy-check reports every copy
+    present; close_tab {items} succeeds per item."""
+    def _r(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            items = params.get("items", [])
+            return {"results": [
+                {"index": i, "ok": True, "tabId": open_ids[i], "windowId": 1}
+                for i in range(len(items))
+            ]}
+        if cmd == protocol.CMD_GET_TAB:
+            items = params.get("items", [])
+            return {"results": [
+                {"index": i, "ok": True, "tabId": it["tabId"]}
+                for i, it in enumerate(items)
+            ]}
+        if cmd == protocol.CMD_CLOSE_TAB:
+            items = params.get("items", [])
+            return {"results": [
+                {"index": i, "ok": True, "tabId": it["tabId"]}
+                for i, it in enumerate(items)
+            ]}
+        return {"ok": True}
+    return _r
+
+
+async def test_relocate_bulk_two_frames_per_item_status_and_copies(tmp_path):
+    # Acceptance 5: relocate a list -> per-item status; target holds copies of all.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://a/x", opened_at=100, last_active_at=200)
+    await _insert_tab(db, "themed", 6, url="https://b/y", opened_at=100, last_active_at=200)
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    out, frames = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_ids=[5, 6],
+                                   instance_to="main", auth_ctx="mcp-s"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _bulk_reloc_responder([101, 102]),
+    )
+    # EXACTLY three frames: ONE open to the target, ONE get_tab copy-check to the target,
+    # ONE close to the source (#49 copy-check makes bulk relocate 3 frames, like #48 single).
+    cmds = [(iid, f["command"]) for iid, f in frames]
+    assert cmds == [("main", protocol.CMD_OPEN_TAB), ("main", protocol.CMD_GET_TAB),
+                    ("themed", protocol.CMD_CLOSE_TAB)]
+    assert out["ok"] is True
+    assert [r["status"] for r in out["results"]] == ["done", "done"]
+    assert all(r["ok"] for r in out["results"])
+    # The target holds BOTH copies; both source rows are gone.
+    urls = await db.read(lambda c: c.execute(
+        "SELECT url FROM tabs WHERE instance_id='main' ORDER BY url").fetchall())
+    assert [u[0] for u in urls] == ["https://a/x", "https://b/y"]
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed'").fetchone()) == (0,)
+
+
+async def test_relocate_bulk_copy_gone_between_open_and_close_leaves_source(tmp_path):
+    # FIX 1 (#49 data-loss guard): a target restart between the open and the close destroys
+    # ONE copy. The get_tab copy-check catches it — that item is half/copy_gone, its SOURCE is
+    # NOT closed (mirror row survives) and its relocate_close is left PENDING for reconcile;
+    # the other item, whose copy is present, completes done and its source is dropped.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://a/x", opened_at=100, last_active_at=200)
+    await _insert_tab(db, "themed", 6, url="https://b/y", opened_at=100, last_active_at=200)
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    def responder(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            items = params["items"]  # copy 101 <- source 5, copy 102 <- source 6
+            return {"results": [{"index": i, "ok": True, "tabId": 101 + i, "windowId": 1}
+                                for i in range(len(items))]}
+        if cmd == protocol.CMD_GET_TAB:
+            # The copy-check: copy 102 (source tab 6) vanished (target restart); 101 present.
+            out = []
+            for i, it in enumerate(params["items"]):
+                if it["tabId"] == 102:
+                    out.append({"index": i, "ok": False, "tabId": 102,
+                                "error": protocol.ERR_NO_SUCH_TAB})
+                else:
+                    out.append({"index": i, "ok": True, "tabId": it["tabId"]})
+            return {"results": out}
+        if cmd == protocol.CMD_CLOSE_TAB:
+            # ONLY the confirmed copy's source (tab 5) may be closed — tab 6 must NOT appear.
+            items = params["items"]
+            assert all(it["tabId"] != 6 for it in items), "copy_gone source must not be closed"
+            return {"results": [{"index": i, "ok": True, "tabId": it["tabId"]}
+                                for i, it in enumerate(items)]}
+        raise AssertionError(f"unexpected command {cmd}")
+
+    out, frames = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_ids=[5, 6],
+                                   instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        responder,
+    )
+    # Item 0 (copy present) done; item 1 (copy gone) half/copy_gone.
+    assert out["results"][0]["status"] == "done"
+    assert out["results"][1]["status"] == "half"
+    assert out["results"][1]["reason"] == "copy_gone"
+    # The copy_gone item's SOURCE (tab 6) is NOT deleted — its mirror row survives.
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed' AND tab_id=6").fetchone()) == (1,)
+    # The done item's source (tab 5) IS gone.
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed' AND tab_id=5").fetchone()) == (0,)
+    # The copy_gone item's relocate_close is still PENDING; the done item's is done.
+    rows = await db.read(lambda c: c.execute(
+        "SELECT tab_id, status FROM actions WHERE kind='relocate_close' ORDER BY tab_id"
+    ).fetchall())
+    assert rows == [(5, "done"), (6, "pending")]
+
+
+async def test_relocate_bulk_dedup_same_url_drops_the_second(tmp_path):
+    # Acceptance 6: two sources holding the SAME url into one target -> the second gets
+    # error:"duplicate", exactly ONE copy in the target, and the open frame carried ONE item.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://dup/same", opened_at=100, last_active_at=200)
+    await _insert_tab(db, "themed", 6, url="https://dup/same", opened_at=100, last_active_at=200)
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    out, frames = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_ids=[5, 6],
+                                   instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _bulk_reloc_responder([201]),  # only ONE copy is ever opened
+    )
+    assert out["results"][0]["status"] == "done"
+    assert out["results"][1] == {"index": 1, "ok": False, "error": "duplicate", "tab_id": 6}
+    # Exactly ONE copy landed in the target.
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='main'").fetchone()) == (1,)
+    # Dedup happened BEFORE the send: the open frame carried a single item.
+    open_frame = next(f for iid, f in frames if f["command"] == protocol.CMD_OPEN_TAB)
+    assert len(open_frame["params"]["items"]) == 1
+
+
+async def test_relocate_bulk_dedup_against_target_existing_url(tmp_path):
+    # Dedup is also against what the TARGET already holds, not only within the batch.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://already/there", opened_at=100, last_active_at=200)
+    await _insert_tab(db, "main", 900, url="https://already/there")  # target already holds it
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    out, frames = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_ids=[5],
+                                   instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _bulk_reloc_responder([]),
+    )
+    assert out["results"][0] == {"index": 0, "ok": False, "error": "duplicate", "tab_id": 5}
+    assert out["undo_pass_id"] is None  # nothing opened => no pass
+    # No frame was ever sent (the only item was deduped before phase A).
+    assert [c for _iid, c in [(iid, f["command"]) for iid, f in frames]] == []
+
+
+async def test_relocate_bulk_one_undo_pass_id_reverses_the_whole_batch(tmp_path):
+    # Acceptance 7: the batch shares ONE undo_pass_id; undo sees it as one unit-set.
+    from src.api.undo import _classify, _read_pass_actions
+
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://a/x", opened_at=100, last_active_at=200)
+    await _insert_tab(db, "themed", 6, url="https://b/y", opened_at=100, last_active_at=200)
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    out, _ = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_ids=[5, 6],
+                                   instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _bulk_reloc_responder([101, 102]),
+    )
+    pid = out["undo_pass_id"]
+    assert pid and pid.startswith("mcp-")
+    rows = await db.read(lambda c: _read_pass_actions(c, pid))
+    # All FOUR rows (2 relocate + 2 relocate_close) share the ONE pass_id.
+    kinds = sorted((r["kind"], r["status"]) for r in rows)
+    assert kinds == [("relocate", "done"), ("relocate", "done"),
+                     ("relocate_close", "done"), ("relocate_close", "done")]
+    # No `passes` row is written for a synthetic mcp- pass.
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM passes WHERE pass_id=?", (pid,)).fetchone()) == (0,)
+    # Undo classifies the batch as TWO units and requires confirm (impact>0), like a pass.
+    cls = _classify(rows)
+    assert cls["relocations"] == 2
+    assert cls["reopens"] == 2 and cls["copy_closes"] == 2 and cls["impact"] > 0

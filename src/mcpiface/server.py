@@ -191,12 +191,20 @@ def build_mcp(app_ref) -> MCPServer:
         ))
 
     @mcp.tool()
-    async def close_tab(instance: str, tab_id: int,
+    async def close_tab(instance: str, tab_id: int | None = None,
+                        tab_ids: list[int] | None = None,
                         expected_session: str | None = None) -> dict:
-        """Close a tab in an instance (§6)."""
+        """Close ONE tab (``tab_id``) or a LIST (``tab_ids``) in an instance (§6/#49).
+
+        EXACTLY ONE of ``tab_id`` / ``tab_ids`` is required (both/neither, an empty
+        ``tab_ids``, or duplicate ids => ``invalid_args``, nothing sent). The single form
+        returns ``{result}`` unchanged; the list returns ``{results:[{index, ok, tabId?,
+        error?, message?}]}`` matched by ``index``. Bulk applies the SAME guards as single
+        (today none). ``timeout``/``no_connection`` on the LIST is UNKNOWN — the truth is
+        the next ``list_tabs``; do NOT blindly retry the whole list."""
         return await _guarded(tools.close_tab(
-            _host(), instance=instance, tab_id=tab_id, auth_ctx=current_mcp_session(),
-            expected_session=expected_session,
+            _host(), instance=instance, tab_id=tab_id, tab_ids=tab_ids,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 
     @mcp.tool()
@@ -210,19 +218,27 @@ def build_mcp(app_ref) -> MCPServer:
 
     @mcp.tool()
     async def move_tab(
-        instance: str, tab_id: int, window_id: int | None, index: int | None = None,
+        instance: str, window_id: int | None, tab_id: int | None = None,
+        tab_ids: list[int] | None = None, index: int | None = None,
         expected_session: str | None = None,
     ) -> dict:
-        """Move a tab to a window/position inside one browser; omit index for the end.
+        """Move ONE tab (``tab_id``) or a LIST (``tab_ids``) to ``window_id``/position
+        inside one browser; omit index for the end (§6/§9/#49).
 
-        Pass ``window_id=null`` to EXTRACT the tab into a brand-new background window
-        (#45); the response ``windowId`` is then the created window's id. Refuses with
-        ``pinned_cross_window`` when the tab is pinned and the move would leave its window
-        (§9, including the new-window case), and with ``no_window`` when a NAMED target is
-        not a normal, non-fullscreen window.
+        EXACTLY ONE of ``tab_id`` / ``tab_ids`` is required (both/neither, empty, or
+        duplicate ids => ``invalid_args``). The single form returns ``{result}`` unchanged;
+        the list returns ``{results:[{index, ok, tabId?, windowId?, error?}]}`` — a pinned
+        cross-window tab gets ``pinned_cross_window`` and stays, others move.
+
+        Pass ``window_id=null`` to EXTRACT a SINGLE tab into a brand-new background window
+        (#45); the response ``windowId`` is the created window's id. ``tab_ids`` WITH
+        ``window_id=null`` is ``invalid_args`` — ``windows.create`` takes one tabId, so
+        "one new window for all" is a different, unrequested op. Refuses with ``no_window``
+        when a NAMED target is not a normal, non-fullscreen window. ``timeout``/
+        ``no_connection`` on the LIST is UNKNOWN — re-read ``list_tabs``, do not blind-retry.
         """
         return await _guarded(tools.move_tab(
-            _host(), instance=instance, tab_id=tab_id, window_id=window_id,
+            _host(), instance=instance, tab_id=tab_id, tab_ids=tab_ids, window_id=window_id,
             index=index, auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 
@@ -249,22 +265,34 @@ def build_mcp(app_ref) -> MCPServer:
         ))
 
     @mcp.tool()
-    async def relocate_tab(instance_from: str, tab_id: int, instance_to: str,
+    async def relocate_tab(instance_from: str, instance_to: str,
+                           tab_id: int | None = None, tab_ids: list[int] | None = None,
                            expected_session_from: str | None = None) -> dict:
-        """Relocate a tab, completed synchronously in ONE call (#48): open the copy in the
-        target and close the source under §7's step-4 guards. Returns ``status:"done"`` on
-        success, or ``status:"half"`` (with a ``reason``) when the source close cannot be
-        completed — today's phase-A-only outcome, which the pass's phase B finishes later.
-        ``undo_pass_id`` (``mcp-<uuid>``) reverses the whole relocation.
+        """Relocate ONE tab (``tab_id``) or a LIST (``tab_ids``) from ``instance_from`` to
+        ``instance_to``, completed synchronously (#48/#49): open the copy in the target and
+        close the source under §7's step-4 guards. Returns ``status:"done"`` on success, or
+        ``status:"half"`` (with a ``reason``) when the source close cannot be completed —
+        today's phase-A-only outcome, which the pass's phase B finishes later.
+
+        EXACTLY ONE of ``tab_id`` / ``tab_ids`` is required (both/neither, empty, or
+        duplicate ids => ``invalid_args``). The single form returns the #48 shape; the list
+        returns ``{results:[{index, ok, status?, reason?, tab_id_to?, error?}]}`` and ONE
+        shared ``undo_pass_id`` (``mcp-<uuid>``) that reverses the WHOLE batch as a unit
+        (undo counts its units and requires ``confirm_impact`` like a pass). Duplicate
+        addresses are DEDUPED within the batch and against what the target already holds —
+        a dropped item gets ``error:"duplicate"`` (else N sources of one url would make N
+        permanent copies). ``undo_pass_id`` (``mcp-<uuid>``) reverses the relocation.
 
         ``expected_session_from`` pins the SOURCE epoch (#47): a restarted source browser
         refuses the relocation before any copy is opened, and the same epoch is stamped on
         the synchronous source close. The target open/get_tab are never session-pinned — a
-        copy in a restarted target is correct, not dangerous.
+        copy in a restarted target is correct, not dangerous. ``timeout``/``no_connection``
+        on the LIST is UNKNOWN — re-read ``list_tabs``, do not blind-retry the batch.
         """
         return await _guarded(tools.relocate_tab(
-            _host(), instance_from=instance_from, tab_id=tab_id, instance_to=instance_to,
-            auth_ctx=current_mcp_session(), expected_session_from=expected_session_from,
+            _host(), instance_from=instance_from, tab_id=tab_id, tab_ids=tab_ids,
+            instance_to=instance_to, auth_ctx=current_mcp_session(),
+            expected_session_from=expected_session_from,
         ))
 
     # --- pass + pause --------------------------------------------------------

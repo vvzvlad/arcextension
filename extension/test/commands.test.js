@@ -1346,3 +1346,210 @@ describe("execute_js checkbox gate (§12)", () => {
     expect(exec).not.toHaveBeenCalled();
   });
 });
+
+// --- #49 bulk verbs: ONE frame per list, looped item by item ----------------
+describe("#49 bulk close_tab {items}", () => {
+  function chromeTwoWindows() {
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", pinned: false, audible: false, active: false },
+        { id: 200, windowId: 2, url: "https://b/", pinned: false, audible: false, active: false },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 2, type: "normal", state: "normal" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+  }
+
+  it("acceptance 1: three items, one already closed => two ok, the gone one no_such_tab", async () => {
+    chromeTwoWindows(); // tabs 100, 200 exist; 999 does not
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { items: [{ tabId: 100 }, { tabId: 999 }, { tabId: 200 }] }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.results).toEqual([
+      { index: 0, ok: true, tabId: 100 },
+      { index: 1, ok: false, tabId: 999, error: "no_such_tab" },
+      { index: 2, ok: true, tabId: 200 },
+    ]);
+    // The two live tabs were really removed; the missing one changed nothing.
+    expect(chrome.__state.tabs.map((t) => t.id)).toEqual([]);
+  });
+
+  it("acceptance 3: ONE markCuratorCause with ALL affected windows, not one per item", async () => {
+    chromeTwoWindows();
+    const map = spyMap();
+    await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { items: [{ tabId: 100 }, { tabId: 200 }] }),
+      ctx({ map }),
+    );
+    expect(map.markCuratorCause).toHaveBeenCalledTimes(1);
+    const [windows, when] = map.markCuratorCause.mock.calls[0];
+    expect(new Set(windows)).toEqual(new Set([1, 2])); // both windows in ONE call
+    expect(when).toBe(NOW);
+  });
+
+  it("whole-batch failure (every live item's remove throws) rolls the marks back", async () => {
+    chromeTwoWindows();
+    // EXISTING tabs 100 (win 1) and 200 (win 2), but every chrome.tabs.remove REJECTS. So
+    // the windows ARE affected (affected=[1,2]) yet removed stays 0 => the rollback branch
+    // (removed===0 && affected.length>0) actually runs — the opposite of the previous
+    // 998/999 version, where the gone ids left affected empty and the branch never fired.
+    chrome.__state.removeError = "Tabs cannot be edited right now.";
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { items: [{ tabId: 100 }, { tabId: 200 }] }),
+      ctx({ map }),
+    );
+    expect(res.result.results.every((r) => r.ok === false)).toBe(true);
+    // Nothing closed (removed===0) but both windows were marked => the marks are rolled back
+    // with EXACTLY those affected windows.
+    expect(map.clearCuratorCause).toHaveBeenCalledTimes(1);
+    expect(new Set(map.clearCuratorCause.mock.calls[0][0])).toEqual(new Set([1, 2]));
+  });
+
+  it("per-item expect (the bulk-relocate close) re-checks guards live; audible one refused", async () => {
+    chromeTwoWindows();
+    chrome.__state.tabs.find((t) => t.id === 200).audible = true;
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, {
+        items: [
+          { tabId: 100, expect: { url: "https://a/", notAudible: true, notPinned: true } },
+          { tabId: 200, expect: { url: "https://b/", notAudible: true, notPinned: true } },
+        ],
+      }),
+      ctx({ map }),
+    );
+    expect(res.result.results[0]).toEqual({ index: 0, ok: true, tabId: 100 });
+    expect(res.result.results[1].ok).toBe(false);
+    expect(res.result.results[1].error).toBe("precondition_failed");
+    expect(chrome.__state.tabs.find((t) => t.id === 200)).toBeDefined(); // the audible tab stayed
+  });
+});
+
+describe("#49 bulk move_tab {items, windowId}", () => {
+  function threeWindowsWithPinned() {
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", pinned: false },
+        { id: 101, windowId: 1, url: "https://p/", pinned: true }, // pinned, will cross
+        { id: 300, windowId: 3, url: "https://d/", pinned: false },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 3, type: "normal", state: "normal" },
+      ],
+      lastFocused: { id: 1, type: "normal", focused: true },
+    });
+  }
+
+  it("acceptance 4: a pinned cross-window item gets pinned_cross_window and stays; others move", async () => {
+    threeWindowsWithPinned();
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { items: [{ tabId: 100 }, { tabId: 101 }, { tabId: 300 }], windowId: 3 }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.results[0]).toEqual({ index: 0, ok: true, tabId: 100, windowId: 3 });
+    expect(res.result.results[1]).toMatchObject({ index: 1, ok: false, tabId: 101, error: "pinned_cross_window" });
+    expect(res.result.results[2].ok).toBe(true); // 300 already in target, still ok
+    // The pinned tab did NOT move; the unpinned one did.
+    expect(chrome.__state.tabs.find((t) => t.id === 101).windowId).toBe(1);
+    expect(chrome.__state.tabs.find((t) => t.id === 100).windowId).toBe(3);
+    // ONE mark covering the target + every source window.
+    expect(map.markCuratorCause).toHaveBeenCalledTimes(1);
+    expect(new Set(map.markCuratorCause.mock.calls[0][0])).toEqual(new Set([3, 1]));
+  });
+
+  it("whole-batch failure (every move throws) rolls the marks back", async () => {
+    threeWindowsWithPinned();
+    // Every chrome.tabs.move REJECTS, so moved stays 0 while the target + source windows were
+    // marked (affected non-empty) => the rollback branch (moved===0 && affected.length>0) runs.
+    chrome.__state.moveError = "Tabs cannot be edited right now (user may be dragging a tab).";
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { items: [{ tabId: 100 }, { tabId: 300 }], windowId: 3 }),
+      ctx({ map }),
+    );
+    expect(res.result.results.every((r) => r.ok === false)).toBe(true);
+    // moved===0 but the target (3) + source (1) windows were marked => rollback with those.
+    expect(map.clearCuratorCause).toHaveBeenCalledTimes(1);
+    expect(new Set(map.clearCuratorCause.mock.calls[0][0])).toEqual(new Set([3, 1]));
+  });
+
+  it("an ineligible/vanished shared target fails EVERY item with no_window, sends no move", async () => {
+    threeWindowsWithPinned();
+    const move = vi.spyOn(chrome.tabs, "move");
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { items: [{ tabId: 100 }, { tabId: 300 }], windowId: 42 }),
+      ctx(),
+    );
+    expect(res.result.results.every((r) => r.error === "no_window")).toBe(true);
+    expect(move).not.toHaveBeenCalled();
+  });
+});
+
+describe("#49 bulk open_tab {items} + hoisted-out-of-loop work", () => {
+  it("opens each item, seeds each, and picks the §9 window ONCE for the whole list", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 7, url: "https://x/" }],
+      windows: [{ id: 7, type: "normal", state: "normal" }],
+      lastFocused: { id: 7, focused: true },
+    });
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_OPEN_TAB, {
+        items: [
+          { url: "https://one/", seed_age_ms: 1000 },
+          { url: "javascript:bad", seed_age_ms: 0 }, // rejected at the edge
+          { url: "https://two/", seed_age_ms: 2000 },
+        ],
+      }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.results[0]).toMatchObject({ index: 0, ok: true, windowId: 7 });
+    expect(res.result.results[1]).toMatchObject({ index: 1, ok: false, error: "precondition_failed" });
+    expect(res.result.results[2]).toMatchObject({ index: 2, ok: true, windowId: 7 });
+    expect(map.seedCuratorTab).toHaveBeenCalledTimes(2); // only the two valid urls
+  });
+
+  it("acceptance 10: a 20-item close on a 200-tab map does O(1) hoisted work, not O(n)", async () => {
+    // 200 live tabs across 10 windows; close 20 of them in ONE list frame. The proof that
+    // the per-item work is hoisted: chrome.tabs.query runs ONCE (not one get per item),
+    // getLastFocused ONCE, markCuratorCause ONCE — so a 200-tab map is not loaded+saved 20
+    // times and the cmd_timeout_ms budget holds.
+    const tabs = [];
+    for (let i = 0; i < 200; i += 1) {
+      tabs.push({ id: i + 1, windowId: (i % 10) + 1, url: `https://t/${i}`, pinned: false, active: false, audible: false });
+    }
+    const windows = [];
+    for (let w = 1; w <= 10; w += 1) windows.push({ id: w, type: "normal", state: "normal" });
+    globalThis.chrome = createChromeMock({ tabs, windows, lastFocused: { id: 1, focused: true } });
+    const query = vi.spyOn(chrome.tabs, "query");
+    const getLF = vi.spyOn(chrome.windows, "getLastFocused");
+    const get = vi.spyOn(chrome.tabs, "get");
+    const map = spyMap();
+    const items = [];
+    for (let i = 0; i < 20; i += 1) items.push({ tabId: i * 5 + 1 }); // 20 spread-out ids
+
+    const started = Date.now();
+    const res = await dispatchCommand(frame(CMD_CLOSE_TAB, { items }), ctx({ map }));
+    const elapsed = Date.now() - started;
+
+    expect(res.result.results).toHaveLength(20);
+    expect(res.result.results.every((r) => r.ok)).toBe(true);
+    expect(query).toHaveBeenCalledTimes(1); // ONE query, not 20 per-item gets
+    expect(getLF).toHaveBeenCalledTimes(1);
+    expect(get).not.toHaveBeenCalled();
+    expect(map.markCuratorCause).toHaveBeenCalledTimes(1);
+    expect(map.readMap).not.toHaveBeenCalled(); // no minIdleMs => no map read at all
+    expect(elapsed).toBeLessThan(1000); // trivially inside any cmd_timeout_ms budget
+  });
+});

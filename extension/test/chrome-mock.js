@@ -136,6 +136,7 @@ export function createChromeMock(opts = {}) {
     nextWindowId: opts.nextWindowId || 500, // id counter for windows.create
     createWindowError: opts.createWindowError || null, // when set, windows.create throws
     moveError: opts.moveError || null, // when set, tabs.move throws this message
+    removeError: opts.removeError || null, // when set, tabs.remove throws this message
     scriptResults: opts.scriptResults || [{ result: null }], // scripting.executeScript return
   };
 
@@ -179,6 +180,7 @@ export function createChromeMock(opts = {}) {
       },
       remove: async (tabId) => {
         await tick();
+        if (state.removeError) throw new Error(state.removeError);
         const i = state.tabs.findIndex((x) => x.id === tabId);
         if (i === -1) throw new Error("no such tab");
         state.tabs.splice(i, 1);
