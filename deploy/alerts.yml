@@ -65,10 +65,11 @@ groups:
         annotations:
           summary: "Curator target is down or missing from discovery (no /metrics scrape)."
 
-      # A pass is overdue past 3×PASS_INTERVAL (§7). The gauge is already 0 while
-      # paused, so a routine hour-long pause never lights this; once the pause
-      # EXPIRES the gauge counts from the expiry, which is what gives the owner the
-      # promised 3×PASS_INTERVAL to click confirm before this fires (§7).
+      # A pass is overdue past 3×PASS_INTERVAL (§7). The gauge is already 0 while the
+      # curator is stopped, so a deliberate (indefinite) stop never lights this; the
+      # start verb runs a confirming pass immediately, which re-anchors the gauge with
+      # a fresh `passes` row. An armed over-threshold latch does not starve it either:
+      # the latched pass still runs and finalizes its row every interval.
       - alert: curator-pass-overdue
         # [A]: curator_pass_overdue_seconds   [C]: A > 300
         # The gauge is overdue-BEYOND-the-interval (elapsed − PASS_INTERVAL), so it
@@ -113,22 +114,6 @@ groups:
           severity: warning
         annotations:
           summary: "One or more curation rules are invalid (orphaned instance_id)."
-
-      # The continuity marker is configured but UNREADABLE, so restore-from-backup
-      # detection is blind (§7). Silent and expensive: every other fingerprint component
-      # travels inside the backup and therefore matches, so a restore looks like
-      # ordinary operation and the very first pass applies yesterday's policy with no
-      # confirmation. The summary names the fix because the metric name does not: the
-      # usual cause is a marker written by root under umask 077 (600 root:root) that the
-      # uid-1000 container can never read.
-      - alert: curator-restore-marker-unreadable
-        # [A]: curator_restore_marker_unreadable   [C]: A == 1
-        expr: curator_restore_marker_unreadable == 1
-        for: 15m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Restore-from-backup detection is BLIND: marker unreadable — check it is readable by uid 1000 (chmod 644; see deploy/DEPLOY.md §8)."
 
       # A migration failed: the service runs degraded, refusing authoritative writes.
       - alert: curator-migration-failed
@@ -331,7 +316,7 @@ groups:
 
       # Half-open socket: connected but the mirror snapshot stopped advancing for
       # >6×PASS_INTERVAL (§12 reserves 6× for exactly this). snapshot_age is already 0
-      # while paused, so the routine hour-long pause never lights this on every
+      # while the curator is stopped, so a deliberate stop never lights this on every
       # instance.
       - alert: curator-instance-snapshot-stale
         # [A]: curator_instance_connected / curator_instance_snapshot_age_seconds

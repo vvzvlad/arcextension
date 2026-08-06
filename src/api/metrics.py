@@ -15,9 +15,10 @@ Design decisions taken straight from §12 "Наблюдаемость":
   present, scalars always carry a value). Per-label families (``{id}`` / ``{kind}`` /
   ``{to_instance}``) legitimately have zero series when nothing exists — that absence
   is handled by ``noDataState: OK`` on the per-metric alert rules.
-* **Pause suppression lives in the GAUGE, not the alert expression** (§12): while
-  paused, ``curator_pass_overdue_seconds`` and ``curator_instance_snapshot_age_seconds``
-  read 0, so the routine hour-long pause cannot light "half-open socket" / "overdue".
+* **Stop suppression lives in the GAUGE, not the alert expression** (§12): while the
+  curator is stopped, ``curator_pass_overdue_seconds`` and
+  ``curator_instance_snapshot_age_seconds`` read 0, so a deliberate stop cannot light
+  "half-open socket" / "overdue".
 
 The Prometheus text format is hand-rolled (a tiny :class:`MetricsRegistry`) rather
 than pulling in ``prometheus_client``: the pass/instance gauges are computed from the
@@ -50,7 +51,7 @@ CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 _BACKUP_GLOB = "curator-*.db"
 
 # The runtime settings keys read at scrape time.
-_PAUSE_UNTIL_KEY = "pause_until"
+_STOPPED_AT_KEY = "curator_stopped_at"
 _RESUME_PENDING_KEY = "resume_pending"
 # Label value for a deferred row whose ``decision`` is NULL/blank — rows written before
 # the cause split landed. They are real deferrals and must keep their count, but an empty
@@ -59,11 +60,6 @@ _DEFERRED_CAUSE_UNKNOWN = "unknown"
 # Persisted by the runner when the server-clock guard trips (see src.curator.runner):
 # the last observed wall-vs-monotonic step in seconds. 0/absent means "never stepped".
 CLOCK_STEP_KEY = "curator_clock_step_seconds"
-# Persisted by ``runner._marker()`` (best-effort, same shape as CLOCK_STEP_KEY): "1" when
-# the CONFIGURED restore marker could not be read on the last pass that needed it, "0"
-# when it was read or none is configured. An ABSENT row means no pass has looked yet and
-# reads as 0 — never as a failure.
-RESTORE_MARKER_UNREADABLE_KEY = "curator_restore_marker_unreadable"
 
 
 # --- the hand-rolled Prometheus text renderer -------------------------------
@@ -155,17 +151,16 @@ class Snapshot:
     # {(instance_to, cause): count} — the cause is ``actions.decision`` (§7's
     # ``target_not_ready`` vs the runner's ``dup_same_pass``); see ``_collect``.
     deferred: dict[tuple[str, str], int] = field(default_factory=dict)
-    pause_until: int | None = None
+    # The emergency-stop moment (epoch ms), or None while running. The stop is
+    # INDEFINITE (no deadline), so presence of the value IS the stopped state.
+    stopped_at: int | None = None
     resume_pending: bool = False
     # Absolute deadline (epoch ms) of an armed enrollment window, or None when no window
     # is armed (§8). Read straight from `settings` at scrape time, exactly like
-    # ``pause_until`` — the signed remaining seconds are computed against ``now`` in
+    # ``stopped_at`` — the signed remaining seconds are computed against ``now`` in
     # ``_enroll_window_seconds_remaining`` so a restart is a no-op.
     enroll_window_until: int | None = None
     clock_step_seconds: float = 0.0
-    # Default False, and that default is the answer for a brand-new install: "no pass has
-    # looked at the marker yet" is not "the marker is broken" (§12).
-    restore_marker_unreadable: bool = False
     # "MAIN cannot serve as the stock branch" — see the query in ``_collect``. Named for
     # what it MEANS rather than for the exported metric (whose name is kept for the alert
     # rule): a revoked MAIN has been seen plenty and is still unusable.
@@ -295,14 +290,14 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
         ).fetchone()[0]
     )
 
-    pause_row = conn.execute(
-        "SELECT value FROM settings WHERE key = ?", (_PAUSE_UNTIL_KEY,)
+    stopped_row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (_STOPPED_AT_KEY,)
     ).fetchone()
-    if pause_row is not None and pause_row[0] not in (None, ""):
+    if stopped_row is not None and stopped_row[0] not in (None, ""):
         try:
-            snap.pause_until = int(pause_row[0])
+            snap.stopped_at = int(stopped_row[0])
         except (TypeError, ValueError):
-            snap.pause_until = None
+            snap.stopped_at = None
 
     resume_row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (_RESUME_PENDING_KEY,)
@@ -310,7 +305,7 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
     snap.resume_pending = bool(resume_row is not None and resume_row[0])
 
     # Enrollment-window deadline (§8). Absent/blank/garbage reads as "no window armed"
-    # (None) — never a spurious 0 deadline, mirroring how ``pause_until`` is decoded.
+    # (None) — never a spurious 0 deadline, mirroring how ``stopped_at`` is decoded.
     enroll_row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (ENROLL_WINDOW_UNTIL_KEY,)
     ).fetchone()
@@ -328,16 +323,6 @@ def _collect(conn: sqlite3.Connection, main_instance_id: str) -> Snapshot:
             snap.clock_step_seconds = float(step_row[0])
         except (TypeError, ValueError):
             snap.clock_step_seconds = 0.0
-
-    # Restore-marker readability. Only the exact "1" is a failure: an absent row (no pass
-    # has needed the marker yet), a blank, or anything unparseable reads as 0, because
-    # the ONE thing this gauge must never do is invent an outage out of missing evidence.
-    marker_row = conn.execute(
-        "SELECT value FROM settings WHERE key = ?", (RESTORE_MARKER_UNREADABLE_KEY,)
-    ).fetchone()
-    snap.restore_marker_unreadable = bool(
-        marker_row is not None and str(marker_row[0]).strip() == "1"
-    )
 
     # The sticky, sleep-independent "the stock branch is off" fact (§12). MAIN is unusable
     # when it has NO row, when it has never said hello (last_seen_at IS NULL) — and,
@@ -372,24 +357,21 @@ def _newest_backup(backup_dir: str) -> Path | None:
     return copies[-1] if copies else None
 
 
-# --- overdue / age computations (pause suppression lives here) --------------
-def _pass_overdue_seconds(snap: Snapshot, now_ms: int, interval_s: int, paused: bool) -> int:
-    """Seconds the next pass is overdue (§12). 0 while paused. The reference is the
+# --- overdue / age computations (stop suppression lives here) ---------------
+def _pass_overdue_seconds(snap: Snapshot, now_ms: int, interval_s: int, stopped: bool) -> int:
+    """Seconds the next pass is overdue (§12). 0 while stopped. The reference is the
     last FINISHED pass; if none ever finished, the OLDEST started_at is the anchor
     so a crash-loop (many started, none finished) trips and — being read from
     ``passes`` — is NOT reset by a fresh process. Zero pass rows at all => 0 (a truly
     fresh install has no evidence a pass was ever due).
 
-    **After a pause EXPIRES the clock restarts from the expiry moment**, not from
-    ``last_pass_ts`` (§7: «`curator_pass_overdue_seconds` после истечения паузы
-    считается от момента истечения, а не от `last_pass_ts`»). Otherwise the hour-long
-    pause the gauge suppressed reappears as overdue the very second it lapses and the
-    alert fires immediately — while §7 promises a full 3×``PASS_INTERVAL`` for the human
-    to see the pending plan and click. ``pause_until`` survives a timeout expiry
-    (only a manual resume / confirm clears it), so it is exactly the "when did the stop
-    lapse" anchor; a resumed pause has no row and changes nothing here.
+    The stop is indefinite (no deadline, no expiry), so there is no "lapsed but not
+    resumed" state to anchor from: the start verb runs a confirming pass immediately,
+    which finalizes a fresh ``passes`` row and re-anchors the gauge by itself. An
+    over-threshold latch never starves the gauge either — the latched pass still runs
+    and finalizes its row every interval.
     """
-    if paused:
+    if stopped:
         return 0
     if snap.finished_at is not None:
         reference_ms = snap.finished_at
@@ -397,9 +379,6 @@ def _pass_overdue_seconds(snap: Snapshot, now_ms: int, interval_s: int, paused: 
         reference_ms = snap.oldest_started_at
     else:
         return 0
-    # `paused` is False here, so a present pause_until is necessarily in the past.
-    if snap.pause_until is not None and snap.pause_until > reference_ms:
-        reference_ms = snap.pause_until
     overdue = (now_ms - reference_ms) // 1000 - interval_s
     return overdue if overdue > 0 else 0
 
@@ -432,7 +411,9 @@ def _enroll_window_seconds_remaining(snap: Snapshot, now_ms: int) -> int:
 def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
     reg = MetricsRegistry()
     interval_s = int(settings.pass_interval_min) * 60
-    paused = snap.pause_until is not None and snap.pause_until > now_ms
+    # The stop is indefinite: the presence of the stored moment IS the stopped state
+    # (nothing to compare against ``now``).
+    stopped = snap.stopped_at is not None
 
     # --- pass facts (from `passes`) -----------------------------------------
     last_pass_ts = (
@@ -471,9 +452,9 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
 
     reg.metric(
         "curator_pass_overdue_seconds",
-        "Seconds the next pass is overdue (0 while paused; from `passes`, not memory).",
+        "Seconds the next pass is overdue (0 while stopped; from `passes`, not memory).",
         "gauge",
-        [({}, _pass_overdue_seconds(snap, now_ms, interval_s, paused))],
+        [({}, _pass_overdue_seconds(snap, now_ms, interval_s, stopped))],
     )
 
     # --- instances ----------------------------------------------------------
@@ -492,9 +473,9 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         else:
             absent = max(0, (now_ms - int(inst.last_seen_at or 0)) // 1000)
         absent_samples.append((labels, absent))
-        # snapshot_age_seconds: 0 while paused (suppression in the gauge, §12); else
+        # snapshot_age_seconds: 0 while stopped (suppression in the gauge, §12); else
         # seconds since the instance's mirror snapshot (huge when never snapshotted).
-        if paused:
+        if stopped:
             age = 0
         else:
             age = max(0, (now_ms - int(inst.snapshot_at or 0)) // 1000)
@@ -520,7 +501,7 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
     )
     reg.metric(
         "curator_instance_snapshot_age_seconds",
-        "Age (s) of the instance's mirror snapshot; 0 while paused.",
+        "Age (s) of the instance's mirror snapshot; 0 while stopped.",
         "gauge",
         snapshot_age_samples,
     )
@@ -580,16 +561,23 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         [({}, snap.relocations_incomplete)],
     )
 
-    # --- pause --------------------------------------------------------------
+    # --- stop / latch -------------------------------------------------------
     reg.metric(
-        "curator_paused_until",
-        "pause_until (server-clock ms) while paused; 0 if not paused.",
+        "curator_stopped",
+        "1 iff the curator is stopped (indefinite emergency stop); else 0.",
         "gauge",
-        [({}, snap.pause_until if paused else 0)],
+        [({}, 1 if stopped else 0)],
+    )
+    reg.metric(
+        "curator_stopped_at",
+        "curator_stopped_at (server-clock ms) while stopped; 0 if running.",
+        "gauge",
+        [({}, snap.stopped_at if stopped else 0)],
     )
     reg.metric(
         "curator_resume_pending",
-        "1 iff a resume-pending flag is set in settings; else 0.",
+        "1 iff the over-threshold plan latch is armed (a pass wants more than "
+        "MAX_ACTIONS_PER_PASS countable actions and waits for a confirming click).",
         "gauge",
         [({}, 1 if snap.resume_pending else 0)],
     )
@@ -655,22 +643,6 @@ def _render(snap: Snapshot, settings, now_ms: int, degraded: bool) -> str:
         "Last observed server-clock step (s) that aborted a pass; 0 if none.",
         "gauge",
         [({}, snap.clock_step_seconds)],
-    )
-    # Emitted on EVERY scrape, including the very first one on a fresh install (§12): a
-    # gauge that only appears once the fault occurs gives NoData for "it never ran", the
-    # exact silence this metric exists to break. "Marker configured but unreadable" is
-    # otherwise invisible — restore-from-backup detection is off for good (the classic
-    # path: the marker is written by a root helper under umask 077, so it lands 600
-    # root:root and the uid-1000 container can never read it), every other fingerprint
-    # component travels inside the backup and matches, and the only trace is a log line
-    # every five minutes.
-    reg.metric(
-        "curator_restore_marker_unreadable",
-        "1 iff the configured restore marker could not be read by the last pass that "
-        "needed it (backup-restore detection is blind); 0 if read, not configured, or "
-        "not yet looked at.",
-        "gauge",
-        [({}, 1 if snap.restore_marker_unreadable else 0)],
     )
     # Process-monotonic auth-rejection counter, now a LABELED family: one series per
     # coarse {reason} the increment sites already pass (api_token / metrics_token /

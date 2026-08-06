@@ -4,7 +4,7 @@ Covers each tool's handler plus the guards the reviewer mutation-checks:
 * confirm_impact on an MCP rule write,
 * execute_js audited (initiator='mcp' + the MCP session as auth_ctx) and kill-switch,
 * relocate_tab writing a live ``relocate`` row (initiator='mcp'),
-* a paused system refusing a mutating verb (and no command leaving the socket).
+* a stopped system refusing a mutating verb (and no command leaving the socket).
 """
 
 import asyncio
@@ -154,12 +154,12 @@ async def _insert_window(db, iid, window_id, *, wtype="normal", state="normal"):
 
 
 # --- reads -------------------------------------------------------------------
-async def test_list_instances_returns_freshness_envelope_and_paused_until(tmp_path):
+async def test_list_instances_returns_freshness_envelope_and_stopped_at(tmp_path):
     db = await _make_db(tmp_path)
     await _insert_instance(db, "main", snapshot_at=1234, connected=0)
     app = _app(db)
     out = await tools.list_instances(app)
-    assert out["paused_until"] is None
+    assert out["stopped_at"] is None
     # `instances` is now a per-instance freshness envelope keyed by id (§6/§11), not a
     # list of mirror rows. No live socket for "main" => ensure_fresh reports disconnected.
     main = out["instances"]["main"]
@@ -170,11 +170,11 @@ async def test_list_instances_returns_freshness_envelope_and_paused_until(tmp_pa
                     "session_id": None, "connected": False, "last_seen_at": None,
                     "reject_reason": None, "reject_at": None}
 
-    # A paused curator surfaces paused_until so an agent does not read pause as a break.
+    # A stopped curator surfaces stopped_at so an agent does not read the stop as a break.
     now = tools._now_ms()
-    await db.write(lambda c: pause_ops.pause(c, now=now, minutes=30))
+    await db.write(lambda c: pause_ops.stop(c, now=now))
     out2 = await tools.list_instances(app)
-    assert out2["paused_until"] is not None and out2["paused_until"] > now
+    assert out2["stopped_at"] == now
 
 
 async def test_list_tabs_returns_tabs_and_per_instance_freshness(tmp_path):
@@ -590,17 +590,17 @@ async def test_move_tab_surfaces_the_pinned_refusal_as_its_own_code(tmp_path):
     assert ei.value.code == protocol.ERR_PINNED_CROSS_WINDOW
 
 
-async def test_move_tab_is_refused_while_paused_and_sends_nothing(tmp_path):
+async def test_move_tab_is_refused_while_stopped_and_sends_nothing(tmp_path):
     # A move is automation like every other mutating verb (§7/§12), and the MCP door has
     # no `force`: an agent is not a human at the keyboard.
     db = await _make_db(tmp_path)
     reg = Registry()
     _cs, ws = _put_conn(reg, "main")
     app = _app(db, reg)
-    await tools.pause(app, minutes=30)
+    await tools.pause(app)
     with pytest.raises(tools.ToolError) as ei:
         await tools.move_tab(app, instance="main", tab_id=7, window_id=3)
-    assert ei.value.code == "paused"
+    assert ei.value.code == "stopped"
     assert ws.sent == []
 
 
@@ -1177,48 +1177,53 @@ async def test_relocate_connection_class_close_stays_pending_half(tmp_path):
 
 
 async def test_relocate_refused_while_paused_sends_nothing(tmp_path):
-    # Acceptance 11: the verb refuses while the stop switch (pause) is armed and sends no
-    # frames. (The codebase's stop switch is the pause gate; its code is "paused".)
+    # Acceptance 11: the verb refuses while the emergency stop is armed and sends no
+    # frames. The stop is indefinite (curator_stopped_at); its refusal code is "stopped".
     db = await _make_db(tmp_path)
     await _insert_instance(db, "themed", session_id="s-themed")
     await _insert_instance(db, "main", session_id="s-main")
     await _insert_tab(db, "themed", 5, url="https://grafana/dash")
     now = tools._now_ms()
-    await db.write(lambda c: pause_ops.pause(c, now=now, minutes=10))
+    await db.write(lambda c: pause_ops.stop(c, now=now))
     reg = Registry()
     _cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
     _cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
     app = _app(db, reg)
     with pytest.raises(tools.ToolError) as ei:
         await tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main")
-    assert ei.value.code == "paused"
+    assert ei.value.code == "stopped"
     assert ws_from.sent == [] and ws_to.sent == []  # no frame reached any socket
     await _no_new_rows(db)
 
 
-# --- pause / resume ----------------------------------------------------------
+# --- pause (stop) / resume (start) -------------------------------------------
 async def test_pause_writes_setting_and_bumps_epoch(tmp_path):
     db = await _make_db(tmp_path)
     app = _app(db)
     before = await db.read(lease.read_lease)
-    out = await tools.pause(app, minutes=10)
-    assert out["ok"] is True and out["paused_until"] is not None
+    out = await tools.pause(app)
+    assert out["ok"] is True and out["stopped_at"] is not None
     after = await db.read(lease.read_lease)
-    assert after["epoch"] == before["epoch"] + 1          # bump_epoch stopped any pass
-    assert await db.read(lambda c: get_setting(c, "pause_until")) == str(out["paused_until"])
+    assert after["epoch"] == before["epoch"] + 1          # bump_epoch fenced any pass
+    assert await db.read(lambda c: get_setting(c, "curator_stopped_at")) == str(out["stopped_at"])
+
+    # `minutes` is accepted for backward compatibility and IGNORED — the stop is
+    # indefinite and idempotent on the timestamp.
+    out2 = await tools.pause(app, minutes=10)
+    assert out2["stopped_at"] == out["stopped_at"]
 
     await tools.resume(app)
-    assert await db.read(pause_ops.read_pause_until) is None
+    assert await db.read(pause_ops.read_stopped_at) is None
 
 
 async def test_mcp_resume_runs_a_pass_like_the_http_twin(tmp_path):
-    """§7/§11 parity: a manual resume runs a pass IMMEDIATELY, whichever door it came
+    """§7/§11 parity: a manual start runs a pass IMMEDIATELY, whichever door it came
     through. The MCP tool used to stop after the settings write, so an agent's resume
     left the curator idle until the next tick — the same verb with two behaviours.
     Reddens (no `pass` key, no `passes` row) if the tool stops writing settings only."""
     db = await _make_db(tmp_path)
     app = _app(db)
-    await tools.pause(app, minutes=30)
+    await tools.pause(app)
 
     out = await tools.resume(app)
     assert out["ok"] is True
@@ -1231,52 +1236,46 @@ async def test_mcp_resume_runs_a_pass_like_the_http_twin(tmp_path):
     ) == (1,)
 
 
-async def test_mcp_resume_escapes_a_continuity_break_latch(tmp_path):
-    """§7/§11 parity, the other half: the agent's resume must be able to LEAVE
-    ``resume_pending``, not only lift a pause.
+async def test_mcp_resume_against_an_empty_world_leaves_the_latch_armed(tmp_path):
+    """§7/§11 parity, the other half: the agent's resume against a fleet that answered
+    NOTHING must not eat the armed plan.
 
     The tool is the same door as ``DELETE /api/pause`` (both run
-    :func:`src.api.pause.resume_now`), and the latch is armed by a CONTINUITY BREAK as
-    well as by an expired pause. On a break there is nothing to clear but the stale
-    fingerprint, which only a real pass refreshes — the pass the latch blocks. An agent
-    that hit that state had no verb that could leave it: the MCP ``run_pass`` tool takes
-    only ``dry_run``, so ``resume`` is its ONLY exit. Reddens if the tool grows a private
-    resume path, or if ``resume_now`` stops confirming the latch: the answer is another
-    ``resume_pending`` and the curator stays latched forever.
+    :func:`src.api.pause.resume_now`), whose pass recomputes the plan FROM the ready
+    instances. Here zero instances are connected, so the recomputed plan is empty by
+    construction — no evidence that the armed 30-action plan shrank. The pass runs,
+    reports ``no_ready_instances``, and leaves the latch untouched (value included):
+    clearing on an evidence-free pass would make ``resume_pending`` flap with fleet
+    connectivity. Reddens if the runner goes back to clearing the latch on a pass
+    with an empty ready set.
     """
-    from src.curator import clock as clockmod
+    from src.db.settings_store import set_setting
 
     db = await _make_db(tmp_path)
     app = _app(db)
-    # A fleet row (a pass stores a fingerprint only when it saw a fleet, §7) plus a
-    # fingerprint taken at a DIFFERENT IDLE_MINUTES than the running config: a §7
-    # continuity break with no pause anywhere near it.
-    await db.write(lambda c: c.execute(
-        "INSERT INTO instances (id, status, connected, conn_epoch) "
-        "VALUES ('main', 'active', 0, 0)"))
-    fp = await db.read(lambda c: clockmod.current_fingerprint(
-        c, idle_minutes=30, main_instance_id="main"))
-    await db.write(lambda c: clockmod.store_fingerprint(c, fp))
-
-    # The scheduled pass defers behind a click and arms the latch.
-    assert (await tools.run_pass(app))["status"] == "resume_pending"
+    latch = '{"since": 1, "plan": {"total": 30, "threshold": 20}}'
+    await db.write(lambda c: set_setting(c, pause_ops.RESUME_PENDING_KEY, latch))
     assert (await tools.list_instances(app))["resume_pending"] is True
 
     out = await tools.resume(app)
     assert out["ok"] is True
-    # A REAL pass ran (nothing is connected → no_ready_instances), the latch is gone and
-    # the fingerprint now matches the running config, so the next tick stays quiet.
+    # A REAL pass ran (nothing is connected → no_ready_instances) ...
     assert out["pass"]["status"] == "no_ready_instances", out["pass"]
-    assert (await tools.list_instances(app))["resume_pending"] is False
-    assert (await db.read(clockmod.read_stored_fingerprint))["idle_minutes"] == 60
-    assert (await tools.run_pass(app))["status"] == "no_ready_instances"
+    # ... and the latch SURVIVED with its plan value UNCHANGED — not cleared, not
+    # overwritten by the empty plan this pass computed.
+    assert (await tools.list_instances(app))["resume_pending"] is True
+    assert await db.read(
+        lambda c: get_setting(c, pause_ops.RESUME_PENDING_KEY)
+    ) == latch
 
 
 async def test_list_instances_exposes_resume_pending(tmp_path):
-    """§7 verbatim: «`resume_pending` виден в `StateResponse` и в `list_instances`».
+    """§7's visibility rule for the latch: an armed over-threshold plan «выводится в
+    статус-полосу и ждёт одного подтверждающего клика», and ``list_instances`` is the
+    agent's window into the same fact.
 
-    Without it an agent sees `paused_until` in the past and no passes happening and
-    concludes the curator is broken, when it is deliberately waiting for a click."""
+    Without it an agent sees no relocations happening and concludes the curator is
+    broken, when it is deliberately deferring an over-threshold plan behind a click."""
     db = await _make_db(tmp_path)
     app = _app(db)
     assert (await tools.list_instances(app))["resume_pending"] is False
@@ -1287,8 +1286,8 @@ async def test_list_instances_exposes_resume_pending(tmp_path):
     ))
     assert (await tools.list_instances(app))["resume_pending"] is True
 
-    # Cleared with the pause (resume clears the latch) → flag drops again.
-    await db.write(lambda c: pause_ops.resume(c, now=tools._now_ms()))
+    # Cleared (as an executing pass would clear it) → flag drops again.
+    await db.write(lambda c: set_setting(c, pause_ops.RESUME_PENDING_KEY, ""))
     assert (await tools.list_instances(app))["resume_pending"] is False
 
 
@@ -1329,14 +1328,14 @@ async def test_pause_refuses_mutating_verb_and_sends_nothing(tmp_path):
     reg = Registry()
     cs, ws = _put_conn(reg, "main")
     app = _app(db, reg)
-    await tools.pause(app, minutes=30)  # arm the pause
+    await tools.pause(app)  # arm the stop
 
     with pytest.raises(tools.ToolError) as ei:
         await tools.open_tab(app, instance="main", url="https://a", auth_ctx="s")
-    assert ei.value.code == "paused"
+    assert ei.value.code == "stopped"
     assert ws.sent == []  # the mutating verb never reached the socket
 
-    # A read is NOT gated by pause.
+    # A read is NOT gated by the stop.
     assert "instances" in await tools.list_instances(app)
     # After resume the same verb proceeds. (resume itself runs a pass — §7 — so it puts
     # its own snapshot_request on the socket; _run_with_response waits for a NEW frame.)
@@ -1662,7 +1661,7 @@ async def test_bulk_verbs_refused_while_paused_send_nothing(tmp_path):
     reg = Registry()
     cs, ws = _put_conn(reg, "main", session_id="s1")
     app = _app(db, reg)
-    await db.write(lambda c: pause_ops.pause(c, now=tools._now_ms(), minutes=30))
+    await db.write(lambda c: pause_ops.stop(c, now=tools._now_ms()))
     calls = [
         lambda: tools.close_tab(app, instance="main", tab_ids=[1, 2]),
         lambda: tools.move_tab(app, instance="main", tab_ids=[1, 2], window_id=3),
@@ -1671,7 +1670,7 @@ async def test_bulk_verbs_refused_while_paused_send_nothing(tmp_path):
     for call in calls:
         with pytest.raises(tools.ToolError) as ei:
             await call()
-        assert ei.value.code == "paused"
+        assert ei.value.code == "stopped"
     assert ws.sent == []
 
 

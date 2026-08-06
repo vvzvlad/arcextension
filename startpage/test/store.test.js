@@ -425,9 +425,9 @@ describe("server clock offset (§10)", () => {
   });
 });
 
-// --- 423: the pause gate is not a breakage (§7) -------------------------------
-describe("paused verbs offer the human's force override (§7)", () => {
-  it("a 423 jump surfaces the deadline and retries with force:true on demand", async () => {
+// --- 423: the stop gate is not a breakage (§7) --------------------------------
+describe("stopped verbs offer the human's force override (§7)", () => {
+  it("a 423 jump surfaces the stop stamp and retries with force:true on demand", async () => {
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const bodies = [];
     const { fetchFn, counts } = makeFetch({
@@ -435,7 +435,7 @@ describe("paused verbs offer the human's force override (§7)", () => {
       focus: (opts, n) => {
         bodies.push(JSON.parse(opts.body));
         return n === 1
-          ? { status: 423, body: { error: "paused", until: NOW + 3_600_000 } }
+          ? { status: 423, body: { error: "stopped", since: NOW - 3_600_000 } }
           : { status: 200, body: { ok: true } };
       },
     });
@@ -447,7 +447,7 @@ describe("paused verbs offer the human's force override (§7)", () => {
 
     // NOT the useless manual fallback: the reason is named and an override offered.
     expect(store.fallbackMessage.value).toBe("");
-    expect(store.pauseBlock.value).toMatchObject({ verb: "focus", until: NOW + 3_600_000 });
+    expect(store.pauseBlock.value).toMatchObject({ verb: "focus", since: NOW - 3_600_000 });
     expect(bodies[0].force).toBeUndefined(); // never forced automatically
 
     await store.retryForced();
@@ -618,34 +618,51 @@ describe("local search (§10)", () => {
   });
 });
 
-// --- pause (§7) ---------------------------------------------------------------
-describe("pause status (§7)", () => {
-  it("surfaces paused_until + resume_pending from state (offline-first, via applyState)", () => {
+// --- stop / start (§7) --------------------------------------------------------
+describe("stop status (§7)", () => {
+  it("surfaces stopped_at + resume_pending from state (offline-first, via applyState)", () => {
     const env = makeChrome({ tabs: [], messages: {} });
     const store = storeWith(env, makeFetch({ state: undefined }).fetchFn);
-    // applyState is the single writer and runs from the CACHE too — a cached pause
+    // applyState is the single writer and runs from the CACHE too — a cached stop
     // renders with no network (§7 "видимость обязательна").
     store.applyState({
       instances: [],
       tabs: [],
       quick_links: [],
-      paused_until: 5_000_000,
+      stopped_at: 5_000_000,
       resume_pending: true,
     });
-    expect(store.pausedUntil.value).toBe(5_000_000);
+    expect(store.stoppedAt.value).toBe(5_000_000);
     expect(store.resumePending.value).toBe(true);
 
-    // A pre-pause state (no key) reads as "not paused", never undefined.
+    // A pre-stop state (no key) reads as "running", never undefined.
     store.applyState({ instances: [], tabs: [], quick_links: [] });
-    expect(store.pausedUntil.value).toBe(null);
+    expect(store.stoppedAt.value).toBe(null);
     expect(store.resumePending.value).toBe(false);
   });
 
-  it("pauseCurator POSTs /api/pause and reflects the new deadline", async () => {
+  it("carries the plan's total + threshold through normalization (§7 threshold gate)", () => {
+    const env = makeChrome({ tabs: [], messages: {} });
+    const store = storeWith(env, makeFetch({ state: undefined }).fetchFn);
+    store.applyState({
+      instances: [],
+      tabs: [],
+      quick_links: [],
+      resume_pending: true,
+      pending_plan: {
+        since: 1,
+        plan: { relocations: 18, phase_b_completions: 3, closures: 7, total: 25, threshold: 20 },
+      },
+    });
+    expect(store.pendingPlan.value.total).toBe(25);
+    expect(store.pendingPlan.value.threshold).toBe(20);
+  });
+
+  it("pauseCurator POSTs /api/pause and reflects the stop stamp", async () => {
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const { fetchFn, counts } = makeFetch({
       state: { status: 200, body: { instances: [], tabs: [], quick_links: [] } },
-      pausePost: { status: 200, body: { paused_until: 9_000_000, pause_started_at: 1_000_000 } },
+      pausePost: { status: 200, body: { stopped_at: 9_000_000 } },
     });
     const store = storeWith(env, fetchFn);
     await store.init();
@@ -654,26 +671,95 @@ describe("pause status (§7)", () => {
     const res = await store.pauseCurator();
     expect(res.ok).toBe(true);
     expect(counts.pausePost).toBe(1);
-    expect(store.pausedUntil.value).toBe(9_000_000);
+    expect(store.stoppedAt.value).toBe(9_000_000);
   });
 
-  it("resumeCurator DELETEs /api/pause, clears the deadline, and re-fetches state", async () => {
+  it("resumeCurator DELETEs /api/pause, clears the stop, and re-fetches state", async () => {
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const { fetchFn, counts } = makeFetch({
-      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], paused_until: null } },
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], stopped_at: null } },
       pauseDelete: { status: 200, body: { resumed: true, pass: { status: "no_ready_instances" } } },
     });
     const store = storeWith(env, fetchFn);
     await store.init();
     await store.refresh();
-    store.pausedUntil.value = 9_000_000; // pretend a pause was armed
+    store.stoppedAt.value = 9_000_000; // pretend a stop was armed
 
     const before = counts.state;
     const res = await store.resumeCurator();
     expect(res.ok).toBe(true);
     expect(counts.pauseDelete).toBe(1);
-    expect(store.pausedUntil.value).toBe(null);
-    expect(counts.state).toBe(before + 1); // manual resume re-fetches the truth
+    expect(store.stoppedAt.value).toBe(null);
+    expect(counts.state).toBe(before + 1); // manual start re-fetches the truth
+  });
+
+  it("resumeCurator holds `resuming` for the whole in-flight DELETE and refuses re-entry", async () => {
+    // DELETE /api/pause spans the WHOLE confirming pass (tens of seconds on a big
+    // fleet). A second DELETE fired meanwhile lands after the stop has cleared
+    // server-side, i.e. as a confirm of a plan the human never saw — so the flag
+    // must cover the full request and a re-entrant call must send nothing.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    let release;
+    const gate = new Promise((r) => {
+      release = r;
+    });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [] } },
+      pauseDelete: async () => {
+        await gate; // park the DELETE in flight until the test releases it
+        return { status: 200, body: { resumed: true } };
+      },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    expect(store.resuming.value).toBe(false);
+    const first = store.resumeCurator(); // not awaited: the DELETE is parked
+    expect(store.resuming.value).toBe(true);
+
+    // Re-entry while in flight: no-op, and crucially NO second DELETE goes out.
+    const second = await store.resumeCurator();
+    expect(second.ok).toBe(false);
+    expect(counts.pauseDelete).toBe(1);
+
+    release();
+    expect((await first).ok).toBe(true);
+    expect(store.resuming.value).toBe(false); // cleared in finally
+    expect(counts.pauseDelete).toBe(1);
+  });
+
+  it("resumeCurator does NOT optimistically clear the latch — refresh() owns it", async () => {
+    // A DELETE while stopped runs a NORMAL-gated pass: the latch may survive or
+    // re-arm, so the client must not guess it away — the refresh that follows
+    // reports it truthfully (here: the server says the plan is still over the
+    // threshold).
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: {
+        status: 200,
+        body: {
+          instances: [],
+          tabs: [],
+          quick_links: [],
+          stopped_at: null,
+          resume_pending: true,
+          pending_plan: { since: 1, plan: { relocations: 30, closures: 5, total: 35, threshold: 20 } },
+        },
+      },
+      pauseDelete: { status: 200, body: { resumed: true } },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+    store.stoppedAt.value = 9_000_000; // pretend a stop was armed under the latch
+
+    const res = await store.resumeCurator();
+    expect(res.ok).toBe(true);
+    expect(store.stoppedAt.value).toBe(null); // the verb itself lifted the stop
+    // The latch is whatever the refresh said — NOT cleared by the resume click.
+    expect(store.resumePending.value).toBe(true);
+    expect(store.pendingPlan.value).toMatchObject({ relocations: 30, closures: 5 });
   });
 
   it("offline: pause/resume no-op with an offline note (never throws)", async () => {

@@ -22,7 +22,7 @@ def _settings(tmp_path, **over):
         metrics_token="m", admin_token=ADMIN_TOKEN,
         idle_minutes=60, pass_interval_min=5, tick_ms=60000,
         cmd_timeout_ms=1000, snapshot_timeout_ms=500, lease_ttl_ms=600_000,
-        restore_exemption_min=120, pause_default_min=60, incomplete_after_min=15,
+        restore_exemption_min=120, max_actions_per_pass=20, incomplete_after_min=15,
         self_nav_limit=10, state_fresh_ms=3000, quarantine_ttl_min=1440,
         actions_retention_days=90, js_audit_retention_days=730,
         main_instance_id="main", log_level="INFO",

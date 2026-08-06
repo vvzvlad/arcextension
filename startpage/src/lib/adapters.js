@@ -313,15 +313,17 @@ export async function getConnectionState(chromeApi) {
   }
 }
 
-// --- pause (§7) ---------------------------------------------------------------
-// Arm/extend a finite pause (POST) or resume early (DELETE). Bearer-authed like the
-// other verbs. Both return {status, body} so the store can react without throwing on a
-// non-2xx (e.g. an offline blip). `minutes` is optional — the server defaults + caps it.
-export async function postPause(fetchFn, base, token, minutes) {
+// --- stop / start (§7) --------------------------------------------------------
+// Stop the automation indefinitely (POST → {stopped_at}) or start it again (DELETE,
+// which also runs an immediate confirming pass). The path is still /api/pause — same
+// endpoint, new semantics: no duration, no deadline. Bearer-authed like the other
+// verbs. Both return {status, body} so the store can react without throwing on a
+// non-2xx (e.g. an offline blip).
+export async function postPause(fetchFn, base, token) {
   const resp = await fetchFn(base + "/api/pause", {
     method: "POST",
     headers: authHeaders(token),
-    body: JSON.stringify(minutes != null ? { minutes } : {}),
+    body: JSON.stringify({}),
   });
   const body = await resp.json().catch(() => null);
   return { status: resp.status, body };

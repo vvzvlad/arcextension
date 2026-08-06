@@ -98,7 +98,7 @@ def build_mcp(app_ref) -> MCPServer:
     # --- reads ---------------------------------------------------------------
     @mcp.tool()
     async def list_instances() -> dict:
-        """List instances with a per-instance freshness envelope, paused_until and
+        """List instances with a per-instance freshness envelope, stopped_at and
         pending_plan (§11). Awaits a fresh snapshot per instance before answering."""
         return await _guarded(tools.list_instances(_host()))
 
@@ -303,12 +303,16 @@ def build_mcp(app_ref) -> MCPServer:
 
     @mcp.tool()
     async def pause(minutes: int | None = None) -> dict:
-        """Pause the curator (writes pause_until + bumps the epoch, §7/§12)."""
+        """Stop the curator indefinitely (writes curator_stopped_at + bumps the epoch,
+        §7/§12). `minutes` is accepted for backward compatibility and ignored — the
+        stop lasts until `resume`."""
         return await _guarded(tools.pause(_host(), minutes=minutes))
 
     @mcp.tool()
     async def resume() -> dict:
-        """Resume the curator (clears pause_until, §7/§12)."""
+        """Start the curator (clears curator_stopped_at, shifts TTL protections, then
+        runs a confirming pass — which also executes an armed over-threshold plan,
+        §7/§12)."""
         return await _guarded(tools.resume(_host()))
 
     # Create the session manager LAZILY, ONCE, BEFORE the lifespan (§11 trap #1).

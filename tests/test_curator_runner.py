@@ -6,7 +6,8 @@ is set exactly as in production) and scripts the ``open_tab`` / ``get_tab`` /
 ``close_tab`` command replies. Covers the required acceptance + coverage points:
 concurrent-passes-one-runs, source-discard-completes, clock-jump-no-eviction,
 foreign-snapshot-doesn't-eject, phase-B-source-mismatch (no un-quenchable loop),
-non-convergence latch, and passes-row-on-empty.
+non-convergence latch, passes-row-on-empty, and the MAX_ACTIONS_PER_PASS threshold
+latch (defer / refresh / auto-unlatch / confirm / phase-B exemption / stop gate).
 """
 
 from __future__ import annotations
@@ -37,6 +38,9 @@ def _settings(**over):
         lease_ttl_ms=600_000,
         quarantine_ttl_min=1440,
         main_instance_id="main",
+        # High enough that ordinary fixtures never trip the threshold gate; the
+        # threshold tests below pass their own small value.
+        max_actions_per_pass=20,
     )
     s.update(over)
     return SimpleNamespace(**s)
@@ -58,15 +62,20 @@ class Ext:
         self.registry = Registry()
         self.sessions: dict = {}
         self.tabs: dict = {}          # instance_id -> list[TabInfo dict]
+        self.windows: dict = {}       # instance_id -> list[window dict] in the snapshot
         self.focused: dict = {}       # instance_id -> focusedWindowId
         self.responder = None         # fn(instance_id, command, params) -> response dict
         self._open_seq = 1000
 
-    async def add_instance(self, instance_id, session="s", tabs=None, focused=None, conn_epoch=1):
+    async def add_instance(self, instance_id, session="s", tabs=None, focused=None,
+                           conn_epoch=1, windows=None):
         cs = ConnState(ws=FakeWS(), conn_epoch=conn_epoch, install_uuid="u", session_id=session)
         self.registry.put(instance_id, cs)
         self.sessions[instance_id] = session
         self.tabs[instance_id] = list(tabs or [])
+        self.windows[instance_id] = list(
+            windows or [{"id": 1, "type": "normal", "state": "normal"}]
+        )
         self.focused[instance_id] = focused
         # Seed the instances row so apply_snapshot's epoch guard passes. status='active'
         # models an enrolled instance (issue #35): the known_instance_ids / send_command
@@ -89,7 +98,7 @@ class Ext:
             "sessionId": self.sessions[instance_id],
             "focusedWindowId": self.focused.get(instance_id),
             "tabs": self.tabs[instance_id],
-            "windows": [{"id": 1, "type": "normal", "state": "normal"}],
+            "windows": self.windows[instance_id],
         }
 
     def next_open_id(self):
@@ -131,9 +140,12 @@ class Ext:
             stop.set()
             await d
 
-    async def run_pass(self, **kw):
+    async def run_pass(self, settings=None, **kw):
         return await self.with_driver(
-            runner.run_pass(self.db, self.registry, _settings(), **kw)
+            runner.run_pass(
+                self.db, self.registry,
+                settings if settings is not None else _settings(), **kw,
+            )
         )
 
     def as_app(self, settings=None):
@@ -154,24 +166,11 @@ def _tabinfo(tab_id, url, *, window_id=1, pinned=False, active=False, audible=Fa
     }
 
 
-async def _mkdb(tmp_path, *, continuity=True):
+async def _mkdb(tmp_path):
     db = Database(str(tmp_path / "curator.db"), str(tmp_path / "backups"))
     await db.open()
     assert not db.degraded
-    if continuity:
-        # Establish continuity so these tests exercise STEADY-STATE passes. Without a
-        # stored fingerprint the very first pass over a populated DB is a §7 first-run
-        # break (dry_run + resume_pending) — that policy has its own tests below.
-        await _establish_continuity(db)
     return db
-
-
-async def _establish_continuity(db, *, idle_minutes=60, main_instance_id="main"):
-    from src.curator import clock as clockmod
-
-    fp = await db.read(lambda c: clockmod.current_fingerprint(
-        c, idle_minutes=idle_minutes, main_instance_id=main_instance_id))
-    await db.write(lambda c: clockmod.store_fingerprint(c, fp))
 
 
 async def _seed_rule(db, pattern, instance_id, *, singleton=0):
@@ -975,301 +974,20 @@ async def test_reconcile_runs_when_source_instance_IS_ready(tmp_path):
         await db.close()
 
 
-# --- first-run policy: a clean DB with a fleet defers behind a click (§7) ----
-async def test_clean_db_with_populated_fleet_defers_to_resume_pending(tmp_path):
-    """§7 lists "чистая БД" among the continuity breaks: every tab arrives with
-    age_unknown=1 and last_active_at=now, so an hour later the WHOLE fleet turns
-    eligible at once and one unconfirmed pass would drain it. With no stored
-    fingerprint and a populated fleet the first pass must be a dry_run that arms
-    resume_pending. Reddens if is_continuity_break keeps answering False on a missing
-    fingerprint: the relocation would be executed unconfirmed."""
-    db = await _mkdb(tmp_path, continuity=False)  # NO fingerprint: a genuinely fresh DB
-    try:
-        await _seed_rule(db, "grafana.lc", "prox")
-        ext = Ext(db)
-        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
-        await ext.add_instance("prox", tabs=[])
-        ext.responder = lambda i, c, p: (
-            {"ok": True, "result": {"tabId": ext.next_open_id(), "windowId": 1}}
-            if c == protocol.CMD_OPEN_TAB else {"ok": True, "result": {}}
-        )
-
-        res = await ext.run_pass()
-        assert res["status"] == "resume_pending"
-        assert res["plan"]["relocations"] == 1     # the plan is shown, not executed
-        # A dry_run writes nothing: no actions, no passes row, source untouched.
-        assert await _rows(db, "SELECT COUNT(*) FROM actions") == [(0,)]
-        assert await _rows(db, "SELECT COUNT(*) FROM passes") == [(0,)]
-        # The latch is armed and persists into the next scheduled pass.
-        from src.curator.pause import RESUME_PENDING_KEY
-        from src.db.settings_store import get_setting
-        assert await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
-        assert (await ext.run_pass())["status"] == "resume_pending"
-
-        # The confirming click runs the real pass and stores the fingerprint.
-        res3 = await ext.run_pass(confirm_pending=True)
-        assert res3["status"] == "ok"
-        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate'") == [(1,)]
-        assert not await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
-    finally:
-        await db.close()
-
-
-async def test_clean_db_with_empty_fleet_runs_normally(tmp_path):
-    """The other side of the boundary: a brand-new install whose browser has never
-    connected has nothing to drain, so it must NOT sit waiting for a click."""
-    db = await _mkdb(tmp_path, continuity=False)
-    try:
-        ext = Ext(db)  # no instances at all
-        res = await ext.run_pass()
-        assert res["status"] == "no_ready_instances"  # a REAL pass, not resume_pending
-        assert await _rows(db, "SELECT COUNT(*) FROM passes") == [(1,)]
-        # And it did NOT consume the first-run latch: no fingerprint was stored, so the
-        # first pass that actually meets a fleet still defers behind the click.
-        from src.curator import clock as clockmod
-        assert await db.read(clockmod.read_stored_fingerprint) is None
-    finally:
-        await db.close()
-
-
-# --- the resume BUTTON is the way out of a continuity-break latch (§7) ------
-async def test_resume_now_escapes_a_continuity_break_latch_and_executes(tmp_path):
-    """The exit from ``resume_pending`` armed by a CONTINUITY BREAK, end to end.
-
-    The latch is armed by two events: an expired pause and a continuity break. For the
-    pause there is something to clear, so a plain resume works. For a break there is
-    NOT: no ``pause_until``, no ``pause_started_at`` — only the stale fingerprint, which
-    is refreshed by a REAL pass and by nothing else. An unconfirmed pass returns
-    ``{"status": "resume_pending"}`` at step 1 before doing anything, so the pass that
-    would lift the latch is exactly the pass the latch blocks. Every press of the button
-    cleared nothing, ran nothing and left the latch armed — the state had no exit
-    through the UI at all.
-
-    So this asserts the whole way out, not just a status string: the pass genuinely
-    EXECUTES (the deferred relocation lands in ``actions``), the latch is gone, the
-    stored fingerprint now matches the running config, and the NEXT pass is an ordinary
-    one. Reddens if ``resume_now`` stops confirming the latch.
-    """
-    from src.api.pause import resume_now
-    from src.curator import clock as clockmod
-    from src.curator.pause import RESUME_PENDING_KEY
-    from src.db.settings_store import get_setting
-
-    db = await _mkdb(tmp_path, continuity=False)
-    try:
-        # Continuity was established at IDLE_MINUTES=30 but the service now runs with
-        # 60 (`_settings()`): a §7 break, and one with no pause anywhere near it.
-        await _establish_continuity(db, idle_minutes=30)
-        await _seed_rule(db, "grafana.lc", "prox")
-        ext = Ext(db)
-        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
-        await ext.add_instance("prox", tabs=[])
-        ext.responder = lambda i, c, p: (
-            {"ok": True, "result": {"tabId": ext.next_open_id(), "windowId": 1}}
-            if c == protocol.CMD_OPEN_TAB else {"ok": True, "result": {}}
-        )
-
-        # The break arms the latch: the plan is shown, nothing is executed.
-        armed = await ext.run_pass()
-        assert armed["status"] == "resume_pending"
-        assert armed["plan"]["relocations"] == 1
-        assert await _rows(db, "SELECT COUNT(*) FROM actions") == [(0,)]
-        assert await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
-
-        # The button. DELETE /api/pause and the MCP `resume` tool both come through here.
-        out = await ext.with_driver(resume_now(ext.as_app()))
-
-        # A REAL pass ran — not another `resume_pending` deferral…
-        assert out["pass"]["status"] == "ok", out["pass"]
-        # …and it actually did the work the plan promised.
-        assert await _rows(
-            db, "SELECT instance_from, instance_to, status FROM actions WHERE kind='relocate'"
-        ) == [("main", "prox", "done")]
-        assert await _rows(db, "SELECT COUNT(*) FROM passes") == [(1,)]
-
-        # The latch is gone and the fingerprint was refreshed to the RUNNING config —
-        # the two halves of "the state has an exit". Without the refresh the next tick
-        # would re-arm on the same stale fingerprint and the loop would never end.
-        assert not await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
-        stored = await db.read(clockmod.read_stored_fingerprint)
-        assert stored["idle_minutes"] == 60
-
-        # And the next scheduled pass is an ordinary one.
-        assert (await ext.run_pass())["status"] == "ok"
-    finally:
-        await db.close()
-
-
-# --- confirm_pending with NOTHING armed must not bypass the gates (§7) ------
-async def test_confirm_pending_without_armed_latch_falls_back_to_the_gate(tmp_path):
-    """A client that sends confirm_pending out of habit must not eat a continuity
-    break: with no armed latch the flag is ignored and the pass goes through the normal
-    step-1 gate, which sees the fingerprint mismatch (a lowered IDLE_MINUTES, §7) and
-    arms resume_pending instead of draining the fleet. Reddens if confirm_pending is
-    honoured unconditionally: the relocation runs and _finish_continuity silently
-    rewrites the fingerprint."""
-    db = await _mkdb(tmp_path)  # continuity established at IDLE_MINUTES=60
-    try:
-        await _seed_rule(db, "grafana.lc", "prox")
-        ext = Ext(db)
-        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
-        await ext.add_instance("prox", tabs=[])
-        ext.responder = lambda i, c, p: (
-            {"ok": True, "result": {"tabId": ext.next_open_id(), "windowId": 1}}
-            if c == protocol.CMD_OPEN_TAB else {"ok": True, "result": {}}
-        )
-        from src.curator.pause import RESUME_PENDING_KEY
-        from src.db.settings_store import get_setting
-        assert not await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
-
-        # IDLE_MINUTES drops 60 -> 30: a §7 continuity break, latch not yet armed.
-        stop = asyncio.Event()
-
-        async def driver():
-            seen: dict = {}
-            while not stop.is_set():
-                for iid, cs in ext.registry.items():
-                    seen.setdefault(iid, 0)
-                    while seen[iid] < len(cs.ws.sent):
-                        frame = cs.ws.sent[seen[iid]]
-                        seen[iid] += 1
-                        await ext._handle_frame(iid, cs, frame)
-                await asyncio.sleep(0.003)
-
-        d = asyncio.create_task(driver())
-        try:
-            res = await runner.run_pass(
-                db, ext.registry, _settings(idle_minutes=30), confirm_pending=True
-            )
-        finally:
-            stop.set()
-            await d
-
-        assert res["status"] == "resume_pending"
-        assert await _rows(db, "SELECT COUNT(*) FROM actions") == [(0,)]
-        assert await db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
-    finally:
-        await db.close()
-
-
-# --- the restore marker: read once, lazily, and its blindness is observable --
-async def test_marker_read_once_per_pass_and_never_before_the_pause_gate(tmp_path):
-    """Two properties of the marker read, both load-bearing.
-
-    ONCE per pass: the step-1 comparison and the closing ``_finish_continuity`` must use
-    the SAME value, or a marker rewritten between them is stored as if it had always been
-    there and the break is swallowed for good.
-
-    NOT AT ALL for a pass that exits at the pause gate: that path is triggered by every
-    POST /api/run_pass and every pause/resume, and each touch of a wedged mount parks a
-    thread for the read timeout. Reddens if the read moves back to pass entry: the paused
-    pass bumps the counter.
-    """
-    from src.curator import clock as clockmod
-    from src.curator import pause as pause_ops
-
-    marker = tmp_path / "continuity-marker"
-    marker.write_text("uuid-1")
-    db = await _mkdb(tmp_path)
-    try:
-        ext = Ext(db)
-        await ext.add_instance("main", tabs=[])
-        ext.responder = lambda i, c, p: {"ok": True, "result": {}}
-        settings = _settings(restore_marker_path=str(marker))
-        calls = {"n": 0}
-        real = clockmod.read_restore_marker_async
-
-        async def counting(path, **kw):
-            calls["n"] += 1
-            return await real(path, **kw)
-        clockmod.read_restore_marker_async = counting
-        try:
-            await _drive(ext, db, settings)
-            assert calls["n"] == 1        # one read served both consumers
-
-            # A paused pass must not touch the filesystem at all.
-            now = runner._now_ms()
-            await db.write(lambda c: pause_ops.pause(c, now=now, minutes=30))
-            res = await runner.run_pass(db, ext.registry, settings, now=now + 1_000)
-            assert res["status"] == "paused"
-            assert calls["n"] == 1        # unchanged
-        finally:
-            clockmod.read_restore_marker_async = real
-    finally:
-        await db.close()
-
-
-async def test_unreadable_marker_is_published_for_metrics(tmp_path):
-    """§12: "the restore detector is blind" must be scrapable STATE, not a log line.
-
-    A configured marker the service can never read (the classic case: written as root
-    with umask 077 while the container runs as uid 1000) disables restore detection
-    permanently and silently — no other fingerprint component can catch a restore,
-    they all travel inside the backup. The runner records it in ``settings`` so
-    /metrics can export a 0/1 gauge at scrape time. Reddens if the row is not written.
-    """
-    from src.db.settings_store import get_setting
-
-    db = await _mkdb(tmp_path)
-    try:
-        ext = Ext(db)
-        await ext.add_instance("main", tabs=[])
-        ext.responder = lambda i, c, p: {"ok": True, "result": {}}
-
-        # A path that cannot be read (a directory: open() raises IsADirectoryError).
-        blind = tmp_path / "not-a-file"
-        blind.mkdir()
-        await _drive(ext, db, _settings(restore_marker_path=str(blind)))
-        assert await db.read(
-            lambda c: get_setting(c, runner._MARKER_UNREADABLE_KEY)) == "1"
-
-        # A readable marker clears it again.
-        good = tmp_path / "continuity-marker"
-        good.write_text("uuid-1")
-        await _drive(ext, db, _settings(restore_marker_path=str(good)))
-        assert await db.read(
-            lambda c: get_setting(c, runner._MARKER_UNREADABLE_KEY)) == "0"
-    finally:
-        await db.close()
-
-
-async def _drive(ext, db, settings):
-    """Run one pass with the frame driver, using a caller-supplied settings object."""
-    stop = asyncio.Event()
-
-    async def driver():
-        seen: dict = {}
-        while not stop.is_set():
-            for iid, cs in ext.registry.items():
-                seen.setdefault(iid, 0)
-                while seen[iid] < len(cs.ws.sent):
-                    frame = cs.ws.sent[seen[iid]]
-                    seen[iid] += 1
-                    await ext._handle_frame(iid, cs, frame)
-            await asyncio.sleep(0.003)
-
-    d = asyncio.create_task(driver())
-    try:
-        return await runner.run_pass(db, ext.registry, settings)
-    finally:
-        stop.set()
-        await d
-
-
-# --- a pause mid-command must NOT let a second pass in (MAJOR: no overlap) --
-async def test_pause_during_phase_a_command_does_not_admit_a_second_pass(tmp_path):
+# --- a stop mid-command must NOT let a second pass in (MAJOR: no overlap) ---
+async def test_stop_during_phase_a_command_does_not_admit_a_second_pass(tmp_path):
     """Two passes must never run at once — the lease SLOT is what guarantees it.
 
-    ``run_phase_a`` sends ``open_tab`` BEFORE its first guarded write, so a pause landing
+    ``run_phase_a`` sends ``open_tab`` BEFORE its first guarded write, so a stop landing
     mid-command fences the pass only AFTER the tab exists in the browser while its
-    ``tabs``/``relocate`` rows are rolled back. If the pause also freed the lease slot,
-    the pass that §7 runs immediately on resume would start right then, decide against a
+    ``tabs``/``relocate`` rows are rolled back. If the stop also freed the lease slot,
+    the pass that §7 runs immediately on start would begin right then, decide against a
     mirror with no copy in it, and open a SECOND one — permanently, for a ``main`` target
     (a sink without dedup, §15). So: while the fenced pass is inside its command, the
     slot stays taken and a concurrent pass gets `lease_unavailable`; once it finishes, it
     releases and the next pass acquires at once.
 
-    Reddens if ``pause()`` frees the slot: the inner pass returns ok/no_ready_instances.
+    Reddens if ``stop()`` frees the slot: the inner pass returns ok/no_ready_instances.
     """
     db = await _mkdb(tmp_path)
     try:
@@ -1288,7 +1006,7 @@ async def test_pause_during_phase_a_command_does_not_admit_a_second_pass(tmp_pat
                 # Right here the owner hits the emergency stop and lifts it again — §7
                 # makes the lift run a pass IMMEDIATELY. It must not start on top of the
                 # pass that is, at this instant, still talking to a browser.
-                inner["res"] = await _pause_then_resume_pass(db, ext)
+                inner["res"] = await _stop_then_start_pass(db, ext)
                 resolve_response(cs, {
                     "type": protocol.TYPE_RESPONSE, "id": frame["id"], "ok": True,
                     "result": {"tabId": ext.next_open_id(), "windowId": 1},
@@ -1313,12 +1031,12 @@ async def test_pause_during_phase_a_command_does_not_admit_a_second_pass(tmp_pat
         await db.close()
 
 
-async def _pause_then_resume_pass(db, ext):
-    """Arm a pause (fencing the in-flight pass), lift it, and try a pass at once."""
+async def _stop_then_start_pass(db, ext):
+    """Arm the stop (fencing the in-flight pass), lift it, and try a pass at once."""
     from src.curator import pause as pause_ops
     now = runner._now_ms()
-    await db.write(lambda c: pause_ops.pause(c, now=now, minutes=30))
-    await db.write(lambda c: pause_ops.resume(c, now=now + 1_000))
+    await db.write(lambda c: pause_ops.stop(c, now=now))
+    await db.write(lambda c: pause_ops.apply_resume_shift(c, now=now + 1_000))
     return await runner.run_pass(db, ext.registry, _settings())
 
 
@@ -1658,5 +1376,373 @@ async def test_non_convergence_latch_quarantines(tmp_path):
         await ext.run_pass()
         opens_after = await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'")
         assert opens_after == opens_before
+    finally:
+        await db.close()
+
+
+# --- the MAX_ACTIONS_PER_PASS threshold latch (§7) ---------------------------
+# The ONE mass-action brake: a real pass whose countable plan (phase-A relocations +
+# closes) exceeds the threshold defers it behind one confirming click. The latch is a
+# fresh snapshot (every pass recomputes and overwrites it), auto-unlatches when the
+# plan shrinks, and exempts phase-B completions (the second half of approved work).
+
+def _latch_raw(db):
+    from src.curator.pause import RESUME_PENDING_KEY
+    from src.db.settings_store import get_setting
+    return db.read(lambda c: get_setting(c, RESUME_PENDING_KEY))
+
+
+async def _seed_fleet_with_phase_a(ext, db, urls):
+    """A main instance holding idle ruled tabs (each becomes one phase-A relocation
+    into prox) and an empty prox. Returns nothing; the responder opens copies."""
+    await _seed_rule(db, "grafana.lc", "prox")
+    await ext.add_instance("main", tabs=[
+        _tabinfo(10 + i, url) for i, url in enumerate(urls)
+    ])
+    await ext.add_instance("prox", tabs=[])
+    ext.responder = lambda i, c, p: (
+        {"ok": True, "result": {"tabId": ext.next_open_id(), "windowId": 1}}
+        if c == protocol.CMD_OPEN_TAB else {"ok": True, "result": {}}
+    )
+
+
+async def test_under_threshold_executes_and_clears_a_stale_latch(tmp_path):
+    """(a) countable <= threshold: the pass runs normally AND drops a stale latch.
+
+    The stale latch models a plan that shrank between passes (the human closed tabs by
+    hand): auto-unlatch means no click is ever needed for work that no longer exists.
+    Reddens if the clear moves onto the confirming path only."""
+    from src.curator.pause import RESUME_PENDING_KEY
+    from src.db.settings_store import set_setting
+
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(ext, db, ["https://grafana.lc/d/a"])
+        await db.write(lambda c: set_setting(
+            c, RESUME_PENDING_KEY, '{"since": 1, "plan": {"total": 99}}'))
+
+        res = await ext.run_pass()  # threshold 20 >> countable 1
+        assert res["status"] == "ok"
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(1,)]
+        assert not await _latch_raw(db)   # stale latch gone without a click
+    finally:
+        await db.close()
+
+
+async def test_over_threshold_defers_countables_but_runs_phase_b(tmp_path):
+    """(b) countable > threshold: phase-A/closes are NOT executed, phase-B/abandon ARE,
+    the latch carries total/threshold, and the pass row is still finalized.
+
+    Phase B is the second half of already-approved work — freezing it keeps duplicate
+    tabs open for as long as the owner takes to click, so it is exempt from both the
+    count and the freeze. Reddens if phase B is frozen with the rest, or if phase A
+    executes despite the latch."""
+    import json
+
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_rule(db, "grafana.lc", "prox")
+        # Two ruled idle tabs => countable phase_a = 2 (> threshold 1) ...
+        await ext.add_instance("main", tabs=[
+            _tabinfo(10, "https://grafana.lc/d/a"),
+            _tabinfo(11, "https://grafana.lc/d/b"),
+            # ... plus the SOURCE of an in-flight relocation whose copy is already
+            # open in prox — the phase-B half that must keep moving.
+            _tabinfo(77, "https://grafana.lc/d/c"),
+        ])
+        await ext.add_instance("prox", tabs=[_tabinfo(99, "https://grafana.lc/d/c")])
+        await _seed_relocate(
+            db, instance_from="main", instance_to="prox", tab_id=77,
+            session_id_from="s", tab_id_to=99, session_id_to="s",
+            url="https://grafana.lc/d/c", url_norm="https://grafana.lc/d/c",
+        )
+        sent_cmds = []
+
+        def respond(iid, cmd, params):
+            sent_cmds.append(cmd)
+            if cmd == protocol.CMD_GET_TAB:
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": "https://grafana.lc/d/c"}}}
+            if cmd == protocol.CMD_CLOSE_TAB:
+                return {"ok": True, "result": {"ok": True}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res = await ext.run_pass(settings=_settings(max_actions_per_pass=1))
+        assert res["status"] == "resume_pending"
+        assert res["plan"]["total"] == 2 and res["plan"]["threshold"] == 1
+        assert res["plan"]["relocations"] == 2
+        assert res["plan"]["phase_b_completions"] == 1
+
+        # Phase A frozen: no open_tab left the socket, no new relocate row.
+        assert protocol.CMD_OPEN_TAB not in sent_cmds
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(1,)]
+        # Phase B EXECUTED: the source closed, the completion journaled.
+        assert await _rows(db, "SELECT status, tab_id FROM actions WHERE kind='relocate_close'") == [("done", 77)]
+        assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='main' AND tab_id=77") == [(0,)]
+        # The latch holds the plan with total/threshold.
+        latch = json.loads(await _latch_raw(db))
+        assert latch["plan"]["total"] == 2 and latch["plan"]["threshold"] == 1
+        assert latch["since"] > 0
+        # The pass row was finalized through the normal path: it ran, it deferred.
+        assert await _rows(db, "SELECT ok FROM passes") == [(1,)]
+    finally:
+        await db.close()
+
+
+async def test_two_over_threshold_passes_refresh_the_latch(tmp_path):
+    """(c) the latch is a fresh snapshot, not a one-shot: a second over-threshold pass
+    OVERWRITES it with the current plan, so the shown plan is at most one interval
+    stale. Reddens if the arm is guarded on "not already armed"."""
+    import json
+
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(
+            ext, db, ["https://grafana.lc/d/a", "https://grafana.lc/d/b"])
+        s = _settings(max_actions_per_pass=1)
+
+        res1 = await ext.run_pass(settings=s)
+        assert res1["status"] == "resume_pending"
+        latch1 = json.loads(await _latch_raw(db))
+        assert latch1["plan"]["total"] == 2
+
+        # The world grows between passes: a third ruled tab appears.
+        ext.tabs["main"].append(_tabinfo(30, "https://grafana.lc/d/z"))
+        res2 = await ext.run_pass(settings=s)
+        assert res2["status"] == "resume_pending"
+        latch2 = json.loads(await _latch_raw(db))
+        assert latch2["plan"]["total"] == 3
+        assert latch2 != latch1   # refreshed, not the first snapshot forever
+    finally:
+        await db.close()
+
+
+async def test_confirm_pending_executes_the_recomputed_plan_and_clears(tmp_path):
+    """(d) the click: confirm_pending with an ARMED latch executes the FULL plan as
+    recomputed at click time and clears the latch. Reddens if the confirm still
+    early-returns or if the latch survives the executing pass."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(
+            ext, db, ["https://grafana.lc/d/a", "https://grafana.lc/d/b"])
+        s = _settings(max_actions_per_pass=1)
+
+        assert (await ext.run_pass(settings=s))["status"] == "resume_pending"
+        assert await _latch_raw(db)
+
+        res = await ext.run_pass(settings=s, confirm_pending=True)
+        assert res["status"] == "ok"
+        # Both relocations of the (recomputed) plan happened.
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(2,)]
+        assert not await _latch_raw(db)
+        # And the next pass is an ordinary one (nothing left to move).
+        assert (await ext.run_pass(settings=s))["status"] == "ok"
+    finally:
+        await db.close()
+
+
+async def test_confirm_pending_without_latch_degrades_and_still_latches(tmp_path):
+    """(e) confirm_pending with NOTHING armed must not pre-approve a plan nobody has
+    seen: the flag degrades to an ordinary pass, and an over-threshold plan computed by
+    THAT pass still latches instead of executing. Reddens if the flag is honoured
+    unconditionally — the two relocations would run on a habit-sent flag."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(
+            ext, db, ["https://grafana.lc/d/a", "https://grafana.lc/d/b"])
+        assert not await _latch_raw(db)
+
+        res = await ext.run_pass(
+            settings=_settings(max_actions_per_pass=1), confirm_pending=True)
+        assert res["status"] == "resume_pending"
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(0,)]
+        assert await _latch_raw(db)
+    finally:
+        await db.close()
+
+
+async def test_phase_b_only_plans_never_latch(tmp_path):
+    """(f) a plan of NOTHING but phase-B completions never latches, whatever its size:
+    countable excludes phase B, so even three completions against threshold 1 run
+    normally. Reddens if phase B is pulled into the count."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_rule(db, "grafana.lc", "prox")
+        urls = [f"https://grafana.lc/d/{x}" for x in ("a", "b", "c")]
+        await ext.add_instance("main", tabs=[
+            _tabinfo(20 + i, url) for i, url in enumerate(urls)
+        ])
+        await ext.add_instance("prox", tabs=[
+            _tabinfo(90 + i, url) for i, url in enumerate(urls)
+        ])
+        for i, url in enumerate(urls):
+            await _seed_relocate(
+                db, instance_from="main", instance_to="prox", tab_id=20 + i,
+                session_id_from="s", tab_id_to=90 + i, session_id_to="s",
+                url=url, url_norm=url,
+            )
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_GET_TAB:
+                idx = params["tabId"] - 90
+                return {"ok": True, "result": {"tab": {"id": params["tabId"],
+                                                       "url": urls[idx]}}}
+            if cmd == protocol.CMD_CLOSE_TAB:
+                return {"ok": True, "result": {"ok": True}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res = await ext.run_pass(settings=_settings(max_actions_per_pass=1))
+        assert res["status"] == "ok"
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate_close' AND status='done'") == [(3,)]
+        assert not await _latch_raw(db)
+    finally:
+        await db.close()
+
+
+async def test_stopped_state_blocks_the_pass(tmp_path):
+    """(g) the indefinite stop blocks a real pass with {"status": "stopped"} — before
+    the lease, before any snapshot traffic."""
+    from src.curator import pause as pause_ops
+
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(ext, db, ["https://grafana.lc/d/a"])
+        now = runner._now_ms()
+        await db.write(lambda c: pause_ops.stop(c, now=now))
+
+        res = await ext.run_pass()
+        assert res == {"status": "stopped", "since": now}
+        assert await _rows(db, "SELECT COUNT(*) FROM passes") == [(0,)]
+        assert await _rows(db, "SELECT COUNT(*) FROM actions") == [(0,)]
+    finally:
+        await db.close()
+
+
+async def test_zero_ready_pass_leaves_the_latch_and_its_plan_untouched(tmp_path):
+    """(h) an evidence-free pass must NOT clear the latch: with no instance answering
+    the snapshot request the computed plan is empty by construction, which proves
+    nothing about the armed 500-action plan having shrunk. Clearing on it would make
+    the latch flap with fleet connectivity (laptop asleep → cleared; laptop back →
+    re-armed). Reddens if the execute-path clear stops being guarded on a non-empty
+    ready set."""
+    from src.curator.pause import RESUME_PENDING_KEY
+    from src.db.settings_store import set_setting
+
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)  # no instances at all => zero ready, empty plan
+        armed = '{"since": 1, "plan": {"total": 500, "threshold": 20}}'
+        await db.write(lambda c: set_setting(c, RESUME_PENDING_KEY, armed))
+
+        res = await ext.run_pass()
+        # The pass ran and found nobody — NOT a resume_pending refresh.
+        assert res["status"] == "no_ready_instances"
+        # The latch survived with its plan value UNCHANGED (not overwritten by the
+        # empty plan this pass computed, not cleared).
+        assert await _latch_raw(db) == armed
+    finally:
+        await db.close()
+
+
+async def test_countable_equal_to_threshold_executes_fully(tmp_path):
+    """(i) the gate is strictly ``>``: countable == threshold executes the whole plan
+    and arms nothing. Reddens if the comparison slips to ``>=``."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(
+            ext, db, ["https://grafana.lc/d/a", "https://grafana.lc/d/b"])
+
+        res = await ext.run_pass(settings=_settings(max_actions_per_pass=2))
+        assert res["status"] == "ok"
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(2,)]
+        assert not await _latch_raw(db)
+    finally:
+        await db.close()
+
+
+async def test_armed_latch_pass_journals_no_deferrals_and_merges_no_windows(tmp_path):
+    """(j) under the latch the SKIPPED list is real: no ``deferred`` rows are journaled
+    (a deferral of a plan that is itself deferred would muddy curator_deferred_total)
+    and no window merges are executed — only phase B / abandon bookkeeping move. The
+    confirming pass afterwards proves the fixture is not vacuous: the SAME world then
+    journals the deferral and merges the windows. Reddens if the over-threshold branch
+    starts journaling deferrals or running step 9."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_rule(db, "grafana.lc", "prox")
+        await _seed_rule(db, "kibana.lc", "ghost")
+        # `ghost` exists as an ACTIVE instances row (so the rule stays valid) but never
+        # connects: its tab journals a target_not_ready deferral on a normal pass.
+        await db.write(lambda c: c.execute(
+            "INSERT INTO instances (id, status, connected) VALUES ('ghost', 'active', 0)"))
+        await ext.add_instance(
+            "main",
+            tabs=[
+                # Two ruled idle tabs => countable phase_a = 2 (> threshold 1).
+                _tabinfo(10, "https://grafana.lc/d/a"),
+                _tabinfo(11, "https://grafana.lc/d/b"),
+                # Ruled to the unconnected `ghost` => a deferral candidate.
+                _tabinfo(12, "https://kibana.lc/d/c"),
+                # An idle unruled-on-main tab alone in window 2. It is NOT a merge
+                # source: step 9 skips `main` unconditionally (#41). Kept as the
+                # control — main's second window must survive both passes below.
+                _tabinfo(30, "https://random.example/p", window_id=2),
+            ],
+            windows=[{"id": 1, "type": "normal", "state": "normal"},
+                     {"id": 2, "type": "normal", "state": "normal"}],
+        )
+        # The merge scenario lives on a THEMED instance, since main is never merged.
+        # Both tabs are ruled home to `prox`, so they stay put (no relocation, no
+        # close) and the countable plan is still the two phase-A opens above; window 2
+        # is idle and holds an unpinned tab => a merge source, target is window 1.
+        await ext.add_instance(
+            "prox",
+            tabs=[
+                _tabinfo(40, "https://grafana.lc/d/p1", window_id=1),
+                _tabinfo(41, "https://grafana.lc/d/p2", window_id=2),
+            ],
+            windows=[{"id": 1, "type": "normal", "state": "normal"},
+                     {"id": 2, "type": "normal", "state": "normal"}],
+        )
+        sent_cmds = []
+
+        def respond(iid, cmd, params):
+            sent_cmds.append(cmd)
+            if cmd == protocol.CMD_OPEN_TAB:
+                return {"ok": True, "result": {"tabId": ext.next_open_id(), "windowId": 1}}
+            if cmd == protocol.CMD_MERGE_WINDOWS:
+                return {"ok": True, "result": {"merged": 1}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        s = _settings(max_actions_per_pass=1)
+        res = await ext.run_pass(settings=s)
+        assert res["status"] == "resume_pending"
+        # The PLAN saw the deferral (the UI must show it) ...
+        assert res["plan"]["deferred"] == {"ghost": 1}
+        # ... but nothing countable-adjacent hit the journal or the sockets:
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE status='deferred'") == [(0,)]
+        assert protocol.CMD_MERGE_WINDOWS not in sent_cmds
+        assert protocol.CMD_OPEN_TAB not in sent_cmds
+
+        # The confirming click over the SAME world executes the full path — deferral
+        # journaled, windows merged — proving the latched pass skipped real work.
+        res2 = await ext.run_pass(settings=s, confirm_pending=True)
+        assert res2["status"] == "ok"
+        assert await _rows(
+            db, "SELECT instance_to, decision FROM actions WHERE status='deferred'"
+        ) == [("ghost", "target_not_ready")]
+        assert protocol.CMD_MERGE_WINDOWS in sent_cmds
     finally:
         await db.close()

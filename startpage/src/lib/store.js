@@ -103,7 +103,7 @@ export function createStore(deps = {}) {
   const enrollReject = ref(null);
 
   // --- the clock (§10) ------------------------------------------------------
-  // Every timestamp the server hands us — snapshot_at, last_seen_at, paused_until — is
+  // Every timestamp the server hands us — snapshot_at, last_seen_at, stopped_at — is
   // on the SERVER's clock. Comparing them to Date.now() means comparing two clocks: a
   // couple of seconds of laptop drift against a 3 s staleness threshold either paints
   // every instance "зеркало устарело" forever or hides a genuinely half-open socket.
@@ -129,19 +129,26 @@ export function createStore(deps = {}) {
     return ms == null ? null : ms - serverOffset.value;
   }
 
-  // --- pause state (§7) — server-wide; rides in the StateResponse ------------
-  // `pausedUntil` is the RAW server deadline (ms) — the status bar counts down from it
-  // in the SERVER scale (see serverNow above). It renders from the cache too
-  // (offline-first): applyState is the single writer, and it runs from both the cache
-  // and a live refresh.
-  const pausedUntil = ref(null);
+  // --- stop state (§7) — server-wide; rides in the StateResponse -------------
+  // `stoppedAt` is the RAW server stamp (ms) of when the automation was stopped;
+  // null = running. The stop is INDEFINITE — no deadline, no countdown — so the only
+  // clock math left is rendering the stamp as a wall-clock time. It renders from the
+  // cache too (offline-first): applyState is the single writer, and it runs from both
+  // the cache and a live refresh.
+  const stoppedAt = ref(null);
   const resumePending = ref(false);
   const pendingPlan = ref(null);
   const pauseError = ref("");
-  // A mutating verb refused by the pause gate (423) — §7's "аварийный стоп", NOT a
-  // breakage. Carries the deadline and the retry that re-issues the SAME verb with
+  // In-flight guard for resumeCurator: DELETE /api/pause holds the connection for
+  // the WHOLE confirming pass (tens of seconds on a big fleet). A second DELETE
+  // fired meanwhile lands after the stop has already cleared server-side, so it
+  // arrives as a confirm of the over-threshold plan — executing a plan the human
+  // never saw. The UI disables both resume buttons while this is set.
+  const resuming = ref(false);
+  // A mutating verb refused by the stop gate (423) — §7's "аварийный стоп", NOT a
+  // breakage. Carries the stop stamp and the retry that re-issues the SAME verb with
   // {force:true}, the exception §7 grants to the human's own buttons.
-  const pauseBlock = ref(null); // { verb, until, retry }
+  const pauseBlock = ref(null); // { verb, since, retry }
 
   // --- quick-link ops the SW has queued but the server has not confirmed -----
   // `pendingOps` is the durable queue read from storage.local; `inFlightOps` are ops
@@ -181,9 +188,12 @@ export function createStore(deps = {}) {
     return out;
   }
 
-  // The deferred-pass plan (§7 "план выводится в статус-полосу"). Tolerates both the
+  // The over-threshold plan (§7 "план выводится в статус-полосу"). Tolerates both the
   // bare plan and the stored `{since, plan}` wrapper so the human sees WHAT the
-  // confirm button will actually do, not just that something is pending.
+  // confirm button will actually do, not just that something is pending. `total` is
+  // the COUNTABLE side (relocations + closures; phase B is exempt and keeps running)
+  // and `threshold` the configured MAX_ACTIONS_PER_PASS — together they are the whole
+  // reason the latch is armed, so the notice renders both.
   function normalizePendingPlan(raw) {
     if (!raw || typeof raw !== "object") return null;
     const plan = raw.plan && typeof raw.plan === "object" ? raw.plan : raw;
@@ -194,6 +204,8 @@ export function createStore(deps = {}) {
       relocations: num(plan.relocations),
       phaseBCompletions: num(plan.phase_b_completions),
       closures: num(plan.closures),
+      total: typeof plan.total === "number" ? plan.total : null,
+      threshold: typeof plan.threshold === "number" ? plan.threshold : null,
       deferred: Object.values(deferred).reduce((a, b) => a + num(b), 0),
       examples: [
         ...(Array.isArray(plan.relocation_examples) ? plan.relocation_examples : []),
@@ -210,9 +222,9 @@ export function createStore(deps = {}) {
       (t) => t.instance_id !== ownInstanceId.value,
     );
     quickLinks.value = sortQuickLinks(overlayPending(state.quick_links || []));
-    // Pause (§7): surface the deadline + the after-expiry click-wait. `undefined`
-    // (a pre-pause cache) reads as "not paused" rather than clobbering a live value.
-    pausedUntil.value = state.paused_until ?? null;
+    // Stop (§7): surface the indefinite stop + the over-threshold latch. `undefined`
+    // (a pre-stop cache) reads as "running" rather than clobbering a live value.
+    stoppedAt.value = state.stopped_at ?? null;
     resumePending.value = !!state.resume_pending;
     pendingPlan.value = normalizePendingPlan(state.pending_plan);
   }
@@ -712,13 +724,13 @@ export function createStore(deps = {}) {
       await refresh();
       return;
     }
-    // 423: the pause gate, not a breakage (§7). Say WHY and offer the override the
+    // 423: the stop gate, not a breakage (§7). Say WHY and offer the override the
     // spec grants to the human's own buttons — "переключитесь вручную" here would be
     // a lie about a working system with a deliberate stop armed.
     if (status === 423) {
       pauseBlock.value = {
         verb: "focus",
-        until: (body && body.until) ?? pausedUntil.value ?? null,
+        since: (body && body.since) ?? stoppedAt.value ?? null,
         retry: () => jumpForeign(instanceId, tab, { force: true }),
       };
       return;
@@ -746,7 +758,7 @@ export function createStore(deps = {}) {
     if (status === 423) {
       pauseBlock.value = {
         verb: "merge_windows",
-        until: (body && body.until) ?? pausedUntil.value ?? null,
+        since: (body && body.since) ?? stoppedAt.value ?? null,
         retry: () => mergeWindowsNow(instanceId, { force: true }),
       };
       return { ok: false, paused: true };
@@ -768,7 +780,7 @@ export function createStore(deps = {}) {
     return { ok: false };
   }
 
-  // Re-issue the verb the pause gate refused, this time with {force:true} (§7).
+  // Re-issue the verb the stop gate refused, this time with {force:true} (§7).
   async function retryForced() {
     const blocked = pauseBlock.value;
     if (!blocked) return { ok: false };
@@ -780,19 +792,22 @@ export function createStore(deps = {}) {
     search.value = q;
   }
 
-  // --- pause / resume (§7) --------------------------------------------------
+  // --- stop / start (§7) ----------------------------------------------------
+  // Names kept as pause*/resume* — the HTTP path is still /api/pause and renaming
+  // would ripple through every consumer for zero behaviour. Semantics are stop/start:
+  // POST stops indefinitely (no deadline), DELETE starts + runs a confirming pass.
   // The buttons need the network (a live mutating verb). Offline they no-op with a
-  // note; the countdown ROW still renders from the cache regardless.
-  async function pauseCurator(minutes = null) {
+  // note; the stop ROW still renders from the cache regardless.
+  async function pauseCurator() {
     pauseError.value = "";
     if (!base || !token) {
       offline.value = true;
       pauseError.value = "offline";
       return { ok: false, offline: true };
     }
-    const { status, body } = await postPause(fetchFn, base, token, minutes);
+    const { status, body } = await postPause(fetchFn, base, token);
     if (status >= 200 && status < 300 && body) {
-      pausedUntil.value = body.paused_until ?? pausedUntil.value;
+      stoppedAt.value = body.stopped_at ?? stoppedAt.value;
       return { ok: true };
     }
     pauseError.value = "pause failed: HTTP " + status;
@@ -800,24 +815,36 @@ export function createStore(deps = {}) {
   }
 
   async function resumeCurator() {
+    // Re-entry is a no-op while a resume is in flight: the DELETE spans the whole
+    // pass, and a second one sent after the stop cleared server-side would arrive
+    // as an unseen-plan confirm (see `resuming` above).
+    if (resuming.value) return { ok: false };
     pauseError.value = "";
     if (!base || !token) {
       offline.value = true;
       pauseError.value = "offline";
       return { ok: false, offline: true };
     }
-    const { status } = await deletePause(fetchFn, base, token);
-    if (status >= 200 && status < 300) {
-      // The server cleared the pause and ran a pass; reflect it + pull fresh state.
-      pausedUntil.value = null;
-      resumePending.value = false;
-      pendingPlan.value = null;
-      pauseBlock.value = null; // whatever the gate refused is no longer refused
-      await refresh();
-      return { ok: true };
+    resuming.value = true;
+    try {
+      const { status } = await deletePause(fetchFn, base, token);
+      if (status >= 200 && status < 300) {
+        // The server started the automation and ran a pass; reflect only what the
+        // verb itself decided: the stop is lifted, and whatever the stop gate
+        // refused is no longer refused. The latch (resumePending/pendingPlan) is
+        // NOT cleared optimistically — a DELETE while stopped runs a NORMAL-gated
+        // pass, so the latch may survive or re-arm; the refresh() below reports it
+        // truthfully instead of this side guessing.
+        stoppedAt.value = null;
+        pauseBlock.value = null;
+        await refresh();
+        return { ok: true };
+      }
+      pauseError.value = "resume failed: HTTP " + status;
+      return { ok: false };
+    } finally {
+      resuming.value = false;
     }
-    pauseError.value = "resume failed: HTTP " + status;
-    return { ok: false };
   }
 
   // --- rules editor (§8/§10) ------------------------------------------------
@@ -964,12 +991,13 @@ export function createStore(deps = {}) {
     tick,
     serverNow,
     localFromServer,
-    // pause state (§7)
-    pausedUntil,
+    // stop state (§7)
+    stoppedAt,
     resumePending,
     pendingPlan,
     pauseError,
     pauseBlock,
+    resuming,
     // quick-link queue overlay (§10) + merge (§9)
     pendingOps,
     mergeResult,
@@ -1007,7 +1035,7 @@ export function createStore(deps = {}) {
     jumpOwn,
     jumpForeign,
     setSearch,
-    // pause methods (§7)
+    // stop/start methods (§7)
     pauseCurator,
     resumeCurator,
     retryForced,

@@ -131,15 +131,15 @@ async def test_db_error_during_resolution_is_503_never_a_pass():
 
 
 # --- integration: real app ----------------------------------------------------
-def _arm_pause(db_path, until_ms=None):
-    until = until_ms if until_ms is not None else int(time.time() * 1000) + 3_600_000
+def _arm_stop(db_path, since_ms=None):
+    since = since_ms if since_ms is not None else int(time.time() * 1000)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('pause_until', ?) "
+            "INSERT INTO settings (key, value) VALUES ('curator_stopped_at', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(until),),
+            (str(since),),
         )
         conn.commit()
     finally:
@@ -195,23 +195,23 @@ def test_db_error_makes_api_state_503_not_401(tmp_path):
 
 
 def test_focus_force_crosses_pause_only_for_instance_not_admin(tmp_path):
-    """Acc 7: at an armed pause, ``POST /api/focus {force:true}`` is 423 for an ADMIN_TOKEN
+    """Acc 7: at an armed stop, ``POST /api/focus {force:true}`` is 423 for an ADMIN_TOKEN
     caller (an agent must not bypass §7 outside MCP) but crosses the gate for the instance
     caller (the human) — it then fails on its own merits (no live socket → 502), which is
-    exactly the proof the PAUSE no longer decided."""
+    exactly the proof the STOP no longer decided."""
     app = create_app(make_settings(tmp_path, pass_interval_min=100_000))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         approve_instance(db_path, "main")
-        _arm_pause(db_path)
+        _arm_stop(db_path)
 
-        # Admin's force:true is refused by the pause.
+        # Admin's force:true is refused by the stop.
         admin_resp = client.post(
             "/api/focus", headers=admin_headers(),
             json={"instance": "main", "tabId": 1, "force": True},
         )
         assert admin_resp.status_code == 423
-        assert admin_resp.json()["error"] == "paused"
+        assert admin_resp.json()["error"] == "stopped"
 
         # The instance caller crosses the gate; with no live socket it 502s, NOT 423.
         inst_resp = client.post(

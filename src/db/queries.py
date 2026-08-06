@@ -31,8 +31,8 @@ class RevokeMainRefused(Exception):
     """Revoking the configured MAIN requires ``replacement == MAIN_INSTANCE_ID`` (§5).
 
     ``replacement`` is a PRECONDITION on the CURRENT env MAIN, not a runtime override:
-    there is nowhere to persist a new MAIN, and the id is part of the continuity
-    fingerprint. Task E maps this refusal to HTTP 409 (acceptance 9).
+    there is nowhere to persist a new MAIN — MAIN_INSTANCE_ID is env config the
+    service cannot rewrite. Task E maps this refusal to HTTP 409 (acceptance 9).
     """
 
 

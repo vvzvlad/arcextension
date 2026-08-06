@@ -236,7 +236,7 @@ export function saveFailureHint(status) {
     return " This browser's credential was refused — re-enroll it in the extension options.";
   }
   if (status === 423) {
-    return " The curator is paused: resume it on the start page (or wait for the pause to end) and click again.";
+    return " The curator is stopped: press Start on the start page and click again.";
   }
   if (status === 422) {
     return " Fix the pattern above and click again — nothing was saved.";

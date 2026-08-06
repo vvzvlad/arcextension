@@ -8,7 +8,7 @@
 // init() populates own tabs + cache, then refresh() hits GET /api/state.
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { createStore } from "./lib/store.js";
-import { formatCountdown, formatTime, resumePendingNotice } from "./lib/status.js";
+import { formatDateTime, formatTime, planGateNotice } from "./lib/status.js";
 import { confirmHeadline, impactLines } from "./lib/impact.js";
 import { cleanTitle, hostOf, plural } from "./lib/bookmarks.js";
 
@@ -59,7 +59,7 @@ function clockLabel(ms) {
 // The template used to call `swatchColor(hostOf(t.url))`, `cleanTitle(t.title, t.url)`
 // (which parses the url AGAIN inside) and `hostOf(t.url)` on every row: three `new URL`
 // per row, re-run on EVERY render. And a render happens every second — store.tick()
-// moves `clockTick`, which `foreignGroups`/`statusRows`/`pauseRemaining` read, so the
+// moves `clockTick`, which `foreignGroups`/`statusRows` read, so the
 // whole component re-renders once a second whether or not anything moved.
 //
 // MEASURED, A/B in one process, on a 452-row profile (200 own tabs in 6 windows, 160
@@ -293,29 +293,23 @@ export default {
       ].join(" · ");
     });
 
-    // --- pause status bar (§7) ---------------------------------------------
-    // One ticking clock drives EVERYTHING time-dependent on this page: the pause
-    // countdown AND the four instance states (§10). It lives in the store
-    // (store.tick/serverNow) so the comparisons happen in the SERVER scale —
-    // `paused_until` and `snapshot_at` are server stamps, and a couple of seconds of
-    // laptop drift would otherwise mis-render both. A computed that read a plain
-    // Date.now() would also never re-evaluate: the labels would freeze at first paint.
-    let pauseTimer = null;
-    const isPaused = computed(
-      () => store.pausedUntil.value != null && store.pausedUntil.value > store.serverNow(),
-    );
-    const pauseRemaining = computed(() =>
-      isPaused.value ? formatCountdown(store.pausedUntil.value - store.serverNow()) : "00:00",
-    );
-    // A server deadline rendered as a LOCAL wall-clock time (the offset undone).
-    const serverTime = (ms) => formatTime(store.localFromServer(ms));
+    // --- stop status bar (§7) ----------------------------------------------
+    // The stop is INDEFINITE — a server stamp, not a deadline — so nothing here
+    // ticks: a plain null-check decides the row. (The four instance states still
+    // ride the store's ticking serverNow; that clock just no longer feeds this row.)
+    let clockTimer = null;
+    const isStopped = computed(() => store.stoppedAt.value != null);
+    // Date + time for the stopped row only: an indefinite stop can span days, and a
+    // bare time-of-day would read as "today" however old the stop is. (The server
+    // stamp is rendered as a LOCAL wall-clock time — the offset undone.)
+    const serverDateTime = (ms) => formatDateTime(store.localFromServer(ms));
 
-    // WHY the curator is waiting for a click — an expired pause and a continuity break
-    // arm the same latch and are NOT the same event (see status.js). The row has to say
-    // which one happened, what it means and what the button will do; "Пауза истекла"
-    // over a pause nobody took sent the owner asking.
-    const resumeNotice = computed(() =>
-      store.resumePending.value ? resumePendingNotice(store.pausedUntil.value) : null,
+    // The over-threshold latch (§7 "Порог действий на проход", see status.js): the
+    // last pass's plan exceeded MAX_ACTIONS_PER_PASS and waits for one confirming
+    // click. Self-refreshing every pass, self-clearing when the plan shrinks below
+    // the threshold; phase B keeps executing meanwhile.
+    const gateNotice = computed(() =>
+      store.resumePending.value ? planGateNotice(store.pendingPlan.value) : null,
     );
 
     // --- merge windows now (§9) --------------------------------------------
@@ -323,16 +317,21 @@ export default {
       await store.mergeWindowsNow(instanceId);
     }
 
-    // --- pause gate override (§7) ------------------------------------------
+    // --- stop gate override (§7) -------------------------------------------
     async function onForce() {
       await store.retryForced();
     }
     async function onPause() {
-      // Post an explicit 60 so the "Пауза на час" label is always truthful,
-      // independent of the server's PAUSE_DEFAULT_MIN.
-      await store.pauseCurator(60);
+      // Indefinite stop — no duration to pass; only «Старт» brings it back.
+      await store.pauseCurator();
     }
     async function onResume() {
+      // Re-entry guard on top of the :disabled binding: DELETE /api/pause spans the
+      // whole pass (tens of seconds on a big fleet), and a second activation after
+      // the stop cleared server-side would arrive as a confirm of a plan the human
+      // never saw. Keyboard/Enter can double-activate before Vue re-renders the
+      // disabled attribute, so the handler itself must refuse too.
+      if (store.resuming.value) return;
       await store.resumeCurator();
     }
 
@@ -475,10 +474,11 @@ export default {
     let alive = true;
 
     onMounted(async () => {
-      // The 1s clock ticks regardless of autostart (a cached pause must still count
-      // down on a purely offline first paint, §7).
+      // The 1s clock ticks regardless of autostart: the four instance states (§10)
+      // must keep updating on a purely offline first paint. (The stop row no longer
+      // needs it — an indefinite stop has nothing to count down.)
       if (typeof setInterval !== "undefined") {
-        pauseTimer = setInterval(() => store.tick(), 1000);
+        clockTimer = setInterval(() => store.tick(), 1000);
       }
       if (!props.autostart) return;
       await store.init(); // local-only first paint
@@ -494,7 +494,7 @@ export default {
 
     onUnmounted(() => {
       alive = false;
-      if (pauseTimer != null) clearInterval(pauseTimer);
+      if (clockTimer != null) clearInterval(clockTimer);
       // Both are LEAKS if skipped: the interval keeps ticking into a dead store, and the
       // chrome.bookmarks listeners hold the store (and this component's closures) alive
       // for the lifetime of the extension, one more set per remount.
@@ -537,12 +537,11 @@ export default {
       onSave,
       onDelete,
       pendingDeleteId,
-      isPaused,
-      resumeNotice,
+      isStopped,
+      gateNotice,
       impactBlock,
       impactHeadline,
-      pauseRemaining,
-      serverTime,
+      serverDateTime,
       onPause,
       onResume,
       onMergeWindows,
@@ -826,7 +825,7 @@ export default {
       </section>
     </div>
 
-    <!-- Status bar: enroll banner (§7) + pause countdown ROW (§7) + four instance
+    <!-- Status bar: enroll banner (§7) + stop/start ROW (§7) + four instance
          states (§10), laid out as one wrapping strip of chips. -->
     <footer class="sp-status" data-role="status-bar">
       <!-- Enroll banner (§7): shows "адрес не настроен" / "не зарегистрирован" /
@@ -842,55 +841,59 @@ export default {
         <span class="sp-status-name">Регистрация</span>
         <span class="sp-sub">— {{ store.enrollStatus.value.label }}</span>
       </div>
-      <!-- Pause row (§7 "видимость обязательна"): a persistent ROW with a live
-           countdown, NOT a badge/toast. Renders from cache too (offline-first). -->
+      <!-- Stop/start row (§7 "видимость обязательна"): a persistent ROW, NOT a
+           badge/toast. Renders from cache too (offline-first). The stop is
+           INDEFINITE — a "since" stamp, never a countdown. -->
       <div class="sp-status-row sp-pause-row" data-role="pause-row">
-        <template v-if="isPaused">
+        <template v-if="isStopped">
           <span class="sp-dot paused"></span>
-          <span class="sp-status-name">Пауза</span>
-          <span class="sp-sub" data-role="pause-countdown">— осталось {{ pauseRemaining }}</span>
-          <button
-            class="sp-btn"
-            type="button"
-            data-role="pause-resume"
-            :disabled="store.offline.value"
-            @click="onResume"
-          >Возобновить</button>
-        </template>
-        <!-- Click-wait (§7): the curator DEFERS until confirmed, so it is neither
-             running nor over — show that explicitly. TWO different events arm this
-             latch (an expired pause and a continuity break) and they are labelled
-             differently, because "Пауза истекла" over a pause nobody took is a lie
-             about what happened AND about what the click does (status.js). -->
-        <template v-else-if="resumeNotice">
-          <span class="sp-dot paused"></span>
-          <span class="sp-status-name" :data-cause="resumeNotice.kind">{{ resumeNotice.title }}</span>
-          <span class="sp-sub" data-role="pause-pending">— {{ resumeNotice.sub }}</span>
-          <button
-            class="sp-btn"
-            type="button"
-            data-role="pause-confirm"
-            :disabled="store.offline.value"
-            @click="onResume"
-          >Запустить сейчас</button>
-          <!-- The screen explains itself: what happened, why nothing was touched, and
-               what this button does. -->
-          <span class="sp-sub sp-pause-explain" data-role="pause-explain">{{ resumeNotice.explain }}</span>
-          <!-- §7: "план выводится в статус-полосу" — the human confirms the salvo
-               SEEING what it will do. A bare boolean asks for a blind click on the
-               largest batch the system ever runs. The zeros carry the same caveat as
-               the rules editor: this is the NEXT pass, not "everything that matches". -->
+          <span class="sp-status-name">Остановлено</span>
+          <!-- Date + time, not time-of-day: the stop is indefinite and can span days. -->
+          <span class="sp-sub" data-role="pause-since">— с {{ serverDateTime(store.stoppedAt.value) }}</span>
+          <!-- A latch armed UNDER the stop: «Старт» resumes through the NORMAL gate
+               and does NOT confirm this plan, so it must be visible here — the
+               informed confirm is the NEXT click, after the start re-shows it. -->
           <span
             v-if="store.pendingPlan.value"
             class="sp-sub sp-pending-plan"
             data-role="pending-plan"
-          >Будет сделано на ближайшем проходе: переселений {{ store.pendingPlan.value.relocations }},
-            довершений {{ store.pendingPlan.value.phaseBCompletions }},
+          >Переселений {{ store.pendingPlan.value.relocations }},
             закрытий {{ store.pendingPlan.value.closures }}<template
               v-if="store.pendingPlan.value.deferred"
-            >, отложено {{ store.pendingPlan.value.deferred }}</template>. Ноль здесь
-            значит «на этом проходе нечего делать» — вкладки, которыми недавно
-            пользовались, в план не входят.</span>
+            >, отложено {{ store.pendingPlan.value.deferred }}</template>
+            — ждёт подтверждения после старта</span>
+          <button
+            class="sp-btn"
+            type="button"
+            data-role="pause-resume"
+            :disabled="store.offline.value || store.resuming.value"
+            @click="onResume"
+          >Старт</button>
+        </template>
+        <!-- The over-threshold latch (§7 "Порог действий на проход"): the plan
+             exceeded MAX_ACTIONS_PER_PASS and waits for ONE confirming click.
+             Self-refreshing every pass, self-clearing below the threshold; phase B
+             keeps executing — so this is a gate on the salvo, not a stop. The human
+             confirms SEEING the counts, never a bare boolean. -->
+        <template v-else-if="gateNotice">
+          <span class="sp-dot paused"></span>
+          <span class="sp-status-name">{{ gateNotice.title }}</span>
+          <span class="sp-sub" data-role="pause-pending">— {{ gateNotice.sub }}</span>
+          <span
+            v-if="store.pendingPlan.value"
+            class="sp-sub sp-pending-plan"
+            data-role="pending-plan"
+          >Переселений {{ store.pendingPlan.value.relocations }},
+            закрытий {{ store.pendingPlan.value.closures }}<template
+              v-if="store.pendingPlan.value.deferred"
+            >, отложено {{ store.pendingPlan.value.deferred }}</template></span>
+          <button
+            class="sp-btn"
+            type="button"
+            data-role="pause-confirm"
+            :disabled="store.offline.value || store.resuming.value"
+            @click="onResume"
+          >Выполнить</button>
         </template>
         <template v-else>
           <span class="sp-dot ok"></span>
@@ -901,7 +904,7 @@ export default {
             data-role="pause-start"
             :disabled="store.offline.value"
             @click="onPause"
-          >Пауза на час</button>
+          >Стоп</button>
         </template>
         <span v-if="store.pauseError.value" class="sp-sub sp-pause-error">{{ store.pauseError.value }}</span>
       </div>
@@ -936,13 +939,11 @@ export default {
 
       <p v-if="store.fallbackMessage.value" class="sp-fallback">{{ store.fallbackMessage.value }}</p>
 
-      <!-- Pause gate (§7): a 423 is the emergency stop doing its job, not a breakage.
+      <!-- Stop gate (§7): a 423 is the emergency stop doing its job, not a breakage.
            Name the reason and offer the human's own override ({force:true}) instead of
            the useless "переключитесь вручную". -->
       <p v-if="store.pauseBlock.value" class="sp-fallback sp-paused-block" data-role="pause-block">
-        Куратор на паузе<template v-if="store.pauseBlock.value.until">
-          до {{ serverTime(store.pauseBlock.value.until) }}</template>
-        — действие не выполнено.
+        Куратор остановлен — действие не выполнено.
         <button class="sp-btn" type="button" data-role="pause-force" @click="onForce">
           Выполнить всё равно
         </button>

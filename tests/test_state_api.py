@@ -197,12 +197,12 @@ def test_state_returns_mirror_shape(tmp_path):
             # Exact §10 StateResponse top-level shape.
             assert set(body.keys()) == {
                 "server_now", "last_pass_at", "last_pass_ok", "rules_total",
-                "rules_invalid", "paused_until", "resume_pending", "pending_plan",
+                "rules_invalid", "stopped_at", "resume_pending", "pending_plan",
                 "instances", "tabs", "quick_links",
             }
-            # Not paused / not waiting for a click on a fresh mirror (§7); with no
+            # Not stopped / not waiting for a click on a fresh mirror (§7); with no
             # latch armed the deferred plan is null, not a stray object.
-            assert body["paused_until"] is None and body["resume_pending"] is False
+            assert body["stopped_at"] is None and body["resume_pending"] is False
             assert body["pending_plan"] is None
             assert isinstance(body["server_now"], int)
             assert body["rules_total"] == 0 and body["rules_invalid"] == 0
@@ -497,10 +497,11 @@ def _set_setting(db_path, key, value):
 
 
 def test_state_carries_the_pending_plan_not_just_the_flag(tmp_path):
-    """§7: after a timeout expiry the runner stores ``{since, plan}`` and the plan «выводится
-    в статус-полосу» — the human confirms the burst SEEING what it will do. Reducing the
+    """§7: an over-threshold pass stores ``{since, plan}`` and the plan «выводится в
+    статус-полосу» — the human confirms the burst SEEING what it will do. Reducing the
     latch to a boolean threw exactly that away. ``resume_pending`` stays a bool (clients
-    are built on it) and ``pending_plan`` is additive next to it."""
+    are built on it) and ``pending_plan`` is additive next to it — the plan now carries
+    ``total``/``threshold`` too, passed through verbatim."""
     app = create_app(_settings(tmp_path))
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
@@ -510,6 +511,7 @@ def test_state_carries_the_pending_plan_not_just_the_flag(tmp_path):
         _set_setting(db_path, "resume_pending", json.dumps({
             "since": 1_700_000_000_000,
             "plan": {"relocations": 2, "closures": 7, "deferred": {},
+                     "total": 9, "threshold": 5,
                      "closure_examples": [{"url": "https://a/b", "instance": "main",
                                            "kind": "dedupe_close"}]},
         }))
@@ -520,6 +522,8 @@ def test_state_carries_the_pending_plan_not_just_the_flag(tmp_path):
         # the examples instead of a bare "something is pending".
         assert body["pending_plan"]["since"] == 1_700_000_000_000
         assert body["pending_plan"]["plan"]["closures"] == 7
+        assert body["pending_plan"]["plan"]["total"] == 9
+        assert body["pending_plan"]["plan"]["threshold"] == 5
         assert body["pending_plan"]["plan"]["closure_examples"][0]["url"] == "https://a/b"
 
 

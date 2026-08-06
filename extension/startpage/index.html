@@ -15,11 +15,12 @@
       the only typefaces are the ones already installed, and every decoration is a
       CSS shape or an inline colour.
 
-      KEEP IN SYNC with extension/pages/ui.css: the `:root` + dark-media token blocks
-      below are copied there verbatim (dedented) so the popup and the options page wear
-      the same palette. That file CAN link a stylesheet; this page cannot, for the reason
-      above — hence a copy rather than a shared import. Any change to a token (value, name
-      or the contrast note) MUST be mirrored in ui.css.
+      KEEP IN SYNC with extension/pages/ui.css AND templates/app.css: the `:root` +
+      dark-media token blocks below are copied into both verbatim (dedented) so the popup,
+      the options page and the service's /admin console wear the same palette. Those files
+      CAN link a stylesheet; this page cannot, for the reason above — hence a copy rather
+      than a shared import. Any change to a token (value, name or the contrast note) MUST
+      be mirrored in BOTH.
     -->
     <style>
       /* --- tokens -------------------------------------------------------------
@@ -335,10 +336,10 @@
       }
       .sp-status-name { font-weight: 600; color: var(--sp-text); }
       .sp-sub { color: var(--sp-secondary); }
-      /* The click-wait row explains itself in full sentences (what happened, what the
-         button does), so it wraps and its explanation takes a line of its own. */
+      /* The latch row carries the plan counts next to the confirm button, so it
+         wraps and the counts take a line of their own. */
       .sp-pause-row { flex-wrap: wrap; max-width: 100%; }
-      .sp-pause-explain, .sp-pending-plan {
+      .sp-pending-plan {
         flex-basis: 100%; max-width: 70ch; line-height: 1.45; font-size: 11px;
       }
       /* "Других инстансов пока нет" is the ONE .sp-empty that does not live inside a
@@ -420,7 +421,7 @@
         .sp-cols > .sp-card:last-child { display: none; }
       }
     </style>
-    <script type="module" crossorigin src="./assets/index-ESuwzr1u.js"></script>
+    <script type="module" crossorigin src="./assets/index-BRn-23jc.js"></script>
   </head>
   <body>
     <!-- Offline-first: this root is populated by the SFC-precompiled app; the very

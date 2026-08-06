@@ -46,15 +46,16 @@ _DEFAULTS: dict = {
     "state_fresh_ms": 3_000_000,
     # horizons / windows
     "restore_exemption_min": 120,
-    "pause_default_min": 60,
     "incomplete_after_min": 15,
     "self_nav_limit": 10,
     "quarantine_ttl_min": 1440,
     "actions_retention_days": 90,
     "js_audit_retention_days": 730,
+    # The plan-size brake (§7). Test-shaped: high enough that ordinary fixtures never
+    # trip it; a test that exercises the threshold passes its own value.
+    "max_actions_per_pass": 20,
     # identity / misc
     "main_instance_id": "main",
-    "restore_marker_path": "",
     "log_level": "INFO",
     "enroll_window_min": 10,
     "enroll_preauth_max": 128,

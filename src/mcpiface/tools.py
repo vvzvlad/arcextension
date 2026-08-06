@@ -18,9 +18,9 @@ command, pass or pause logic — the handlers only call the reused functions:
 * run_pass  -> :func:`src.curator.runner.run_pass`
 * pause     -> :mod:`src.curator.pause` (settings write + ``lease.bump_epoch``)
 
-§12: a paused system REFUSES mutating verbs. Reads and ``pause`` / ``resume`` are
-never gated; ``run_pass`` handles pause itself (a dry_run is never muted — looking at
-the plan is exactly why a pause is taken).
+§12: a stopped system REFUSES mutating verbs. Reads and ``pause`` / ``resume`` are
+never gated; ``run_pass`` handles the stop itself (a dry_run is never muted — looking
+at the plan is exactly why the stop is pressed).
 """
 
 from __future__ import annotations
@@ -64,16 +64,17 @@ class ToolError(Exception):
         super().__init__(f"{code}: {message}")
 
 
-# --- pause gate (§12) --------------------------------------------------------
+# --- stop gate (§12) ---------------------------------------------------------
 async def _ensure_not_paused(app) -> None:
-    """Raise :class:`ToolError` when a pause is armed — a paused system refuses every
-    mutating MCP verb (§12). Reused by all command/rule-write/relocate/reset verbs."""
-    until = await app.state.db.read(pause_ops.read_pause_until)
-    if until is not None and until > _now_ms():
+    """Raise :class:`ToolError` while the emergency stop is armed — a stopped system
+    refuses every mutating MCP verb (§12). Reused by all command/rule-write/relocate/
+    reset verbs."""
+    since = await app.state.db.read(pause_ops.read_stopped_at)
+    if since is not None:
         raise ToolError(
-            "paused",
-            "the curator is paused; mutating verbs are refused until resume",
-            {"paused_until": until},
+            "stopped",
+            "the curator is stopped; mutating verbs are refused until resume",
+            {"stopped_at": since},
         )
 
 
@@ -164,29 +165,34 @@ async def _freshen_fleet(app) -> dict:
 
 
 async def list_instances(app) -> dict:
-    """Per-instance freshness + ``paused_until`` + ``resume_pending`` + ``pending_plan`` (§11).
+    """Per-instance freshness + ``stopped_at`` + ``resume_pending`` + ``pending_plan`` (§11).
 
     Awaits a fresh snapshot from every active instance (§6 blocking-fresh, via
     :func:`_freshen_fleet`) before answering, so the ``instances`` map carries a mirror
     the agent has just refreshed — each entry ``{snapshot_at, fresh, reason, session_id}``
-    (``session_id`` is the #47 epoch to echo back as ``expected_session``). The
-    ``paused_until`` field lets the agent tell a pause from a broken curator (§11).
+    plus the mirror fields the envelope replaced. ``session_id`` is the #47 epoch to
+    echo back as ``expected_session``.
 
-    ``resume_pending`` is required here by §7 verbatim — «`resume_pending` виден в
-    `StateResponse` и в `list_instances`» — and for the same reason: after a pause
-    expires by TIMEOUT the curator is deliberately idle, waiting for a confirming click.
-    Without the flag an agent reads ``paused_until`` in the past, sees no pass
-    happening, and concludes the curator is broken. ``pending_plan`` is the SAME
-    resume/pending-plan shape the startpage already sees in ``StateResponse`` (parsed
-    by :func:`src.db.state._parse_pending_plan`) — the burst the human confirms the
-    click BY — surfaced to the agent that only had the bare boolean before."""
+    ``stopped_at`` lets the agent tell a deliberate stop from a broken curator (§11).
+    The stop is INDEFINITE — there is no deadline and no countdown; the field is the
+    moment it was pressed, ``null`` while running.
+
+    ``resume_pending`` follows §7's visibility rule for the threshold latch: an armed
+    over-threshold plan «выводится в статус-полосу и ждёт одного подтверждающего
+    клика» — the human sees it on the startpage status bar, and this field is the
+    agent's window into the same fact. While the latch is armed the curator
+    deliberately defers its countable work; without the flag an agent sees no
+    relocations happening and concludes the curator is broken. ``pending_plan`` is the
+    SAME plan shape the startpage already sees in ``StateResponse`` (parsed by
+    :func:`src.db.state._parse_pending_plan`) — the burst the human confirms the click
+    BY — surfaced to the agent that only had the bare boolean before."""
     db = app.state.db
     instances = await _freshen_fleet(app)
-    paused_until = await db.read(pause_ops.read_pause_until)
+    stopped_at = await db.read(pause_ops.read_stopped_at)
     resume_raw = await db.read(lambda c: get_setting(c, pause_ops.RESUME_PENDING_KEY))
     return {
         "server_now": _now_ms(),
-        "paused_until": paused_until,
+        "stopped_at": stopped_at,
         "resume_pending": bool(resume_raw),
         "pending_plan": state_read._parse_pending_plan(resume_raw),
         "instances": instances,
@@ -1268,10 +1274,10 @@ def _delete_source_tab(conn, instance_id: str, tab_id: int) -> None:
     )
 
 
-# --- pass + pause ------------------------------------------------------------
+# --- pass + stop/start -------------------------------------------------------
 async def run_pass(app, *, dry_run: bool = False) -> dict:
-    """Trigger one curator pass (§7). Delegates to the runner, which itself honours a
-    pause at step 1 (and never mutes a dry_run — the plan is exactly why one pauses)."""
+    """Trigger one curator pass (§7). Delegates to the runner, which itself honours the
+    stop at step 1 (and never mutes a dry_run — the plan is exactly why one stops)."""
     app_state = app.state
     return await runner.run_pass(
         app_state.db, app_state.ext_registry, app_state.settings,
@@ -1281,26 +1287,37 @@ async def run_pass(app, *, dry_run: bool = False) -> dict:
 
 
 async def pause(app, *, minutes: int | None = None) -> dict:
-    """Pause the curator: write ``pause_until`` + bump the fencing epoch (stops an
-    in-flight pass). Not itself a "mutating verb" that pause refuses. Defaults to
-    ``PAUSE_DEFAULT_MIN`` and is clamped to a finite window (a pause is never
-    infinite, §7) — the same write-shape as ``POST /api/pause``."""
-    mins = pause_ops.clamp_minutes(minutes, app.state.settings.pause_default_min)
+    """Stop the curator INDEFINITELY: write ``curator_stopped_at`` + bump the fencing
+    epoch (fences an in-flight pass). Not itself a "mutating verb" the stop refuses.
+
+    The tool KEEPS its historical name (``pause``) for API stability, but there is no
+    duration anymore: the stop lasts until ``resume``. ``minutes`` is accepted for
+    backward compatibility with older agent configs and IGNORED — the same write-shape
+    as ``POST /api/pause``, which likewise ignores its former body."""
+    del minutes  # accepted for compatibility, deliberately ignored (the stop is indefinite)
     now = _now_ms()
-    until = await app.state.db.write(lambda c: pause_ops.pause(c, now=now, minutes=mins))
-    return {"ok": True, "paused_until": until}
+    stopped_at = await app.state.db.write(lambda c: pause_ops.stop(c, now=now))
+    return {"ok": True, "stopped_at": stopped_at}
 
 
 async def resume(app) -> dict:
-    """Resume the curator (§7/§12): apply the TTL shift on the ACTUAL pause duration,
-    clear ``pause_until`` / ``pause_started_at`` / ``resume_pending``, THEN run a pass
-    immediately — the SAME :func:`src.api.pause.resume_now` core ``DELETE /api/pause``
-    runs. §7 makes the immediate pass part of what "resume by hand" MEANS (only a
-    timeout expiry defers behind a click); stopping after the settings write left the
-    same verb with two behaviours depending on which door it was called through, and
-    an agent's resume left the curator idle until the next tick.
+    """Start the curator (§7/§12): apply the TTL shift on the ACTUAL stop duration,
+    clear ``curator_stopped_at``, THEN run a pass immediately — the SAME
+    :func:`src.api.pause.resume_now` core ``DELETE /api/pause`` runs. §7 makes the
+    immediate pass part of what "start by hand" MEANS; stopping after the settings
+    write left the same verb with two behaviours depending on which door it was called
+    through, and an agent's resume left the curator idle until the next tick.
 
-    KNOWN COST, accepted deliberately: this now BLOCKS for the whole pass — tens of
+    Whether that pass CONFIRMS the over-threshold plan latch (``resume_pending``)
+    follows ``resume_now``'s two meanings of the one verb: a resume that lifts an
+    ACTUAL stop runs the NORMAL threshold gate — an over-threshold plan recomputed at
+    start time latches and is returned, never silently executed, because the stop
+    hid the plan from whoever pressed start. A resume with NO stop armed is the
+    informed confirm: it executes the plan recomputed at click time, so it doubles
+    as the agent's "yes, run the big plan" verb. With nothing armed at all the
+    confirm degrades to an ordinary pass inside the runner.
+
+    KNOWN COST, accepted deliberately: this BLOCKS for the whole pass — tens of
     seconds on a large fleet — where it used to be one settings write. Detaching the
     pass and answering immediately was considered and rejected, because it would restore
     exactly the divergence just removed: ``DELETE /api/pause`` returns the pass RESULT

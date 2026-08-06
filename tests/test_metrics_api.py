@@ -2,7 +2,7 @@
 
 Covers: the separate METRICS_TOKEN guard (a non-metrics bearer rejected), every §12 metric
 present from the first scrape, pass facts read from `passes` (incl. the green-and-dead
-last_pass_ok=0), the two acceptance scenarios (hour-long pause suppresses overdue +
+last_pass_ok=0), the two acceptance scenarios (a deliberate stop suppresses overdue +
 snapshot_age so NO alert can fire; a crash-loop trips overdue computed from `passes`
 and survives a fresh process), the actions-last-pass zeroing, main-never-seen, the
 auth-rejections counter, degraded-mode serving, and the alerts.yml convention.
@@ -39,7 +39,8 @@ ALL_METRICS = [
     "curator_auth_rejections_total",
     "curator_deferred_total",
     "curator_quarantined_total",
-    "curator_paused_until",
+    "curator_stopped",
+    "curator_stopped_at",
     "curator_resume_pending",
     "curator_rules_total",
     "curator_rules_invalid",
@@ -226,8 +227,8 @@ def test_last_pass_ok_zero_when_no_ready_instances(tmp_path):
         assert _scalar(body, "curator_last_pass_ok") == 0.0
 
 
-# --- ACCEPTANCE #1: an hour-long pause fires no alert ------------------------
-def test_pause_suppresses_overdue_and_snapshot_age(tmp_path):
+# --- ACCEPTANCE #1: a deliberate stop fires no alert -------------------------
+def test_stop_suppresses_overdue_and_snapshot_age(tmp_path):
     s = _settings(tmp_path)
     app = create_app(s)
     now = int(time.time() * 1000)
@@ -237,21 +238,25 @@ def test_pause_suppresses_overdue_and_snapshot_age(tmp_path):
         _insert_pass(s.db_path, "p1", now - 7_200_000, now - 7_200_000, ok=1, instances_ready=1)
         _insert_instance(s.db_path, "main", connected=1, last_seen_at=now,
                          snapshot_at=now - 7_200_000)
-        _set_setting(s.db_path, "pause_until", now + 3_600_000)  # +60min
+        _set_setting(s.db_path, "curator_stopped_at", now - 3_600_000)  # stopped 60min ago
 
         body = _scrape(client)
-        # Suppression lives in the GAUGE: both read 0 while paused, so NO rule reading
-        # them can fire (acceptance #1). Remove the pause-branch in the gauge and these
-        # become ~6900 / ~7200 and redden.
+        # Suppression lives in the GAUGE: both read 0 while stopped, so NO rule reading
+        # them can fire (acceptance #1). Remove the stop-branch in the gauge and these
+        # become ~6900 / ~7200 and redden. The stop state itself is exported.
         assert _scalar(body, "curator_pass_overdue_seconds") == 0.0
         assert _by_label(body, "curator_instance_snapshot_age_seconds", "id", "main") == 0.0
+        assert _scalar(body, "curator_stopped") == 1.0
+        assert _scalar(body, "curator_stopped_at") == float(now - 3_600_000)
 
-        # Non-vacuity: clear the pause and the SAME data now reads > 0 (the gauge was
+        # Non-vacuity: clear the stop and the SAME data now reads > 0 (the gauge was
         # genuinely suppressed, not trivially zero).
-        _set_setting(s.db_path, "pause_until", "")
+        _set_setting(s.db_path, "curator_stopped_at", "")
         body2 = _scrape(client)
         assert _scalar(body2, "curator_pass_overdue_seconds") > 1800
         assert _by_label(body2, "curator_instance_snapshot_age_seconds", "id", "main") > 1800
+        assert _scalar(body2, "curator_stopped") == 0.0
+        assert _scalar(body2, "curator_stopped_at") == 0.0
 
 
 # --- ACCEPTANCE #2: a crash-loop trips "no pass happened" -------------------
@@ -638,48 +643,15 @@ def test_deferred_rows_without_a_decision_get_an_explicit_cause(tmp_path):
         assert 'cause=""' not in body
 
 
-# --- restore-marker readability (§12) ---------------------------------------
-def test_restore_marker_unreadable_gauge(tmp_path):
-    """"Marker configured but unreadable" is otherwise an INVISIBLE state.
-
-    Backup-restore detection is then off for good — the classic path is a marker written
-    by a root helper under umask 077, landing 600 root:root where the uid-1000 container
-    can never read it, while every other fingerprint component travels inside the backup
-    and matches. The only trace is a log line every five minutes.
-
-    The runner writes ``"1"``/``"0"`` into ``settings``; this reads it at SCRAPE time
-    (from the DB, never process memory) so a restart cannot reset it to a healthy zero.
-    """
+# --- the stop gauge never invents a state ------------------------------------
+def test_stopped_gauge_never_invents_a_stop(tmp_path):
+    # A blank or garbage curator_stopped_at value must read as RUNNING (0/0): the one
+    # thing these gauges must not do is manufacture a stop out of a malformed row.
     s = _settings(tmp_path)
     app = create_app(s)
     with TestClient(app) as client:
-        # ABSENT row — no pass has looked yet. Must be 0 AND present: a gauge that only
-        # appears once the fault occurs gives NoData for "it never ran" (§12), which is
-        # the exact silence this metric exists to break.
-        body = _scrape(client)
-        assert "curator_restore_marker_unreadable" in body
-        assert _scalar(body, "curator_restore_marker_unreadable") == 0.0
-
-        # The fault.
-        _set_setting(s.db_path, "curator_restore_marker_unreadable", "1")
-        assert _scalar(_scrape(client), "curator_restore_marker_unreadable") == 1.0
-
-        # Read again, or never configured.
-        _set_setting(s.db_path, "curator_restore_marker_unreadable", "0")
-        assert _scalar(_scrape(client), "curator_restore_marker_unreadable") == 0.0
-
-
-def test_restore_marker_gauge_never_invents_a_fault(tmp_path):
-    # Only the exact "1" is a failure. A blank or garbage value must read 0: the one
-    # thing this gauge must not do is manufacture an outage out of missing evidence.
-    s = _settings(tmp_path)
-    app = create_app(s)
-    with TestClient(app) as client:
-        for value in ("", "  ", "yes", "true", "2", "-1"):
-            _set_setting(s.db_path, "curator_restore_marker_unreadable", value)
-            assert _scalar(
-                _scrape(client), "curator_restore_marker_unreadable"
-            ) == 0.0, f"{value!r} was read as a fault"
-        # …and whitespace around a real "1" still counts as the fault.
-        _set_setting(s.db_path, "curator_restore_marker_unreadable", " 1 ")
-        assert _scalar(_scrape(client), "curator_restore_marker_unreadable") == 1.0
+        for value in ("", "  ", "nope"):
+            _set_setting(s.db_path, "curator_stopped_at", value)
+            body = _scrape(client)
+            assert _scalar(body, "curator_stopped") == 0.0, f"{value!r} read as stopped"
+            assert _scalar(body, "curator_stopped_at") == 0.0

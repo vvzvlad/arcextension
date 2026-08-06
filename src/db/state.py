@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from src.curator.pause import RESUME_PENDING_KEY, read_pause_until
+from src.curator.pause import RESUME_PENDING_KEY, read_stopped_at
 
 # Column lists kept next to their SELECTs so the JSON shape and the SQL never drift
 # from §10's StateResponse.
@@ -240,12 +240,13 @@ def _read_rule_counts(conn: sqlite3.Connection) -> tuple[int, int]:
 def _parse_pending_plan(raw) -> dict | None:
     """The deferred pass plan the runner stashed in ``settings.resume_pending``.
 
-    The runner writes ``json.dumps({"since": <ms>, "plan": {...}})`` — the dry-run plan
-    computed when a pause expired by timeout (§7). Reducing it to a bare boolean, as
-    ``resume_pending`` does, throws away exactly the thing §7 says the human confirms
-    the burst BY: «план … выводится в статус-полосу», so the click is informed rather
-    than blind. Returned VERBATIM as parsed (``{"since": …, "plan": {relocations,
-    closures, deferred, examples…}}``) so no field is lost on the way to the status row.
+    The runner writes ``json.dumps({"since": <ms>, "plan": {...}})`` — the plan of the
+    over-threshold pass that armed the latch (§7, MAX_ACTIONS_PER_PASS), refreshed by
+    every subsequent pass. Reducing it to a bare boolean, as ``resume_pending`` does,
+    throws away exactly the thing §7 says the human confirms the burst BY: «план …
+    выводится в статус-полосу», so the click is informed rather than blind. Returned
+    VERBATIM as parsed (``{"since": …, "plan": {relocations, closures, deferred, total,
+    threshold, examples…}}``) so no field is lost on the way to the status row.
 
     Anything unparseable / non-object => ``None``: a malformed latch must degrade to
     "no plan to show", never to a 500 on every ``/api/state``.
@@ -264,11 +265,10 @@ def build_state(conn: sqlite3.Connection, server_now: int) -> dict:
     connection. ``server_now`` is stamped by the caller (server clock)."""
     last_pass_at, last_pass_ok = _read_last_pass(conn)
     rules_total, rules_invalid = _read_rule_counts(conn)
-    # Pause visibility (§7 "видимость обязательна"): the startpage renders a countdown
-    # row from ``paused_until``, so the server-wide pause deadline (and the after-expiry
-    # ``resume_pending`` latch) ride along in the StateResponse. ``paused_until`` is the
-    # RAW deadline (may already be in the past during resume_pending) — the client
-    # decides "still counting down" against ``server_now``.
+    # Stop visibility (§7 "видимость обязательна"): the startpage renders a "stopped
+    # since" row from ``stopped_at`` (null = running — the stop is indefinite, there is
+    # no deadline to count down), and the over-threshold ``resume_pending`` latch rides
+    # along next to it so the click is informed.
     resume_row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (RESUME_PENDING_KEY,)
     ).fetchone()
@@ -279,7 +279,7 @@ def build_state(conn: sqlite3.Connection, server_now: int) -> dict:
         "last_pass_ok": last_pass_ok,
         "rules_total": rules_total,
         "rules_invalid": rules_invalid,
-        "paused_until": read_pause_until(conn),
+        "stopped_at": read_stopped_at(conn),
         # The boolean stays EXACTLY as it was (clients are built on it); the plan is a
         # new, additive field next to it.
         "resume_pending": bool(resume_raw),

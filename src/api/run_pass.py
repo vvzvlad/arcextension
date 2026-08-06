@@ -2,10 +2,12 @@
 
 Body (all optional): ``{dry_run?: bool, confirm_pending?: bool}``. ``dry_run`` takes
 the lease, requests snapshots and returns the plan WITHOUT writing actions and is NOT
-muted by a pause (looking at the plan is exactly why a pause is taken).
-``confirm_pending`` confirms the deferred plan armed by a pause expiry or a
-continuity break. Authed via ``require_api_caller`` (Bearer ADMIN_TOKEN or an instance
-secret — §35 §4); refuses degraded mode.
+muted by a stop (looking at the plan is exactly why the stop is pressed).
+``confirm_pending`` confirms the over-threshold plan latched by the
+``MAX_ACTIONS_PER_PASS`` gate — the pass recomputes the plan at confirm time and
+executes it. A stopped curator answers ``{"status": "stopped", "since": <ms>}``.
+Authed via ``require_api_caller`` (Bearer ADMIN_TOKEN or an instance secret — §35 §4);
+refuses degraded mode.
 """
 
 from __future__ import annotations

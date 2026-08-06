@@ -323,9 +323,9 @@ def test_delete_rejects_the_same_shapes(tmp_path):
         assert r.status_code == 422
 
 
-# --- §7 pause gate, both mutating verbs -------------------------------------
+# --- §7 stop gate, both mutating verbs --------------------------------------
 def test_exemption_mutations_are_gated_by_pause(tmp_path):
-    """§7: a pause silences the mutating verbs. Editing the protection policy is not one
+    """§7: the stop silences the mutating verbs. Editing the protection policy is not one
     of the human's own BUTTONS (§7's exception covers focus / restore / undo /
     merge_windows), so no ``force`` here either — reddens if the gate is dropped from
     either verb, or if ``force`` starts being honoured."""
@@ -333,18 +333,18 @@ def test_exemption_mutations_are_gated_by_pause(tmp_path):
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         _seed_instance(db_path, "prox")
-        client.post("/api/pause", headers=AUTH, json={"minutes": 60})
+        client.post("/api/pause", headers=AUTH)
 
         body = {"instance_id": "prox", "url": "https://a/b", "minutes": 30}
         for payload in (body, {**body, "force": True}):
             r = client.post("/api/exemptions", headers=AUTH, json=payload)
-            assert r.status_code == 423 and r.json()["error"] == "paused"
+            assert r.status_code == 423 and r.json()["error"] == "stopped"
 
         for payload in ({"instance_id": "prox", "url": "https://a/b"},
                         {"instance_id": "prox", "url": "https://a/b", "force": True}):
             r = client.request("DELETE", "/api/exemptions", headers=AUTH, json=payload)
-            assert r.status_code == 423 and r.json()["error"] == "paused"
+            assert r.status_code == 423 and r.json()["error"] == "stopped"
 
         assert _rows(db_path) == []
-        # Reads stay open during a pause (the page must show the truth, §7).
+        # Reads stay open while stopped (the page must show the truth, §7).
         assert client.get("/api/exemptions", headers=AUTH).status_code == 200

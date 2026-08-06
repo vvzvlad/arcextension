@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 
 import App from "../src/App.vue";
+import { formatDateTime } from "../src/lib/status.js";
 import { makeChrome, makeFetch } from "./mocks.js";
 
 // SFC render smoke: the precompiled component renders a NON-EMPTY root from LOCAL
@@ -27,9 +28,10 @@ describe("App renders non-empty offline-first (§10)", () => {
     // The always-present scaffolding (search + status bar) is there.
     expect(wrapper.find("input.sp-search").exists()).toBe(true);
     expect(wrapper.find('[data-role="status-bar"]').exists()).toBe(true);
-    // The pause ROW renders offline-first (§7): not paused → "active" + a Pause button.
+    // The stop ROW renders offline-first (§7): running → "active" + a Стоп button.
     expect(wrapper.find('[data-role="pause-row"]').exists()).toBe(true);
     expect(wrapper.find('[data-role="pause-start"]').exists()).toBe(true);
+    expect(wrapper.find('[data-role="pause-start"]').text()).toBe("Стоп");
     // Offline indicator is shown.
     expect(wrapper.find(".sp-header").text()).toContain("офлайн");
   });
@@ -272,7 +274,7 @@ describe("App renders non-empty offline-first (§10)", () => {
     expect(sections[0].text()).not.toContain("Окно 1");
   });
 
-  async function clickWaitRow(state) {
+  async function statusRow(state) {
     const env = makeChrome({
       tabs: [{ id: 1, windowId: 1, url: "https://own/a", title: "Own A" }],
       messages: { get_identity: { instanceId: "me" } },
@@ -285,59 +287,41 @@ describe("App renders non-empty offline-first (§10)", () => {
     return wrapper;
   }
 
-  it("shows the click-wait state when the pause EXPIRED but the pass DEFERS (§7)", async () => {
-    // resume_pending: the hour is over (paused_until in the past) but the curator waits
-    // for a confirm — it must NOT read "Автоматика активна" (a forgotten pause here is
-    // otherwise invisible). Drop the resume_pending branch and this reddens.
-    const wrapper = await clickWaitRow({ paused_until: 999_000, resume_pending: true });
+  it("shows the STOPPED row with the since-stamp and a Старт button (§7)", async () => {
+    // stopped_at != null = the automation is stopped INDEFINITELY: no deadline, no
+    // countdown — a "since" stamp and the one button that brings it back.
+    const wrapper = await statusRow({ stopped_at: 999_000, server_now: 1_000_000 });
 
-    expect(wrapper.find('[data-role="pause-pending"]').exists()).toBe(true);
-    expect(wrapper.find('[data-role="pause-confirm"]').exists()).toBe(true);
     const rowText = wrapper.find('[data-role="pause-row"]').text();
-    expect(rowText).toContain("Пауза истекла");
-    expect(rowText).toContain("ожидание подтверждения");
+    expect(rowText).toContain("Остановлено");
     expect(rowText).not.toContain("Автоматика активна");
-    // …and it says WHY the pass is not running by itself and what the button does.
-    expect(wrapper.find('[data-role="pause-explain"]').text()).toMatch(/по кнопке/);
+    // Date AND time: an indefinite stop can span days, so a bare time-of-day would
+    // read as "today" however old the stop is.
+    expect(wrapper.find('[data-role="pause-since"]').text()).toMatch(
+      /с \d{2}\.\d{2}\.\d{4} \d{2}:\d{2}/,
+    );
+    const btn = wrapper.find('[data-role="pause-resume"]');
+    expect(btn.exists()).toBe(true);
+    expect(btn.text()).toBe("Старт");
   });
 
-  it("a CONTINUITY BREAK is not labelled as a pause, and says what it is (§7)", async () => {
-    // The same `resume_pending` latch is armed when `is_continuity_break` fires — a new
-    // schema version, a changed IDLE_MINUTES / MAIN_INSTANCE_ID, a restored DB. The
-    // owner had never taken a pause and the row told him one had expired. `paused_until`
-    // is what separates the two grounds (an expired pause keeps its deadline until the
-    // confirming pass shifts it). Label this branch "Пауза истекла" again and this test
-    // reddens.
-    const wrapper = await clickWaitRow({ paused_until: null, resume_pending: true });
-
-    expect(wrapper.find('[data-role="pause-confirm"]').exists()).toBe(true);
-    const rowText = wrapper.find('[data-role="pause-row"]').text();
-    expect(rowText).not.toContain("Пауза истекла");
-    expect(rowText).toContain("Состояние сервиса изменилось");
-    // The row explains itself: what happened, that nothing was touched, and what the
-    // button will do — without anyone having to ask.
-    const explain = wrapper.find('[data-role="pause-explain"]').text();
-    expect(explain).toMatch(/обновления|настроек|восстановления/);
-    expect(explain).toMatch(/ничего не тронул/);
-    expect(explain).toMatch(/подтверждает план/);
-    expect(explain).toMatch(/паузу/i);
-  });
-
-  it("shows the DEFERRED PASS PLAN next to the confirm button (§7)", async () => {
-    // §7: the plan "выводится в статус-полосу" — the human confirms the largest salvo
-    // the system ever fires SEEING what it will do. A bare resume_pending boolean asks
-    // for a blind click. Drop the pending-plan span and this reddens.
-    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
-    const { fetchFn } = makeFetch({
-      state: {
-        instances: [],
-        tabs: [],
-        paused_until: null,
-        resume_pending: true,
-        pending_plan: {
-          since: 1,
-          plan: { relocations: 12, phase_b_completions: 3, closures: 40, deferred: { x: 2 } },
-        },
+  it("«Старт» is disabled while the resume DELETE is in flight (double-click guard, §7)", async () => {
+    // The DELETE spans the whole confirming pass; a second click meanwhile would
+    // arrive after the stop cleared server-side and confirm a plan the human never
+    // saw. So the button must carry `disabled` for the full in-flight window.
+    const env = makeChrome({
+      tabs: [],
+      messages: { get_identity: { instanceId: "me" } },
+    });
+    let release;
+    const gate = new Promise((r) => {
+      release = r;
+    });
+    const { fetchFn, counts } = makeFetch({
+      state: { instances: [], tabs: [], stopped_at: 999_000 },
+      pauseDelete: async () => {
+        await gate; // park the DELETE in flight
+        return { status: 200, body: { resumed: true } };
       },
     });
     const wrapper = mount(App, {
@@ -345,15 +329,107 @@ describe("App renders non-empty offline-first (§10)", () => {
     });
     await flushPromises();
 
-    const plan = wrapper.find('[data-role="pending-plan"]');
+    const btn = wrapper.find('[data-role="pause-resume"]');
+    expect(btn.attributes("disabled")).toBeUndefined();
+    await btn.trigger("click");
+    expect(counts.pauseDelete).toBe(1);
+    expect(btn.attributes("disabled")).toBeDefined(); // in flight → disabled
+    await btn.trigger("click"); // a second click must not send a second DELETE
+    expect(counts.pauseDelete).toBe(1);
+
+    release();
+    await flushPromises();
+  });
+
+  it("stopped + armed latch renders the deferred plan counts (§7)", async () => {
+    // «Старт» resumes through the NORMAL gate and does NOT confirm the latched plan,
+    // so the plan must be VISIBLE while stopped — the informed confirm is the NEXT
+    // click, and a human cannot be informed by a hidden plan.
+    const wrapper = await statusRow({
+      stopped_at: 999_000,
+      server_now: 1_000_000,
+      resume_pending: true,
+      pending_plan: {
+        since: 1,
+        plan: { relocations: 12, closures: 40, deferred: { x: 2 }, total: 52, threshold: 20 },
+      },
+    });
+
+    const row = wrapper.find('[data-role="pause-row"]');
+    expect(row.text()).toContain("Остановлено");
+    const plan = row.find('[data-role="pending-plan"]');
     expect(plan.exists()).toBe(true);
-    expect(plan.text()).toContain("переселений 12");
+    expect(plan.text()).toContain("Переселений 12");
     expect(plan.text()).toContain("закрытий 40");
     expect(plan.text()).toContain("отложено 2");
-    // A zero in this plan means "nothing to do on the NEXT pass", not "no rules" —
-    // the same misreading the rules editor's zeros caused.
-    expect(plan.text()).toContain("ближайшем проходе");
-    expect(plan.text()).toMatch(/недавно/);
+    // One short sub, not a wall of text: what the counts are waiting for.
+    expect(plan.text()).toContain("ждёт подтверждения после старта");
+    // The button stays «Старт» — «Выполнить» appears only once the stop is lifted.
+    expect(row.find('[data-role="pause-resume"]').text()).toBe("Старт");
+    expect(row.find('[data-role="pause-confirm"]').exists()).toBe(false);
+  });
+
+  it("shows the over-threshold LATCH with the plan counts and a Выполнить button (§7)", async () => {
+    // resume_pending has exactly ONE meaning now: the plan exceeded
+    // MAX_ACTIONS_PER_PASS and waits for one confirming click. The human confirms
+    // SEEING the counts — a bare boolean asks for a blind click on the largest salvo
+    // the system ever fires. Drop the latch branch and this reddens.
+    const wrapper = await statusRow({
+      resume_pending: true,
+      pending_plan: {
+        since: 1,
+        plan: {
+          relocations: 12,
+          phase_b_completions: 3,
+          closures: 40,
+          deferred: { x: 2 },
+          total: 52,
+          threshold: 20,
+        },
+      },
+    });
+
+    expect(wrapper.find('[data-role="pause-pending"]').exists()).toBe(true);
+    const rowText = wrapper.find('[data-role="pause-row"]').text();
+    expect(rowText).toContain("Ждёт подтверждения");
+    expect(rowText).toContain("план 52 действий при пороге 20");
+    expect(rowText).not.toContain("Автоматика активна");
+    // The counts line is SHORT — counts only, no explain wall.
+    const plan = wrapper.find('[data-role="pending-plan"]');
+    expect(plan.exists()).toBe(true);
+    expect(plan.text()).toContain("Переселений 12");
+    expect(plan.text()).toContain("закрытий 40");
+    expect(plan.text()).toContain("отложено 2");
+    const btn = wrapper.find('[data-role="pause-confirm"]');
+    expect(btn.exists()).toBe(true);
+    expect(btn.text()).toBe("Выполнить");
+  });
+
+  it("a STOP wins over the latch, and running shows the Стоп button (§7)", async () => {
+    // Stopped + latched at once renders as stopped: the stop is the stronger fact —
+    // nothing runs at all, so "ждёт подтверждения" would understate it.
+    const both = await statusRow({ stopped_at: 999_000, resume_pending: true });
+    expect(both.find('[data-role="pause-row"]').text()).toContain("Остановлено");
+    expect(both.find('[data-role="pause-confirm"]').exists()).toBe(false);
+
+    const running = await statusRow({ stopped_at: null });
+    expect(running.find('[data-role="pause-row"]').text()).toContain("Автоматика активна");
+    expect(running.find('[data-role="pause-start"]').text()).toBe("Стоп");
+  });
+});
+
+// --- the stopped row's date+time stamp (§7) -----------------------------------
+describe("formatDateTime (status.js)", () => {
+  it("renders date AND time, zero-padded, deterministically", () => {
+    // Built from LOCAL date components so the expectation is timezone-independent.
+    const ts = new Date(2026, 0, 5, 9, 3).getTime();
+    expect(formatDateTime(ts)).toBe("05.01.2026 09:03");
+  });
+
+  it("answers — for null/invalid input, like formatTime", () => {
+    expect(formatDateTime(null)).toBe("—");
+    expect(formatDateTime(undefined)).toBe("—");
+    expect(formatDateTime(NaN)).toBe("—");
   });
 });
 
@@ -719,8 +795,8 @@ describe("merge windows now (§9)", () => {
 });
 
 // --- §7: a 423 is the emergency stop working, with the human's way past it -----
-describe("pause gate override (§7)", () => {
-  it("names the pause and offers the force button after a 423", async () => {
+describe("stop gate override (§7)", () => {
+  it("names the stop and offers the force button after a 423", async () => {
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const bodies = [];
     const { fetchFn } = makeFetch({
@@ -738,7 +814,7 @@ describe("pause gate override (§7)", () => {
       focus: (opts, n) => {
         bodies.push(JSON.parse(opts.body));
         return n === 1
-          ? { status: 423, body: { error: "paused", until: 1_003_600_000 } }
+          ? { status: 423, body: { error: "stopped", since: 999_000 } }
           : { status: 200, body: { ok: true } };
       },
     });
@@ -752,7 +828,7 @@ describe("pause gate override (§7)", () => {
 
     const block = wrapper.find('[data-role="pause-block"]');
     expect(block.exists()).toBe(true);
-    expect(block.text()).toContain("на паузе");
+    expect(block.text()).toContain("остановлен");
     // The generic "переключитесь вручную" must NOT be what the human is told here.
     expect(wrapper.find(".sp-fallback").text()).not.toContain("вручную");
 

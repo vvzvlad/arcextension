@@ -231,10 +231,10 @@ def test_merge_windows_is_gated_by_pause_without_force(tmp_path):
     with TestClient(app) as client:
         ws = _connect(client, db_path=str(tmp_path / "curator.db"))
         try:
-            _set_setting(db_path, "pause_until", str(int(time.time() * 1000) + 3_600_000))
+            _set_setting(db_path, "curator_stopped_at", str(int(time.time() * 1000)))
             resp = client.post("/api/instances/prox/merge_windows", headers=AUTH)
             assert resp.status_code == 423
-            assert resp.json()["error"] == "paused"
+            assert resp.json()["error"] == "stopped"
             resp2 = client.post(
                 "/api/instances/prox/merge_windows", headers=AUTH, json={}
             )
@@ -256,7 +256,7 @@ def test_merge_windows_force_crosses_the_pause_and_is_journaled(tmp_path):
     with TestClient(app) as client:
         ws = _connect(client, db_path=str(tmp_path / "curator.db"))
         try:
-            _set_setting(db_path, "pause_until", str(int(time.time() * 1000) + 3_600_000))
+            _set_setting(db_path, "curator_stopped_at", str(int(time.time() * 1000)))
             pool = ThreadPoolExecutor(1)
             # force is honoured only for the INSTANCE caller (the human at the §9 button,
             # §35 §4) — authenticate as prox with its RAW secret, not as admin.
@@ -387,16 +387,16 @@ async def test_mcp_merge_windows_refuses_under_pause_whatever_the_arguments(tmp_
     reg.put("prox", ConnState(ws=ws, conn_epoch=1, install_uuid="u", session_id="s1"))
     app = SimpleNamespace(state=SimpleNamespace(
         db=db, ext_registry=reg,
-        settings=SimpleNamespace(cmd_timeout_ms=500, pause_default_min=60),
+        settings=SimpleNamespace(cmd_timeout_ms=500),
     ))
-    await db.write(lambda c: pause_ops.pause(c, now=int(time.time() * 1000), minutes=60))
+    await db.write(lambda c: pause_ops.stop(c, now=int(time.time() * 1000)))
 
     for kwargs in ({}, {"params": {"force": True}}, {"params": {}}):
         try:
             await tools.merge_windows(app, instance="prox", **kwargs)
             raise AssertionError(f"merge_windows must refuse while paused: {kwargs}")
         except tools.ToolError as exc:
-            assert exc.code == "paused"
+            assert exc.code == "stopped"
     assert ws.sent == []           # no frame ever reached the socket
     assert await db.read(
         lambda c: c.execute("SELECT COUNT(*) FROM actions").fetchone()

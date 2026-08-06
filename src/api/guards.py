@@ -15,7 +15,7 @@
   failure means the schema cannot be trusted for authoritative writes). ``/healthz``
   deliberately does NOT call it: liveness must stay green so an orchestrator keeps
   routing to the container (§12).
-* :func:`require_not_paused` — 423 while the emergency-stop pause is armed (§7), with
+* :func:`require_not_paused` — 423 while the emergency stop is armed (§7), with
   the ``force=True`` exception reserved for the human's own buttons.
 * :func:`read_force_body` — the optional-JSON-body reader those endpoints use to see
   ``{"force": true}`` before the gate runs.
@@ -30,7 +30,6 @@ the endpoint modules can import them without a cycle.
 from __future__ import annotations
 
 import secrets
-import time
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
@@ -310,18 +309,19 @@ async def read_force_body(request: Request) -> dict:
 
 
 async def require_not_paused(request: Request, *, force: bool = False) -> None:
-    """Refuse a mutating ``/api/*`` verb while a pause is armed (§7).
+    """Refuse a mutating ``/api/*`` verb while the emergency stop is armed (§7).
 
-    Mirrors :func:`require_operational` but for the pause "kill switch": a paused
+    Mirrors :func:`require_operational` but for the "kill switch": a stopped
     curator silences ALL automation, not just the pass, so every mutating verb answers
-    ``paused {until}`` (§7 "Пауза глушит всю автоматику"). Applied to every mutating
-    ``/api/*`` route EXCEPT the resume verbs (``POST``/``DELETE /api/pause`` — else an
-    agent that paused by MCP could never lift it) and ``/api/run_pass`` (its own
-    dry_run/confirm/pause logic lives in the runner). Reads ``pause_until`` from the DB
-    — hence ``async`` — and raises **423 Locked** with a structured
-    ``{"error": "paused", "until": <ms>}`` body (rendered by the app's dict-detail
+    ``stopped {since}`` (§7 "Стоп глушит всю автоматику, а не только проход").
+    Applied to every mutating
+    ``/api/*`` route EXCEPT the stop/start verbs (``POST``/``DELETE /api/pause`` — else
+    an agent that stopped by MCP could never lift it) and ``/api/run_pass`` (its own
+    dry_run/confirm/stop logic lives in the runner). Reads ``curator_stopped_at`` from
+    the DB — hence ``async`` — and raises **423 Locked** with a structured
+    ``{"error": "stopped", "since": <ms>}`` body (rendered by the app's dict-detail
     exception handler). 423 (the automation is locked) is used consistently for the
-    pause gate; the MCP path returns the parallel ``ToolError("paused", …)``.
+    stop gate; the MCP path returns the parallel ``ToolError("stopped", …)``.
 
     ``force`` is §7's ONE exception: «Исключение — собственные кнопки человека, и то с
     явным ``force:true``, который пишется в ``actions`` как ``initiator=user``». The
@@ -356,10 +356,10 @@ async def require_not_paused(request: Request, *, force: bool = False) -> None:
     it is simply not an archived event.
     """
     # Leaf import (no import cycle): pause.py never imports the api package.
-    from src.curator.pause import read_pause_until
+    from src.curator.pause import read_stopped_at
 
-    until = await request.app.state.db.read(read_pause_until)
-    if until is not None and until > int(time.time() * 1000):
+    since = await request.app.state.db.read(read_stopped_at)
+    if since is not None:
         if force:
             return
-        raise HTTPException(status_code=423, detail={"error": "paused", "until": until})
+        raise HTTPException(status_code=423, detail={"error": "stopped", "since": since})

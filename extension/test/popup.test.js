@@ -593,22 +593,23 @@ describe("init: build -> preview -> save", () => {
     expect(saves(calls).every((c) => bodyOf(c).confirm_impact === undefined)).toBe(true);
   });
 
-  it("re-enables Save after a retryable failure (423 paused / 422 / 5xx)", async () => {
-    // A paused curator answers 423 and resumes later; a typo gets fixed. Leaving the
-    // button disabled forced the human to close and reopen the popup.
+  it("re-enables Save after a retryable failure (423 stopped / 422 / 5xx)", async () => {
+    // A stopped curator answers 423 and is started later; a typo gets fixed. Leaving
+    // the button disabled forced the human to close and reopen the popup.
     const doc = fakeDoc();
     const { fetchFn } = routedFetch({ relocations: 0, closures: 0 }, (n) =>
       n === 1
-        ? jsonResp(423, { error: "paused", until: 1 })
+        ? jsonResp(423, { error: "stopped", since: 1 })
         : jsonResp(201, { ok: true, id: 3 }),
     );
 
     await init(doc, chromeOn("https://borneo.lc/x"), fetchFn);
     await doc.els.save._click();
     expect(doc.els.status.textContent).toContain("423");
-    // …and it says what to DO about it, not only that it failed.
-    expect(doc.els.status.textContent).toContain("paused");
-    expect(doc.els.status.textContent).toContain("start page");
+    // …and it says what to DO about it, not only that it failed. The stop is
+    // indefinite — no "wait for the pause to end"; the way back is the Start button.
+    expect(doc.els.status.textContent).toContain("stopped");
+    expect(doc.els.status.textContent).toContain("press Start on the start page");
     expect(doc.els.save.disabled).toBe(false); // retryable
     expect(doc.els.save.textContent).toBe("Save rule"); // not armed as a confirm
 

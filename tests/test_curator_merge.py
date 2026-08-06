@@ -282,7 +282,7 @@ def _settings(**over):
     s = dict(
         idle_minutes=60, pass_interval_min=5, cmd_timeout_ms=1500,
         snapshot_timeout_ms=1500, lease_ttl_ms=600_000, quarantine_ttl_min=1440,
-        main_instance_id="main",
+        main_instance_id="main", max_actions_per_pass=20,
     )
     s.update(over)
     return SimpleNamespace(**s)
@@ -368,13 +368,6 @@ async def _mkdb(tmp_path):
     db = Database(str(tmp_path / "curator.db"), str(tmp_path / "backups"))
     await db.open()
     assert not db.degraded
-    # Establish continuity so the pass below is a steady-state one: without a stored
-    # fingerprint the FIRST pass over a populated DB is a §7 first-run break (dry_run +
-    # resume_pending), which is tested in tests/test_curator_runner.py.
-    from src.curator import clock as clockmod
-    fp = await db.read(lambda c: clockmod.current_fingerprint(
-        c, idle_minutes=60, main_instance_id="main"))
-    await db.write(lambda c: clockmod.store_fingerprint(c, fp))
     return db
 
 

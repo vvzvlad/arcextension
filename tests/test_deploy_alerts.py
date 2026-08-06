@@ -115,7 +115,7 @@ def test_pass_overdue_FIRES_at_exactly_three_pass_intervals():
 
     def gauge_after(elapsed_s: int) -> int:
         snap = Snapshot(finished_at=now_ms - elapsed_s * 1000)
-        return _pass_overdue_seconds(snap, now_ms, _PASS_INTERVAL_S, paused=False)
+        return _pass_overdue_seconds(snap, now_ms, _PASS_INTERVAL_S, stopped=False)
 
     fires_at = 3 * _PASS_INTERVAL_S  # §7: «через 3×PASS_INTERVAL срабатывает алерт»
     crosses_at = fires_at - _PASS_OVERDUE_FOR_S
@@ -126,22 +126,6 @@ def test_pass_overdue_FIRES_at_exactly_three_pass_intervals():
     # the alert actually fires at 3×PASS_INTERVAL rather than resolving in between.
     assert gauge_after(crosses_at + 1) > _PASS_OVERDUE_THRESHOLD
     assert gauge_after(fires_at) > _PASS_OVERDUE_THRESHOLD
-
-
-def test_blind_restore_detection_is_alerted():
-    # `1` means the marker is configured but unreadable, so restore-from-backup
-    # detection is off — and nothing else reveals it: every other fingerprint component
-    # travels inside the backup and matches, so a restore proceeds as ordinary work.
-    # The summary must carry the fix, because the metric name does not tell an operator
-    # that the cause is almost always file permissions (600 root:root vs uid 1000).
-    rule = next(
-        r for r in _rules() if r["alert"] == "curator-restore-marker-unreadable"
-    )
-    assert rule["expr"] == "curator_restore_marker_unreadable == 1"
-    assert rule["for"] == "15m"
-    summary = rule["annotations"]["summary"].lower()
-    assert "unreadable" in summary
-    assert "uid 1000" in summary, "the operator cannot diagnose this from the name alone"
 
 
 def test_snapshot_stale_keeps_the_six_interval_threshold():

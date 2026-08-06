@@ -25,7 +25,7 @@ def test_loads_defaults_from_section4(monkeypatch):
     assert s.snapshot_timeout_ms == 10000
     assert s.lease_ttl_ms == 600000
     assert s.restore_exemption_min == 120
-    assert s.pause_default_min == 60
+    assert s.max_actions_per_pass == 20
     assert s.incomplete_after_min == 15
     assert s.self_nav_limit == 10
     assert s.state_fresh_ms == 3000
@@ -142,14 +142,16 @@ def test_enroll_window_min_default_and_override(monkeypatch):
     assert Settings(_env_file=None).enroll_window_min == 25
 
 
-def test_restore_marker_path_defaults_to_unset(monkeypatch):
-    # §7 WARNING 2: no default path — an invented one would either never exist (silently
-    # disabling the detector) or sit inside the backup (detecting nothing). Empty means
-    # "not configured", which is the pre-existing behaviour.
+def test_max_actions_per_pass_env_and_floor(monkeypatch):
+    # §7: the ONLY mass-action brake. Env-tunable; ge=1 because a 0 threshold would
+    # defer every non-empty pass forever (config that means "never run").
     _base_env(monkeypatch)
-    assert Settings(_env_file=None).restore_marker_path == ""
-    monkeypatch.setenv("RESTORE_MARKER_PATH", "/app/state/restore-marker")
-    assert Settings(_env_file=None).restore_marker_path == "/app/state/restore-marker"
+    assert Settings(_env_file=None).max_actions_per_pass == 20
+    monkeypatch.setenv("MAX_ACTIONS_PER_PASS", "5")
+    assert Settings(_env_file=None).max_actions_per_pass == 5
+    monkeypatch.setenv("MAX_ACTIONS_PER_PASS", "0")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 # --- build identity: stamped by the image build, honest when it is not -------

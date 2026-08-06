@@ -710,10 +710,10 @@ def test_reset_refused_while_paused(tmp_path):
         _seed_instance(db_path, "prox")
         rid = _seed_rule(db_path, "grafana.lc", "prox")
         _set_canonical(db_path, rid, "https://grafana.lc/home")
-        _set_setting(db_path, "pause_until", str(_now_ms() + 3_600_000))
+        _set_setting(db_path, "curator_stopped_at", str(_now_ms()))
         resp = client.post(f"/api/rules/{rid}/reset", headers=AUTH)
         assert resp.status_code == 423
-        assert resp.json()["error"] == "paused"
+        assert resp.json()["error"] == "stopped"
         # force is NOT honoured for reset.
         forced = client.post(
             f"/api/rules/{rid}/reset", headers=AUTH, json={"force": True}

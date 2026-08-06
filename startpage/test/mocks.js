@@ -256,10 +256,8 @@ export function makeFetch(routes = {}) {
       counts.pausePost = (counts.pausePost || 0) + 1;
       const r = routes.pausePost;
       const v = await (typeof r === "function" ? r(opts, counts.pausePost) : r);
-      return jsonResponse(
-        (v && v.status) ?? 200,
-        (v && v.body) ?? { paused_until: 2_000_000, pause_started_at: 1_000_000 },
-      );
+      // POST /api/pause = indefinite stop (§7): the server answers with the stamp.
+      return jsonResponse((v && v.status) ?? 200, (v && v.body) ?? { stopped_at: 1_000_000 });
     }
     // --- rules editor (§8/§10). /preview is more specific — check it first. -----
     if (u.includes("/api/rules/preview")) {

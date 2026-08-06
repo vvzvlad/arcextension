@@ -50,7 +50,6 @@ class Settings(BaseSettings):
     snapshot_timeout_ms: int = 10000
     lease_ttl_ms: int = 600000
     restore_exemption_min: int = 120
-    pause_default_min: int = 60
     incomplete_after_min: int = 15
     self_nav_limit: int = 10
     state_fresh_ms: int = 3000
@@ -90,20 +89,16 @@ class Settings(BaseSettings):
     # ge=1: 0 refuses EVERY /ext handshake before accept() — the whole fleet drops out of
     # curation with only `curator_auth_rejections_total{reason="capacity"}` to show for it.
     enroll_preauth_max: int = Field(default=128, ge=1)
-    # Path to the EXTERNAL restore-from-backup marker (§7 WARNING 2). DEFAULT EMPTY =
-    # detection off — which the continuity fingerprint records as a state ("no marker
-    # configured"), not as a missing component: an install that stays off never breaks,
-    # but switching detection on or off later is a break like any other fingerprint
-    # config change (deliberate — a silent switch-OFF would drop restore detection with
-    # no signal; see clock.is_continuity_break). When set, it must point at a small file
-    # that is NOT the DB and NOT inside the backup copies, holding a fresh uuid
-    # written on every restore — see src/curator/clock.read_restore_marker for the
-    # operator contract and deploy/DEPLOY.md for the procedure. In prod the shipped
-    # compose file points it at /app/data/restore/continuity-marker: the same volume as
-    # the DB, but its own file (the container entrypoint creates it once and never
-    # rewrites it). No default path: an invented one would either never exist (silently
-    # disabling the detector) or accidentally sit inside the backup (detecting nothing).
-    restore_marker_path: str = ""
+    # The ONLY mass-action brake (§7). A real pass whose countable plan — phase-A
+    # relocations + closes — exceeds this does not execute them: it arms the
+    # ``resume_pending`` latch with the current plan and waits for ONE confirming click
+    # (POST /api/run_pass {confirm_pending} or the resume button). Cause-agnostic by
+    # design: whatever made the plan big (a restored backup, a lowered IDLE_MINUTES, a
+    # clean DB turning eligible all at once, a fat-fingered rule), the damage arrives as
+    # "too many actions in one pass", and that is the thing gated. Phase-B completions
+    # are NOT counted — they are the second half of already-approved work. ge=1: 0
+    # would defer every non-empty pass forever.
+    max_actions_per_pass: int = Field(default=20, ge=1)
 
     # --- Non-secret infra defaults ----------------------------------------------
     log_level: str = "INFO"

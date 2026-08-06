@@ -1,11 +1,16 @@
 """The curator pass orchestration — the nine steps of §7.
 
-Order (§7): (0) server-clock check; (1) pause / resume_pending / continuity gate;
+Order (§7): (0) server-clock check; (1) the stop gate + the resume_pending latch read;
 (2) lease with fencing epoch + a SEPARATE renewal task; (3) snapshot freshness keyed
 on the pass's OWN request ids; (4-8) guards / routing / phase A / phase B / dedup /
 singleton, each tab isolated; the ``passes`` row is written for every real pass
 (even an empty one). Window merge (step 9, §9) runs LAST, after the tab decisions,
 so those decide against a stable window picture (Фаза 15).
+
+The ONE mass-action protection is the plan-size threshold (``MAX_ACTIONS_PER_PASS``):
+a real pass whose countable plan (phase-A relocations + closes) exceeds it defers the
+plan behind a confirming click instead of executing it — see the threshold gate below
+for the full design rationale.
 
 Every mutation is a lease-guarded ``Database.write`` (§7): a lost lease raises
 :class:`~src.curator.lease.LeaseLost`, which stops the pass at once. WS I/O and the
@@ -22,7 +27,6 @@ from dataclasses import dataclass
 
 from loguru import logger
 
-from src.curator import clock as clockmod
 from src.curator import decide as decidemod
 from src.curator import lease, pause, phases
 from src.curator.mirror import load_mirror
@@ -36,18 +40,14 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-_RESUME_PENDING_KEY = "resume_pending"
-_PAUSE_UNTIL_KEY = "pause_until"
-_PAUSE_STARTED_AT_KEY = "pause_started_at"
+# The latch and the stop flag live in `settings` under the names pause.py owns
+# (the rows MUST share a name across the runner, the API guards and /metrics).
+_RESUME_PENDING_KEY = pause.RESUME_PENDING_KEY
+_STOPPED_AT_KEY = pause.STOPPED_AT_KEY
 # The last observed server-clock step (seconds) is persisted here so /metrics can
 # export curator_clock_step_seconds (§12): the clock-step abort happens BEFORE any
 # `passes` row is written, so settings is the only durable place to record it.
 _CLOCK_STEP_KEY = "curator_clock_step_seconds"
-# "1" while the CONFIGURED restore marker cannot be read (permissions, a wedged mount) —
-# i.e. restore-from-backup detection is blind. "0" when it read fine or is not configured;
-# an absent row means no pass has looked yet. Exported by /metrics as a 0/1 gauge (§12);
-# the row is the contract between this module and src/api/metrics.py.
-_MARKER_UNREADABLE_KEY = "curator_restore_marker_unreadable"
 
 # ``decision`` values on an aggregated `deferred` row — the CAUSE of the deferral (§7).
 # ``target_not_ready`` is the §7 one (connection / epoch change / an unreachable home);
@@ -84,25 +84,29 @@ def _finalize_pass(conn: sqlite3.Connection, pass_id: str, **cols) -> None:
     )
 
 
-# --- step 2 helper: pause check + lease acquire in ONE transaction (§7) ------
-def _acquire_unless_paused(
-    conn: sqlite3.Connection, owner: str, now: int, ttl_ms: int, *, honor_pause: bool
+# --- step 2 helper: stop check + lease acquire in ONE transaction (§7) -------
+def _acquire_unless_stopped(
+    conn: sqlite3.Connection, owner: str, now: int, ttl_ms: int, *, honor_stop: bool
 ):
-    """Take the lease unless a pause is live. Returns ``(acquired, epoch, blocked_until)``.
+    """Take the lease unless the curator is stopped. Returns ``(acquired, epoch,
+    stopped_since)``.
 
-    ``pause_until`` and the lease both live in ``settings``, so this is one synchronous
-    ``fn(conn)`` inside a single ``BEGIN IMMEDIATE`` — which is what closes the window
-    between the step-1 pause read and the acquire. When a pause is live NOTHING is
-    touched (no epoch bump, no owner), and ``blocked_until`` names the deadline.
+    ``curator_stopped_at`` and the lease both live in ``settings``, so this is one
+    synchronous ``fn(conn)`` inside a single ``BEGIN IMMEDIATE`` — which is what closes
+    the window between the step-1 stop read and the acquire (the TOCTOU hole: a stop
+    pressed between that read and this write would otherwise be out-epoched by the
+    acquire's own bump, and the pass would run through an armed emergency stop). When
+    stopped NOTHING is touched (no epoch bump, no owner), and ``stopped_since`` names
+    the stop moment.
 
-    ``honor_pause`` is False only for an explicit ``dry_run``: §7 keeps the plan
-    readable while paused. The step-1 check stays where it is — it exits early without
+    ``honor_stop`` is False only for an explicit ``dry_run``: §7 keeps the plan
+    readable while stopped. The step-1 check stays where it is — it exits early without
     ever touching the lease; this is the race-safe duplicate for the window after it.
     """
-    if honor_pause:
-        blocked_until = pause.read_pause_until(conn)
-        if blocked_until is not None and blocked_until > now:
-            return False, 0, blocked_until
+    if honor_stop:
+        stopped_since = pause.read_stopped_at(conn)
+        if stopped_since is not None:
+            return False, 0, stopped_since
     acquired, epoch = lease.acquire(conn, owner, now, ttl_ms)
     return acquired, epoch, None
 
@@ -182,7 +186,16 @@ async def _snapshot_request_everyone(registry) -> None:
 
 
 # --- the plan (dry_run / resume_pending) ------------------------------------
-def _plan(decisions) -> dict:
+def _countable(decisions) -> int:
+    """The actions the threshold gate counts: phase-A relocations + closes.
+
+    Phase-B completions, abandon bookkeeping, deferred journaling and window merges are
+    NOT counted — none of them destroys state the owner has not already approved (see
+    the threshold gate in :func:`run_pass`)."""
+    return len(decisions.phase_a) + len(decisions.closes)
+
+
+def _plan(decisions, threshold: int) -> dict:
     relocations = [
         {"url": d.tab.url, "from": d.tab.instance_id, "to": d.home}
         for d in decisions.phase_a
@@ -203,6 +216,11 @@ def _plan(decisions) -> dict:
         # Why part of `deferred` happened: an identical (target, url) pair was already
         # scheduled for phase A this pass, so the second tab waits (§7).
         "deferred_same_url": dict(decisions.deferred_same_url),
+        # The countable total vs the brake it is compared against — carried in the plan
+        # (dry_run and latch alike) so the UI can say "34 actions > 20" without
+        # re-deriving which kinds count.
+        "total": _countable(decisions),
+        "threshold": threshold,
         "relocation_examples": relocations[:20],
         "closure_examples": closures[:20],
         "phase_b_examples": phase_b[:20],
@@ -247,118 +265,49 @@ async def run_pass(
             return {"status": "clock_step", "clock_step_seconds": skew}
 
     idle_ms = settings.idle_minutes * 60_000
-    # Tolerated via getattr so a settings shim without the (optional, default-empty)
-    # knob still runs a pass; an unset marker means "not configured" anyway (§7).
-    marker_path = getattr(settings, "restore_marker_path", "")
-    marker_cell: list = []  # holds at most one entry: the digest read for THIS pass
 
-    async def _marker():
-        """The restore marker for this pass — read AT MOST ONCE, and only if needed.
-
-        Once, because the two consumers (the step-1 comparison and the closing
-        ``_finish_continuity``) must agree: reading twice would compare one value and
-        store another, so a marker rewritten in between would be recorded as if it had
-        always been there and the break swallowed for good.
-
-        Lazily, because a pass that exits at the pause gate or fails to take the lease
-        must not touch the filesystem at all — that path is triggered by every
-        ``POST /api/run_pass`` and every pause/resume, and each touch of a wedged mount
-        parks a thread for ``_MARKER_READ_TIMEOUT_S``.
-        """
-        if not marker_cell:
-            value = await clockmod.read_restore_marker_async(marker_path)
-            marker_cell.append(value)
-            # §12 observability: "the restore detector is blind" must be a state /metrics
-            # can scrape, not just a log line every five minutes. A configured marker the
-            # service can never read (the classic one: the operator writes it as root with
-            # umask 077, the container runs as uid 1000) silently disables restore
-            # detection FOREVER — every pass drops the component and carries the old
-            # digest forward, and no other fingerprint component can catch a restore
-            # because they all travel inside the backup. Written to `settings` (not held
-            # in process memory) so a scrape reads it from the DB (§12). Best-effort: an
-            # observability write must never break a pass.
-            try:
-                await db.write(lambda c: set_setting(
-                    c, _MARKER_UNREADABLE_KEY,
-                    "1" if value == clockmod.MARKER_UNREADABLE else "0",
-                ))
-            except Exception:  # noqa: BLE001
-                logger.exception("curator: failed to publish restore-marker state")
-        return marker_cell[0]
-
-    # --- step 1: pause / resume_pending / continuity gate (§7) ---------------
-    effective_dry_run = dry_run
-    armed_after_break = False
-    # ``dry_run`` is never muted by a pause — looking at the plan is exactly why a
-    # pause is taken (§7) — so the whole gate is skipped for it. Everything else,
-    # ``confirm_pending`` included, loses to a LIVE pause: if a pause was re-armed
-    # AFTER the plan was computed (the owner saw the plan and hit "stop" again), the
-    # confirm must not run a full pass through an active emergency stop (SUGGESTION 7).
+    # --- step 1: the stop gate + the resume_pending latch read (§7) ----------
+    # ``dry_run`` is never muted by a stop — looking at the plan is exactly why the
+    # stop is pressed (§7) — so the gate is skipped for it. Everything else,
+    # ``confirm_pending`` included, loses to a LIVE stop: if the owner saw the deferred
+    # plan and hit "stop", the confirm must not run a full pass through an active
+    # emergency stop.
     if not dry_run:
-        pause_until = get_setting_int(await _read_setting(db, _PAUSE_UNTIL_KEY))
-        if pause_until is not None and pause_until > now:
-            return {"status": "paused", "until": pause_until}
+        stopped_at = get_setting_int(await _read_setting(db, _STOPPED_AT_KEY))
+        if stopped_at is not None:
+            return {"status": "stopped", "since": stopped_at}
         resume_armed = bool(await _read_setting(db, _RESUME_PENDING_KEY))
         # A ``confirm_pending`` confirms an ARMED plan. With no latch there is nothing
         # to confirm, and honouring the flag anyway would let a client that sends it out
-        # of habit bypass the continuity gate AND have _finish_continuity overwrite the
-        # fingerprint — a break (say, a lowered IDLE_MINUTES) would be eaten silently and
-        # the promised confirmation never shown. So it degrades to an ordinary pass and
-        # goes through every gate below.
+        # of habit pre-approve a plan nobody has seen: an over-threshold plan computed
+        # below would execute instead of latching. So it degrades to an ordinary pass —
+        # which still latches if THIS pass's plan turns out over-threshold.
         if confirm_pending and not resume_armed:
             logger.info("curator: confirm_pending with no armed latch — running the normal gate")
             confirm_pending = False
-        if not confirm_pending:
-            if resume_armed:
-                return {"status": "resume_pending"}
-            # A pause that EXPIRED but was never resumed by hand still has its start armed
-            # (``pause_started_at`` set — a manual resume/confirm clears it via the TTL
-            # shift). The FIRST pass after a timeout expiry must NOT auto-run and drain the
-            # night's backlog (§7 "истечение по таймауту — нет"): it computes a dry-run plan,
-            # arms ``resume_pending`` and waits for a click. The click
-            # (run_pass{confirm_pending}) applies the full TTL shift and runs the real pass.
-            pause_started = get_setting_int(await _read_setting(db, _PAUSE_STARTED_AT_KEY))
-            if pause_until is not None and pause_started is not None:
-                effective_dry_run = True
-                armed_after_break = True
-            else:
-                marker_now = await _marker()
-                current_fp = await db.read(
-                    lambda c: clockmod.current_fingerprint(
-                        c, idle_minutes=settings.idle_minutes,
-                        main_instance_id=settings.main_instance_id,
-                        restore_marker=marker_now,
-                    )
-                )
-                stored_fp = await db.read(clockmod.read_stored_fingerprint)
-                # The fresh-DB (first-run) arm of the same policy: no stored fingerprint
-                # AND a fleet already in the DB is the §7 "чистая БД" break.
-                populated = await db.read(clockmod.fleet_populated)
-                if clockmod.is_continuity_break(
-                    stored_fp, current_fp, fleet_populated=populated
-                ):
-                    # First pass after a continuity break: compute a dry-run plan and arm
-                    # resume_pending; the owner confirms with run_pass{confirm_pending} (§7).
-                    effective_dry_run = True
-                    armed_after_break = True
+        # An armed latch does NOT early-return: the pass always proceeds to decide().
+        # That is what makes the latch self-refreshing (every pass overwrites it with
+        # the CURRENT plan, so the shown plan is at most one interval stale) and
+        # self-clearing (a plan that shrank back under the threshold simply executes
+        # and drops the latch, no click needed) — see the threshold gate below.
 
     # --- step 2: acquire the lease with a fencing epoch (§7) ------------------
     owner = f"pass-{uuid.uuid4()}"
-    # The pause is re-read INSIDE the acquiring transaction. Step 1's check alone is a
-    # TOCTOU hole: a pause armed between that read and this write bumps the epoch to
+    # The stop flag is re-read INSIDE the acquiring transaction. Step 1's check alone is
+    # a TOCTOU hole: a stop pressed between that read and this write bumps the epoch to
     # E+1, `acquire` immediately bumps it to E+2, and the pass then owns the freshest
-    # epoch — every guarded write passes, ``pause_until`` is never consulted again, and
-    # the owner who hit the emergency stop watches the curator close tabs for minutes
-    # (§7 "этого достаточно, чтобы остановить уже идущий проход"). Both values live in
-    # ``settings``, so the check costs one extra SELECT in the same ``fn(conn)`` — no
-    # await, no second transaction, no race left.
-    acquired, epoch, blocked_until = await db.write(
-        lambda c: _acquire_unless_paused(
-            c, owner, now, settings.lease_ttl_ms, honor_pause=not dry_run
+    # epoch — every guarded write passes, ``curator_stopped_at`` is never consulted
+    # again, and the owner who hit the emergency stop watches the curator close tabs
+    # for minutes (§7 "этого достаточно, чтобы остановить уже идущий проход"). Both
+    # values live in ``settings``, so the check costs one extra SELECT in the same
+    # ``fn(conn)`` — no await, no second transaction, no race left.
+    acquired, epoch, stopped_since = await db.write(
+        lambda c: _acquire_unless_stopped(
+            c, owner, now, settings.lease_ttl_ms, honor_stop=not dry_run
         )
     )
-    if blocked_until is not None:
-        return {"status": "paused", "until": blocked_until}
+    if stopped_since is not None:
+        return {"status": "stopped", "since": stopped_since}
     if not acquired:
         return {"status": "lease_unavailable"}
     pass_start = now
@@ -371,22 +320,10 @@ async def run_pass(
     considered = 0
     ready: dict = {}
     error: str | None = None
+    deferred_plan: dict | None = None
     try:
-        if not effective_dry_run:
+        if not dry_run:
             await db.write(lease.guarded(epoch, lambda c: _insert_pass_started(c, pass_id, pass_start)))
-
-        # Timeout-expiry TTL shift (§7): when a pause ends by expiry, its protections
-        # are shifted by the FULL pause duration the moment the deferred plan is
-        # CONFIRMED (confirm_pending) — BEFORE any decision, so the first post-resume
-        # pass respects the shifted quarantine/exemptions instead of evicting exactly
-        # what the pause protected. Guarded ONCE by pause_started_at (apply_resume_shift
-        # is a no-op after it clears the start), so a normal pass shifts nothing and the
-        # manual-resume path — which already shifted in DELETE /api/pause — is not
-        # double-shifted here.
-        if confirm_pending and not effective_dry_run:
-            await db.write(
-                lease.guarded(epoch, lambda c: pause.apply_resume_shift(c, now=now))
-            )
 
         # --- step 3: freshness — snapshot_request keyed on our OWN ids -------
         sent = await _request_all_snapshots(registry)
@@ -401,7 +338,7 @@ async def run_pass(
         # ACTIONS journal (§12) — the plan must cost no closures and no `passes` row —
         # and `rules.invalid` is neither: it is the policy's own health, which §12 says
         # every pass re-derives. Skipping it here would make the plan the owner CONFIRMS
-        # after a continuity break disagree with the pass that executes it: the plan
+        # behind the threshold latch disagree with the pass that executes it: the plan
         # would be routed on stale flags, the confirming pass would revalidate first and
         # route differently, and "confirmed" would stop meaning "this is what will
         # happen" for exactly the rules §12 wants re-checked.
@@ -424,7 +361,7 @@ async def run_pass(
         # (`mark_action_abandoned`), not a parallel mechanism. Skipped on dry_run (a
         # dry_run writes no actions, exactly like reconcile). Per row isolated; one failed
         # retire must not abort the pass.
-        if not effective_dry_run:
+        if not dry_run:
             for reloc_id in await db.read(read_revoked_relocations):
                 await _isolated(_retire_revoked_relocation(db, epoch, reloc_id))
 
@@ -451,7 +388,7 @@ async def run_pass(
         # synchronous relocate_tab verb writes its pending close BEFORE sending the
         # source close, so its row must not be reconciled while that verb is still
         # awaiting the response.
-        if not effective_dry_run:
+        if not dry_run:
             for pending_row in await db.read(
                 lambda c: read_pending_closes(
                     c, now=now, cmd_timeout_ms=settings.cmd_timeout_ms
@@ -465,66 +402,122 @@ async def run_pass(
         )
         considered = decisions.considered
 
-        if effective_dry_run:
-            plan = _plan(decisions)
-            if armed_after_break:
-                await db.write(
-                    lease.guarded(
-                        epoch,
-                        lambda c: set_setting(
-                            c, _RESUME_PENDING_KEY,
-                            _resume_pending_value(pass_start, plan),
-                        ),
+        if dry_run:
+            return {"status": "dry_run",
+                    "plan": _plan(decisions, settings.max_actions_per_pass)}
+
+        # --- the plan-size threshold gate (§7) — the ONE mass-action brake ---
+        # Cause-agnostic by design: a restored backup, a clean DB whose whole fleet
+        # turns eligible at once, a lowered IDLE_MINUTES, a fat-fingered rule — every
+        # such event does its damage as "too many actions in one pass", so the SIZE of
+        # the plan is what is gated, not a guess at its cause. When the countable plan
+        # (phase-A relocations + closes) exceeds MAX_ACTIONS_PER_PASS, the pass does
+        # not execute it: it stores the CURRENT plan in the resume_pending latch and
+        # waits for one confirming click (run_pass{confirm_pending} / the resume
+        # button).
+        #
+        # The latch is a fresh snapshot, not a one-shot: every subsequent pass still
+        # runs decide() and OVERWRITES it, so the plan the owner sees is at most one
+        # pass-interval stale — and a plan that shrinks back under the threshold simply
+        # executes on the normal path below and clears the latch (auto-unlatch, no
+        # click needed). The click therefore executes the plan recomputed AT CLICK
+        # TIME, not the possibly stale one that first armed the latch.
+        #
+        # Phase-B completions are EXEMPT — excluded from the count AND still executed
+        # while the latch is armed. They are the second half of already-approved work
+        # (the copy is already open in the target); freezing them would keep duplicate
+        # tabs open for as long as the owner takes to click, and phases.run_phase_b's
+        # own target verification already protects against stale relocate rows. The
+        # abandon bookkeeping runs for the same reason: it retires rows decide() has
+        # already proven stale, destroying nothing.
+        countable = _countable(decisions)
+        if countable > settings.max_actions_per_pass and not confirm_pending:
+            deferred_plan = _plan(decisions, settings.max_actions_per_pass)
+            # Say it out loud: arming (unarmed -> armed) is an event the operator
+            # wants in the log, a refresh is routine chatter. Step 1 already read
+            # the latch, so `resume_armed` tells the two apart.
+            if resume_armed:
+                logger.debug(
+                    "curator: threshold latch refreshed: plan of {} countable actions"
+                    " > threshold {}", countable, settings.max_actions_per_pass,
+                )
+            else:
+                logger.info(
+                    "curator: threshold latch armed: plan of {} countable actions"
+                    " > threshold {} — waiting for a confirming click",
+                    countable, settings.max_actions_per_pass,
+                )
+            for ab in decisions.abandon:
+                await _isolated(_abandon(ctx, ab))
+            for dec in decisions.phase_b:
+                await _isolated(phases.run_phase_b(ctx, dec))
+            # SKIPPED: deferred-row journaling, phase A, closes, window merges — the
+            # countable work waits for the click; journaling a deferral that is itself
+            # deferred would only muddy curator_deferred_total.
+            plan_value = _resume_pending_value(pass_start, deferred_plan)
+            await db.write(
+                lease.guarded(
+                    epoch, lambda c: set_setting(c, _RESUME_PENDING_KEY, plan_value)
+                )
+            )
+        else:
+            # --- steps 4-8: execute (each decision isolated) -----------------
+            # Abandon stale relocate rows (source moved/gone); their source tabs, if
+            # any, were already re-routed in the SAME decide() call (not "owned").
+            for ab in decisions.abandon:
+                await _isolated(_abandon(ctx, ab))
+            # Aggregated deferred rows: one per (pass_id, instance_to, cause) (§7 step
+            # 6). §7 defines `deferred` as "вызвано соединением, сменой эпохи или
+            # слиянием окон", and the same-url hold-back (a tab waiting for the copy
+            # this pass is opening) is a DIFFERENT thing wearing the same status.
+            # Splitting the rows by ``decision`` keeps curator_deferred_total exactly
+            # as it was (metrics sums every deferred row per instance_to) while making
+            # the cause answerable from the journal and separable by a later metrics
+            # change — see the report.
+            for to_instance, count in decisions.deferred.items():
+                same_url = decisions.deferred_same_url.get(to_instance, 0)
+                if count - same_url > 0:
+                    await _isolated(
+                        _write_deferred(ctx, to_instance, count - same_url, _DEFER_UNREADY)
                     )
-                )
-                return {"status": "resume_pending", "plan": plan}
-            return {"status": "dry_run", "plan": plan}
+                if same_url > 0:
+                    await _isolated(
+                        _write_deferred(ctx, to_instance, same_url, _DEFER_SAME_URL)
+                    )
+            for dec in decisions.phase_b:
+                await _isolated(phases.run_phase_b(ctx, dec))
+            for dec in decisions.phase_a:
+                await _isolated(phases.run_phase_a(ctx, dec))
+            for dec in decisions.closes:
+                await _isolated(phases.run_close(ctx, dec))
 
-        # --- steps 4-8: execute (each decision isolated) ---------------------
-        # Abandon stale relocate rows (source moved/gone); their source tabs, if any,
-        # were already re-routed in the SAME decide() call (they are not "owned").
-        for ab in decisions.abandon:
-            await _isolated(_abandon(ctx, ab))
-        # Aggregated deferred rows: one per (pass_id, instance_to, cause) (§7 step 6).
-        # §7 defines `deferred` as "вызвано соединением, сменой эпохи или слиянием окон",
-        # and the same-url hold-back (a tab waiting for the copy this pass is opening) is
-        # a DIFFERENT thing wearing the same status. Splitting the rows by ``decision``
-        # keeps curator_deferred_total exactly as it was (metrics sums every deferred row
-        # per instance_to) while making the cause answerable from the journal and
-        # separable by a later metrics change — see the report.
-        for to_instance, count in decisions.deferred.items():
-            same_url = decisions.deferred_same_url.get(to_instance, 0)
-            if count - same_url > 0:
-                await _isolated(
-                    _write_deferred(ctx, to_instance, count - same_url, _DEFER_UNREADY)
-                )
-            if same_url > 0:
-                await _isolated(
-                    _write_deferred(ctx, to_instance, same_url, _DEFER_SAME_URL)
-                )
-        for dec in decisions.phase_b:
-            await _isolated(phases.run_phase_b(ctx, dec))
-        for dec in decisions.phase_a:
-            await _isolated(phases.run_phase_a(ctx, dec))
-        for dec in decisions.closes:
-            await _isolated(phases.run_close(ctx, dec))
+            # --- step 9: window merge (§9), LAST — the tab decisions (4-8) ran
+            # against the STABLE window picture; only now do the instance's windows
+            # collapse into one. Planned purely from the same frozen mirror; each
+            # instance isolated so one bad merge cannot sink the pass; every write
+            # lease-guarded (§7/§9).
+            # main is skipped unconditionally (#41): its window layout is the owner's,
+            # and a merge is not undoable.
+            for merge in decidemod.decide_window_merges(
+                mirror, ready_ids, now=now, idle_ms=idle_ms,
+                main_instance_id=settings.main_instance_id,
+            ):
+                await _isolated(phases.run_window_merge(ctx, merge))
 
-        # --- step 9: window merge (§9), LAST — the tab decisions (4-8) ran against
-        # the STABLE window picture; only now do the instance's windows collapse into
-        # one. Planned purely from the same frozen mirror; each instance isolated so
-        # one bad merge cannot sink the pass; every write lease-guarded (§7/§9).
-        for merge in decidemod.decide_window_merges(
-            mirror, ready_ids, now=now, idle_ms=idle_ms,
-            main_instance_id=settings.main_instance_id,
-        ):
-            await _isolated(phases.run_window_merge(ctx, merge))
-
-        # A real pass with established continuity refreshes the fingerprint and
-        # clears any resume_pending it was confirming (§7).
-        marker_final = await _marker()
-        await db.write(
-            lease.guarded(epoch, lambda c: _finish_continuity(c, settings, marker_final))
-        )
+            # A pass that executed its (under-threshold or confirmed) plan clears the
+            # latch: whatever was deferred either just ran or no longer exists (§7).
+            # ONLY when the pass had evidence, though: the plan is computed FROM the
+            # ready instances, so an empty ready set produces an empty plan by
+            # construction and proves nothing about the armed plan having shrunk.
+            # Clearing on it would make the latch (and curator_resume_pending) flap
+            # with fleet connectivity — a sleeping laptop erases a 500-action plan,
+            # the next connected pass re-arms it. So the latch outlives passes that
+            # saw nothing. The confirm path shares this guard deliberately: a click
+            # that ran against zero ready instances executed nothing and its plan is
+            # still pending — consistent with the resume_now docstring ("a pass that
+            # never got to run leaves the latch armed").
+            if ready_ids:
+                await db.write(lease.guarded(epoch, _clear_deferred_plan))
     except lease.LeaseLost:
         error = "lease_lost"
         logger.info("curator: lease lost mid-pass {}; stopping", pass_id)
@@ -537,7 +530,7 @@ async def run_pass(
             await renew_task
         except asyncio.CancelledError:
             pass
-        # Hand the slot back. Keyed on the OWNER, not the epoch: a pass fenced by a pause
+        # Hand the slot back. Keyed on the OWNER, not the epoch: a pass fenced by a stop
         # MUST still release (else the slot is hostage until the TTL), while a pass whose
         # lease was taken over after expiry must NOT (someone else owns it now). This
         # release is what keeps "one pass at a time" true — the slot stays taken for as
@@ -547,7 +540,7 @@ async def run_pass(
         except Exception:  # noqa: BLE001
             logger.exception("curator: lease release failed for {}", pass_id)
 
-    if effective_dry_run:
+    if dry_run:
         # (Only reached if a dry_run hit LeaseLost/other error before returning.)
         return {"status": "error" if error else "dry_run", "error": error}
 
@@ -566,6 +559,19 @@ async def run_pass(
         )
     except Exception:  # noqa: BLE001 - a passes-row finalize fault must not mask result
         logger.exception("curator: finalize passes row failed for {}", pass_id)
+
+    # An over-threshold pass that latched its plan DID run (it kept the exempt phase-B
+    # work moving and refreshed the latch), so it goes through the normal finalize
+    # above — but its answer to the caller is the deferred plan, not "ok".
+    if deferred_plan is not None and error is None:
+        return {
+            "status": "resume_pending",
+            "plan": deferred_plan,
+            "pass_id": pass_id,
+            "instances_ready": instances_ready,
+            "tabs_considered": considered,
+            "actions_count": actions_count,
+        }
 
     return {
         "status": "ok" if ok else ("error" if error else "no_ready_instances"),
@@ -613,23 +619,13 @@ async def _write_deferred(ctx, to_instance: str, count: int, decision: str) -> N
     ctx.actions_count += 1
 
 
-def _finish_continuity(conn: sqlite3.Connection, settings, marker: str | None = None) -> None:
-    """Refresh the continuity fingerprint and clear resume_pending (a real pass ran).
-
-    The fingerprint is stored ONLY for a pass that saw a fleet. A pass over a
-    completely empty DB (the service is up, no browser has ever connected) would
-    otherwise consume the first-run latch before there is anything to protect, and the
-    genuine clean-DB break — the whole fleet arriving with ``age_unknown=1`` and turning
-    eligible one hour later, all at once — would never be caught (§7). The latch itself
-    is always cleared: an empty pass still finishes whatever it was confirming.
-    """
-    if clockmod.fleet_populated(conn):
-        fp = clockmod.current_fingerprint(
-            conn, idle_minutes=settings.idle_minutes,
-            main_instance_id=settings.main_instance_id,
-            restore_marker=marker,
-        )
-        clockmod.store_fingerprint(conn, fp)
+def _clear_deferred_plan(conn: sqlite3.Connection) -> None:
+    """Drop the threshold latch (a writer ``fn``): a pass that executed its plan —
+    under-threshold or confirmed — leaves nothing pending. Clearing on EVERY executing
+    pass (not only a confirming one) is the auto-unlatch half of the design: a plan
+    that shrank back under the threshold runs normally and the stale latch goes with
+    it, no click needed. The caller guards this on a non-empty ready set — an
+    evidence-free pass must not clear (see the execute path in :func:`run_pass`)."""
     set_setting(conn, _RESUME_PENDING_KEY, "")
 
 

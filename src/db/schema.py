@@ -174,8 +174,8 @@ _V1_STATEMENTS: list[str] = [
         created_at INTEGER NOT NULL
     )
     """,
-    # settings — runtime state, NOT config: pass lease, pause_until,
-    # pause_started_at, resume_pending, the runtime execute_js switch.
+    # settings — runtime state, NOT config: pass lease, curator_stopped_at,
+    # resume_pending, the runtime execute_js switch.
     "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)",
 ]
 

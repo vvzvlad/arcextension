@@ -94,8 +94,8 @@ async def healthz(request: Request) -> JSONResponse:
 
 async def _http_exception(request: Request, exc: HTTPException) -> Response:
     """HTTPException renderer: a DICT ``detail`` becomes a JSON body, everything else
-    keeps Starlette's plain-text default. The pause gate (``require_not_paused``)
-    raises 423 with ``{"error":"paused","until":<ms>}`` — a structured body the client
+    keeps Starlette's plain-text default. The stop gate (``require_not_paused``)
+    raises 423 with ``{"error":"stopped","since":<ms>}`` — a structured body the client
     reads — while existing string-detail 4xx/5xx responses render unchanged (§7/§12)."""
     if exc.status_code in {204, 304}:
         return Response(status_code=exc.status_code, headers=exc.headers)
@@ -247,8 +247,8 @@ def create_app(settings) -> Starlette:
         ),
         # Curator pass (§7): trigger one pass (dry_run / confirm_pending optional).
         Route("/api/run_pass", run_pass_endpoint, methods=["POST"]),
-        # Pause (§7): POST arms/extends a finite pause; DELETE resumes (TTL shift +
-        # an immediate pass). Both are exceptions to the pause gate (resume verbs).
+        # Stop/start (§7): POST stops the curator indefinitely; DELETE starts it (TTL
+        # shift + an immediate confirming pass). Both are exceptions to the stop gate.
         Route("/api/pause", pause_endpoint, methods=["POST"]),
         Route("/api/pause", resume_endpoint, methods=["DELETE"]),
         # Enrollment JSON API (§13). ADMIN-only (ADMIN_TOKEN / MCP): the operator opens /

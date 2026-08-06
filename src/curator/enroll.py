@@ -6,18 +6,18 @@ the enrollment WINDOW is open — a short, operator-opened interval, so an enrol
 an arbitrary later time is refused. The window IS the permission: there is no second
 approval step (§6), which is exactly why the window has to be short and its code fresh.
 
-The window is modelled exactly like ``pause_until`` in :mod:`src.curator.pause`: a
-deadline stored in the ``settings`` key/value table and compared against ``now`` AT
-READ TIME, NOT a background timer. That is deliberate — a timer would either silently
-close the window on a restart (an operator mid-approval loses it) or, if re-armed on
-boot, leave it open forever. Reading the deadline and comparing it to the caller's
+The window is modelled as a deadline stored in the ``settings`` key/value table and
+compared against ``now`` AT READ TIME, NOT a background timer (the same pattern
+``curator_stopped_at`` in :mod:`src.curator.pause` uses for its flag). That is
+deliberate — a timer would either silently close the window on a restart (an operator
+mid-approval loses it) or, if re-armed on boot, leave it open forever. Reading the deadline and comparing it to the caller's
 ``now`` makes a restart a no-op: the window stays open until its stored deadline and
 then reads closed, with no thread to keep alive.
 
 Two ``settings`` rows model an open window:
 
-* ``enroll_window_until`` — the absolute deadline (epoch ms, the SAME unit
-  ``pause_until`` uses), and
+* ``enroll_window_until`` — the absolute deadline (epoch ms, the unit every
+  ``settings`` timestamp uses), and
 * ``enroll_window_code`` — a short, human-typeable code REGENERATED on every arm
   (issue #35: "код новый на каждое открытие окна"), so a code leaked from a previous
   window cannot be used to approve during a later one.
@@ -50,8 +50,8 @@ _CODE_LENGTH = 6
 # The enrollment window is a SHORT operator-opened interval (docstring above): its whole
 # security value is that a stolen hello cannot be approved at an arbitrary later time. An
 # unbounded ENROLL_WINDOW_MIN (e.g. 525600 = a year) would make the window effectively
-# always-open and void that guarantee, so — exactly like pause.PAUSE_MAX_MIN — the armed
-# length is clamped to a finite ceiling here, the single write-shape for the window.
+# always-open and void that guarantee, so the armed length is clamped to a finite
+# ceiling here, the single write-shape for the window.
 ENROLL_WINDOW_MAX_MIN = 60
 
 
@@ -158,8 +158,8 @@ def close_enroll_window(conn: sqlite3.Connection) -> None:
     """Close the window NOW: clear both the deadline and the code.
 
     Writes empty strings (which ``get_setting`` / ``_to_int`` read back as "not set"),
-    matching how :mod:`src.curator.pause` clears ``pause_until``. After this a read
-    returns a closed state with no code.
+    matching how :mod:`src.curator.pause` clears ``curator_stopped_at``. After this a
+    read returns a closed state with no code.
     """
     set_setting(conn, ENROLL_WINDOW_UNTIL_KEY, "")
     set_setting(conn, ENROLL_WINDOW_CODE_KEY, "")
