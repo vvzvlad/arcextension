@@ -108,3 +108,32 @@ describe("snapshot build — windows and focus (§6)", () => {
     expect(snap.focusedWindowId).toBeNull();
   });
 });
+
+describe("snapshot build — pendingUrl fallback (§5, freshly created tabs)", () => {
+  // COVERAGE: a just-created tab reports an empty `url` with the address in
+  // `pendingUrl`. The snapshot must fall back to it, else the tab reaches the
+  // mirror address-less. Revert the fallback (url: t.url) and case 1 reddens.
+  it("uses pendingUrl when url is empty", async () => {
+    mockWith([{ id: 1, windowId: 10, url: "", pendingUrl: "https://x.test/y", title: "X", active: false }]);
+    await onCreated(1, 1000);
+    const snap = await buildSnapshot(5000, "sess-1");
+    const tab = snap.tabs.find((t) => t.tabId === 1);
+    expect(tab.url).toBe("https://x.test/y");
+  });
+
+  it("falls back to empty string when both url and pendingUrl are absent", async () => {
+    mockWith([{ id: 1, windowId: 10, title: "X", active: false }]);
+    await onCreated(1, 1000);
+    const snap = await buildSnapshot(5000, "sess-1");
+    const tab = snap.tabs.find((t) => t.tabId === 1);
+    expect(tab.url).toBe("");
+  });
+
+  it("prefers a non-empty url over pendingUrl", async () => {
+    mockWith([{ id: 1, windowId: 10, url: "https://real.test/a", pendingUrl: "https://pending.test/b", title: "X", active: false }]);
+    await onCreated(1, 1000);
+    const snap = await buildSnapshot(5000, "sess-1");
+    const tab = snap.tabs.find((t) => t.tabId === 1);
+    expect(tab.url).toBe("https://real.test/a");
+  });
+});

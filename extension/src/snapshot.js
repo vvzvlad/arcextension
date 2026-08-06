@@ -75,7 +75,10 @@ export function buildSnapshot(now, sessionId) {
       return {
         tabId: t.id,
         windowId: t.windowId,
-        url: t.url,
+        // Freshly created tabs report an empty `url` with the address parked in
+        // `pendingUrl` (chrome.tabs.Tab). Fall back to it so the tab is not
+        // address-less in the mirror; `""` keeps the field a stable shape.
+        url: t.url || t.pendingUrl || "",
         title: t.title,
         favIconUrl: t.favIconUrl,
         pinned: !!t.pinned,
