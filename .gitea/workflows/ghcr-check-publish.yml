@@ -5,9 +5,11 @@ on:
   push:
     branches: [ "main", "develop" ]
 
+# No `packages: write` here: that scope is GitHub-specific and has no effect on Gitea
+# Actions — the built-in GITEA_TOKEN carries no package scope at all. The registry push
+# below authenticates with the `REGISTRY_TOKEN` PAT from the repo secrets instead.
 permissions:
   contents: read   # checkout
-  packages: write  # push image to ghcr.io
 
 jobs:
   test:
@@ -129,22 +131,28 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    - name: Log in to GitHub Container Registry
+    - name: Log in to the Gitea container registry
       uses: docker/login-action@v4
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        registry: gitea.vvzvlad.xyz
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.REGISTRY_TOKEN }}
 
     - name: Compute image tags
       id: tags
       # develop -> :develop, and that is the tag watchtower deploys today.
       # main -> :latest + :<sha> is reserved for releases; the branch does not exist yet.
+      # ANY OTHER branch gets its own :<branch> tag. It used to fall through to :develop,
+      # which meant a build off a side branch silently overwrote the tag production
+      # deploys from — a one-character typo away from shipping unreviewed code.
+      # The branch name is sanitised into a legal docker tag: everything outside
+      # [A-Za-z0-9_.-] (a `/` in feat/foo above all) becomes `-`.
       run: |
         if [ "${{ github.ref_name }}" = "main" ]; then
-          echo "tags=ghcr.io/${{ github.repository }}:latest ghcr.io/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:latest gitea.vvzvlad.xyz/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
         else
-          echo "tags=ghcr.io/${{ github.repository }}:develop" >> "$GITHUB_OUTPUT"
+          branch_tag=$(printf '%s' "${{ github.ref_name }}" | tr -c 'A-Za-z0-9_.-' '-')
+          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:${branch_tag}" >> "$GITHUB_OUTPUT"
         fi
 
     # BUILD_REVISION is the ONE thing the deployed container cannot work out for itself
