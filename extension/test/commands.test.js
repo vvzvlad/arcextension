@@ -1412,6 +1412,34 @@ describe("#49 bulk close_tab {items}", () => {
     expect(new Set(map.clearCuratorCause.mock.calls[0][0])).toEqual(new Set([1, 2]));
   });
 
+  it("partial batch clears the mark of a window that saw NO successful close (§5)", async () => {
+    // A bulk close of [active-in-focus tab (guard-refused), a tab in another window
+    // (closed)] marks BOTH windows up front, but only window 2 saw a real close. Window 1
+    // (the FOCUS window, where the user is likely acting) must have its mark CLEARED — else
+    // a real onActivated there is falsely suppressed for CURATOR_CAUSE_WINDOW_MS. Reddens if
+    // the unused-window mark is retained (the pre-fix behaviour).
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 100, windowId: 1, url: "https://a/", active: true },
+        { id: 200, windowId: 2, url: "https://b/" },
+      ],
+      windows: [{ id: 1, type: "normal" }, { id: 2, type: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_CLOSE_TAB, { items: [{ tabId: 100 }, { tabId: 200 }] }),
+      ctx({ map }),
+    );
+    expect(res.result.results[0].ok).toBe(false); // active-in-focus: refused, no close in win 1
+    expect(res.result.results[1].ok).toBe(true); // closed in win 2
+    // Marked both up front; cleared ONLY window 1 (no successful close), kept window 2.
+    expect(map.markCuratorCause).toHaveBeenCalledTimes(1);
+    expect(new Set(map.markCuratorCause.mock.calls[0][0])).toEqual(new Set([1, 2]));
+    expect(map.clearCuratorCause).toHaveBeenCalledTimes(1);
+    expect(map.clearCuratorCause.mock.calls[0][0]).toEqual([1]); // the unused window only
+  });
+
   it("per-item expect (the bulk-relocate close) re-checks guards live; audible one refused", async () => {
     chromeTwoWindows();
     chrome.__state.tabs.find((t) => t.id === 200).audible = true;

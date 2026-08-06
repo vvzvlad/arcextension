@@ -783,6 +783,7 @@ async function closeTabBulk(params, nowFn, map) {
 
   const results = [];
   let removed = 0;
+  const successWindows = new Set(); // windows that saw >=1 real close (a neighbour activated)
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index] || {};
     const tabId = item.tabId;
@@ -820,15 +821,20 @@ async function closeTabBulk(params, nowFn, map) {
     try {
       await chrome.tabs.remove(tabId);
       removed += 1;
+      successWindows.add(tab.windowId);
       results.push({ index, ok: true, tabId });
     } catch (e) {
       results.push({ index, ok: false, tabId, error: ERR_INTERNAL, message: String((e && e.message) || e) });
     }
   }
-  // Whole-batch failure: no neighbour was ever activated, so undo the marks (as moveTab
-  // does on a failed move). A partial success keeps them — a real close DID happen.
-  if (removed === 0 && affected.length > 0) {
-    await map.clearCuratorCause(affected);
+  // Clear the mark of every affected window that saw NO successful close: no neighbour was
+  // activated there, so keeping the mark would spuriously suppress a real user onActivated
+  // for CURATOR_CAUSE_WINDOW_MS — worst in the focused window, whose active tab a guard just
+  // refused. A window with >=1 close keeps its mark (a neighbour DID activate). This mirrors
+  // the single close, which marks a window only around a real remove.
+  const unusedWindows = affected.filter((w) => !successWindows.has(w));
+  if (unusedWindows.length > 0) {
+    await map.clearCuratorCause(unusedWindows);
   }
   return ok({ results });
 }
@@ -880,6 +886,7 @@ async function moveTabBulk(params, nowFn, map) {
 
   const results = [];
   let moved = 0;
+  const successWindows = new Set(); // windows a real move touched (source neighbour + target)
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i] || {};
     const tabId = item.tabId;
@@ -897,6 +904,8 @@ async function moveTabBulk(params, nowFn, map) {
     try {
       await chrome.tabs.move(tabId, { windowId: targetWindowId, index });
       moved += 1;
+      successWindows.add(tab.windowId);   // source: a neighbour activated as the tab left
+      successWindows.add(targetWindowId); // target: the tab arrived (re-activated there)
       results.push({ index: i, ok: true, tabId, windowId: targetWindowId });
     } catch (e) {
       const msg = String((e && e.message) || e);
@@ -909,8 +918,13 @@ async function moveTabBulk(params, nowFn, map) {
       }
     }
   }
-  if (moved === 0 && affected.length > 0) {
-    await map.clearCuratorCause(affected);
+  // Clear the mark of every affected window that saw NO successful move (same §5 reason as
+  // the bulk close): a window whose items were all refused had no neighbour activated, so
+  // its mark would spuriously suppress a real onActivated. A window touched by >=1 move
+  // (as source or target) keeps its mark.
+  const unusedWindows = affected.filter((w) => !successWindows.has(w));
+  if (unusedWindows.length > 0) {
+    await map.clearCuratorCause(unusedWindows);
   }
   return ok({ results });
 }
