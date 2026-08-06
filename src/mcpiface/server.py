@@ -142,31 +142,42 @@ def build_mcp(app_ref) -> MCPServer:
         return await _guarded(tools.reset_singleton(_host(), rule_id=rule_id))
 
     # --- commands (initiator='mcp' + auth_ctx = MCP session) -----------------
+    # #47 "session epoch": every mutating verb that targets an instance accepts an
+    # optional ``expected_session`` — the ``session_id`` the agent just read off
+    # list_instances/list_tabs. It is STAMPED into the command frame so the extension
+    # refuses (``stale_session``) if the browser has restarted since; omit it to run
+    # unprotected, exactly as before (fail-open by design).
     @mcp.tool()
-    async def open_tab(instance: str, url: str, pinned: bool = False, active: bool = False) -> dict:
+    async def open_tab(instance: str, url: str, pinned: bool = False, active: bool = False,
+                       expected_session: str | None = None) -> dict:
         """Open a tab in an instance (§6)."""
         return await _guarded(tools.open_tab(
             _host(), instance=instance, url=url, pinned=pinned, active=active,
-            auth_ctx=current_mcp_session(),
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 
     @mcp.tool()
-    async def close_tab(instance: str, tab_id: int) -> dict:
+    async def close_tab(instance: str, tab_id: int,
+                        expected_session: str | None = None) -> dict:
         """Close a tab in an instance (§6)."""
         return await _guarded(tools.close_tab(
-            _host(), instance=instance, tab_id=tab_id, auth_ctx=current_mcp_session()
+            _host(), instance=instance, tab_id=tab_id, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
         ))
 
     @mcp.tool()
-    async def focus_tab(instance: str, tab_id: int) -> dict:
+    async def focus_tab(instance: str, tab_id: int,
+                        expected_session: str | None = None) -> dict:
         """Focus a tab and raise its window (§6/§10)."""
         return await _guarded(tools.focus_tab(
-            _host(), instance=instance, tab_id=tab_id, auth_ctx=current_mcp_session()
+            _host(), instance=instance, tab_id=tab_id, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
         ))
 
     @mcp.tool()
     async def move_tab(
-        instance: str, tab_id: int, window_id: int, index: int | None = None
+        instance: str, tab_id: int, window_id: int, index: int | None = None,
+        expected_session: str | None = None,
     ) -> dict:
         """Move a tab to a window/position inside one browser; omit index for the end.
 
@@ -176,33 +187,43 @@ def build_mcp(app_ref) -> MCPServer:
         """
         return await _guarded(tools.move_tab(
             _host(), instance=instance, tab_id=tab_id, window_id=window_id,
-            index=index, auth_ctx=current_mcp_session(),
+            index=index, auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 
     @mcp.tool()
-    async def merge_windows(instance: str, params: dict | None = None) -> dict:
+    async def merge_windows(instance: str, params: dict | None = None,
+                            expected_session: str | None = None) -> dict:
         """Merge windows in an instance (§9)."""
         return await _guarded(tools.merge_windows(
-            _host(), instance=instance, params=params, auth_ctx=current_mcp_session()
+            _host(), instance=instance, params=params, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
         ))
 
     @mcp.tool()
     async def execute_js(
         instance: str, tab_id: int, code: str,
         world: str | None = None, url_at_exec: str | None = None,
+        expected_session: str | None = None,
     ) -> dict:
         """Run JS in a tab (§12: audited before send, gated by the checkbox+kill-switch)."""
         return await _guarded(tools.execute_js(
             _host(), instance=instance, tab_id=tab_id, code=code, world=world,
             url_at_exec=url_at_exec, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
         ))
 
     @mcp.tool()
-    async def relocate_tab(instance_from: str, tab_id: int, instance_to: str) -> dict:
-        """Relocate a tab: phase-A open + a relocate row the pass's phase B completes (§7)."""
+    async def relocate_tab(instance_from: str, tab_id: int, instance_to: str,
+                           expected_session_from: str | None = None) -> dict:
+        """Relocate a tab: phase-A open + a relocate row the pass's phase B completes (§7).
+
+        ``expected_session_from`` pins the SOURCE epoch only (#47): a restarted source
+        browser refuses the relocation before any copy is opened. The target open is never
+        session-pinned — a copy in a restarted target is correct, not dangerous.
+        """
         return await _guarded(tools.relocate_tab(
             _host(), instance_from=instance_from, tab_id=tab_id, instance_to=instance_to,
-            auth_ctx=current_mcp_session(),
+            auth_ctx=current_mcp_session(), expected_session_from=expected_session_from,
         ))
 
     # --- pass + pause --------------------------------------------------------

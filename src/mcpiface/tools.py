@@ -76,7 +76,12 @@ async def _ensure_not_paused(app) -> None:
 # --- reads -------------------------------------------------------------------
 async def _freshen_fleet(app) -> dict:
     """Actively refresh EVERY active instance's mirror and return the per-instance
-    freshness envelope ``{id: {snapshot_at, fresh, reason}}`` (§6/§11).
+    freshness envelope ``{id: {snapshot_at, fresh, reason, session_id}}`` (§6/§11).
+
+    ``session_id`` (#47 "session epoch") is each active instance's current
+    ``instances.session_id`` — the epoch an agent echoes back as ``expected_session``
+    to a mutating verb so a command minted against a now-dead session is refused
+    (``stale_session``) instead of closing the wrong tab after a browser restart.
 
     ``list_tabs`` / ``list_instances`` join the restore/preview/reset (blocking-fresh)
     class (§6), NOT ``/api/state``'s detached kick: an agent that acts on a mirror of
@@ -119,6 +124,9 @@ async def _freshen_fleet(app) -> dict:
     snapshot_at = {
         i["id"]: i["snapshot_at"] for i in await db.read(state_read._read_instances)
     }
+    # session_id per active instance (#47): the epoch stamped alongside freshness so the
+    # agent can pin it as expected_session on a later mutating verb.
+    sessions = await db.read(state_read._read_active_sessions)
     envelope: dict = {}
     for iid, res in zip(known, results):
         # Only a reader FAULT (a sqlite Exception from the unwrapped db.read inside
@@ -134,6 +142,7 @@ async def _freshen_fleet(app) -> dict:
             "snapshot_at": snapshot_at.get(iid),
             "fresh": fresh,
             "reason": reason,
+            "session_id": sessions.get(iid),
         }
     return envelope
 
@@ -143,7 +152,8 @@ async def list_instances(app) -> dict:
 
     Awaits a fresh snapshot from every active instance (§6 blocking-fresh, via
     :func:`_freshen_fleet`) before answering, so the ``instances`` map carries a mirror
-    the agent has just refreshed — each entry ``{snapshot_at, fresh, reason}``. The
+    the agent has just refreshed — each entry ``{snapshot_at, fresh, reason, session_id}``
+    (``session_id`` is the #47 epoch to echo back as ``expected_session``). The
     ``paused_until`` field lets the agent tell a pause from a broken curator (§11).
 
     ``resume_pending`` is required here by §7 verbatim — «`resume_pending` виден в
@@ -174,8 +184,9 @@ async def list_tabs(app) -> dict:
     :func:`_freshen_fleet`) before returning the tabs, so the agent never acts on a
     mirror of unknown age (§11: else it re-opens a tab a human opened three minutes
     ago — permanently, in ``main`` where there is no dedup). The ``instances`` map
-    carries ``{snapshot_at, fresh, reason}`` per instance — the age and freshness the
-    agent must weigh before acting."""
+    carries ``{snapshot_at, fresh, reason, session_id}`` per instance — the age, freshness
+    and (#47) session epoch the agent must weigh before acting (``session_id`` echoes back
+    as ``expected_session``)."""
     db = app.state.db
     instances = await _freshen_fleet(app)
     tabs = await db.read(state_read._read_tabs)
@@ -329,51 +340,63 @@ def _tool_error_from_http(exc: HTTPException) -> tuple[str, str]:
 
 
 # --- commands (initiator='mcp' + auth_ctx, §12) ------------------------------
-async def _command(app, instance, command, params, *, auth_ctx):
+async def _command(app, instance, command, params, *, auth_ctx, expected_session=None):
     """Issue one extension command as an MCP verb. Every command carries
     ``initiator='mcp'`` and ``auth_ctx`` = the MCP session (§12: js_audit records the
     session, never a token id). Command failures are surfaced as a ``ToolError`` so
-    the agent sees the §6 error code instead of a transport-level fault."""
+    the agent sees the §6 error code instead of a transport-level fault — including
+    ``stale_session`` (#47), which rides the SAME generic mapping: when the agent pinned
+    ``expected_session`` and the browser has since restarted, ``send_command`` stamps the
+    old session, the extension refuses with ``stale_session``, and it reaches the agent as
+    a ToolError like any other §6 code."""
     settings = app.state.settings
     try:
         return await send_command(
             app.state.ext_registry, app.state.db, instance, command, params,
             cmd_timeout_ms=settings.cmd_timeout_ms, initiator="mcp", auth_ctx=auth_ctx,
+            expected_session=expected_session,
         )
     except CommandError as exc:
         raise ToolError(exc.code, exc.message)
 
 
 async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
-                   active: bool = False, auth_ctx: str | None = None) -> dict:
+                   active: bool = False, auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
     await _ensure_not_paused(app)
     result = await _command(
         app, instance, protocol.CMD_OPEN_TAB,
         {"url": url, "pinned": bool(pinned), "active": bool(active)}, auth_ctx=auth_ctx,
+        expected_session=expected_session,
     )
     return {"ok": True, "result": result}
 
 
 async def close_tab(app, *, instance: str, tab_id: int,
-                    auth_ctx: str | None = None) -> dict:
+                    auth_ctx: str | None = None,
+                    expected_session: str | None = None) -> dict:
     await _ensure_not_paused(app)
     result = await _command(
-        app, instance, protocol.CMD_CLOSE_TAB, {"tabId": tab_id}, auth_ctx=auth_ctx
+        app, instance, protocol.CMD_CLOSE_TAB, {"tabId": tab_id}, auth_ctx=auth_ctx,
+        expected_session=expected_session,
     )
     return {"ok": True, "result": result}
 
 
 async def focus_tab(app, *, instance: str, tab_id: int,
-                    auth_ctx: str | None = None) -> dict:
+                    auth_ctx: str | None = None,
+                    expected_session: str | None = None) -> dict:
     await _ensure_not_paused(app)
     result = await _command(
-        app, instance, protocol.CMD_FOCUS_TAB, {"tabId": tab_id}, auth_ctx=auth_ctx
+        app, instance, protocol.CMD_FOCUS_TAB, {"tabId": tab_id}, auth_ctx=auth_ctx,
+        expected_session=expected_session,
     )
     return {"ok": True, "result": result}
 
 
 async def move_tab(app, *, instance: str, tab_id: int, window_id: int,
-                   index: int | None = None, auth_ctx: str | None = None) -> dict:
+                   index: int | None = None, auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
     """Move one tab to a window/position INSIDE one browser (§6/§9).
 
     The gap this fills: relocation BETWEEN instances is the §7 open+close pair, which
@@ -400,12 +423,14 @@ async def move_tab(app, *, instance: str, tab_id: int, window_id: int,
     params: dict = {"tabId": tab_id, "windowId": window_id}
     if index is not None:
         params["index"] = index
-    result = await _command(app, instance, protocol.CMD_MOVE_TAB, params, auth_ctx=auth_ctx)
+    result = await _command(app, instance, protocol.CMD_MOVE_TAB, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session)
     return {"ok": True, "result": result}
 
 
 async def merge_windows(app, *, instance: str, params: dict | None = None,
-                        auth_ctx: str | None = None) -> dict:
+                        auth_ctx: str | None = None,
+                        expected_session: str | None = None) -> dict:
     """Fold an instance's windows into one (§9). Delegates to the SHARED core in
     :mod:`src.api.instances` — the same one ``POST /api/instances/:id/merge_windows``
     runs — so the startpage button and the agent cannot drift apart.
@@ -420,7 +445,8 @@ async def merge_windows(app, *, instance: str, params: dict | None = None,
     await _ensure_not_paused(app)
     try:
         result = await instances_api.merge_windows(
-            app, instance, params, initiator="mcp", auth_ctx=auth_ctx
+            app, instance, params, initiator="mcp", auth_ctx=auth_ctx,
+            expected_session=expected_session,
         )
     except CommandError as exc:
         raise ToolError(exc.code, exc.message)
@@ -429,7 +455,8 @@ async def merge_windows(app, *, instance: str, params: dict | None = None,
 
 async def execute_js(app, *, instance: str, tab_id: int, code: str,
                      world: str | None = None, url_at_exec: str | None = None,
-                     auth_ctx: str | None = None) -> dict:
+                     auth_ctx: str | None = None,
+                     expected_session: str | None = None) -> dict:
     """Run JS in a tab as an MCP verb. ``send_command`` writes the js_audit row
     BEFORE the send and enforces the runtime kill-switch (§12): a disabled/rejected
     call is still audited (with ``initiator='mcp'`` + the MCP ``auth_ctx``), and the
@@ -441,7 +468,8 @@ async def execute_js(app, *, instance: str, tab_id: int, code: str,
         params["world"] = world
     if url_at_exec is not None:
         params["urlAtExec"] = url_at_exec
-    result = await _command(app, instance, protocol.CMD_EXECUTE_JS, params, auth_ctx=auth_ctx)
+    result = await _command(app, instance, protocol.CMD_EXECUTE_JS, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session)
     return {"ok": True, "result": result}
 
 
@@ -474,7 +502,8 @@ def _read_relocate_inputs(instance_from: str, tab_id: int, instance_to: str):
 
 
 async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str,
-                       auth_ctx: str | None = None) -> dict:
+                       auth_ctx: str | None = None,
+                       expected_session_from: str | None = None) -> dict:
     """MCP-initiated relocation: do phase A (open the copy in the target) and write a
     live ``relocate`` row (``kind='relocate'``, ``status='done'``, ``initiator='mcp'``)
     so the NEXT curator pass's phase B closes the source under §7's full close guards
@@ -500,6 +529,26 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
     cs_to = registry.get(instance_to)
     session_from = cs_from.session_id if cs_from is not None else db_session_from
     session_to = cs_to.session_id if cs_to is not None else db_session_to
+
+    # #47 session epoch — SOURCE side only. Unlike the direct verbs there is no source
+    # command to stamp here: relocate does ONLY phase A (the copy opens in the TARGET),
+    # and the source ``close_tab`` is the pass's deferred phase B. So the source guard is
+    # a pre-check on the source session, BEFORE phase A opens any copy — a mismatch means
+    # the source browser has restarted since the agent read the session, its ``tab_id`` is
+    # from a dead epoch, and relocating it would copy a stale tab and later close the wrong
+    # one. Refuse with ``stale_session`` and touch nothing (no copy, no relocate row).
+    #
+    # The recorded ``session_id_from`` (below) still carries this epoch onto the relocate
+    # row, so if the source flips AFTER this check the pass's own mirror.py liveness rule
+    # (``src.session_id == session_id_from``) refuses phase B — the source close is
+    # protected end-to-end without touching src/curator/. The TARGET open gets NO expected
+    # session on purpose: opening a copy in a restarted target is correct, not dangerous.
+    if expected_session_from is not None and expected_session_from != session_from:
+        raise ToolError(
+            protocol.ERR_STALE_SESSION,
+            f"source session for {instance_from} is not {expected_session_from!r} "
+            "(the source browser restarted); relocation refused",
+        )
 
     now = _now_ms()
     url = tab["url"]

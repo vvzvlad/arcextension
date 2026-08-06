@@ -97,6 +97,39 @@ async def test_command_stamps_current_session():
     await task
 
 
+# --- expected_session STAMP (#47) -------------------------------------------
+async def test_command_stamps_expected_session_when_given():
+    # #47: when expected_session is passed, the frame carries THAT session, NOT the live
+    # conn_state one. A version that always stamps the live session reddens this (it would
+    # stamp "sess-live"), which is exactly what would defeat the extension's stale check
+    # after a browser restart.
+    reg, cs, ws = _registry_with(session_id="sess-live")
+    task = asyncio.create_task(
+        send_command(reg, None, "i1", protocol.CMD_FOCUS_TAB, {"tabId": 3},
+                     cmd_timeout_ms=5000, expected_session="sess-old")
+    )
+    assert await _until(lambda: ws.sent)
+    assert ws.sent[-1]["sessionId"] == "sess-old"  # the PASSED session, not "sess-live"
+    resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                          "result": {"ok": True}})
+    await task
+
+
+async def test_command_stamps_live_session_when_expected_session_is_none():
+    # The fail-open twin (#47): expected_session=None => stamp the current live session,
+    # exactly as before — so a caller that omits it goes unprotected, by design.
+    reg, cs, ws = _registry_with(session_id="sess-live")
+    task = asyncio.create_task(
+        send_command(reg, None, "i1", protocol.CMD_FOCUS_TAB, {"tabId": 3},
+                     cmd_timeout_ms=5000, expected_session=None)
+    )
+    assert await _until(lambda: ws.sent)
+    assert ws.sent[-1]["sessionId"] == "sess-live"
+    resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                          "result": {"ok": True}})
+    await task
+
+
 # --- stale_session propagated ----------------------------------------------
 async def test_stale_session_propagated_as_command_error():
     reg, cs, ws = _registry_with(session_id="sess-1")

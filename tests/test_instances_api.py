@@ -160,8 +160,8 @@ def test_http_and_mcp_share_one_implementation(tmp_path):
     calls = []
 
     async def _fake_core(app, instance_id, params=None, *, initiator="user",
-                         auth_ctx=None, forced=False):
-        calls.append((instance_id, params, initiator, auth_ctx, forced))
+                         auth_ctx=None, forced=False, expected_session=None):
+        calls.append((instance_id, params, initiator, auth_ctx, forced, expected_session))
         return {"merged": 7}
 
     original = instances_api.merge_windows
@@ -190,6 +190,9 @@ def test_http_and_mcp_share_one_implementation(tmp_path):
     assert calls[0][2] == "user" and calls[1][2] == "mcp"   # initiator is the only diff
     # The MCP path never passes `forced` — it has no force at all (§7/§12).
     assert calls[1][4] is False
+    # #47: the HTTP button (the human at the console) pins no session — it stamps the
+    # live one, as before. Reddens if the endpoint ever forwards a stale expected_session.
+    assert calls[0][5] is None
 
 
 # --- §7 pause: the button is forcible, the MCP tool is not ------------------

@@ -105,6 +105,22 @@ def _read_tabs(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def _read_active_sessions(conn: sqlite3.Connection) -> dict[str, str | None]:
+    """``{instance_id: session_id}`` for every ACTIVE instance (#47 "session epoch").
+
+    Kept OFF :func:`_read_instances` on purpose: the MCP freshness envelope stamps
+    ``session_id`` next to each instance so an agent can echo it back as
+    ``expected_session``, but the §10 ``StateResponse`` shape (``_read_instances``)
+    stays byte-identical. ``session_id`` may be NULL for an instance that never sent a
+    usable hello.
+    """
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        f"SELECT id, session_id FROM instances {_ACTIVE_ONLY}"
+    ).fetchall()
+    return {r["id"]: r["session_id"] for r in rows}
+
+
 def _read_quick_links(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(

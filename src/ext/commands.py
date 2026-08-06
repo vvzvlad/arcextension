@@ -98,6 +98,7 @@ async def send_command(
     cmd_timeout_ms: int,
     initiator: str = "curator",
     auth_ctx: str | None = None,
+    expected_session: str | None = None,
 ) -> dict[str, Any]:
     """Send one command to ``instance_id`` and await its correlated response.
 
@@ -106,6 +107,21 @@ async def send_command(
     ``stale_session`` (§5). Returns the ``result`` dict on ``ok:true``; raises
     :class:`CommandError` carrying the §6 code on ``ok:false``, on timeout, or when
     there is no live socket.
+
+    ``expected_session`` (#47 "session epoch") pins the frame to a session the caller
+    read EARLIER: when given, it is STAMPED as ``sessionId`` in place of the live
+    ``conn_state.session_id``. The service never compares — it only stamps — and the
+    extension's own live check (incoming ``sessionId`` vs its current session →
+    ``stale_session``) enforces it: if the browser restarted since the agent read the
+    session, the stamped-old value no longer matches and the command is refused. This
+    is race-free where a pre-send comparison would be TOCTOU: there are ``await`` points
+    between reading the session and putting the frame on the socket (revoke check, the
+    execute_js audit/kill-switch), and a reconnect in that window would re-stamp the NEW
+    live session and defeat a comparison. ``None`` = today's behavior (stamp the live
+    session); the param is deliberately OPTIONAL — a caller may go unprotected. (An
+    instance whose envelope ``session_id`` is ``null`` — no clean hello yet — echoes
+    back as ``None`` and is thus fail-open: it cannot be stale-protected until it has a
+    real session. Inherent, not a bug.)
 
     For ``execute_js`` a ``js_audit`` row is written BEFORE the send (so rejected
     and timed-out executions are also recorded, §12) and its ``outcome`` is updated
@@ -139,8 +155,11 @@ async def send_command(
     frame = {
         "type": protocol.TYPE_COMMAND,
         "id": request_id,
-        # STAMP the current session so a stale/foreign session is rejected (§5).
-        "sessionId": conn_state.session_id,
+        # STAMP the session so a stale/foreign session is rejected by the extension (§5).
+        # When the caller pinned an ``expected_session`` (#47) stamp THAT — an epoch it
+        # read earlier — so a browser restart in between makes the extension refuse
+        # (``stale_session``); otherwise stamp the CURRENT live session, as before.
+        "sessionId": expected_session if expected_session is not None else conn_state.session_id,
         "command": command,
         "params": params,
     }

@@ -117,7 +117,9 @@ async def test_list_instances_returns_freshness_envelope_and_paused_until(tmp_pa
     # `instances` is now a per-instance freshness envelope keyed by id (§6/§11), not a
     # list of mirror rows. No live socket for "main" => ensure_fresh reports disconnected.
     main = out["instances"]["main"]
-    assert main == {"snapshot_at": 1234, "fresh": False, "reason": "disconnected"}
+    # session_id rides the envelope (#47); "main" was inserted with no session_id.
+    assert main == {"snapshot_at": 1234, "fresh": False, "reason": "disconnected",
+                    "session_id": None}
 
     # A paused curator surfaces paused_until so an agent does not read pause as a break.
     now = tools._now_ms()
@@ -137,7 +139,9 @@ async def test_list_tabs_returns_tabs_and_per_instance_freshness(tmp_path):
     _put_conn(reg, "main", session_id="sess-1")
     out = await tools.list_tabs(_app(db, reg))
     assert [t["tab_id"] for t in out["tabs"]] == [1]
-    assert out["instances"] == {"main": {"snapshot_at": now, "fresh": True, "reason": "fresh"}}
+    assert out["instances"] == {
+        "main": {"snapshot_at": now, "fresh": True, "reason": "fresh", "session_id": "sess-1"}
+    }
 
 
 async def test_list_tabs_freshens_and_flags_a_disconnected_sibling(tmp_path):
@@ -154,8 +158,10 @@ async def test_list_tabs_freshens_and_flags_a_disconnected_sibling(tmp_path):
     out = await tools.list_tabs(_app(db, reg))
     inst = out["instances"]
     assert set(inst) == {"main", "media"}
-    assert inst["main"] == {"snapshot_at": now, "fresh": True, "reason": "fresh"}
-    assert inst["media"] == {"snapshot_at": None, "fresh": False, "reason": "disconnected"}
+    assert inst["main"] == {"snapshot_at": now, "fresh": True, "reason": "fresh",
+                            "session_id": "sess-1"}
+    assert inst["media"] == {"snapshot_at": None, "fresh": False, "reason": "disconnected",
+                             "session_id": "sess-2"}
     # The disconnected sibling did not drop the fresh instance's tab.
     assert [t["tab_id"] for t in out["tabs"]] == [1]
 
@@ -187,7 +193,8 @@ async def test_list_tabs_reader_error_maps_to_error_and_isolates_siblings(tmp_pa
     inst = out["instances"]
     # The faulting instance is reported, not lost; snapshot_at still comes from the
     # (separate, working) mirror read.
-    assert inst["bad"] == {"snapshot_at": 42, "fresh": False, "reason": "error"}
+    assert inst["bad"] == {"snapshot_at": 42, "fresh": False, "reason": "error",
+                           "session_id": "sess-2"}
     # The sibling with a working reader is returned normally.
     assert inst["main"]["reason"] == "fresh" and inst["main"]["fresh"] is True
 
@@ -460,6 +467,170 @@ async def test_relocate_tab_writes_relocate_action_initiator_mcp(tmp_path):
     assert copy == ("https://grafana/dash",)
 
 
+# --- #47 session epoch: session_id out + expected_session stamped ------------
+async def _extension_answers(cs, ws, *, browser_session, ok_result=None):
+    """Wait for the handler's frame, then answer like the EXTENSION edge does (§5,
+    extension/src/commands.js): the STAMPED sessionId is checked against the browser's
+    LIVE session and a mismatch is refused with stale_session. This is what turns a stale
+    stamp into the error the agent sees — the service itself never compares, it only
+    stamps. Returns the frame so a test can assert exactly WHICH session was stamped."""
+    for _ in range(400):
+        if ws.sent:
+            break
+        await asyncio.sleep(0.005)
+    assert ws.sent, "handler never sent a command frame"
+    frame = ws.sent[-1]
+    if frame.get("sessionId") == browser_session:
+        resolve_response(cs, {"type": "response", "id": frame["id"], "ok": True,
+                              "result": ok_result or {"ok": True}})
+    else:
+        resolve_response(cs, {"type": "response", "id": frame["id"], "ok": False,
+                              "error": {"code": protocol.ERR_STALE_SESSION,
+                                        "message": "foreign session"}})
+    return frame
+
+
+async def test_envelope_session_id_equals_instances_session_id(tmp_path):
+    # Acceptance 1: list_instances / list_tabs carry session_id per ACTIVE instance, equal
+    # to the stored instances.session_id.
+    db = await _make_db(tmp_path)
+    now = tools._now_ms()
+    await _insert_instance(db, "main", session_id="sess-A", snapshot_at=now, connected=1)
+    await _insert_instance(db, "media", session_id="sess-B", snapshot_at=now, connected=1)
+    reg = Registry()
+    _put_conn(reg, "main", session_id="sess-A")
+    _put_conn(reg, "media", session_id="sess-B")
+    app = _app(db, reg)
+
+    li = await tools.list_instances(app)
+    lt = await tools.list_tabs(app)
+    for out in (li, lt):
+        assert out["instances"]["main"]["session_id"] == "sess-A"
+        assert out["instances"]["media"]["session_id"] == "sess-B"
+    # ...and it is literally the DB column value, not the live-socket value.
+    db_sessions = await db.read(state_read._read_active_sessions)
+    assert db_sessions == {"main": "sess-A", "media": "sess-B"}
+
+
+async def test_close_tab_old_expected_session_after_restart_is_stale(tmp_path):
+    # Acceptance 2: the agent read sess-OLD; the browser restarted (both sides now on
+    # sess-NEW). close_tab pinned to sess-OLD stamps sess-OLD, the extension rejects it =>
+    # stale_session, and the tab is NOT closed (the fake extension performed no close).
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="sess-NEW")  # live = restarted session
+    app = _app(db, reg)
+    task = asyncio.create_task(
+        tools.close_tab(app, instance="main", tab_id=3, expected_session="sess-OLD")
+    )
+    frame = await _extension_answers(cs, ws, browser_session="sess-NEW")
+    # The frame carried the PINNED old session, not the live one.
+    assert frame["sessionId"] == "sess-OLD"
+    with pytest.raises(tools.ToolError) as ei:
+        await task
+    assert ei.value.code == protocol.ERR_STALE_SESSION
+
+
+async def test_close_tab_without_expected_session_goes_through(tmp_path):
+    # Acceptance 3: omit expected_session and the verb behaves exactly as today — the LIVE
+    # session is stamped and the command runs. Pins the deliberate fail-open.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="sess-NEW")
+    app = _app(db, reg)
+    task = asyncio.create_task(tools.close_tab(app, instance="main", tab_id=3))
+    frame = await _extension_answers(cs, ws, browser_session="sess-NEW")
+    assert frame["sessionId"] == "sess-NEW"  # live session stamped, as before
+    out = await task
+    assert out["ok"] is True
+
+
+async def test_close_tab_matching_expected_session_runs(tmp_path):
+    # Acceptance 4: a matching expected_session stamps that session and the command runs.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main", session_id="sess-NEW")
+    app = _app(db, reg)
+    task = asyncio.create_task(
+        tools.close_tab(app, instance="main", tab_id=3, expected_session="sess-NEW")
+    )
+    frame = await _extension_answers(cs, ws, browser_session="sess-NEW")
+    assert frame["sessionId"] == "sess-NEW"
+    out = await task
+    assert out["ok"] is True
+
+
+async def test_expected_session_stamps_passed_not_live_after_reconnect(tmp_path):
+    # Acceptance 5: a reconnect swaps the ConnState/session in the registry between the
+    # agent reading the session and the send. Because the PASSED session is stamped (not
+    # re-read from the now-live ConnState), the stale one still travels => stale_session.
+    # A version that stamped the LIVE session would stamp the reconnected sess-NEW and
+    # WRONGLY pass — so this is the mutation that must redden.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _put_conn(reg, "main", session_id="sess-OLD")            # what the agent read
+    cs_new, ws_new = _put_conn(reg, "main", session_id="sess-NEW")  # a reconnect swapped it
+    app = _app(db, reg)
+    task = asyncio.create_task(
+        tools.close_tab(app, instance="main", tab_id=3, expected_session="sess-OLD")
+    )
+    frame = await _extension_answers(cs_new, ws_new, browser_session="sess-NEW")
+    assert frame["sessionId"] == "sess-OLD"  # the PASSED session, NOT the live sess-NEW
+    with pytest.raises(tools.ToolError) as ei:
+        await task
+    assert ei.value.code == protocol.ERR_STALE_SESSION
+
+
+async def test_relocate_tab_mismatched_expected_session_from_refuses(tmp_path):
+    # Acceptance 6: a mismatched expected_session_from means the SOURCE browser restarted
+    # since the agent read the session; relocate refuses and opens NOTHING — no copy row in
+    # `tabs`, no `relocate` row in `actions` — because the guard fires BEFORE phase A.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    _cs_to, ws = _put_conn(reg, "main", session_id="s-main")  # target socket
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.relocate_tab(
+            app, instance_from="themed", tab_id=5, instance_to="main",
+            expected_session_from="s-OLD",
+        )
+    assert ei.value.code == protocol.ERR_STALE_SESSION
+    assert ws.sent == []  # phase A never opened a copy in the target
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='main'").fetchone()) == (0,)
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM actions").fetchone()) == (0,)
+
+
+async def test_relocate_tab_matching_expected_session_from_proceeds(tmp_path):
+    # Pins the source guard as NON-vacuous: a MATCHING expected_session_from relocates
+    # exactly as an unpinned call would (phase A opens the copy, the relocate row is
+    # written with the pinned source epoch). The TARGET open carries NO expected session.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    cs_to, ws = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.relocate_tab(
+            app, instance_from="themed", tab_id=5, instance_to="main",
+            expected_session_from="s-themed",
+        ),
+        cs_to, ws, {"tabId": 99, "windowId": 1},
+    )
+    assert out["ok"] is True and out["tab_id_to"] == 99
+    # The target open stamped the LIVE target session, never expected_session_from.
+    assert frame["command"] == protocol.CMD_OPEN_TAB and frame["sessionId"] == "s-main"
+    row = await db.read(lambda c: c.execute(
+        "SELECT session_id_from FROM actions WHERE kind='relocate'").fetchone())
+    assert row == ("s-themed",)
+
+
 # --- pause / resume ----------------------------------------------------------
 async def test_pause_writes_setting_and_bumps_epoch(tmp_path):
     db = await _make_db(tmp_path)
@@ -569,6 +740,23 @@ async def test_mcp_merge_windows_delegates_to_the_shared_core(tmp_path):
     )
     assert frame["command"] == protocol.CMD_MERGE_WINDOWS
     assert out["ok"] is True and out["merged"] == 4
+
+
+async def test_merge_windows_forwards_expected_session_through_the_core(tmp_path):
+    # #47: expected_session must reach send_command THROUGH the shared merge core, so
+    # the frame stamps the PINNED session (not the live 'sess-1'). Reddens if the tool
+    # or the core drops the forward — a mutation deleting expected_session=expected_session
+    # at src/api/instances.py would then stamp the live session here.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")  # live session is 'sess-1'
+    app = _app(db, reg)
+    _out, frame = await _run_with_response(
+        lambda: tools.merge_windows(app, instance="main", expected_session="pinned-99",
+                                    auth_ctx="s"),
+        cs, ws, {"merged": 1},
+    )
+    assert frame["sessionId"] == "pinned-99"
 
 
 async def test_pause_refuses_mutating_verb_and_sends_nothing(tmp_path):
