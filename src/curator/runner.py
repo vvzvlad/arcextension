@@ -506,7 +506,8 @@ async def run_pass(
         # one. Planned purely from the same frozen mirror; each instance isolated so
         # one bad merge cannot sink the pass; every write lease-guarded (§7/§9).
         for merge in decidemod.decide_window_merges(
-            mirror, ready_ids, now=now, idle_ms=idle_ms
+            mirror, ready_ids, now=now, idle_ms=idle_ms,
+            main_instance_id=settings.main_instance_id,
         ):
             await _isolated(phases.run_window_merge(ctx, merge))
 

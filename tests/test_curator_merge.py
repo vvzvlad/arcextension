@@ -54,8 +54,43 @@ def _mirror(tabs, instances, windows):
     )
 
 
-def _plan(mirror, ready):
-    return decide_window_merges(mirror, set(ready), now=NOW, idle_ms=IDLE)
+def _plan(mirror, ready, main_instance_id="main"):
+    return decide_window_merges(
+        mirror, set(ready), now=NOW, idle_ms=IDLE, main_instance_id=main_instance_id
+    )
+
+
+# --- main is exempt from automatic window merge (§9, owner decision 2026-08-06) --
+def test_main_windows_are_not_auto_merged_but_thematic_still_are():
+    # main and a thematic instance each have two mergeable, all-idle windows. In the
+    # SAME plan main is skipped entirely while the thematic instance folds normally.
+    tabs = [
+        _tab("main", 10, window_id=1), _tab("main", 20, window_id=2),
+        _tab("prox", 30, window_id=1), _tab("prox", 40, window_id=2),
+    ]
+    windows = {
+        ("main", 1): ("normal", "normal"), ("main", 2): ("normal", "normal"),
+        ("prox", 1): ("normal", "normal"), ("prox", 2): ("normal", "normal"),
+    }
+    plans = _plan(
+        _mirror(tabs, [_inst("main"), _inst("prox")], windows),
+        {"main", "prox"},
+    )
+    assert all(m.instance_id != "main" for m in plans)  # main untouched, both windows live
+    prox = [m for m in plans if m.instance_id == "prox"]
+    assert len(prox) == 1  # thematic instance still merges in the same pass
+
+
+def test_main_skip_is_keyed_on_the_configured_id():
+    # The SAME main-shaped mirror, but main_instance_id points elsewhere -> "main" is
+    # now an ordinary instance and DOES get a merge. Proves the skip is the exemption,
+    # not some unrelated reason the two windows failed to merge.
+    tabs = [_tab("main", 10, window_id=1), _tab("main", 20, window_id=2)]
+    windows = {("main", 1): ("normal", "normal"), ("main", 2): ("normal", "normal")}
+    mirror = _mirror(tabs, [_inst("main")], windows)
+    assert _plan(mirror, {"main"}, main_instance_id="main") == []
+    [m] = _plan(mirror, {"main"}, main_instance_id="somethingelse")
+    assert m.instance_id == "main"
 
 
 # --- target choice: most tabs; tie -> smallest window_id (§9) ----------------
@@ -353,8 +388,10 @@ async def test_pass_issues_merge_command_journals_and_keeps_ages(tmp_path):
         ext = _Ext(db)
         # Two normal windows, all tabs idle 2h, none on-screen/audible. Window 1 has
         # two tabs (=> target), window 2 has one unpinned tab (=> source, folds in).
+        # A thematic instance (main is exempt from auto-merge, §9); the end-to-end
+        # merge mechanism is identical for thematic instances.
         await ext.add_instance(
-            "main",
+            "media",
             tabs=[
                 _tabinfo(10, window_id=1),
                 _tabinfo(11, window_id=1),
@@ -385,7 +422,7 @@ async def test_pass_issues_merge_command_journals_and_keeps_ages(tmp_path):
         wm = await _rows(db, "SELECT instance_from, status, initiator, detail "
                              "FROM actions WHERE kind='window_merge'")
         assert len(wm) == 1
-        assert wm[0][0] == "main" and wm[0][1] == "done" and wm[0][2] == "curator"
+        assert wm[0][0] == "media" and wm[0][1] == "done" and wm[0][2] == "curator"
         assert '"targetWindowId": 1' in wm[0][3] and '"moved_tab_ids": [20]' in wm[0][3]
         assert res["actions_count"] == 1
 
@@ -414,9 +451,10 @@ async def test_merge_journal_excludes_tabs_closed_by_the_same_pass(tmp_path):
 
     The merge plan is built from the mirror frozen BEFORE steps 4-8, so a tab that this
     very pass closed would otherwise be journalled as "moved" — a move that never
-    happened, in a row the archive treats as the record of what the merge did. Here main
-    tab 20 (in the source window) is dedupe-closed against prox, so only tab 21 is left
-    to move. Reddens if the plan's raw ``moved_tab_ids`` is journalled: 20 reappears.
+    happened, in a row the archive treats as the record of what the merge did. Here the
+    thematic instance's tab 20 (in the source window) is dedupe-closed against prox, so
+    only tab 21 is left to move. Reddens if the plan's raw ``moved_tab_ids`` is
+    journalled: 20 reappears. (main itself is exempt from auto-merge, §9.)
     """
     db = await _mkdb(tmp_path)
     try:
@@ -424,10 +462,10 @@ async def test_merge_journal_excludes_tabs_closed_by_the_same_pass(tmp_path):
             "INSERT INTO rules (pattern, instance_id, singleton, invalid, created_at) "
             "VALUES ('grafana.lc', 'prox', 0, 0, 0)"))
         ext = _Ext(db)
-        # main: window 1 = two unruled tabs (target), window 2 = the ruled tab 20 plus
+        # media: window 1 = two unruled tabs (target), window 2 = the ruled tab 20 plus
         # an unruled 21 (source). Tie on tab count => target is the smaller id, 1.
         await ext.add_instance(
-            "main",
+            "media",
             tabs=[
                 _tabinfo(10, window_id=1, url="https://a/"),
                 _tabinfo(11, window_id=1, url="https://b/"),
@@ -461,7 +499,7 @@ async def test_merge_journal_excludes_tabs_closed_by_the_same_pass(tmp_path):
         assert res["status"] == "ok"
         # The dedupe really happened (so 20 is gone from the mirror).
         assert await _rows(db, "SELECT status FROM actions WHERE kind='dedupe_close'") == [("done",)]
-        assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='main' AND tab_id=20") == [(0,)]
+        assert await _rows(db, "SELECT COUNT(*) FROM tabs WHERE instance_id='media' AND tab_id=20") == [(0,)]
         # ... and the merge journal lists only the tab that could still move.
         detail = (await _rows(db, "SELECT detail FROM actions WHERE kind='window_merge'"))[0][0]
         assert '"moved_tab_ids": [21]' in detail

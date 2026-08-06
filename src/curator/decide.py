@@ -469,16 +469,26 @@ def _source_eligible(tabs, focused_window_id, now: int, idle_ms: int) -> bool:
     return True
 
 
-def decide_window_merges(mirror, ready_ids: set, *, now: int, idle_ms: int) -> list:
+def decide_window_merges(
+    mirror, ready_ids: set, *, now: int, idle_ms: int, main_instance_id: str
+) -> list:
     """Plan every instance's window merge for step 9 (§9). Pure over the frozen
     mirror, so the guards are unit- and mutation-testable without a socket.
 
     Per instance: among its mergeable windows pick the TARGET (most tabs; tie ->
     smallest ``window_id``, §9), then fold every OTHER mergeable window that clears
     the source guard AND still has an unpinned tab to move. An instance with fewer
-    than two mergeable windows, or no eligible source, yields no decision."""
+    than two mergeable windows, or no eligible source, yields no decision.
+
+    ``main`` is exempt: its windows are NEVER auto-merged (owner decision 2026-08-06
+    — laptop sleep counts as idle, so the first pass after a night would otherwise
+    collapse the whole main layout at once, and window_merge is not undoable). Manual
+    ``merge_windows`` on main still works; only the automatic step-9 folding is
+    withheld. Thematic instances (prox, media, ...) still merge as before."""
     merges: list = []
     for instance_id in ready_ids:
+        if instance_id == main_instance_id:
+            continue  # main is a sink whose window layout the pass never collapses
         inst = mirror.instances.get(instance_id)
         focused_window_id = inst.focused_window_id if inst is not None else None
 
