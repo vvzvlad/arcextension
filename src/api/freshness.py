@@ -38,6 +38,11 @@ from src.ext import protocol
 FRESH = "fresh"
 DISCONNECTED = "disconnected"
 TIMEOUT = "timeout"
+# NOT returned by :func:`ensure_fresh` itself — it reads the DB unwrapped and lets a
+# reader fault propagate. A fan-out caller that runs ``ensure_fresh`` under
+# ``gather(return_exceptions=True)`` maps a raised result onto this reason, so the
+# whole reason vocabulary still lives in one place.
+ERROR = "error"
 
 # Poll cadence while waiting for a snapshot to land: a fresh reader connection per
 # tick, coarse enough to stay off the hot path at this scale.

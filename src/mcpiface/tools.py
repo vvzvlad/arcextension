@@ -6,7 +6,10 @@ directly without an MCP client or a socket. NOTHING here reimplements state, rul
 command, pass or pause logic — the handlers only call the reused functions:
 
 * reads     -> :mod:`src.db.state`, :mod:`src.rules.access`, :mod:`src.api.actions`
-* freshness -> :func:`src.api.state.kick_state_refresh` (same path as ``/api/state``)
+* freshness -> :func:`src.api.freshness.ensure_fresh` fanned across the active fleet
+  (the BLOCKING-fresh class §6, same as restore/preview/reset — NOT ``/api/state``'s
+  detached kick), so ``list_tabs`` / ``list_instances`` return a mirror the agent has
+  just refreshed rather than one of arbitrary age
 * rules CRUD + the SAME ``confirm_impact`` gate -> :mod:`src.api.rules`
 * commands  -> :func:`src.ext.commands.send_command` (``initiator='mcp'`` + ``auth_ctx``)
 * relocate  -> phase-A open + a live ``relocate`` row the pass's phase B completes
@@ -20,6 +23,7 @@ the plan is exactly why a pause is taken).
 
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -29,7 +33,7 @@ from src.api import actions as actions_api
 from src.api import instances as instances_api
 from src.api import pause as pause_api
 from src.api import rules as rules_api
-from src.api.state import kick_state_refresh
+from src.api.freshness import ERROR, ensure_fresh
 from src.curator import pause as pause_ops
 from src.curator import runner
 from src.db import state as state_read
@@ -70,48 +74,115 @@ async def _ensure_not_paused(app) -> None:
 
 
 # --- reads -------------------------------------------------------------------
-async def list_instances(app) -> dict:
-    """Instances mirror + ``snapshot_at`` + ``paused_until`` + ``resume_pending`` (§11).
+async def _freshen_fleet(app) -> dict:
+    """Actively refresh EVERY active instance's mirror and return the per-instance
+    freshness envelope ``{id: {snapshot_at, fresh, reason}}`` (§6/§11).
 
-    Goes through the SAME freshness path as ``/api/state`` (kick a single-flight
-    refresh, then return the current mirror) so a stale mirror is at least refreshed
-    for the next call, and the agent sees each instance's ``snapshot_at`` age. The
+    ``list_tabs`` / ``list_instances`` join the restore/preview/reset (blocking-fresh)
+    class (§6), NOT ``/api/state``'s detached kick: an agent that acts on a mirror of
+    arbitrary age re-opens a tab a human opened three minutes ago — permanently, in
+    ``main`` where there is no dedup (§11). So we WAIT for a fresh snapshot instead of
+    firing one and reading the stale mirror immediately.
+
+    Instance set is :func:`known_instance_ids` (every ``status='active'`` instance —
+    the same set preview fans over), NOT "only connected": ``ensure_fresh`` itself
+    reports ``disconnected`` for an instance without a live socket, whereas a
+    connected-only set would silently DROP an instance whose DB row is a stale
+    ``connected=0`` and hide it from the agent entirely.
+
+    Fanned out CONCURRENTLY with ONE ``SNAPSHOT_TIMEOUT_MS`` budget each (the concurrent-
+    with-budget shape of the preview fan-out in :mod:`src.api.rules`; here deliberately
+    hardened with ``return_exceptions=True``, which the preview does not use): each call
+    only awaits its own socket and polls its own reader connection, so N wedged instances
+    cost ONE budget of wall time, not N.
+
+    ``return_exceptions=True`` is MANDATORY: ``ensure_fresh`` awaits ``db.read`` unwrapped,
+    so a reader fault (``database is locked``, disk I/O) propagates; without it that one
+    fault would sink the whole tool and leave the sibling tasks hanging. A raised result
+    is mapped to ``fresh: false, reason: "error"`` and the siblings are returned normally.
+
+    ``snapshot_at`` is each instance's stored value, read AFTER the fan-out so it reflects
+    any snapshot that just landed (``null`` when the instance has never been snapshotted).
+    Both ``fresh`` and ``reason`` are reported even though ``fresh == (reason == "fresh")``:
+    ``reason`` names WHY (``disconnected`` / ``timeout`` / ``error``) so the agent can act.
+    """
+    db, settings, registry = app.state.db, app.state.settings, app.state.ext_registry
+    known = sorted(await db.read(rules_access.known_instance_ids))
+    results = await asyncio.gather(
+        *(
+            ensure_fresh(registry, db, iid, settings, budget_ms=settings.snapshot_timeout_ms)
+            for iid in known
+        ),
+        return_exceptions=True,
+    )
+    # snapshot_at read after the waits so a just-landed snapshot is reflected.
+    snapshot_at = {
+        i["id"]: i["snapshot_at"] for i in await db.read(state_read._read_instances)
+    }
+    envelope: dict = {}
+    for iid, res in zip(known, results):
+        # Only a reader FAULT (a sqlite Exception from the unwrapped db.read inside
+        # ensure_fresh) becomes "error"; a control-flow BaseException (CancelledError
+        # on tool cancellation) is left to propagate rather than mislabelled as a
+        # per-instance error. Outer cancellation raises out of gather() before this
+        # loop, so such a result never lands here.
+        if isinstance(res, Exception):
+            fresh, reason = False, ERROR
+        else:
+            fresh, reason, _conn_state = res
+        envelope[iid] = {
+            "snapshot_at": snapshot_at.get(iid),
+            "fresh": fresh,
+            "reason": reason,
+        }
+    return envelope
+
+
+async def list_instances(app) -> dict:
+    """Per-instance freshness + ``paused_until`` + ``resume_pending`` + ``pending_plan`` (§11).
+
+    Awaits a fresh snapshot from every active instance (§6 blocking-fresh, via
+    :func:`_freshen_fleet`) before answering, so the ``instances`` map carries a mirror
+    the agent has just refreshed — each entry ``{snapshot_at, fresh, reason}``. The
     ``paused_until`` field lets the agent tell a pause from a broken curator (§11).
 
     ``resume_pending`` is required here by §7 verbatim — «`resume_pending` виден в
     `StateResponse` и в `list_instances`» — and for the same reason: after a pause
     expires by TIMEOUT the curator is deliberately idle, waiting for a confirming click.
     Without the flag an agent reads ``paused_until`` in the past, sees no pass
-    happening, and concludes the curator is broken."""
-    db, settings = app.state.db, app.state.settings
-    await kick_state_refresh(app, db, settings)
-    instances = await db.read(state_read._read_instances)
+    happening, and concludes the curator is broken. ``pending_plan`` is the SAME
+    resume/pending-plan shape the startpage already sees in ``StateResponse`` (parsed
+    by :func:`src.db.state._parse_pending_plan`) — the burst the human confirms the
+    click BY — surfaced to the agent that only had the bare boolean before."""
+    db = app.state.db
+    instances = await _freshen_fleet(app)
     paused_until = await db.read(pause_ops.read_pause_until)
     resume_raw = await db.read(lambda c: get_setting(c, pause_ops.RESUME_PENDING_KEY))
     return {
         "server_now": _now_ms(),
         "paused_until": paused_until,
         "resume_pending": bool(resume_raw),
+        "pending_plan": state_read._parse_pending_plan(resume_raw),
         "instances": instances,
     }
 
 
 async def list_tabs(app) -> dict:
-    """Tabs mirror + per-instance ``snapshot_at`` (§11).
+    """Tabs mirror + per-instance freshness envelope (§11).
 
-    Same freshness path as ``/api/state``; returns ``snapshot_at`` per instance so
-    the agent never acts on a mirror of unknown age (§11: else it re-opens a tab a
-    human opened three minutes ago — permanently, in ``main`` where there is no
-    dedup)."""
-    db, settings = app.state.db, app.state.settings
-    await kick_state_refresh(app, db, settings)
+    Awaits a fresh snapshot from every active instance (§6 blocking-fresh, via
+    :func:`_freshen_fleet`) before returning the tabs, so the agent never acts on a
+    mirror of unknown age (§11: else it re-opens a tab a human opened three minutes
+    ago — permanently, in ``main`` where there is no dedup). The ``instances`` map
+    carries ``{snapshot_at, fresh, reason}`` per instance — the age and freshness the
+    agent must weigh before acting."""
+    db = app.state.db
+    instances = await _freshen_fleet(app)
     tabs = await db.read(state_read._read_tabs)
-    instances = await db.read(state_read._read_instances)
     return {
         "server_now": _now_ms(),
         "tabs": tabs,
-        # snapshot_at per instance — the age the agent must weigh before acting.
-        "snapshot_at": {i["id"]: i["snapshot_at"] for i in instances},
+        "instances": instances,
     }
 
 

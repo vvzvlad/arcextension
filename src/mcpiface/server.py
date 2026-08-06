@@ -98,12 +98,14 @@ def build_mcp(app_ref) -> MCPServer:
     # --- reads ---------------------------------------------------------------
     @mcp.tool()
     async def list_instances() -> dict:
-        """List instances with per-instance snapshot_at and paused_until (§11)."""
+        """List instances with a per-instance freshness envelope, paused_until and
+        pending_plan (§11). Awaits a fresh snapshot per instance before answering."""
         return await _guarded(tools.list_instances(_host()))
 
     @mcp.tool()
     async def list_tabs() -> dict:
-        """List all mirrored tabs plus per-instance snapshot_at (§11 freshness)."""
+        """List all mirrored tabs plus a per-instance freshness envelope
+        (snapshot_at/fresh/reason). Awaits a fresh snapshot before answering (§11/§6)."""
         return await _guarded(tools.list_tabs(_host()))
 
     @mcp.tool()

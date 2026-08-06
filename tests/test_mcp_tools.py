@@ -8,6 +8,7 @@ Covers each tool's handler plus the guards the reviewer mutation-checks:
 """
 
 import asyncio
+import sqlite3
 from conftest import make_settings
 from types import SimpleNamespace
 
@@ -15,9 +16,10 @@ import pytest
 
 from src.curator import lease
 from src.curator import pause as pause_ops
+from src.db import state as state_read
 from src.db.access import Database
 from src.db.audit import insert_js_audit  # noqa: F401  (schema presence)
-from src.db.settings_store import get_setting, set_execute_js_enabled
+from src.db.settings_store import get_setting, set_execute_js_enabled, set_setting
 from src.ext import protocol
 from src.ext.commands import resolve_response
 from src.ext.registry import ConnState, Registry
@@ -106,14 +108,16 @@ async def _insert_tab(db, iid, tab_id, *, url, title="t", opened_at=1000,
 
 
 # --- reads -------------------------------------------------------------------
-async def test_list_instances_returns_snapshot_at_and_paused_until(tmp_path):
+async def test_list_instances_returns_freshness_envelope_and_paused_until(tmp_path):
     db = await _make_db(tmp_path)
     await _insert_instance(db, "main", snapshot_at=1234, connected=0)
     app = _app(db)
     out = await tools.list_instances(app)
     assert out["paused_until"] is None
-    ids = {i["id"]: i for i in out["instances"]}
-    assert ids["main"]["snapshot_at"] == 1234
+    # `instances` is now a per-instance freshness envelope keyed by id (§6/§11), not a
+    # list of mirror rows. No live socket for "main" => ensure_fresh reports disconnected.
+    main = out["instances"]["main"]
+    assert main == {"snapshot_at": 1234, "fresh": False, "reason": "disconnected"}
 
     # A paused curator surfaces paused_until so an agent does not read pause as a break.
     now = tools._now_ms()
@@ -122,13 +126,86 @@ async def test_list_instances_returns_snapshot_at_and_paused_until(tmp_path):
     assert out2["paused_until"] is not None and out2["paused_until"] > now
 
 
-async def test_list_tabs_returns_tabs_and_per_instance_snapshot_at(tmp_path):
+async def test_list_tabs_returns_tabs_and_per_instance_freshness(tmp_path):
     db = await _make_db(tmp_path)
-    await _insert_instance(db, "main", snapshot_at=555)
+    now = tools._now_ms()
+    # A live socket + a snapshot younger than STATE_FRESH_MS => ensure_fresh answers
+    # `fresh` without sending or waiting for anything.
+    await _insert_instance(db, "main", session_id="sess-1", snapshot_at=now, connected=1)
     await _insert_tab(db, "main", 1, url="https://a")
-    out = await tools.list_tabs(_app(db))
+    reg = Registry()
+    _put_conn(reg, "main", session_id="sess-1")
+    out = await tools.list_tabs(_app(db, reg))
     assert [t["tab_id"] for t in out["tabs"]] == [1]
-    assert out["snapshot_at"] == {"main": 555}
+    assert out["instances"] == {"main": {"snapshot_at": now, "fresh": True, "reason": "fresh"}}
+
+
+async def test_list_tabs_freshens_and_flags_a_disconnected_sibling(tmp_path):
+    # Acceptance (a): the fan-out is over known_instance_ids (every status='active'
+    # instance), NOT "only connected" — so an instance with no live socket is REPORTED
+    # as disconnected rather than silently dropped, and its siblings still come back.
+    db = await _make_db(tmp_path)
+    now = tools._now_ms()
+    await _insert_instance(db, "main", session_id="sess-1", snapshot_at=now, connected=1)
+    await _insert_instance(db, "media", session_id="sess-2", snapshot_at=None, connected=0)
+    await _insert_tab(db, "main", 1, url="https://a")
+    reg = Registry()
+    _put_conn(reg, "main", session_id="sess-1")  # only "main" has a live socket
+    out = await tools.list_tabs(_app(db, reg))
+    inst = out["instances"]
+    assert set(inst) == {"main", "media"}
+    assert inst["main"] == {"snapshot_at": now, "fresh": True, "reason": "fresh"}
+    assert inst["media"] == {"snapshot_at": None, "fresh": False, "reason": "disconnected"}
+    # The disconnected sibling did not drop the fresh instance's tab.
+    assert [t["tab_id"] for t in out["tabs"]] == [1]
+
+
+async def test_list_tabs_reader_error_maps_to_error_and_isolates_siblings(tmp_path, monkeypatch):
+    # Acceptance (b): ensure_fresh awaits db.read UNWRAPPED, so a reader fault
+    # (database is locked / disk I/O) propagates. The fan-out runs under
+    # gather(return_exceptions=True), so that fault is mapped to reason="error" for the
+    # one instance and does NOT sink the tool or leave siblings hanging.
+    db = await _make_db(tmp_path)
+    now = tools._now_ms()
+    await _insert_instance(db, "main", session_id="sess-1", snapshot_at=now, connected=1)
+    await _insert_instance(db, "bad", session_id="sess-2", snapshot_at=42, connected=1)
+    reg = Registry()
+    _put_conn(reg, "main", session_id="sess-1")
+    _put_conn(reg, "bad", session_id="sess-2")  # live socket => ensure_fresh reaches the reader
+
+    import src.api.freshness as fresh_mod
+    real = fresh_mod.read_instance_freshness
+
+    def _maybe_raise(conn, instance_id):
+        if instance_id == "bad":
+            raise sqlite3.OperationalError("database is locked")
+        return real(conn, instance_id)
+
+    monkeypatch.setattr(fresh_mod, "read_instance_freshness", _maybe_raise)
+
+    out = await tools.list_tabs(_app(db, reg))
+    inst = out["instances"]
+    # The faulting instance is reported, not lost; snapshot_at still comes from the
+    # (separate, working) mirror read.
+    assert inst["bad"] == {"snapshot_at": 42, "fresh": False, "reason": "error"}
+    # The sibling with a working reader is returned normally.
+    assert inst["main"]["reason"] == "fresh" and inst["main"]["fresh"] is True
+
+
+async def test_list_instances_exposes_pending_plan(tmp_path):
+    # Acceptance (c): list_instances additionally carries the resume/pending-plan shape
+    # the startpage's StateResponse already sees — verbatim _parse_pending_plan of the
+    # same latch — which the agent previously only saw as the bare resume_pending bool.
+    db = await _make_db(tmp_path)
+    app = _app(db)
+    assert (await tools.list_instances(app))["pending_plan"] is None
+
+    raw = '{"since": 7, "plan": {"relocations": 2, "closures": 3, "deferred": {}}}'
+    await db.write(lambda c: set_setting(c, pause_ops.RESUME_PENDING_KEY, raw))
+    out = await tools.list_instances(app)
+    assert out["pending_plan"] == state_read._parse_pending_plan(raw)
+    assert out["pending_plan"]["plan"]["closures"] == 3
+    assert out["resume_pending"] is True
 
 
 async def test_get_rules_and_list_actions(tmp_path):

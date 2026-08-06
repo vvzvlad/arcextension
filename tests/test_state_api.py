@@ -268,6 +268,33 @@ def test_state_kicks_background_refresh_when_stale(tmp_path):
             ws.__exit__(None, None, None)
 
 
+def test_state_does_not_await_a_snapshot_even_with_a_large_timeout(tmp_path):
+    """Regression (issue #44 acceptance d): ``list_tabs`` / ``list_instances`` now BLOCK on
+    a fresh snapshot (§6), but ``/api/state`` deliberately does NOT — its refresh stays a
+    detached background kick, because the startpage is newtab and a blocking fan-out would
+    move ``snapshot_at`` on every Cmd+T during a pass.
+
+    Proven by construction, not luck: with a stale mirror and a 5 s snapshot timeout, a
+    blocking implementation would await the answer (that we never send) for ~5 s. The
+    detached one returns in well under that. The generous margin keeps this off timing
+    flakiness while still failing hard if ``/api/state`` were ever made to await.
+    """
+    app = create_app(_settings(tmp_path, state_fresh_ms=3000, snapshot_timeout_ms=5000))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect_fresh(client, db_path, tabs=[])
+        try:
+            _stale_the_mirror(db_path)   # a refresh is genuinely wanted (by fact, not timing)
+            started = time.time()
+            resp = client.get("/api/state", headers=AUTH)   # we never answer the kicked request
+            elapsed = time.time() - started
+            assert resp.status_code == 200
+            # Nowhere near the 5 s a blocking await would have cost.
+            assert elapsed < 2.0, f"/api/state appears to await the snapshot ({elapsed:.2f}s)"
+        finally:
+            ws.__exit__(None, None, None)
+
+
 # --- POST /api/focus success (foreign jump) ---------------------------------
 def test_focus_sends_focus_tab_and_returns_ok(tmp_path):
     app = create_app(_settings(tmp_path))
