@@ -131,6 +131,23 @@ def test_orphaned_rule_defers_in_both_engines(tmp_path):
     assert dec.phase_a == [] and dict(dec.deferred) == {"ghost": 1}
 
 
+def test_path_prefix_rule_agrees(tmp_path):
+    """A path-prefix rule (#43) must route identically in preview and pass. One tab
+    under /wirenboard relocates to 'work'; one under /personal has no rule and drains
+    to main. Both engines must agree on the count AND the destinations."""
+    tabs = [
+        _tab("prox", 1, "https://github.com/wirenboard/wb-mqtt"),
+        _tab("prox", 2, "https://github.com/personal/notes"),
+    ]
+    rules = [_rule(1, "github.com/wirenboard", "work")]
+    dec, prev = _both(tabs, [_inst(MAIN), _inst("prox"), _inst("work")], rules)
+    _assert_agree(dec, prev)
+    assert prev.relocations == 2  # one to 'work', one drained to main
+    dests = {e["url"]: e["to"] for e in prev.relocation_examples}
+    assert dests["https://github.com/wirenboard/wb-mqtt"] == "work"
+    assert dests["https://github.com/personal/notes"] == MAIN
+
+
 def test_second_identical_tab_defers_instead_of_opening_twice(tmp_path):
     """Two tabs, same URL, same target, one pass: the pass opens ONE copy and defers the
     other (§7 forbids the curator creating duplicates of its own). The preview used to

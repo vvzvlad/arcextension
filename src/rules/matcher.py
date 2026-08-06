@@ -11,15 +11,17 @@ Semantics, verbatim from §8:
 * Normalize the URL's host+port explicitly: ``hostname`` lowercased, IDN → punycode
   via the stdlib ``idna`` codec, a trailing FQDN dot stripped, an IPv6 literal in
   bracketless form, and a missing port filled with the scheme default (80 / 443).
-* A ``pattern`` is ``<hostPattern>`` or ``<hostPattern>:<port>``. A missing port in
-  the pattern matches ANY port.
+* A ``pattern`` is ``<hostPattern>[:<port>][/<prefix>]``. A missing port in the
+  pattern matches ANY port; a missing path prefix matches ANY path.
 * ``hostPattern`` is matched against the WHOLE hostname, anchored (full string):
   ``*`` → ``.*``, every other regex metachar escaped. There is NO partial match —
-  ``borneo.lc`` matches neither ``evil-borneo.lc`` nor ``x.borneo.lc``. The path is
-  irrelevant to matching.
+  ``borneo.lc`` matches neither ``evil-borneo.lc`` nor ``x.borneo.lc``. A path prefix,
+  if present, restricts to a SEGMENT-boundary prefix of the URL path (case-sensitive):
+  ``github.com/wirenboard`` matches ``/wirenboard`` and ``/wirenboard/repo`` but not
+  ``/wirenboardXYZ``. Without a prefix the path is irrelevant to matching.
 * Specificity ladder (pick the most specific matching rule): (a) an explicit port
-  beats a missing port; (b) more characters in ``hostPattern`` excluding ``*``;
-  (c) smaller ``rules.id``.
+  beats a missing port; (b) a longer path prefix; (c) more characters in
+  ``hostPattern`` excluding ``*``; (d) smaller ``rules.id``.
 * Validation happens at save, not as an exception during a pass: a pattern that
   does not parse (e.g. a full URL ``https://borneo.lc/path``) is rejected; a stored
   rule that stops compiling is excluded from matching (``invalid=1``) but never
@@ -52,16 +54,20 @@ class CompiledPattern:
     port: int | None          # None => matches any port
     explicit_port: bool       # a port was written in the pattern
     host_chars: int           # count of hostPattern chars EXCLUDING '*' (specificity)
+    path_prefix: str | None   # None => matches any path; else a '/'-anchored prefix
     source: str               # the original pattern text (for diagnostics)
 
 
 # --- URL normalization (§8) -------------------------------------------------
-def normalize_target(url: str | None) -> tuple[str, int] | None:
-    """Return the normalized ``(hostname, port)`` of ``url`` or ``None``.
+def normalize_target(url: str | None) -> tuple[str, int, str] | None:
+    """Return the normalized ``(hostname, port, path)`` of ``url`` or ``None``.
 
     ``None`` means "this URL can never match any rule": a non-http(s) scheme, a
     missing host, an out-of-range port, or a hostname the ``idna`` codec refuses.
     We never raise — a malformed URL simply does not match (§8).
+
+    The path is taken verbatim from ``urlsplit(url).path`` (an empty path becomes
+    ``/``); it is NOT lowercased — the host is case-insensitive, the path is not.
     """
     if not url:
         return None
@@ -87,7 +93,9 @@ def normalize_target(url: str | None) -> tuple[str, int] | None:
         return None
     if port is None:
         port = _DEFAULT_PORTS[parts.scheme]
-    return host, port
+    # Path is case-sensitive and never lowercased; an empty path normalizes to '/'.
+    path = parts.path or "/"
+    return host, port, path
 
 
 def _to_ascii_host(host: str) -> str | None:
@@ -113,11 +121,13 @@ def _to_ascii_host(host: str) -> str | None:
 
 # --- pattern parsing / compilation (§8) -------------------------------------
 def compile_pattern(pattern: str) -> CompiledPattern:
-    """Compile a ``hostPattern[:port]`` pattern; raise :class:`InvalidPattern`.
+    """Compile a ``hostPattern[:port][/prefix]`` pattern; raise :class:`InvalidPattern`.
 
-    Only this grammar is accepted. A full URL (``https://borneo.lc/path``), a path,
-    a query/fragment, whitespace, an empty host, or a non-numeric / out-of-range
-    port are all rejected — that is the "validation at save" of §8.
+    Only this grammar is accepted. A scheme (``https://borneo.lc``), a query/fragment,
+    whitespace, an empty host, or a non-numeric / out-of-range port are all rejected —
+    that is the "validation at save" of §8. An optional path prefix is now allowed:
+    ``github.com/wirenboard`` restricts the rule to URLs whose path starts, on a
+    segment boundary, with ``/wirenboard``.
     """
     if not isinstance(pattern, str):
         raise InvalidPattern("pattern must be a string")
@@ -125,16 +135,29 @@ def compile_pattern(pattern: str) -> CompiledPattern:
         raise InvalidPattern("pattern must not be empty")
     if any(c.isspace() for c in pattern):
         raise InvalidPattern("pattern must not contain whitespace")
-    # A '/', '?', '#', or a scheme separator means a full URL was entered, not a
-    # host pattern — the exact mistake §8 calls out ("введённый как полный URL").
-    for bad in ("/", "?", "#"):
+    # A scheme separator means a full URL was entered, not a host pattern — the exact
+    # mistake §8 calls out ("введённый как полный URL"). Checked BEFORE the path split
+    # so '://' is reported as a scheme, not mis-parsed as an empty-host path.
+    if "://" in pattern:
+        raise InvalidPattern(
+            f"pattern looks like a full URL (contains a scheme '://'); "
+            "enter only a host pattern like 'borneo.lc' or 'github.com/wirenboard'"
+        )
+    # A query/fragment still means a full URL was pasted; the path is now allowed.
+    for bad in ("?", "#"):
         if bad in pattern:
             raise InvalidPattern(
                 f"pattern looks like a URL (contains {bad!r}); "
-                "enter only a host pattern like 'borneo.lc' or 'borneo.lc:8443'"
+                "enter only a host pattern like 'borneo.lc' or 'github.com/wirenboard'"
             )
 
-    host_part, port = _split_host_port(pattern)
+    # Split the path prefix off FIRST, before host:port parsing — so a bracketed IPv6
+    # authority ('[::1]:8080/path') is split at the FIRST '/', leaving '[::1]:8080' for
+    # the unchanged _split_host_port (which understands the IPv6 authority form).
+    head, slash, rest = pattern.partition("/")
+    path_prefix = _normalize_path_prefix(rest) if slash else None
+
+    host_part, port = _split_host_port(head)
     if host_part == "":
         raise InvalidPattern("pattern has an empty host")
 
@@ -146,8 +169,26 @@ def compile_pattern(pattern: str) -> CompiledPattern:
         port=port,
         explicit_port=port is not None,
         host_chars=host_chars,
+        path_prefix=path_prefix,
         source=pattern,
     )
+
+
+def _normalize_path_prefix(rest: str) -> str | None:
+    """Normalize the text after the first '/' into a stored path prefix.
+
+    ``rest`` is what followed the first '/' in the pattern. A trailing slash is
+    cosmetic: ``github.com/wirenboard/`` is the same rule as ``github.com/wirenboard``,
+    and ``github.com/`` (bare host) is the same as no prefix at all. So trailing
+    slash(es) are stripped first; if nothing remains the prefix is ``None`` (matches
+    any path, and must NOT win the ladder with a length-1 prefix). Otherwise the prefix
+    is stored '/'-anchored (``/wirenboard``) and is NOT lowercased (paths are
+    case-sensitive).
+    """
+    rest = rest.rstrip("/")
+    if rest == "":
+        return None
+    return "/" + rest
 
 
 def validate_pattern(pattern: str) -> None:
@@ -222,13 +263,21 @@ def _host_pattern_regex(host_for_regex: str) -> re.Pattern:
     return re.compile(body)
 
 
-def pattern_matches(compiled: CompiledPattern, host: str, port: int) -> bool:
-    """True if a normalized ``(host, port)`` satisfies this compiled pattern."""
+def pattern_matches(compiled: CompiledPattern, host: str, port: int, path: str) -> bool:
+    """True if a normalized ``(host, port, path)`` satisfies this compiled pattern."""
     if compiled.port is not None and compiled.port != port:
         return False
     # fullmatch anchors the WHOLE hostname (§8: "matched against the WHOLE
     # hostname"); unlike `$.match` it cannot be fooled by a trailing '\n'.
-    return compiled.regex.fullmatch(host) is not None
+    if compiled.regex.fullmatch(host) is None:
+        return False
+    # A path prefix restricts to a SEGMENT-boundary prefix: '/wirenboard' matches
+    # '/wirenboard' and '/wirenboard/repo' but not '/wirenboardXYZ'. Case-sensitive.
+    if compiled.path_prefix is not None:
+        prefix = compiled.path_prefix
+        if path != prefix and not path.startswith(prefix + "/"):
+            return False
+    return True
 
 
 # --- selection (§8 specificity ladder) --------------------------------------
@@ -264,17 +313,23 @@ def best_match_compiled(url: str | None, compiled_rules) -> object | None:
     target = normalize_target(url)
     if target is None:
         return None
-    host, port = target
+    host, port, path = target
 
     best = None
     best_key = None
     for rule, compiled in compiled_rules:
-        if not pattern_matches(compiled, host, port):
+        if not pattern_matches(compiled, host, port, path):
             continue
         rule_id = _rule_field(rule, "id")
-        # Ladder as a min-key: explicit port first (0 < 1), then MORE host chars
-        # (negated), then the SMALLER id.
-        key = (0 if compiled.explicit_port else 1, -compiled.host_chars, rule_id)
+        prefix_len = len(compiled.path_prefix) if compiled.path_prefix else 0
+        # Ladder as a min-key: explicit port first (0 < 1), then a LONGER path prefix
+        # (negated), then MORE host chars (negated), then the SMALLER id.
+        key = (
+            0 if compiled.explicit_port else 1,
+            -prefix_len,
+            -compiled.host_chars,
+            rule_id,
+        )
         if best_key is None or key < best_key:
             best_key = key
             best = rule
