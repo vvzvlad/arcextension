@@ -424,14 +424,40 @@ async def _command(app, instance, command, params, *, auth_ctx, expected_session
 
 
 async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
-                   active: bool = False, auth_ctx: str | None = None,
+                   active: bool = False, window_id: int | None = None,
+                   auth_ctx: str | None = None,
                    expected_session: str | None = None) -> dict:
+    """Open a tab in an instance (§6), optionally in a NAMED window (#45).
+
+    ``window_id`` is optional: absent, this is exactly today's behaviour — the extension
+    auto-selects the §9 window (the curator's own pass never names one). Given, the
+    extension is asked to open in THAT window and validates it with §9's mergeable
+    predicate (``no_window`` for a popup/devtools/app/fullscreen or a vanished window).
+
+    The SERVER-SIDE cross-check is required, not belt-and-suspenders: an OLD extension
+    silently IGNORES the unknown ``windowId`` frame key, drops the tab in its OWN window
+    and still answers ``ok``. The service and the extension update by different paths
+    (the Dockerfile does not ship ``extension/``), so "new service + old extension" is a
+    guaranteed state — so we compare the ``windowId`` the extension actually reports to
+    the one we asked for and turn a mismatch into a loud ``no_window``. The extension
+    cannot do this itself: to it the request never said "here", it was an unknown key.
+    """
     await _ensure_not_paused(app)
+    params: dict = {"url": url, "pinned": bool(pinned), "active": bool(active)}
+    if window_id is not None:
+        params["windowId"] = window_id
     result = await _command(
-        app, instance, protocol.CMD_OPEN_TAB,
-        {"url": url, "pinned": bool(pinned), "active": bool(active)}, auth_ctx=auth_ctx,
+        app, instance, protocol.CMD_OPEN_TAB, params, auth_ctx=auth_ctx,
         expected_session=expected_session,
     )
+    if window_id is not None:
+        actual = result.get("windowId")
+        if actual != window_id:
+            raise ToolError(
+                protocol.ERR_NO_WINDOW,
+                f"open_tab landed in window {actual!r}, not the requested {window_id!r} "
+                "(the window vanished, or this extension predates window addressing)",
+            )
     return {"ok": True, "result": result}
 
 
@@ -457,10 +483,11 @@ async def focus_tab(app, *, instance: str, tab_id: int,
     return {"ok": True, "result": result}
 
 
-async def move_tab(app, *, instance: str, tab_id: int, window_id: int,
+async def move_tab(app, *, instance: str, tab_id: int, window_id: int | None,
                    index: int | None = None, auth_ctx: str | None = None,
                    expected_session: str | None = None) -> dict:
-    """Move one tab to a window/position INSIDE one browser (§6/§9).
+    """Move one tab to a window/position INSIDE one browser (§6/§9), or — with
+    ``window_id=None`` — EXTRACT it into a brand-new background window (#45).
 
     The gap this fills: relocation BETWEEN instances is the §7 open+close pair, which
     only works because the browsers are separate processes. Between the windows of one
@@ -476,6 +503,14 @@ async def move_tab(app, *, instance: str, tab_id: int, window_id: int,
     never moved across a window boundary (``pinned_cross_window``, nothing moved) —
     both surface here as a :class:`ToolError` carrying that code, which is exactly
     what makes the pinned refusal actionable rather than a generic failure.
+
+    ``window_id=None`` addresses "extract into a NEW window" (#45): it rides the frame
+    verbatim as ``windowId: null`` and the extension calls ``windows.create({tabId})``,
+    returning the created window's id in the response ``windowId``. The pinned guard
+    applies there too (that create strips ``pinned`` down the same Chromium path), and an
+    OLD extension refuses ``null`` loudly at its ``Number.isInteger(windowId)`` guard with
+    ``precondition_failed`` (it never learned that null means "new window"), so the
+    migration is safe — a loud refusal, never a silent misplacement.
 
     No ``actions`` row: this follows its siblings ``open_tab`` / ``close_tab`` /
     ``focus_tab``, which journal nothing from the MCP door either. (``merge_windows``

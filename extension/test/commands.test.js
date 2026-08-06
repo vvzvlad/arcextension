@@ -286,6 +286,98 @@ describe("open_tab", () => {
     expect(opened.windowId).toBe(res.result.windowId);
     expect(opened.pinned).toBe(true);
   });
+
+  // --- #45: window as address -----------------------------------------------
+  it("#45: opens in a NAMED windowId, overriding the §9 auto-pick", async () => {
+    // Window 1 has the MOST tabs, so the auto-select would land there; naming window 2
+    // must win. Drop the explicit-window branch and this reddens (create lands in 1).
+    globalThis.chrome = createChromeMock({
+      tabs: [
+        { id: 1, windowId: 1, url: "https://a/" },
+        { id: 3, windowId: 1, url: "https://a2/" },
+        { id: 2, windowId: 2, url: "https://b/" },
+      ],
+      windows: [
+        { id: 1, type: "normal", state: "normal" }, // 2 tabs — the auto-pick
+        { id: 2, type: "normal", state: "normal" }, // 1 tab — the NAMED window
+      ],
+      lastFocused: { id: 1, focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    const res = await dispatchCommand(
+      frame(CMD_OPEN_TAB, { url: "https://x/", windowId: 2 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(true);
+    expect(create.mock.calls[0][0].windowId).toBe(2); // the caller's window, not §9's 1
+    expect(res.result.windowId).toBe(2);
+  });
+
+  it("#45: a NAMED fullscreen (or popup) windowId is refused with no_window, nothing created", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 1, url: "https://a/" }],
+      windows: [
+        { id: 1, type: "normal", state: "normal" },
+        { id: 7, type: "normal", state: "fullscreen" }, // the wall-dashboard showcase
+        { id: 8, type: "popup", state: "normal" },
+      ],
+      lastFocused: { id: 1, focused: true },
+    });
+    for (const badId of [7, 8]) {
+      const create = vi.spyOn(chrome.tabs, "create");
+      const winCreate = vi.spyOn(chrome.windows, "create");
+      const res = await dispatchCommand(
+        frame(CMD_OPEN_TAB, { url: "https://x/", windowId: badId }),
+        ctx(),
+      );
+      expect(res.ok, `windowId ${badId}`).toBe(false);
+      expect(res.error.code).toBe("no_window");
+      expect(create).not.toHaveBeenCalled(); // no tab created into the ineligible window
+      expect(winCreate).not.toHaveBeenCalled(); // and NO fallback window either
+      create.mockRestore();
+      winCreate.mockRestore();
+    }
+  });
+
+  it("#45: a NAMED window that vanished before create is no_window, never a fallback window", async () => {
+    // The window is present at getAll() (passes validation) but gone by create() — the
+    // human closed it in the gap. Unlike the AUTO-SELECT path, a caller-named window is
+    // NOT retried in one of our own: silently relocating would put the tab where the
+    // caller did not ask, and an OLD extension ignoring the key is what the server
+    // cross-check catches. Turn the refusal into a retry and this reddens.
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 2, url: "https://a/" }],
+      windows: [{ id: 2, type: "normal", state: "normal" }],
+      lastFocused: { id: 2, focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    create.mockRejectedValueOnce(new Error("No window with id: 2"));
+    const winCreate = vi.spyOn(chrome.windows, "create");
+    const res = await dispatchCommand(
+      frame(CMD_OPEN_TAB, { url: "https://x/", windowId: 2 }),
+      ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("no_window");
+    expect(winCreate).not.toHaveBeenCalled(); // no window of our own
+  });
+
+  it("#45: WITHOUT a windowId, the vanished-window retry still fires (auto-select unchanged)", async () => {
+    // Acceptance 5 / compatibility: the curator's own pass names no window, so its
+    // auto-select AND its self-healing retry must be exactly as before. This is the
+    // mirror of the test above: same race, opposite handling, because WE chose the window.
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 1, windowId: 1, url: "https://a/" }],
+      windows: [{ id: 1, type: "normal", state: "normal" }],
+      lastFocused: { id: 1, focused: true },
+    });
+    const create = vi.spyOn(chrome.tabs, "create");
+    create.mockRejectedValueOnce(new Error("No window with id: 1"));
+    const winCreate = vi.spyOn(chrome.windows, "create");
+    const res = await dispatchCommand(frame(CMD_OPEN_TAB, { url: "https://x/" }), ctx());
+    expect(res.ok).toBe(true); // retried into a window of our own
+    expect(winCreate).toHaveBeenCalledOnce();
+  });
 });
 
 // --- close_tab: the edge re-check is the whole point ------------------------
@@ -1079,6 +1171,113 @@ describe("move_tab", () => {
       expect(res.error.code, JSON.stringify(params)).toBe("precondition_failed");
       expect(move).not.toHaveBeenCalled();
     }
+  });
+
+  // --- #45: windowId:null extracts the tab into a NEW window -----------------
+  it("#45: windowId:null extracts the tab into a NEW unfocused window (both windows marked)", async () => {
+    chromeTwoNormalWindows();
+    const winCreate = vi.spyOn(chrome.windows, "create");
+    const tabsMove = vi.spyOn(chrome.tabs, "move");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: null }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    // windows.create MOVES the tab in — no tabs.move, no new tab id — unfocused + normal.
+    expect(winCreate).toHaveBeenCalledWith({ tabId: 100, focused: false, state: "normal" });
+    expect(tabsMove).not.toHaveBeenCalled();
+    // Same response shape as a normal move; windowId is the CREATED window (mock: 500).
+    expect(res.result).toEqual({ tabId: 100, windowId: 500, index: 0 });
+    expect(tabById(100).windowId).toBe(500); // it really moved into the new window
+    // BOTH windows are marked: the SOURCE before the move, and the NEW window AFTER
+    // create (once its id exists), so the onActivated Chrome fires in the new window is
+    // suppressed and cannot rejuvenate the extracted tab.
+    expect(map.markCuratorCause).toHaveBeenCalledTimes(2);
+    expect(map.markCuratorCause.mock.calls[0][0]).toBe(1);   // source, before the move
+    expect(map.markCuratorCause.mock.calls[1][0]).toBe(500); // new window, after create
+    expect(map.clearCuratorCause).not.toHaveBeenCalled();
+  });
+
+  it("#45: extracting a PINNED tab is refused with pinned_cross_window; it stays put and pinned", async () => {
+    // windows.create({tabId}) strips `pinned` down the same Chromium path a cross-window
+    // tabs.move takes, so the §9 shield must cover the new-window case too.
+    chromeTwoNormalWindows();
+    tabById(100).pinned = true;
+    const winCreate = vi.spyOn(chrome.windows, "create");
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: null }),
+      ctx({ map }),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "pinned_cross_window", message: expect.any(String) },
+    });
+    expect(winCreate).not.toHaveBeenCalled();
+    expect(map.markCuratorCause).not.toHaveBeenCalled(); // refused before any mark
+    expect(tabById(100).windowId).toBe(1); // unmoved
+    expect(tabById(100).pinned).toBe(true); // still shielded
+  });
+
+  it("#45: a tab that vanished between the get and windows.create is no_such_tab, mark rolled back", async () => {
+    chromeTwoNormalWindows();
+    chrome.__state.createWindowError = "No tab with id: 100.";
+    const map = spyMap();
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: null }),
+      ctx({ map }),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+    expect(map.markCuratorCause).toHaveBeenCalled();
+    expect(map.clearCuratorCause).toHaveBeenCalled(); // source mark undone
+  });
+
+  it("#45: extraction PRESERVES the clock — seedCuratorTab restores the pre-move age", async () => {
+    // Chrome fires onActivated in the new window (unmarkable — its id does not exist yet),
+    // which would rejuvenate the tab. The command reads the tab's age BEFORE the move and
+    // re-seeds it after, so the next pass sees it exactly as old as before (§5). Remove
+    // the restore and seedCuratorTab is never called => this reddens.
+    chromeTwoNormalWindows();
+    const map = spyMap({
+      tabs: { 100: { lastActive: NOW - 100_000, openedAt: NOW - 200_000, ageUnknown: false } },
+    });
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: null }),
+      ctx({ map }),
+    );
+    expect(res.ok).toBe(true);
+    expect(map.seedCuratorTab).toHaveBeenCalledTimes(1);
+    const [seededTabId, seed, when] = map.seedCuratorTab.mock.calls[0];
+    expect(seededTabId).toBe(100);
+    expect(seed).toEqual({
+      seed_age_ms: 100_000, // exactly the age it had, not 0 (freshly touched)
+      seed_opened_ago_ms: 200_000,
+      seed_age_unknown: false,
+    });
+    expect(when).toBe(NOW);
+  });
+
+  it("#45: extraction preserves the clock END-TO-END — a later onActivated in the new window does not rejuvenate", async () => {
+    // Outcome test on the REAL activity map (not the spy): seed tab 100 old, extract it
+    // into a new window, THEN fire the onActivated Chrome delivers in that fresh window.
+    // The new window is marked curatorCause after create, so the activation is suppressed
+    // and the re-seeded age stands — the next pass sees the tab exactly as old as before
+    // (§5). Reddens WITHOUT the post-create markCuratorCause(newWindowId): the late
+    // onActivated would then stamp lastActive = NOW. This is what the spy test above (which
+    // only checks seedCuratorTab was CALLED) cannot catch.
+    chromeTwoNormalWindows();
+    await activityMap.onCreated(100, NOW - 100_000); // record: lastActive=openedAt old
+    const res = await dispatchCommand(
+      frame(CMD_MOVE_TAB, { tabId: 100, windowId: null }),
+      { sessionId: SID, now: () => NOW }, // no map override => real activityMap
+    );
+    expect(res.ok).toBe(true);
+    const newWindowId = res.result.windowId;
+    // Chrome now delivers onActivated for the moved tab in the fresh window.
+    await activityMap.onActivated(100, newWindowId, NOW);
+    const map = await activityMap.readMap();
+    expect(map.tabs[100].lastActive).toBe(NOW - 100_000); // preserved, NOT rejuvenated to NOW
   });
 });
 

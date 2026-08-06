@@ -225,7 +225,27 @@ async function openTab(params, nowFn, map) {
   if (!isHttpUrl(params.url)) {
     return fail(ERR_PRECONDITION_FAILED, "open_tab accepts only http/https urls");
   }
-  const windowId = await pickNormalWindowId();
+  // #45 "window as address": an explicit `windowId` names the destination. The CALLER
+  // chose it (an agent addressing one window), so it is validated with the SAME §9
+  // predicate merge_windows/move_tab use, and every miss is a loud refusal — never the
+  // auto-select path's "fall back to a window of our own". Without a `windowId` this is
+  // exactly today's behaviour: the curator's own pass never names a window, so its
+  // deterministic auto-select (and the vanished-window retry) is untouched.
+  const named = Number.isInteger(params.windowId);
+  let windowId;
+  if (named) {
+    // Validate the NAMED window live: by command time it may be closed or have become a
+    // popup/fullscreen. `no_window` is in the service's _CLIENT_ERRORS set ("your picture
+    // is stale, refetch"), so it never lands the copy where the pass cannot see it.
+    const windows = await chrome.windows.getAll();
+    const target = windows.find((w) => w.id === params.windowId);
+    if (!isMergeableWindow(target)) {
+      return fail(ERR_NO_WINDOW, `no eligible target window: ${params.windowId}`);
+    }
+    windowId = params.windowId;
+  } else {
+    windowId = await pickNormalWindowId();
+  }
   let tab;
   try {
     tab = await createCuratorTab(params, windowId);
@@ -241,10 +261,16 @@ async function openTab(params, nowFn, map) {
     if (/drag/i.test(msg)) {
       return fail(ERR_BUSY_DRAGGING, msg);
     }
-    // ONLY the race the explicit windowId introduced: the chosen window was closed
-    // between getAll() and create() (a bare tabs.create had no window to lose). Retry
-    // in a window we make ourselves — windows.create cannot lose that race.
-    if (windowId !== null && /no window/i.test(msg)) {
+    // The window vanished between getAll() and create(). The response depends on WHO
+    // chose it (#45): a window WE auto-selected is retried in one we make ourselves
+    // (windows.create cannot lose that race), but a window the CALLER named is refused
+    // with `no_window` — silently relocating the tab to some other window would put it
+    // where the caller did not ask, and an OLD extension that ignored the key is exactly
+    // what the server-side cross-check catches.
+    if (named && /no window/i.test(msg)) {
+      return fail(ERR_NO_WINDOW, msg);
+    }
+    if (!named && windowId !== null && /no window/i.test(msg)) {
       tab = await createCuratorTab(params, null);
     } else {
       throw e; // anything else is a genuine fault => internal, which is the truth
@@ -514,14 +540,97 @@ async function mergeWindows(params, nowFn, map) {
 //
 // INSIDE one window a pinned tab moves freely: `pinned` survives the move, so there
 // is no shield to lose and nothing to protect against.
+// #45 move_tab {windowId:null}: extract ONE tab into a brand-new BACKGROUND normal
+// window. `chrome.windows.create({tabId})` moves the existing tab in — no open+close,
+// no new tab id — and goes down the SAME Chromium path a cross-window `tabs.move` takes,
+// so it strips `pinned`. Two consequences handled here:
+//
+//   1. A PINNED tab is refused with `pinned_cross_window` (§9), the identical shield
+//      the in-window cross-move honours: losing `pinned` across the move would destroy
+//      the owner's only "do not touch by hand" signal.
+//   2. The clock is preserved BY HAND. moveTab normally marks BOTH windows UP FRONT so
+//      the target activation is not read as "a human looked at the tab", but the new
+//      window's id does not exist until windows.create. So we mark the SOURCE before the
+//      move (a neighbour activates there) and READ the tab's activity-map age; then AFTER
+//      create — once its id exists — we mark the NEW window too AND re-seed the age. The
+//      mark suppresses a late onActivated; the seed corrects one delivered during create.
+//      Without both, the onActivated Chrome fires in the new window would rejuvenate the
+//      tab and it would read as fresh for steps 4-8.
+async function extractTabToNewWindow(tab, nowFn, map) {
+  if (tab.pinned) {
+    return fail(
+      ERR_PINNED_CROSS_WINDOW,
+      "a pinned tab is never moved across windows (§9) — unpin it, or move it inside its own window",
+    );
+  }
+  // Mark the SOURCE before the move (its neighbour activation must not count as
+  // activity). The new window is unmarkable — its id is unknown until windows.create,
+  // and curatorCause is keyed by windowId — so its rejuvenation is undone by the restore
+  // below rather than suppressed up front.
+  await map.markCuratorCause(tab.windowId, nowFn());
+  // Read the age the tab had BEFORE the move so it can be restored verbatim afterwards.
+  const before = await map.readMap();
+  const rec = before && before.tabs ? before.tabs[tab.id] : undefined;
+  let win;
+  try {
+    win = await chrome.windows.create({ tabId: tab.id, focused: false, state: "normal" });
+  } catch (e) {
+    // The move failed => undo the source mark so a later REAL activation still counts.
+    await map.clearCuratorCause(tab.windowId);
+    const msg = String((e && e.message) || e);
+    if (/drag/i.test(msg)) {
+      return fail(ERR_BUSY_DRAGGING, msg);
+    }
+    // The tab was closed between the `get` above and windows.create; Chromium answers
+    // "No tab with id: N". The vanished tab, not an internal fault (same as tabs.move).
+    if (/no tab with id|no such tab/i.test(msg)) {
+      return fail(ERR_NO_SUCH_TAB, msg);
+    }
+    return fail(ERR_INTERNAL, msg);
+  }
+  const created = win && win.tabs && win.tabs[0];
+  const newWindowId = win && win.id;
+  // Mark the NEW window curator-caused now that its id exists: Chrome fires an
+  // onActivated in it (the moved tab becomes active in the fresh window) which must NOT
+  // be read as a human touch. This closes the race the normal move avoids by marking
+  // both windows UP FRONT: an onActivated delivered AFTER this mark is suppressed by it;
+  // one Chrome already delivered BEFORE it (during windows.create) is corrected by the
+  // seed below. Together they preserve the clock in every enqueue order.
+  await map.markCuratorCause(newWindowId, nowFn());
+  // Restore the pre-move clock (§5): re-seed lastActive/openedAt from the record read
+  // above so the extracted tab stays exactly as old as it was — the next pass must not
+  // see it as freshly touched. A tab with no prior record has nothing to preserve.
+  if (rec) {
+    const nowMs = nowFn();
+    await map.seedCuratorTab(
+      tab.id,
+      {
+        seed_age_ms: nowMs - rec.lastActive,
+        seed_opened_ago_ms: nowMs - rec.openedAt,
+        seed_age_unknown: !!rec.ageUnknown,
+      },
+      nowMs,
+    );
+  }
+  // Same shape as a normal move; `windowId` is the CREATED window and its tab is the
+  // sole one, so index 0 (chrome reports it on the created window's tab).
+  const resultIndex = created && created.index !== undefined ? created.index : 0;
+  return ok({ tabId: tab.id, windowId: newWindowId, index: resultIndex });
+}
+
 async function moveTab(params, nowFn, map) {
   const tabId = params.tabId;
   const targetWindowId = params.windowId;
-  if (!Number.isInteger(targetWindowId)) {
-    return fail(ERR_PRECONDITION_FAILED, "move_tab requires an integer windowId");
+  // #45: `windowId: null` is the "extract into a NEW window" address — the one legal
+  // non-integer. Any OTHER non-integer (a string, undefined, a float) is still a
+  // malformed frame refused at the edge.
+  const extractToNew = targetWindowId === null;
+  if (!extractToNew && !Number.isInteger(targetWindowId)) {
+    return fail(ERR_PRECONDITION_FAILED, "move_tab requires an integer windowId or null");
   }
   // The position is optional; -1 is chrome.tabs.move's own "append to the end".
   // Anything below that is rejected HERE rather than left to throw as `internal`.
+  // (The new-window path has no position to give — its tab is the window's only one.)
   const index = params.index === undefined || params.index === null ? -1 : params.index;
   if (!Number.isInteger(index) || index < -1) {
     return fail(ERR_PRECONDITION_FAILED, "move_tab index must be an integer >= -1");
@@ -534,6 +643,10 @@ async function moveTab(params, nowFn, map) {
     tab = await chrome.tabs.get(tabId);
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${tabId}`);
+  }
+
+  if (extractToNew) {
+    return await extractTabToNewWindow(tab, nowFn, map);
   }
 
   // The SAME eligibility predicate merge_windows applies to its target (§9): a

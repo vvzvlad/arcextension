@@ -326,6 +326,55 @@ async def test_open_tab_sends_command(tmp_path):
     assert frame["command"] == protocol.CMD_OPEN_TAB and frame["params"]["url"] == "https://a"
 
 
+# --- #45: open_tab window as address + server cross-check --------------------
+async def test_open_tab_with_window_id_stamps_the_frame(tmp_path):
+    # Acceptance 1: a named window rides the frame as `windowId`, and when the extension
+    # answers with that same window the verb succeeds and echoes it.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.open_tab(app, instance="main", url="https://a", window_id=5, auth_ctx="s"),
+        cs, ws, {"tabId": 7, "windowId": 5},
+    )
+    assert frame["params"]["windowId"] == 5
+    assert out["ok"] is True and out["result"]["windowId"] == 5
+
+
+async def test_open_tab_window_id_mismatch_is_no_window(tmp_path):
+    # Acceptance 4: an OLD extension ignores the unknown `windowId` key, drops the tab in
+    # its OWN window and still answers ok. The server cross-check compares the reported
+    # windowId to the requested one and turns the miss into a loud `no_window`. Emulated
+    # by having the extension answer a DIFFERENT windowId than requested.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await _run_with_response(
+            lambda: tools.open_tab(app, instance="main", url="https://a", window_id=5),
+            cs, ws, {"tabId": 7, "windowId": 9},  # NOT the requested 5
+        )
+    assert ei.value.code == protocol.ERR_NO_WINDOW
+
+
+async def test_open_tab_without_window_id_omits_key_and_skips_cross_check(tmp_path):
+    # Acceptance 5 / compatibility: no window_id => the frame is exactly today's (no
+    # `windowId` key) and there is NO cross-check — the extension may report whatever
+    # window its §9 auto-select chose, and the verb still succeeds.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.open_tab(app, instance="main", url="https://a"),
+        cs, ws, {"tabId": 7, "windowId": 3},  # a window we never named — must NOT trip a check
+    )
+    assert "windowId" not in frame["params"]
+    assert out["ok"] is True
+
+
 async def test_close_and_focus_send_commands(tmp_path):
     db = await _make_db(tmp_path)
     reg = Registry()
@@ -367,6 +416,24 @@ async def test_move_tab_sends_the_command_and_omits_an_absent_index(tmp_path):
         cs, ws, {"tabId": 7, "windowId": 3, "index": 0},
     )
     assert frame2["params"] == {"tabId": 7, "windowId": 3, "index": 0}
+
+
+async def test_move_tab_null_window_extracts_into_a_new_window(tmp_path):
+    # #45 (acceptance 6, server half): window_id=None rides the frame verbatim as
+    # `windowId: null` — the extract-into-a-new-window address — and the created window's
+    # id comes back unchanged in the response. No `index` key: the new window's tab is its
+    # only one and the extension owns the default.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.move_tab(app, instance="main", tab_id=7, window_id=None, auth_ctx="s"),
+        cs, ws, {"tabId": 7, "windowId": 500, "index": 0},
+    )
+    assert frame["command"] == protocol.CMD_MOVE_TAB
+    assert frame["params"] == {"tabId": 7, "windowId": None}  # null on the wire, no index
+    assert out["ok"] is True and out["result"]["windowId"] == 500
 
 
 async def test_move_tab_surfaces_the_pinned_refusal_as_its_own_code(tmp_path):

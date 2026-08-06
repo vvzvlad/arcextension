@@ -226,6 +226,36 @@ async def test_phase_a_opens_copy_and_writes_relocate(tmp_path):
         await db.close()
 
 
+# --- #45 regression: the curator's open_tab frame NEVER names a window --------
+async def test_phase_a_open_tab_frame_carries_no_window_id(tmp_path):
+    """#45 acceptance 10: window addressing is an MCP-only feature. The curator's own
+    pass must issue the SAME ``open_tab`` frame as before — no ``windowId`` key — so the
+    extension's deterministic §9 auto-select (and its vanished-window retry) is untouched.
+    Slip a ``windowId`` into phase A's frame and this reddens."""
+    db = await _mkdb(tmp_path)
+    try:
+        await _seed_rule(db, "grafana.lc", "prox")
+        ext = Ext(db)
+        await ext.add_instance("main", tabs=[_tabinfo(20, "https://grafana.lc/d/x")])
+        await ext.add_instance("prox", tabs=[])
+
+        seen_open_params = []
+
+        def respond(iid, cmd, params):
+            if cmd == protocol.CMD_OPEN_TAB:
+                seen_open_params.append(params)
+                return {"ok": True, "result": {"tabId": ext.next_open_id(), "windowId": 1}}
+            return {"ok": True, "result": {}}
+        ext.responder = respond
+
+        res = await ext.run_pass()
+        assert res["status"] == "ok"
+        assert seen_open_params, "phase A never issued an open_tab frame"
+        assert all("windowId" not in p for p in seen_open_params)
+    finally:
+        await db.close()
+
+
 # --- passes row on an empty pass --------------------------------------------
 async def test_passes_row_written_on_empty_pass(tmp_path):
     db = await _mkdb(tmp_path)

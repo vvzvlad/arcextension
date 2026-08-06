@@ -173,11 +173,21 @@ def build_mcp(app_ref) -> MCPServer:
     # unprotected, exactly as before (fail-open by design).
     @mcp.tool()
     async def open_tab(instance: str, url: str, pinned: bool = False, active: bool = False,
+                       window_id: int | None = None,
                        expected_session: str | None = None) -> dict:
-        """Open a tab in an instance (§6)."""
+        """Open a tab in an instance (§6).
+
+        ``window_id`` optionally names the destination window (#45): omit it and the
+        extension auto-selects the §9 window (today's behaviour); give it and the tab is
+        opened in THAT window, refused with ``no_window`` if it is not a normal,
+        non-fullscreen window or has vanished. A server-side cross-check turns an OLD
+        extension that ignores the key (dropping the tab in its own window) into the same
+        loud ``no_window``.
+        """
         return await _guarded(tools.open_tab(
             _host(), instance=instance, url=url, pinned=pinned, active=active,
-            auth_ctx=current_mcp_session(), expected_session=expected_session,
+            window_id=window_id, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
         ))
 
     @mcp.tool()
@@ -200,14 +210,16 @@ def build_mcp(app_ref) -> MCPServer:
 
     @mcp.tool()
     async def move_tab(
-        instance: str, tab_id: int, window_id: int, index: int | None = None,
+        instance: str, tab_id: int, window_id: int | None, index: int | None = None,
         expected_session: str | None = None,
     ) -> dict:
         """Move a tab to a window/position inside one browser; omit index for the end.
 
-        Refuses with ``pinned_cross_window`` when the tab is pinned and the move would
-        leave its window (§9), and with ``no_window`` when the target is not a normal,
-        non-fullscreen window.
+        Pass ``window_id=null`` to EXTRACT the tab into a brand-new background window
+        (#45); the response ``windowId`` is then the created window's id. Refuses with
+        ``pinned_cross_window`` when the tab is pinned and the move would leave its window
+        (§9, including the new-window case), and with ``no_window`` when a NAMED target is
+        not a normal, non-fullscreen window.
         """
         return await _guarded(tools.move_tab(
             _host(), instance=instance, tab_id=tab_id, window_id=window_id,

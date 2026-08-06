@@ -223,6 +223,20 @@ export function createChromeMock(opts = {}) {
           state: props.state || "normal",
           focused: !!props.focused,
         };
+        // windows.create({tabId}) MOVES an existing tab into the new window (#45's
+        // move_tab extract-to-new path) — no new tab id. It goes down the same Chromium
+        // cross-window path as tabs.move, so it strips `pinned`, and throws "No tab with
+        // id" for a tab that vanished. Modelled here so the command can be exercised end
+        // to end.
+        if (props.tabId !== undefined && props.tabId !== null) {
+          const moved = state.tabs.find((t) => t.id === props.tabId);
+          if (!moved) throw new Error(`No tab with id: ${props.tabId}.`);
+          moved.windowId = id;
+          moved.pinned = false; // cross-window create resets pinned
+          moved.index = 0; // sole tab of the fresh window
+          state.windows.push(win);
+          return { ...win, tabs: [{ ...moved }] };
+        }
         state.windows.push(win);
         const tab = props.url
           ? {
