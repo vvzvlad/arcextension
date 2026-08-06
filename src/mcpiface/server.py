@@ -251,11 +251,16 @@ def build_mcp(app_ref) -> MCPServer:
     @mcp.tool()
     async def relocate_tab(instance_from: str, tab_id: int, instance_to: str,
                            expected_session_from: str | None = None) -> dict:
-        """Relocate a tab: phase-A open + a relocate row the pass's phase B completes (§7).
+        """Relocate a tab, completed synchronously in ONE call (#48): open the copy in the
+        target and close the source under §7's step-4 guards. Returns ``status:"done"`` on
+        success, or ``status:"half"`` (with a ``reason``) when the source close cannot be
+        completed — today's phase-A-only outcome, which the pass's phase B finishes later.
+        ``undo_pass_id`` (``mcp-<uuid>``) reverses the whole relocation.
 
-        ``expected_session_from`` pins the SOURCE epoch only (#47): a restarted source
-        browser refuses the relocation before any copy is opened. The target open is never
-        session-pinned — a copy in a restarted target is correct, not dangerous.
+        ``expected_session_from`` pins the SOURCE epoch (#47): a restarted source browser
+        refuses the relocation before any copy is opened, and the same epoch is stamped on
+        the synchronous source close. The target open/get_tab are never session-pinned — a
+        copy in a restarted target is correct, not dangerous.
         """
         return await _guarded(tools.relocate_tab(
             _host(), instance_from=instance_from, tab_id=tab_id, instance_to=instance_to,

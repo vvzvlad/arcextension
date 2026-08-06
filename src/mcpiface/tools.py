@@ -12,7 +12,9 @@ command, pass or pause logic — the handlers only call the reused functions:
   just refreshed rather than one of arbitrary age
 * rules CRUD + the SAME ``confirm_impact`` gate -> :mod:`src.api.rules`
 * commands  -> :func:`src.ext.commands.send_command` (``initiator='mcp'`` + ``auth_ctx``)
-* relocate  -> phase-A open + a live ``relocate`` row the pass's phase B completes
+* relocate  -> BOTH phases synchronously (#48): open the copy, then close the source
+  under the step-4 guards; degrades to today's phase-A-only ``half`` when the source
+  close cannot be completed (the pass's phase B / reconcile finishes it later)
 * run_pass  -> :func:`src.curator.runner.run_pass`
 * pause     -> :mod:`src.curator.pause` (settings write + ``lease.bump_epoch``)
 
@@ -27,6 +29,7 @@ import asyncio
 import time
 from collections import Counter
 from types import SimpleNamespace
+from uuid import uuid4
 
 from starlette.exceptions import HTTPException
 
@@ -38,7 +41,7 @@ from src.api.freshness import ERROR, ensure_fresh
 from src.curator import pause as pause_ops
 from src.curator import runner
 from src.db import state as state_read
-from src.db.actions import insert_action, normalize_url
+from src.db.actions import insert_action, normalize_url, set_action_status
 from src.db.settings_store import get_setting
 from src.ext import protocol
 from src.ext.commands import CommandError, send_command
@@ -571,30 +574,43 @@ async def execute_js(app, *, instance: str, tab_id: int, code: str,
     return {"ok": True, "result": result}
 
 
-# --- relocate: phase-A open + a live relocate row (§7 two-phase, §11) --------
+# --- relocate: synchronous open + guarded source close in one call (#48, §11) ---
 def _read_relocate_inputs(instance_from: str, tab_id: int, instance_to: str):
-    """Reader ``fn(conn)``: the source tab row + both instances' current sessions.
+    """Reader ``fn(conn)``: the source tab row (incl. pinned/audible/active), both
+    instances' current sessions, and the SOURCE instance's focused window id.
 
-    Returns ``(tab, session_from, session_to)`` where ``tab`` is the source tabs row
-    (or None). The sessions come from the ``instances`` mirror; the caller prefers a
-    live ``ConnState`` session when one exists (same order phase A uses)."""
+    Returns ``(tab, session_from, session_to, focused_window_id_from)`` where ``tab`` is
+    the source tabs row (or None). The sessions come from the ``instances`` mirror; the
+    caller prefers a live ``ConnState`` session when one exists (same order phase A uses).
+    ``pinned`` / ``audible`` / ``active`` and ``focused_window_id_from`` are read (#48) so
+    the caller can refuse a source that phase B's step-4 close guards could never close —
+    BEFORE it opens an un-closeable copy."""
     import sqlite3
 
     def _fn(conn: sqlite3.Connection):
         conn.row_factory = sqlite3.Row
         tab = conn.execute(
             "SELECT instance_id, tab_id, window_id, url, title, opened_at, "
-            "last_active_at, age_unknown FROM tabs WHERE instance_id = ? AND tab_id = ?",
+            "last_active_at, age_unknown, pinned, audible, active "
+            "FROM tabs WHERE instance_id = ? AND tab_id = ?",
             (instance_from, tab_id),
         ).fetchone()
-        sessions = {
-            r["id"]: r["session_id"]
+        rows = {
+            r["id"]: r
             for r in conn.execute(
-                "SELECT id, session_id FROM instances WHERE id IN (?, ?)",
+                "SELECT id, session_id, focused_window_id FROM instances "
+                "WHERE id IN (?, ?)",
                 (instance_from, instance_to),
             ).fetchall()
         }
-        return tab, sessions.get(instance_from), sessions.get(instance_to)
+        src = rows.get(instance_from)
+        dst = rows.get(instance_to)
+        return (
+            tab,
+            src["session_id"] if src is not None else None,
+            dst["session_id"] if dst is not None else None,
+            src["focused_window_id"] if src is not None else None,
+        )
 
     return _fn
 
@@ -602,22 +618,32 @@ def _read_relocate_inputs(instance_from: str, tab_id: int, instance_to: str):
 async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str,
                        auth_ctx: str | None = None,
                        expected_session_from: str | None = None) -> dict:
-    """MCP-initiated relocation: do phase A (open the copy in the target) and write a
-    live ``relocate`` row (``kind='relocate'``, ``status='done'``, ``initiator='mcp'``)
-    so the NEXT curator pass's phase B closes the source under §7's full close guards
-    (idle / not-pinned / not-audible / not active-in-focus / survivor still present).
+    """MCP-initiated relocation, completed SYNCHRONOUSLY in one call (#48).
 
-    A one-shot move that closed the source here would skip those guards (§11) — so
-    this deliberately does ONLY phase A. The source is untouched until the guarded
-    phase B. Reuses the copy-tab writer and the actions writer; no lease/epoch (an
-    MCP verb is not a pass), no quarantine strike (that is a pass-internal latch)."""
-    await _ensure_not_paused(app)
+    The MCP verb now attempts BOTH phases: phase A opens the copy in the target and
+    writes the live ``relocate`` row, and — new here — a synchronous phase B closes the
+    source under §7's step-4 volatile close guards. It walks this state machine:
+
+    * ``opening``  — the guards pass and the copy is opened;
+    * ``closing``  — the copy is open, the rows are written, the source close is sent;
+    * ``done``     — the source closed: the pair ``relocate``(done) + ``relocate_close``
+      (done) is journalled and the source mirror row is removed;
+    * ``half``     — the copy is open but the source close could not be completed
+      (precondition / uncertain / copy vanished): this is TODAY'S normal state, NOT an
+      error — the source is left alive and the pass's phase B / reconcile finishes it
+      later. The synchronous path degrades to exactly what phase-A-only used to do.
+
+    The curator pass stays two-phase; nothing in ``src/curator/`` changes. Undo works
+    through a synthetic ``pass_id`` (``mcp-<uuid>``) stamped on both halves and returned
+    as ``undo_pass_id`` — no ``passes`` row is written, so metrics and ``_read_last_pass``
+    never see it and a double undo is safe (``restored_at`` → ``already_undone``)."""
+    await _ensure_not_paused(app)  # guard 1: the stop switch — a paused curator refuses.
     db, registry = app.state.db, app.state.ext_registry
 
-    tab, db_session_from, db_session_to = await db.read(
+    tab, db_session_from, db_session_to, focused_window_id_from = await db.read(
         _read_relocate_inputs(instance_from, tab_id, instance_to)
     )
-    if tab is None:
+    if tab is None:  # guard 2: the tab must be in the mirror.
         raise ToolError("no_such_tab", f"no mirrored tab {tab_id} on {instance_from}")
 
     # Prefer the live ConnState session (freshest), fall back to the mirror — the
@@ -628,24 +654,44 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
     session_from = cs_from.session_id if cs_from is not None else db_session_from
     session_to = cs_to.session_id if cs_to is not None else db_session_to
 
-    # #47 session epoch — SOURCE side only. Unlike the direct verbs there is no source
-    # command to stamp here: relocate does ONLY phase A (the copy opens in the TARGET),
-    # and the source ``close_tab`` is the pass's deferred phase B. So the source guard is
-    # a pre-check on the source session, BEFORE phase A opens any copy — a mismatch means
-    # the source browser has restarted since the agent read the session, its ``tab_id`` is
-    # from a dead epoch, and relocating it would copy a stale tab and later close the wrong
-    # one. Refuse with ``stale_session`` and touch nothing (no copy, no relocate row).
-    #
-    # The recorded ``session_id_from`` (below) still carries this epoch onto the relocate
-    # row, so if the source flips AFTER this check the pass's own mirror.py liveness rule
-    # (``src.session_id == session_id_from``) refuses phase B — the source close is
-    # protected end-to-end without touching src/curator/. The TARGET open gets NO expected
-    # session on purpose: opening a copy in a restarted target is correct, not dangerous.
+    # guard 3, #47 session epoch — SOURCE side. A pre-check BEFORE phase A opens any copy:
+    # a mismatch means the source browser has restarted since the agent read the session,
+    # its ``tab_id`` is from a dead epoch, and relocating it would copy a stale tab and
+    # later close the wrong one. Refuse with ``stale_session`` and touch nothing. The
+    # recorded ``session_id_from`` still carries this epoch onto the relocate row, and the
+    # synchronous source close below STAMPS ``expected_session_from`` (see step 6) so a
+    # source restart AFTER this check is refused by the extension edge, not acted on.
     if expected_session_from is not None and expected_session_from != session_from:
         raise ToolError(
             protocol.ERR_STALE_SESSION,
             f"source session for {instance_from} is not {expected_session_from!r} "
             "(the source browser restarted); relocation refused",
+        )
+
+    # guard 4 (#48): a pinned / audible / active-in-focused-window source can NEVER be
+    # closed by phase B's step-4 close guards (notPinned / notAudible / not-active-in-
+    # focus). Opening the copy first and only THEN discovering the source is un-closeable
+    # would leave the copy live and strike the source pair toward quarantine on every
+    # refused close. Refuse BEFORE ``open_tab`` — nothing is opened, nothing written.
+    if tab["pinned"]:
+        raise ToolError(
+            protocol.ERR_PRECONDITION_FAILED,
+            f"source tab {tab_id} on {instance_from} is pinned; not relocatable",
+        )
+    if tab["audible"]:
+        raise ToolError(
+            protocol.ERR_PRECONDITION_FAILED,
+            f"source tab {tab_id} on {instance_from} is audible; not relocatable",
+        )
+    if (
+        tab["active"]
+        and tab["window_id"] is not None
+        and tab["window_id"] == focused_window_id_from
+    ):
+        raise ToolError(
+            protocol.ERR_PRECONDITION_FAILED,
+            f"source tab {tab_id} on {instance_from} is active in the focused window; "
+            "not relocatable",
         )
 
     now = _now_ms()
@@ -654,7 +700,7 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
     seed_age_ms = now - tab["last_active_at"]
     seed_opened_ago_ms = now - tab["opened_at"]
 
-    # Phase A: open the copy in the target (async, outside any txn).
+    # step 2: phase A — open the copy in the target (async, outside any txn).
     result = await _command(
         app, instance_to, protocol.CMD_OPEN_TAB,
         {
@@ -673,6 +719,11 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
             "open_failed", f"open_tab returned no integer tabId ({tab_id_to!r})"
         )
 
+    # The synthetic pass id (#48) — ONE per verb call, generated BEFORE the insert (never
+    # from lastrowid) and stamped on BOTH halves so ``undo_pass`` reaches the pair via
+    # ``_read_pass_actions``.
+    pass_id = f"mcp-{uuid4()}"
+
     # The seed clocks the copy inherits from the source (so it is not "younger" for
     # dedup/idle/singleton), mirroring phase A's copy-tab row.
     seed = SimpleNamespace(
@@ -680,7 +731,19 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
         last_active_at=tab["last_active_at"], age_unknown=tab["age_unknown"],
     )
 
-    def _write(conn):
+    # steps 3+4: ONE transaction — the copy's mirror row + the live ``relocate``(done)
+    # row + the ``relocate_close``(pending) marker. These are written TOGETHER (not in two
+    # commits) on purpose: ``load_mirror`` treats a ``relocate`` with no done/pending
+    # relocate_close as a LIVE phase-B candidate (mirror.py), so a relocate committed
+    # WITHOUT its pending marker — even for one await tick — would let a concurrent pass
+    # (passes are not serialized against MCP verbs) capture that mirror and issue its own
+    # source close, racing this verb's step-6 close. The pending marker is phase B's
+    # at-least-once pattern: written BEFORE the browser close so a crash between a
+    # successful close and the completion write never leaves the source closed with no
+    # journal row. A concurrent pass's reconcile will not touch this pending row while the
+    # verb may still be awaiting the close — ``read_pending_closes`` skips rows younger
+    # than the open+get_tab+close round-trip budget.
+    def _write_pair(conn):
         # Reuse phase A's copy-tab UPSERT so the copy's mirror row is identical.
         from src.curator.phases import _insert_copy_tab
 
@@ -688,8 +751,9 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
             conn, instance_id=instance_to, tab_id=tab_id_to, window_id=window_id_to,
             tab=seed, now=now,
         )
-        return insert_action(
+        relocate_id = insert_action(
             conn, ts=now, kind="relocate", status="done", initiator="mcp",
+            pass_id=pass_id,
             instance_from=instance_from, instance_to=instance_to,
             tab_id=tab["tab_id"], session_id_from=session_from,
             tab_id_to=tab_id_to, session_id_to=session_to,
@@ -698,12 +762,95 @@ async def relocate_tab(app, *, instance_from: str, tab_id: int, instance_to: str
             src_age_unknown=tab["age_unknown"],
             url=url, url_norm=url_norm, title=tab["title"], pinned=0,
         )
+        close_id = insert_action(
+            conn, ts=now, kind="relocate_close", status="pending", initiator="mcp",
+            pass_id=pass_id, origin_action_id=relocate_id,
+            instance_from=instance_from, instance_to=instance_to,
+            tab_id=tab["tab_id"], session_id_from=session_from,
+            tab_id_to=tab_id_to, session_id_to=session_to,
+            url=url, url_norm=url_norm, title=tab["title"],
+        )
+        return relocate_id, close_id
 
-    action_id = await db.write(_write)
-    return {
+    action_id, pending_id = await db.write(_write_pair)
+    base = {
         "ok": True, "action_id": action_id, "tab_id_to": tab_id_to,
-        "instance_to": instance_to,
+        "instance_to": instance_to, "undo_pass_id": pass_id,
     }
+
+    # step 5: COPY CHECK — the copy must still exist before we close the source. A target
+    # restart in the window between the open and now would have destroyed the copy;
+    # closing the source then loses the tab irrecoverably. ``get_tab`` to the TARGET (no
+    # ``expected_session`` — reading a restarted target is fine). ``no_such_tab`` ⇒
+    # degrade to ``half`` (``copy_gone``), source untouched. The leftover ``pending``
+    # relocate_close is resolved by a later pass's reconcile (source present ⇒ abandoned;
+    # the relocate then re-enters ``live_relocations`` and phase B abandons it once its own
+    # ``get_tab`` also finds the copy gone) — self-healing, never a closed source.
+    try:
+        await _command(
+            app, instance_to, protocol.CMD_GET_TAB, {"tabId": tab_id_to},
+            auth_ctx=auth_ctx,
+        )
+    except ToolError as exc:
+        reason = "copy_gone" if exc.code == protocol.ERR_NO_SUCH_TAB else exc.code
+        return {**base, "status": "half", "reason": reason}
+
+    # step 6: close the SOURCE with the step-4 volatile guards — url / notAudible /
+    # notPinned — but deliberately NO ``minIdleMs``. The idle threshold protects AUTOMATION
+    # from a tab a human is using; here the agent explicitly chose this tab, and minIdleMs
+    # would refuse exactly the tab it asked to move (today's MCP close sends no ``expect``
+    # at all, so this is a tightening). ``expected_session_from`` (#47) is stamped so a
+    # source restart between the guard-3 pre-check and here is refused (``stale_session``)
+    # by the extension edge instead of closing the wrong tab.
+    expect = {"url": url, "notAudible": True, "notPinned": True}
+    try:
+        await _command(
+            app, instance_from, protocol.CMD_CLOSE_TAB,
+            {"tabId": tab["tab_id"], "expect": expect},
+            auth_ctx=auth_ctx, expected_session=expected_session_from,
+        )
+    except ToolError as exc:
+        if exc.code == protocol.ERR_PRECONDITION_FAILED:
+            # The source turned pinned/audible/active — it did NOT close. Fail the pending
+            # row; the relocation stays a live ``half`` and the pass's phase B retries it
+            # (a FAILED relocate_close does not retire the relocate row, mirror.py).
+            await db.write(
+                lambda c: set_action_status(c, pending_id, "failed", reason=exc.code)
+            )
+            return {**base, "status": "half", "reason": exc.code}
+        if exc.code == protocol.ERR_NO_SUCH_TAB:
+            # The source is already gone (someone closed it): the goal is reached.
+            # Complete the relocation — pending → done — and drop the stale source row so
+            # it is not left live.
+            def _done_gone(conn):
+                set_action_status(
+                    conn, pending_id, "done", reason=protocol.ERR_NO_SUCH_TAB
+                )
+                _delete_source_tab(conn, instance_from, tab["tab_id"])
+
+            await db.write(_done_gone)
+            return {**base, "status": "done"}
+        # Connection-class (no_connection / timeout) or a stale-session refusal: the close
+        # is UNCERTAIN or did not happen. Leave the ``pending`` row for the next pass's
+        # reconcile and report ``half`` with the code.
+        return {**base, "status": "half", "reason": exc.code}
+
+    # The source closed => complete: pending → done, drop the source mirror row.
+    def _done(conn):
+        set_action_status(conn, pending_id, "done")
+        _delete_source_tab(conn, instance_from, tab["tab_id"])
+
+    await db.write(_done)
+    return {**base, "status": "done"}
+
+
+def _delete_source_tab(conn, instance_id: str, tab_id: int) -> None:
+    """Drop the closed source tab from the mirror so the verb's own view is consistent
+    at once (the next snapshot would remove it anyway). Mirrors the pass's ``_delete_tab``.
+    """
+    conn.execute(
+        "DELETE FROM tabs WHERE instance_id = ? AND tab_id = ?", (instance_id, tab_id)
+    )
 
 
 # --- pass + pause ------------------------------------------------------------

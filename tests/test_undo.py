@@ -531,6 +531,98 @@ def test_undo_pass_with_both_halves_reverses_once(tmp_path):
             ws_src.__exit__(None, None, None)
 
 
+# --- #48: a synchronous MCP relocation is undoable by its mcp- pass_id -------
+def _seed_sync_reloc_pair(db_path, pass_id):
+    """Seed the exact pair the synchronous relocate_tab verb (#48) writes: relocate(done)
+    + relocate_close(done) under a synthetic ``mcp-<uuid>`` pass_id, linked by
+    origin_action_id, and DELIBERATELY no ``passes`` row."""
+    reloc = _seed_action(
+        db_path, ts=1_000_000, pass_id=pass_id, kind="relocate", status="done",
+        initiator="mcp", instance_from="src", instance_to="dst", tab_id=5,
+        session_id_from="sess-1", tab_id_to=77, session_id_to="sess-9",
+        url="https://a/b", url_norm="https://a/b",
+    )
+    _seed_action(
+        db_path, ts=1_000_001, pass_id=pass_id, kind="relocate_close", status="done",
+        initiator="mcp", origin_action_id=reloc, instance_from="src", instance_to="dst",
+        tab_id=5, session_id_from="sess-1", tab_id_to=77, session_id_to="sess-9",
+        url="https://a/b", url_norm="https://a/b",
+    )
+    return reloc
+
+
+def test_undo_sync_mcp_relocation_without_passes_row(tmp_path):
+    # Acceptance 3: undo by the mcp- pass_id (with confirm_impact) reopens the source and
+    # closes the copy — even though NO `passes` row exists for the synthetic id (undo finds
+    # the pair purely via _read_pass_actions; the 404 guard is satisfied by the rows).
+    app = create_app(_settings(tmp_path, cmd_timeout_ms=2000))
+    db_path = str(tmp_path / "curator.db")
+    pass_id = "mcp-11111111"
+    with TestClient(app) as client:
+        ws_src = _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=[])
+        ws_dst = _connect_fresh(client, db_path, instance_id="dst", session="sess-9", tabs=[])
+        try:
+            reloc = _seed_sync_reloc_pair(db_path, pass_id)
+            assert _db_row(db_path, "SELECT COUNT(*) FROM passes") == (0,)  # no passes row
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(lambda: client.post(
+                f"/api/passes/{pass_id}/undo", headers=AUTH, json={"confirm_impact": True}))
+            open_cmd = _recv(ws_src)
+            assert open_cmd["command"] == "open_tab"          # reopen the source
+            ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
+                              "result": {"tabId": 55, "windowId": 1}})
+            close_cmd = _recv(ws_dst)
+            assert close_cmd["command"] == "close_tab" and close_cmd["params"]["tabId"] == 77
+            ws_dst.send_json({"type": "response", "id": close_cmd["id"], "ok": True, "result": {}})
+            resp = fut.result(timeout=5)
+            assert resp.status_code == 200
+            body = resp.json()
+            # The pair is reversed as ONE unit (reverse-ts => the relocate_close half is the
+            # trigger; the relocate half is skipped as paired_already_undone).
+            assert body["counts"]["reopened"] == 1 and body["counts"]["copies_closed"] == 1
+            done = next(r for r in body["results"] if r.get("reopened"))
+            assert done["relocate_id"] == reloc and done["copy_closed"] is True
+            assert _db_row(db_path, "SELECT restored_at FROM actions WHERE id=?", (reloc,))[0] is not None
+            assert _db_row(db_path, "SELECT COUNT(*) FROM passes") == (0,)  # never invented
+        finally:
+            ws_dst.__exit__(None, None, None)
+            ws_src.__exit__(None, None, None)
+
+
+def test_undo_sync_mcp_relocation_double_undo_already_undone(tmp_path):
+    # Acceptance 4: a SECOND undo of the same mcp- pass reverses nothing — both halves
+    # carry restored_at and are reported already_undone (idempotent, §10). Impact is 0 the
+    # second time, so the confirm gate does not fire and no frame leaves.
+    app = create_app(_settings(tmp_path, cmd_timeout_ms=2000))
+    db_path = str(tmp_path / "curator.db")
+    pass_id = "mcp-22222222"
+    with TestClient(app) as client:
+        ws_src = _connect_fresh(client, db_path, instance_id="src", session="sess-1", tabs=[])
+        ws_dst = _connect_fresh(client, db_path, instance_id="dst", session="sess-9", tabs=[])
+        try:
+            reloc = _seed_sync_reloc_pair(db_path, pass_id)
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(lambda: client.post(
+                f"/api/passes/{pass_id}/undo", headers=AUTH, json={"confirm_impact": True}))
+            open_cmd = _recv(ws_src)
+            ws_src.send_json({"type": "response", "id": open_cmd["id"], "ok": True,
+                              "result": {"tabId": 55, "windowId": 1}})
+            close_cmd = _recv(ws_dst)
+            ws_dst.send_json({"type": "response", "id": close_cmd["id"], "ok": True, "result": {}})
+            assert fut.result(timeout=5).status_code == 200
+            # Second undo: nothing reversible, no confirm needed, no socket traffic.
+            resp2 = client.post(f"/api/passes/{pass_id}/undo", headers=AUTH)
+            assert resp2.status_code == 200
+            body = resp2.json()
+            assert body["results"] == []
+            reasons = {s["action_id"]: s["reason"] for s in body["skipped"]}
+            assert reasons.get(reloc) == "already_undone"
+            assert body["counts"]["reopened"] == 0
+        finally:
+            ws_dst.__exit__(None, None, None)
+            ws_src.__exit__(None, None, None)
+
+
 # --- the copy close is JOURNALED, at-least-once (Фаза 16 discipline) --------
 def test_undo_copy_close_is_journaled_pending_then_done(tmp_path):
     """Until now this was the ONLY close in the system performed outside the journal:

@@ -644,7 +644,12 @@ async def test_phase_b_lease_lost_before_completion_pending_survives_then_reconc
         ext.tabs["main"] = []
         _expire_lease_raw(db.db_path)  # let the next pass acquire (pass 1 left it held)
 
-        res2 = await ext.run_pass()
+        # The reconcile grace (#48: read_pending_closes skips rows younger than one
+        # cmd_timeout_ms, so a synchronous relocate_tab still awaiting its close is not
+        # reconciled underneath it) means the pending row is only reconcilable once it is
+        # older than cmd_timeout_ms. A real next pass is pass_interval_min (minutes) later
+        # — here the two passes fire back-to-back, so advance the clock past the grace.
+        res2 = await ext.run_pass(now=runner._now_ms() + 60_000)
         assert res2["status"] == "ok"
         # Reconcile flipped the pending → done: the journal hole is closed at-least-once.
         rc2 = await _rows(db, "SELECT status, tab_id FROM actions WHERE kind='relocate_close'")

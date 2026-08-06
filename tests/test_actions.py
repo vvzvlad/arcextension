@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from src.db.access import Database
-from src.db.actions import insert_action, normalize_url
+from src.db.actions import insert_action, normalize_url, read_pending_closes
 
 
 def test_normalize_url_strips_query_and_fragment():
@@ -109,5 +109,32 @@ async def test_insert_action_validates_enums(tmp_path):
                 )
             )
             assert isinstance(aid, int)
+    finally:
+        await db.close()
+
+
+async def test_read_pending_closes_grace_excludes_in_flight_rows(tmp_path):
+    # Acceptance 10 (#48): the synchronous relocate_tab verb writes a `pending`
+    # relocate_close BEFORE its open_tab/get_tab/close round-trips, so a pass firing INSIDE
+    # that command window must not reconcile the row (a second close / a phantom abandon).
+    # The `ts < now - 3*cmd_timeout_ms` grace enforces it: the row's ts is stamped before
+    # open (≤1×), get_tab (≤1×) and the source close (≤1×), so a sender may still be in
+    # flight up to 3× a command timeout; only a row older than that is reconcilable.
+    db = await _make_db(tmp_path)
+    try:
+        now = 10_000_000
+        cmd_timeout_ms = 20_000  # 3x = 60_000
+        # IN-FLIGHT: 2x old — the source close may still be unsent (open+get_tab pending).
+        fresh = await db.write(lambda c: insert_action(
+            c, ts=now - 40_000, kind="relocate_close", status="pending", initiator="mcp",
+            instance_from="themed", tab_id=5, url="https://a/b", url_norm="https://a/b"))
+        # AGED OUT: older than the full 3x budget — no sender can still be in flight.
+        stale = await db.write(lambda c: insert_action(
+            c, ts=now - 70_000, kind="relocate_close", status="pending", initiator="mcp",
+            instance_from="themed", tab_id=6, url="https://a/c", url_norm="https://a/c"))
+        rows = await db.read(lambda c: read_pending_closes(
+            c, now=now, cmd_timeout_ms=cmd_timeout_ms))
+        ids = {r["id"] for r in rows}
+        assert stale in ids and fresh not in ids  # only the aged-out row is reconcilable
     finally:
         await db.close()

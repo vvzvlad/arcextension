@@ -228,21 +228,42 @@ def set_action_status(
         )
 
 
-def read_pending_closes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Read every ``pending`` close row for the pass's reconcile step (Фаза 16).
+def read_pending_closes(
+    conn: sqlite3.Connection, *, now: int, cmd_timeout_ms: int
+) -> list[sqlite3.Row]:
+    """Read the prior-pass ``pending`` close rows the reconcile step may resolve — those
+    OLDER than one command timeout — for the pass's reconcile step (Фаза 16).
 
-    Returns the ``*_close`` rows (relocate_close / dedupe_close / singleton_close)
-    left ``pending`` by a prior pass — a close whose browser ``close_tab`` succeeded
-    (or is uncertain) but whose completion write was fenced by a lost lease. The
-    reconcile step (runner, before decide) resolves each against the fresh mirror.
-    Runs before any of THIS pass's own pending writes, so every row it returns is
-    necessarily prior-pass and safe to reconcile."""
+    Returns the ``*_close`` rows (relocate_close / dedupe_close / singleton_close) left
+    ``pending`` by a close whose browser ``close_tab`` succeeded (or is uncertain) but
+    whose completion write was fenced by a lost lease. The reconcile step (runner, before
+    decide) resolves each against the fresh mirror.
+
+    **The ``ts < now - 3*cmd_timeout_ms`` GRACE is load-bearing (issue #48).** The old
+    invariant was "this runs before any of THIS pass's own pending writes, so every row it
+    returns is necessarily prior-pass and safe to reconcile". That held while the pass was
+    the ONLY writer of pending closes. It stopped holding when the synchronous
+    ``relocate_tab`` MCP verb became a SECOND writer: that verb records a ``pending``
+    relocate_close and is STILL AWAITING the source ``close_tab`` response when a
+    concurrent pass could run its reconcile. Resolving such a row off the mirror would
+    either mark it ``abandoned`` (a second close then races the verb's own) or ``done`` (a
+    phantom completion) while its real close has not even landed. The grace restores the
+    invariant a different way, over the verb's FULL in-flight budget: the pending row's
+    ``ts`` is stamped before the verb's ``open_tab`` (≤1×), ``get_tab`` (≤1×) and the
+    source ``close_tab`` (≤1×), so a live sender may still be awaiting the close up to
+    ``ts + 3*cmd_timeout_ms``. A row younger than that is left for a later pass; once it is
+    older, no sender can still be in flight (every round-trip has resolved or timed out),
+    so it is safe to reconcile. A lease-fenced pass's own leftover row is always far older
+    than 3× a command timeout by the next pass (passes are ``PASS_INTERVAL_MIN`` apart), so
+    nothing that used to be reconciled is now missed."""
     conn.row_factory = sqlite3.Row
     return conn.execute(
         "SELECT id, kind, pass_id, instance_from, instance_to, tab_id, "
         "session_id_from, url, url_norm FROM actions "
         "WHERE status = 'pending' "
-        "AND kind IN ('relocate_close', 'dedupe_close', 'singleton_close')"
+        "AND kind IN ('relocate_close', 'dedupe_close', 'singleton_close') "
+        "AND ts < ?",
+        (now - 3 * cmd_timeout_ms,),
     ).fetchall()
 
 

@@ -86,28 +86,62 @@ async def _run_with_response(coro_factory, cs, ws, response_result):
     return await task, frame
 
 
-async def _insert_instance(db, iid, *, session_id=None, snapshot_at=None, connected=0):
+async def _insert_instance(db, iid, *, session_id=None, snapshot_at=None, connected=0,
+                           focused_window_id=None):
     def _w(c):
         c.execute(
-            "INSERT INTO instances (id, connected, session_id, snapshot_at, status) "
-            "VALUES (?, ?, ?, ?, 'active')",
-            (iid, connected, session_id, snapshot_at),
+            "INSERT INTO instances (id, connected, session_id, snapshot_at, "
+            "focused_window_id, status) VALUES (?, ?, ?, ?, ?, 'active')",
+            (iid, connected, session_id, snapshot_at, focused_window_id),
         )
     await db.write(_w)
 
 
 async def _insert_tab(db, iid, tab_id, *, url, title="t", opened_at=1000,
                       last_active_at=1000, age_unknown=0, now=2000, window_id=1,
-                      fav_icon_url=None):
+                      fav_icon_url=None, pinned=0, audible=0, active=0):
     def _w(c):
         c.execute(
             "INSERT INTO tabs (instance_id, tab_id, window_id, url, title, fav_icon_url, "
-            "opened_at, last_active_at, age_unknown, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (iid, tab_id, window_id, url, title, fav_icon_url, opened_at,
-             last_active_at, age_unknown, now),
+            "pinned, active, audible, opened_at, last_active_at, age_unknown, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (iid, tab_id, window_id, url, title, fav_icon_url, pinned, active, audible,
+             opened_at, last_active_at, age_unknown, now),
         )
     await db.write(_w)
+
+
+async def _drive(coro_factory, conns, responder, *, timeout=5.0):
+    """Run a MULTI-command handler (e.g. the synchronous relocate_tab, #48), answering
+    every frame on whichever instance socket it lands on until the handler returns.
+
+    ``conns`` maps instance_id -> (ConnState, FakeWS). ``responder(instance, cmd, params)``
+    returns a result dict to answer ``ok:true`` OR ``("err", code)`` to refuse with that §6
+    code. Returns ``(handler_return_value, [(instance, frame), ...])``. Re-raises whatever
+    the handler raises (so a ``ToolError`` still surfaces to ``pytest.raises``)."""
+    import time as _t
+
+    seen = {iid: 0 for iid in conns}
+    frames = []
+    task = asyncio.create_task(coro_factory())
+    deadline = _t.monotonic() + timeout
+    while not task.done() and _t.monotonic() < deadline:
+        for iid, (cs, ws) in conns.items():
+            while len(ws.sent) > seen[iid]:
+                frame = ws.sent[seen[iid]]
+                seen[iid] += 1
+                frames.append((iid, frame))
+                verdict = responder(iid, frame["command"], frame.get("params", {}))
+                if isinstance(verdict, tuple) and verdict and verdict[0] == "err":
+                    resolve_response(cs, {"type": "response", "id": frame["id"],
+                                          "ok": False,
+                                          "error": {"code": verdict[1], "message": verdict[1]}})
+                else:
+                    resolve_response(cs, {"type": "response", "id": frame["id"],
+                                          "ok": True, "result": verdict or {}})
+        await asyncio.sleep(0.002)
+    out = await task
+    return out, frames
 
 
 async def _insert_window(db, iid, window_id, *, wtype="normal", state="normal"):
@@ -516,34 +550,86 @@ async def test_execute_js_refused_by_kill_switch_still_audited_and_not_sent(tmp_
     assert outcome == ("disabled", "mcp")
 
 
-# --- relocate_tab: phase-A open + live relocate row (initiator='mcp') --------
+# --- relocate_tab (#48): synchronous open + close in one call ----------------
+def _reloc_responder(open_id=99):
+    """A default extension responder for a synchronous relocate: open the copy with
+    ``open_id``, answer get_tab, and let the source close succeed."""
+    def _r(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            return {"tabId": open_id, "windowId": 1}
+        return {"ok": True}  # get_tab (copy check) + close_tab both succeed
+    return _r
+
+
 async def test_relocate_tab_writes_relocate_action_initiator_mcp(tmp_path):
+    # Acceptance 2: the synchronous verb journals the PAIR relocate(done) +
+    # relocate_close(done) — the close half linked via origin_action_id, both under ONE
+    # `mcp-` pass_id.
     db = await _make_db(tmp_path)
     await _insert_instance(db, "themed", session_id="s-themed")
     await _insert_instance(db, "main", session_id="s-main-db")
     await _insert_tab(db, "themed", 5, url="https://grafana/dash", opened_at=100, last_active_at=200)
     reg = Registry()
-    cs_to, ws = _put_conn(reg, "main", session_id="s-main-live")
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main-live")
     app = _app(db, reg)
 
-    out, frame = await _run_with_response(
-        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main",
-                                   auth_ctx="mcp-s"),
-        cs_to, ws, {"tabId": 99, "windowId": 1},
+    out, frames = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5,
+                                   instance_to="main", auth_ctx="mcp-s"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _reloc_responder(99),
     )
-    assert out["ok"] is True and out["tab_id_to"] == 99
-    assert frame["command"] == protocol.CMD_OPEN_TAB  # phase A opened the copy in target
+    assert out["ok"] is True and out["status"] == "done" and out["tab_id_to"] == 99
+    assert out["undo_pass_id"].startswith("mcp-")
+    # open_tab + get_tab to the target, close_tab to the source (three frames).
+    cmds = [(iid, f["command"]) for iid, f in frames]
+    assert cmds == [("main", protocol.CMD_OPEN_TAB), ("main", protocol.CMD_GET_TAB),
+                    ("themed", protocol.CMD_CLOSE_TAB)]
 
-    row = await db.read(lambda c: c.execute(
+    rows = await db.read(lambda c: c.execute(
         "SELECT kind, status, initiator, instance_from, instance_to, tab_id, tab_id_to, "
-        "session_id_from, session_id_to, url FROM actions"
-    ).fetchone())
-    assert row == ("relocate", "done", "mcp", "themed", "main", 5, 99,
-                   "s-themed", "s-main-live", "https://grafana/dash")
-    # The copy's mirror row exists in the target (so the pass's phase B can verify it).
-    copy = await db.read(lambda c: c.execute(
-        "SELECT url FROM tabs WHERE instance_id='main' AND tab_id=99").fetchone())
-    assert copy == ("https://grafana/dash",)
+        "session_id_from, session_id_to, origin_action_id, pass_id, url "
+        "FROM actions ORDER BY id"
+    ).fetchall())
+    reloc, close = rows
+    assert reloc[:9] == ("relocate", "done", "mcp", "themed", "main", 5, 99,
+                         "s-themed", "s-main-live")
+    assert close[:7] == ("relocate_close", "done", "mcp", "themed", "main", 5, 99)
+    assert close[9] == out["action_id"]            # origin_action_id -> the relocate row
+    assert reloc[10] == close[10] == out["undo_pass_id"]  # ONE mcp- pass_id for the pair
+    # The source mirror row is GONE (the sync close removed it); the copy stays in target.
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed'").fetchone()) == (0,)
+    assert await db.read(lambda c: c.execute(
+        "SELECT url FROM tabs WHERE instance_id='main' AND tab_id=99").fetchone()) == (
+        "https://grafana/dash",)
+
+
+async def test_relocate_tab_untouched_source_completes_done_and_leaves_source(tmp_path):
+    # Acceptance 1: an untouched tab relocates with status:"done"; list_tabs right after
+    # does not show it under the source instance.
+    db = await _make_db(tmp_path)
+    now = tools._now_ms()
+    await _insert_instance(db, "themed", session_id="s-themed", snapshot_at=now, connected=1)
+    await _insert_instance(db, "main", session_id="s-main", snapshot_at=now, connected=1)
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    out, _ = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5,
+                                   instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _reloc_responder(77),
+    )
+    assert out["status"] == "done"
+    # list_tabs freshens the fleet; answer any snapshot the freshen fires, then assert the
+    # source no longer lists tab 5.
+    lt = await tools.list_tabs(app, instance="themed")
+    assert [t["tab_id"] for t in lt["tabs"]] == []
 
 
 # --- #47 session epoch: session_id out + expected_session stamped ------------
@@ -685,29 +771,297 @@ async def test_relocate_tab_mismatched_expected_session_from_refuses(tmp_path):
 
 
 async def test_relocate_tab_matching_expected_session_from_proceeds(tmp_path):
-    # Pins the source guard as NON-vacuous: a MATCHING expected_session_from relocates
-    # exactly as an unpinned call would (phase A opens the copy, the relocate row is
-    # written with the pinned source epoch). The TARGET open carries NO expected session.
+    # Pins the source guard as NON-vacuous AND the #47 stamp on the sync source close: a
+    # MATCHING expected_session_from relocates fully. The TARGET open/get_tab carry the
+    # live target session; the SOURCE close STAMPS expected_session_from.
     db = await _make_db(tmp_path)
     await _insert_instance(db, "themed", session_id="s-themed")
     await _insert_instance(db, "main", session_id="s-main")
     await _insert_tab(db, "themed", 5, url="https://grafana/dash")
     reg = Registry()
-    cs_to, ws = _put_conn(reg, "main", session_id="s-main")
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
     app = _app(db, reg)
-    out, frame = await _run_with_response(
+    out, frames = await _drive(
         lambda: tools.relocate_tab(
             app, instance_from="themed", tab_id=5, instance_to="main",
             expected_session_from="s-themed",
         ),
-        cs_to, ws, {"tabId": 99, "windowId": 1},
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _reloc_responder(99),
     )
-    assert out["ok"] is True and out["tab_id_to"] == 99
+    assert out["ok"] is True and out["status"] == "done" and out["tab_id_to"] == 99
+    by_cmd = {(iid, f["command"]): f for iid, f in frames}
     # The target open stamped the LIVE target session, never expected_session_from.
-    assert frame["command"] == protocol.CMD_OPEN_TAB and frame["sessionId"] == "s-main"
+    assert by_cmd[("main", protocol.CMD_OPEN_TAB)]["sessionId"] == "s-main"
+    # The source close STAMPED expected_session_from (#47), NOT the live source session.
+    close = by_cmd[("themed", protocol.CMD_CLOSE_TAB)]
+    assert close["sessionId"] == "s-themed"
+    assert close["params"]["expect"] == {
+        "url": "https://grafana/dash", "notAudible": True, "notPinned": True,
+    }  # NO minIdleMs — the agent chose this tab (#48)
     row = await db.read(lambda c: c.execute(
         "SELECT session_id_from FROM actions WHERE kind='relocate'").fetchone())
     assert row == ("s-themed",)
+
+
+async def test_relocate_source_reconnect_after_precheck_stamps_the_passed_session(tmp_path):
+    # #47/#48 NON-VACUITY for the sync close stamp: guard-3 passes (expected == live source
+    # session), THEN the source browser reconnects with a NEW session BEFORE the close is
+    # sent. The close must stamp the epoch the agent PASSED (s-themed), NOT the now-live
+    # one — otherwise a tab_id from the dead epoch would be acted on. Unlike the matching
+    # test (where expected == live, so the two stamps are indistinguishable), this makes
+    # live != expected at close time: it reddens if the close stamps conn_state.session_id.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    def _responder(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            return {"tabId": 99, "windowId": 1}
+        if cmd == protocol.CMD_GET_TAB:
+            # Source browser restarts AFTER guard-3 read s-themed, BEFORE the close send.
+            cs_from.session_id = "s-NEW"
+            return {"ok": True}
+        return {"ok": True}  # close_tab succeeds at the emulated edge
+
+    _out, frames = await _drive(
+        lambda: tools.relocate_tab(
+            app, instance_from="themed", tab_id=5, instance_to="main",
+            expected_session_from="s-themed",
+        ),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _responder,
+    )
+    by_cmd = {(iid, f["command"]): f for iid, f in frames}
+    close = by_cmd[("themed", protocol.CMD_CLOSE_TAB)]
+    assert close["sessionId"] == "s-themed"  # the PASSED epoch, not the now-live s-NEW
+
+
+async def _no_new_rows(db):
+    """Assert no copy landed in the target and no action row was journalled."""
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='main'").fetchone()) == (0,)
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM actions").fetchone()) == (0,)
+
+
+async def test_relocate_pinned_source_refused_before_open(tmp_path):
+    # Acceptance 5: a PINNED source is refused with precondition_failed BEFORE open_tab —
+    # phase B's notPinned guard could never close it, so nothing is opened or written.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash", pinned=1)
+    reg = Registry()
+    _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main")
+    assert ei.value.code == protocol.ERR_PRECONDITION_FAILED
+    assert ws_to.sent == []  # no open_tab ever left for the target
+    await _no_new_rows(db)
+
+
+async def test_relocate_audible_source_refused_before_open(tmp_path):
+    # Acceptance 6: an AUDIBLE source is refused before open (notAudible guard).
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash", audible=1)
+    reg = Registry()
+    _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main")
+    assert ei.value.code == protocol.ERR_PRECONDITION_FAILED
+    assert ws_to.sent == []
+    await _no_new_rows(db)
+
+
+async def test_relocate_active_in_focused_window_refused_before_open(tmp_path):
+    # Guard 4 (#48), active-in-focus arm: a tab ACTIVE in the source's FOCUSED window is
+    # un-closeable by phase B, so it is refused before open. Non-vacuity: the SAME tab in a
+    # NON-focused window (or non-active) relocates — covered by the happy-path tests.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed", focused_window_id=7)
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash", active=1, window_id=7)
+    reg = Registry()
+    _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main")
+    assert ei.value.code == protocol.ERR_PRECONDITION_FAILED
+    assert ws_to.sent == []
+    await _no_new_rows(db)
+
+
+async def test_relocate_active_but_not_in_focused_window_is_allowed(tmp_path):
+    # The active guard is SCOPED to the focused window: an active tab in a NON-focused
+    # window still relocates (else the guard would refuse far too much). Reddens if the
+    # guard drops the window comparison.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed", focused_window_id=1)
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash", active=1, window_id=9)
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+    out, _ = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)},
+        _reloc_responder(42),
+    )
+    assert out["status"] == "done"
+
+
+async def test_relocate_copy_gone_between_open_and_check_is_half(tmp_path):
+    # Acceptance 7: the copy vanishes between step 3 and the copy check (get_tab =>
+    # no_such_tab). The verb degrades to status:"half", reason:"copy_gone", and NEVER
+    # touches the source — no close_tab is sent and the source tab stays in the mirror.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    def responder(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            return {"tabId": 99, "windowId": 1}
+        if cmd == protocol.CMD_GET_TAB:
+            return ("err", protocol.ERR_NO_SUCH_TAB)  # copy already gone
+        raise AssertionError(f"unexpected command {cmd} — the source must not be touched")
+
+    out, frames = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main"),
+        {"main": (cs_to, ws_to)}, responder,
+    )
+    assert out["status"] == "half" and out["reason"] == "copy_gone"
+    assert [f["command"] for _, f in frames] == [protocol.CMD_OPEN_TAB, protocol.CMD_GET_TAB]
+    # Source untouched: its mirror row survives; the relocate row is live, the close pending.
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed' AND tab_id=5").fetchone()) == (1,)
+    statuses = await db.read(lambda c: c.execute(
+        "SELECT kind, status FROM actions ORDER BY id").fetchall())
+    assert statuses == [("relocate", "done"), ("relocate_close", "pending")]
+
+
+async def test_relocate_target_disconnected_open_fails_no_rows(tmp_path):
+    # Acceptance 8: the target has no live socket. open_tab fails no_connection and NOTHING
+    # is written (no copy tab, no action rows). The source tab (the seed) is untouched.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    _put_conn(reg, "themed", session_id="s-themed")  # source live; target has NO conn
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main")
+    assert ei.value.code == protocol.ERR_NO_CONNECTION
+    await _no_new_rows(db)
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed'").fetchone()) == (1,)
+
+
+async def test_relocate_source_closed_by_someone_completes_done(tmp_path):
+    # Acceptance 9: the source is closed by someone between the steps, so the source close
+    # returns no_such_tab. The goal is reached: relocate_close => done (reason no_such_tab),
+    # the source mirror row is dropped, and the relocation is NOT left live.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    def responder(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            return {"tabId": 99, "windowId": 1}
+        if cmd == protocol.CMD_GET_TAB:
+            return {"ok": True}
+        return ("err", protocol.ERR_NO_SUCH_TAB)  # the source close: already gone
+
+    out, _ = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)}, responder,
+    )
+    assert out["status"] == "done"
+    close = await db.read(lambda c: c.execute(
+        "SELECT status, reason FROM actions WHERE kind='relocate_close'").fetchone())
+    assert close == ("done", protocol.ERR_NO_SUCH_TAB)
+    # Source row dropped; the relocation is retired (a done relocate_close => not live).
+    assert await db.read(lambda c: c.execute(
+        "SELECT COUNT(*) FROM tabs WHERE instance_id='themed' AND tab_id=5").fetchone()) == (0,)
+    from src.curator.mirror import load_mirror
+    assert (await db.read(load_mirror)).live_relocations == []
+
+
+async def test_relocate_precondition_failed_on_close_is_half(tmp_path):
+    # Step-6 precondition_failed (source turned pinned/audible/active after the pre-check):
+    # relocate_close => failed, response half; a FAILED close leaves the relocation live so
+    # the pass's phase B retries it.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    reg = Registry()
+    cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+
+    def responder(iid, cmd, params):
+        if cmd == protocol.CMD_OPEN_TAB:
+            return {"tabId": 99, "windowId": 1}
+        if cmd == protocol.CMD_GET_TAB:
+            return {"ok": True}
+        return ("err", protocol.ERR_PRECONDITION_FAILED)
+
+    out, _ = await _drive(
+        lambda: tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main"),
+        {"themed": (cs_from, ws_from), "main": (cs_to, ws_to)}, responder,
+    )
+    assert out["status"] == "half" and out["reason"] == protocol.ERR_PRECONDITION_FAILED
+    close = await db.read(lambda c: c.execute(
+        "SELECT status, reason FROM actions WHERE kind='relocate_close'").fetchone())
+    assert close == ("failed", protocol.ERR_PRECONDITION_FAILED)
+    # A failed relocate_close does NOT retire the relocation (mirror.py): still live.
+    from src.curator.mirror import load_mirror
+    assert len((await db.read(load_mirror)).live_relocations) == 1
+
+
+async def test_relocate_refused_while_paused_sends_nothing(tmp_path):
+    # Acceptance 11: the verb refuses while the stop switch (pause) is armed and sends no
+    # frames. (The codebase's stop switch is the pause gate; its code is "paused".)
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "themed", session_id="s-themed")
+    await _insert_instance(db, "main", session_id="s-main")
+    await _insert_tab(db, "themed", 5, url="https://grafana/dash")
+    now = tools._now_ms()
+    await db.write(lambda c: pause_ops.pause(c, now=now, minutes=10))
+    reg = Registry()
+    _cs_from, ws_from = _put_conn(reg, "themed", session_id="s-themed")
+    _cs_to, ws_to = _put_conn(reg, "main", session_id="s-main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.relocate_tab(app, instance_from="themed", tab_id=5, instance_to="main")
+    assert ei.value.code == "paused"
+    assert ws_from.sent == [] and ws_to.sent == []  # no frame reached any socket
+    await _no_new_rows(db)
 
 
 # --- pause / resume ----------------------------------------------------------

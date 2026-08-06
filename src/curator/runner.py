@@ -446,9 +446,17 @@ async def run_pass(
         # a pending relocate_close is already excluded from live_relocations, so a
         # relocation is never both reconciled AND phase-B'd in the same pass.
         # A row whose source instance did NOT answer THIS pass's snapshot is left
-        # alone by ``run_reconcile`` — see its readiness gate.
+        # alone by ``run_reconcile`` — see its readiness gate. A row younger than one
+        # ``cmd_timeout_ms`` is skipped by ``read_pending_closes`` itself (#48): the
+        # synchronous relocate_tab verb writes its pending close BEFORE sending the
+        # source close, so its row must not be reconciled while that verb is still
+        # awaiting the response.
         if not effective_dry_run:
-            for pending_row in await db.read(read_pending_closes):
+            for pending_row in await db.read(
+                lambda c: read_pending_closes(
+                    c, now=now, cmd_timeout_ms=settings.cmd_timeout_ms
+                )
+            ):
                 await _isolated(phases.run_reconcile(ctx, pending_row))
 
         decisions = decidemod.decide(
