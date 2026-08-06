@@ -97,12 +97,24 @@ async def _insert_instance(db, iid, *, session_id=None, snapshot_at=None, connec
 
 
 async def _insert_tab(db, iid, tab_id, *, url, title="t", opened_at=1000,
-                      last_active_at=1000, age_unknown=0, now=2000):
+                      last_active_at=1000, age_unknown=0, now=2000, window_id=1,
+                      fav_icon_url=None):
     def _w(c):
         c.execute(
-            "INSERT INTO tabs (instance_id, tab_id, window_id, url, title, opened_at, "
-            "last_active_at, age_unknown, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (iid, tab_id, 1, url, title, opened_at, last_active_at, age_unknown, now),
+            "INSERT INTO tabs (instance_id, tab_id, window_id, url, title, fav_icon_url, "
+            "opened_at, last_active_at, age_unknown, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (iid, tab_id, window_id, url, title, fav_icon_url, opened_at,
+             last_active_at, age_unknown, now),
+        )
+    await db.write(_w)
+
+
+async def _insert_window(db, iid, window_id, *, wtype="normal", state="normal"):
+    def _w(c):
+        c.execute(
+            "INSERT INTO windows (instance_id, window_id, type, state) VALUES (?,?,?,?)",
+            (iid, window_id, wtype, state),
         )
     await db.write(_w)
 
@@ -790,6 +802,166 @@ async def test_run_pass_dry_run_writes_nothing(tmp_path):
     assert out["status"] == "dry_run"
     assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM actions").fetchone()) == (0,)
     assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM passes").fetchone()) == (0,)
+
+
+# --- #46: list_tabs filters, dup marking, window summary, minus favicon ------
+async def test_list_tabs_omits_fav_icon_url_but_state_reader_keeps_it(tmp_path):
+    # Acceptance 1: fav_icon_url is projected OUT of list_tabs (no agent consumer), while
+    # the shared reader (the /api/state / build_state path) still carries it — the drop
+    # lives in the MCP adapter over the rows, NOT in the SQL surface.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "main", connected=0)
+    await _insert_tab(db, "main", 1, url="https://a", fav_icon_url="https://a/favicon.ico")
+    out = await tools.list_tabs(_app(db))
+    assert [t["tab_id"] for t in out["tabs"]] == [1]
+    assert all("fav_icon_url" not in t for t in out["tabs"])
+    # The canonical SQL selection is untouched — the row still has the favicon.
+    rows = await db.read(state_read._read_tabs)
+    assert rows[0]["fav_icon_url"] == "https://a/favicon.ico"
+
+
+async def test_build_state_reader_unbroken_by_new_filter_params(tmp_path):
+    # Acceptance 4: build_state calls the SHARED _read_tabs with no filter args; the new
+    # optional params must default to None so /api/state's reader is unbroken and still
+    # exposes fav_icon_url.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "main", connected=0)
+    await _insert_tab(db, "main", 1, url="https://a", fav_icon_url="f")
+    state = await db.read(lambda c: state_read.build_state(c, 123))
+    assert [t["tab_id"] for t in state["tabs"]] == [1]
+    assert state["tabs"][0]["fav_icon_url"] == "f"
+
+
+async def test_list_tabs_filters_by_instance_window_and_url(tmp_path):
+    # Acceptance 2: each of the three filters narrows correctly (url_contains is
+    # case-INsensitive).
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "prox", connected=0)
+    await _insert_instance(db, "media", connected=0)
+    await _insert_tab(db, "prox", 1, url="https://example.com/a", window_id=10)
+    await _insert_tab(db, "prox", 2, url="https://www.YouTube.com/watch?v=1", window_id=20)
+    await _insert_tab(db, "media", 3, url="https://other.com", window_id=30)
+    app = _app(db)
+    out = await tools.list_tabs(app, instance="prox")
+    assert {t["instance_id"] for t in out["tabs"]} == {"prox"}
+    assert {t["tab_id"] for t in out["tabs"]} == {1, 2}
+    out = await tools.list_tabs(app, window_id=30)
+    assert [t["tab_id"] for t in out["tabs"]] == [3]
+    out = await tools.list_tabs(app, url_contains="youtube")
+    assert [t["tab_id"] for t in out["tabs"]] == [2]
+
+
+async def test_list_tabs_filters_intersect(tmp_path):
+    # Acceptance 3: combined filters AND together.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "prox", connected=0)
+    await _insert_instance(db, "media", connected=0)
+    await _insert_tab(db, "prox", 1, url="https://example.com/keep", window_id=10)
+    await _insert_tab(db, "prox", 2, url="https://example.com/keep", window_id=20)
+    await _insert_tab(db, "media", 3, url="https://example.com/keep", window_id=10)
+    out = await tools.list_tabs(_app(db), instance="prox", window_id=10)
+    assert [(t["instance_id"], t["tab_id"]) for t in out["tabs"]] == [("prox", 1)]
+
+
+async def test_dup_group_marks_shared_normalized_address(tmp_path):
+    # Acceptance 5: two tabs differing only by query share the SAME non-empty dup_group
+    # (the normalized address); a unique-key tab gets null.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "main", connected=0)
+    await _insert_tab(db, "main", 1, url="https://x.com/p?a=1")
+    await _insert_tab(db, "main", 2, url="https://x.com/p?a=2")
+    await _insert_tab(db, "main", 3, url="https://y.com/q")
+    out = await tools.list_tabs(_app(db))
+    by_id = {t["tab_id"]: t for t in out["tabs"]}
+    assert by_id[1]["dup_group"] == by_id[2]["dup_group"] == "https://x.com/p"
+    assert by_id[3]["dup_group"] is None
+
+
+async def test_dup_group_computed_after_filters(tmp_path):
+    # Acceptance 6: dup_group is computed over the POST-filter output — narrowing to one
+    # of a former pair makes that survivor the sole holder of its key => null.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "main", connected=0)
+    await _insert_tab(db, "main", 1, url="https://x.com/p?a=1")
+    await _insert_tab(db, "main", 2, url="https://x.com/p?a=2")
+    out = await tools.list_tabs(_app(db), url_contains="a=1")
+    assert [t["tab_id"] for t in out["tabs"]] == [1]
+    assert out["tabs"][0]["dup_group"] is None
+
+
+async def test_list_windows_summary_with_counts_and_focused_flag(tmp_path):
+    # Acceptance 7: one record per window, correct tab_count + focused flag, and a
+    # response that is a few hundred bytes (a per-window summary, not per-tab).
+    import json
+
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "main", connected=0)
+    await db.write(lambda c: c.execute(
+        "UPDATE instances SET focused_window_id = ? WHERE id = ?", (10, "main")))
+    await _insert_window(db, "main", 10)
+    await _insert_window(db, "main", 20, wtype="popup", state="minimized")
+    await _insert_tab(db, "main", 1, url="https://a", window_id=10)
+    await _insert_tab(db, "main", 2, url="https://b", window_id=10)
+    await _insert_tab(db, "main", 3, url="https://c", window_id=20)
+    out = await tools.list_windows(_app(db))
+    by_win = {w["window_id"]: w for w in out["windows"]}
+    assert by_win[10]["tab_count"] == 2 and by_win[10]["focused"] is True
+    assert by_win[20]["tab_count"] == 1 and by_win[20]["focused"] is False
+    assert by_win[20]["type"] == "popup" and by_win[20]["state"] == "minimized"
+    assert len(json.dumps(out["windows"])) < 1000
+
+
+async def test_window_tab_counts_sum_to_list_tabs_count(tmp_path):
+    # Acceptance 8: sum of a window's tab counts == that instance's list_tabs count with
+    # no filters, same moment.
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "prox", connected=0)
+    await _insert_window(db, "prox", 10)
+    await _insert_window(db, "prox", 20)
+    await _insert_tab(db, "prox", 1, url="https://a", window_id=10)
+    await _insert_tab(db, "prox", 2, url="https://b", window_id=10)
+    await _insert_tab(db, "prox", 3, url="https://c", window_id=20)
+    app = _app(db)
+    wins = await tools.list_windows(app)
+    tabs = await tools.list_tabs(app, instance="prox")
+    total = sum(w["tab_count"] for w in wins["windows"] if w["instance_id"] == "prox")
+    assert total == len(tabs["tabs"]) == 3
+
+
+async def test_read_tools_return_dict_no_structured_content_and_failure_shape(tmp_path):
+    # Acceptance 9: the read tools stay dict-returning (structured_content ABSENT), and a
+    # failure still surfaces as {"ok": false, "error": ...} rather than a transport fault.
+    from src.mcpiface.server import build_mcp
+
+    db = await _make_db(tmp_path)
+    try:
+        await _insert_instance(db, "main", connected=0)
+        await _insert_window(db, "main", 1)
+        await _insert_tab(db, "main", 1, url="https://a", window_id=1)
+        app = _app(db)
+        mcp = build_mcp(SimpleNamespace(app=app))
+        for name in ("list_tabs", "list_windows"):
+            res = await mcp.call_tool(name, {})
+            # A dict return with no output schema => text content, structured_content None.
+            assert res.structured_content is None
+            assert res.is_error is False
+
+        # The handlers themselves return plain dicts.
+        assert isinstance(await tools.list_tabs(app), dict)
+        assert isinstance(await tools.list_windows(app), dict)
+
+        # Failure path: degraded mode makes _guarded return the structured refusal dict
+        # {"ok": false, "error": ...} — still a dict, still no structured_content, not a
+        # transport error.
+        import json
+
+        app.state.degraded = True
+        res = await mcp.call_tool("list_tabs", {})
+        assert res.structured_content is None
+        payload = json.loads(res.content[0].text)
+        assert payload["ok"] is False and payload["error"] == "degraded"
+    finally:
+        await db.close()
 
 
 # --- §12 parity: degraded mode refuses tools (through the real _guarded wrapper) --

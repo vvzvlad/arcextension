@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
 from types import SimpleNamespace
 
 from starlette.exceptions import HTTPException
@@ -177,8 +178,33 @@ async def list_instances(app) -> dict:
     }
 
 
-async def list_tabs(app) -> dict:
-    """Tabs mirror + per-instance freshness envelope (§11).
+def _project_tabs(rows: list[dict]) -> list[dict]:
+    """Adapter-side (#46) projection over the mirror rows: DROP ``fav_icon_url`` and add
+    ``dup_group``.
+
+    ``fav_icon_url`` has zero consumers on the agent side (the startpage draws a CSS
+    swatch from the host, not ``<img src=favIconUrl>``), so it is omitted here rather
+    than by changing the SQL surface — ``_TAB_COLUMNS`` / ``GET /api/state`` keep it.
+
+    ``dup_group`` is the ``normalize_url(url)`` key (origin+path, no query/fragment),
+    set ONLY when MORE THAN ONE tab in THIS output (i.e. after any filters) shares that
+    key; the sole holder of a key gets ``None``. Computed in Python because ``tabs`` has
+    no ``url_norm`` column (it exists only on ``actions``). The key IS the normalized
+    address — readable and stable between calls.
+    """
+    keys = [normalize_url(r["url"]) for r in rows]
+    counts = Counter(k for k in keys if k is not None)
+    projected: list[dict] = []
+    for row, key in zip(rows, keys):
+        tab = {k: v for k, v in row.items() if k != "fav_icon_url"}
+        tab["dup_group"] = key if (key is not None and counts[key] > 1) else None
+        projected.append(tab)
+    return projected
+
+
+async def list_tabs(app, *, instance: str | None = None, window_id: int | None = None,
+                    url_contains: str | None = None) -> dict:
+    """Tabs mirror + per-instance freshness envelope (§11), with #46 filters + dup marking.
 
     Awaits a fresh snapshot from every active instance (§6 blocking-fresh, via
     :func:`_freshen_fleet`) before returning the tabs, so the agent never acts on a
@@ -186,13 +212,50 @@ async def list_tabs(app) -> dict:
     ago — permanently, in ``main`` where there is no dedup). The ``instances`` map
     carries ``{snapshot_at, fresh, reason, session_id}`` per instance — the age, freshness
     and (#47) session epoch the agent must weigh before acting (``session_id`` echoes back
-    as ``expected_session``)."""
+    as ``expected_session``).
+
+    Filters (all optional, intersecting) are applied in SQL by :func:`_read_tabs`:
+    ``instance`` (exact), ``window_id`` (exact), ``url_contains`` (case-insensitive
+    substring of the url). ``window_id`` alone filters across instances but is ambiguous
+    — the tabs/windows key is ``(instance_id, window_id)`` — so pass ``instance`` with it
+    to name one window.
+
+    Each tab carries ``dup_group``: the normalized address (origin+path) shared by more
+    than one tab in the POST-FILTER output, else ``null``. It is an agent-facing HINT,
+    not a prediction of what the curator collapses: dup_group groups by the NORMALIZED
+    address computed over this output, whereas the curator dedups by the FULL url string
+    and only OUTSIDE ``main`` (``main`` is a sink without dedup). ``fav_icon_url`` is NOT
+    in this response (no consumer); ``GET /api/state`` still carries it."""
     db = app.state.db
     instances = await _freshen_fleet(app)
-    tabs = await db.read(state_read._read_tabs)
+    rows = await db.read(
+        lambda c: state_read._read_tabs(
+            c, instance=instance, window_id=window_id, url_contains=url_contains
+        )
+    )
     return {
         "server_now": _now_ms(),
-        "tabs": tabs,
+        "tabs": _project_tabs(rows),
+        "instances": instances,
+    }
+
+
+async def list_windows(app) -> dict:
+    """Per-window summary + per-instance freshness envelope (§11, #46).
+
+    One record per window — ``instance_id``, ``window_id``, ``type``, ``state``,
+    ``tab_count`` and a ``focused`` flag — sourced from the ``windows`` table, a COUNT
+    over ``tabs`` and ``instances.focused_window_id`` (see :func:`_read_windows`). A
+    per-window summary (a few hundred bytes for a typical fleet), NOT the per-tab list.
+
+    Same freshness contract and ``instances`` envelope as :func:`list_tabs`: it awaits a
+    fresh snapshot per active instance via :func:`_freshen_fleet` before answering."""
+    db = app.state.db
+    instances = await _freshen_fleet(app)
+    windows = await db.read(state_read._read_windows)
+    return {
+        "server_now": _now_ms(),
+        "windows": windows,
         "instances": instances,
     }
 

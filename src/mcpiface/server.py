@@ -103,10 +103,34 @@ def build_mcp(app_ref) -> MCPServer:
         return await _guarded(tools.list_instances(_host()))
 
     @mcp.tool()
-    async def list_tabs() -> dict:
-        """List all mirrored tabs plus a per-instance freshness envelope
-        (snapshot_at/fresh/reason). Awaits a fresh snapshot before answering (§11/§6)."""
-        return await _guarded(tools.list_tabs(_host()))
+    async def list_tabs(
+        instance: str | None = None, window_id: int | None = None,
+        url_contains: str | None = None,
+    ) -> dict:
+        """List mirrored tabs plus a per-instance freshness envelope
+        (snapshot_at/fresh/reason/session_id). Awaits a fresh snapshot before answering
+        (§11/§6).
+
+        Optional, intersecting filters: ``instance`` (exact), ``window_id`` (exact),
+        ``url_contains`` (case-insensitive substring of the url). ``window_id`` alone
+        filters across instances but is ambiguous — the key is (instance_id, window_id) —
+        so pass ``instance`` alongside it to name one window.
+
+        Each tab carries ``dup_group``: the normalized address (origin+path) shared by
+        more than one tab in the POST-FILTER output, else null. It is a HINT, not a
+        prediction of the curator's collapse — the curator dedups by the FULL url string
+        and only OUTSIDE main (main is a sink without dedup). ``fav_icon_url`` is not
+        returned."""
+        return await _guarded(tools.list_tabs(
+            _host(), instance=instance, window_id=window_id, url_contains=url_contains,
+        ))
+
+    @mcp.tool()
+    async def list_windows() -> dict:
+        """List a per-window summary (instance_id, window_id, type, state, tab_count,
+        focused) plus the same per-instance freshness envelope as list_tabs (§11/§6).
+        A compact per-window view, not the per-tab list."""
+        return await _guarded(tools.list_windows(_host()))
 
     @mcp.tool()
     async def get_rules() -> dict:

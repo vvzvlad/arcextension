@@ -76,16 +76,53 @@ def _read_instances(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def _read_tabs(conn: sqlite3.Connection) -> list[dict]:
+def _read_tabs(
+    conn: sqlite3.Connection,
+    *,
+    instance: str | None = None,
+    window_id: int | None = None,
+    url_contains: str | None = None,
+) -> list[dict]:
+    """Read the tabs mirror (§10), optionally narrowed by the #46 MCP filters.
+
+    ``_TAB_COLUMNS`` stays the canonical SQL selection (``fav_icon_url`` included) so
+    ``build_state`` / ``GET /api/state`` are byte-identical — the MCP adapter drops the
+    favicon over the ROWS, not by changing this SQL surface.
+
+    The three filter params are ALL optional (default ``None``): this reader is shared
+    with ``build_state``, which calls it with no arguments, so a required param would
+    break ``/api/state``. When given they intersect (AND):
+
+    * ``instance``      — exact ``instance_id`` match.
+    * ``window_id``     — exact ``window_id`` match. The tabs/windows key is
+      ``(instance_id, window_id)``, so a bare window number is ambiguous across
+      instances; pass ``instance`` alongside it to name one window unambiguously.
+    * ``url_contains``  — case-INsensitive substring of ``url`` (via ``instr`` over
+      lowercased operands, so ``%``/``_`` in the needle are literal, not LIKE wildcards).
+    """
     conn.row_factory = sqlite3.Row
     # Tabs follow their instance through the SAME filter. Nothing ever deletes a revoked
     # instance's tabs (``apply_snapshot`` is the only writer and it needs a live socket),
     # so leaving them in would render a phantom group on the startpage — full of tabs
     # whose "jump" can only fail. One rule, applied to the whole StateResponse.
+    clauses = ["instance_id IN (SELECT id FROM instances WHERE status = 'active')"]
+    args: list = []
+    if instance is not None:
+        clauses.append("instance_id = ?")
+        args.append(instance)
+    if window_id is not None:
+        clauses.append("window_id = ?")
+        args.append(window_id)
+    if url_contains is not None:
+        # instr(lower(url), lower(needle)) > 0 — case-insensitive substring; NULL url
+        # yields NULL (falsy), so it is excluded rather than matched.
+        clauses.append("instr(lower(url), lower(?)) > 0")
+        args.append(url_contains)
     rows = conn.execute(
         "SELECT " + ", ".join(_TAB_COLUMNS) + " FROM tabs "
-        "WHERE instance_id IN (SELECT id FROM instances WHERE status = 'active') "
-        "ORDER BY instance_id, tab_id"
+        "WHERE " + " AND ".join(clauses) + " "
+        "ORDER BY instance_id, tab_id",
+        args,
     ).fetchall()
     return [
         {
@@ -100,6 +137,44 @@ def _read_tabs(conn: sqlite3.Connection) -> list[dict]:
             "audible": bool(r["audible"]),
             "last_active_at": r["last_active_at"],
             "age_unknown": bool(r["age_unknown"]),
+        }
+        for r in rows
+    ]
+
+
+def _read_windows(conn: sqlite3.Connection) -> list[dict]:
+    """One summary record per window (#46 ``list_windows``): ``instance_id``,
+    ``window_id``, ``type``, ``state``, ``tab_count`` and a ``focused`` flag.
+
+    Sources are exactly the three the tool advertises: the ``windows`` table, a COUNT
+    over ``tabs`` (LEFT JOIN so a window with zero tabs still reports 0), and
+    ``instances.focused_window_id`` (the ``focused`` flag). Active fleet only, the same
+    status filter the rest of this module applies. A per-window summary — a few hundred
+    bytes for a typical fleet — not the per-tab list ``list_tabs`` returns.
+    """
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT w.instance_id AS instance_id, w.window_id AS window_id, "
+        "w.type AS type, w.state AS state, "
+        "COUNT(t.tab_id) AS tab_count, "
+        "(w.window_id = i.focused_window_id) AS focused "
+        "FROM windows w "
+        "JOIN instances i ON i.id = w.instance_id "
+        "LEFT JOIN tabs t "
+        "  ON t.instance_id = w.instance_id AND t.window_id = w.window_id "
+        "WHERE i.status = 'active' "
+        "GROUP BY w.instance_id, w.window_id, w.type, w.state, i.focused_window_id "
+        "ORDER BY w.instance_id, w.window_id"
+    ).fetchall()
+    return [
+        {
+            "instance_id": r["instance_id"],
+            "window_id": r["window_id"],
+            "type": r["type"],
+            "state": r["state"],
+            "tab_count": r["tab_count"],
+            # focused_window_id NULL => the comparison is NULL => not focused.
+            "focused": bool(r["focused"]),
         }
         for r in rows
     ]
