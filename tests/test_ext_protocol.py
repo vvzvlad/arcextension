@@ -204,11 +204,11 @@ def test_command_verbs_mirror_the_extension_exactly():
     """
     js = {k: v for k, v in _js_wire_constants().items() if k.startswith("CMD_")}
     assert js == _py_wire_constants("CMD_")
-    # The seven original verbs plus move_tab — spelled out so a silent RENAME of a live
-    # wire string (which would keep both sides equal, and break every deployed copy of
-    # the other half) still reddens here.
+    # The seven original verbs plus move_tab and focus_window — spelled out so a silent
+    # RENAME of a live wire string (which would keep both sides equal, and break every
+    # deployed copy of the other half) still reddens here.
     assert set(js.values()) == {
-        "open_tab", "close_tab", "get_tab", "focus_tab", "navigate_tab",
+        "open_tab", "close_tab", "get_tab", "focus_tab", "focus_window", "navigate_tab",
         "merge_windows", "execute_js", "move_tab",
     }
 

@@ -1546,6 +1546,67 @@ async def test_confirm_pending_executes_the_recomputed_plan_and_clears(tmp_path)
         await db.close()
 
 
+async def test_run_all_executes_over_threshold_in_one_pass_without_latching(tmp_path):
+    """(run_all) the "выполнить все правила сейчас" button: an over-threshold plan
+    executes in ONE pass and never arms the latch. Reddens if run_all still defers
+    (status resume_pending) or leaves a latch behind."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        # Two ruled idle tabs => countable phase_a = 2 (> threshold 1).
+        await _seed_fleet_with_phase_a(
+            ext, db, ["https://grafana.lc/d/a", "https://grafana.lc/d/b"])
+        s = _settings(max_actions_per_pass=1)
+
+        res = await ext.run_pass(settings=s, run_all=True)
+        # ONE call, over-threshold plan executed, no latch armed.
+        assert res["status"] == "ok"
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(2,)]
+        assert not await _latch_raw(db)
+    finally:
+        await db.close()
+
+
+async def test_over_threshold_without_run_all_still_latches(tmp_path):
+    """(run_all regression) the SAME plan WITHOUT run_all still defers behind the
+    threshold latch — run_all is the only reason it executes."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(
+            ext, db, ["https://grafana.lc/d/a", "https://grafana.lc/d/b"])
+        s = _settings(max_actions_per_pass=1)
+
+        res = await ext.run_pass(settings=s)
+        assert res["status"] == "resume_pending"
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(0,)]
+        assert await _latch_raw(db)
+    finally:
+        await db.close()
+
+
+async def test_run_all_clears_an_already_armed_latch(tmp_path):
+    """(run_all) run_all is not stuck behind an armed latch: after a pass has armed the
+    over-threshold latch, a run_all pass executes the recomputed plan and clears it —
+    the same effect a confirming click has, no click needed."""
+    db = await _mkdb(tmp_path)
+    try:
+        ext = Ext(db)
+        await _seed_fleet_with_phase_a(
+            ext, db, ["https://grafana.lc/d/a", "https://grafana.lc/d/b"])
+        s = _settings(max_actions_per_pass=1)
+
+        assert (await ext.run_pass(settings=s))["status"] == "resume_pending"
+        assert await _latch_raw(db)
+
+        res = await ext.run_pass(settings=s, run_all=True)
+        assert res["status"] == "ok"
+        assert await _rows(db, "SELECT COUNT(*) FROM actions WHERE kind='relocate' AND status='done'") == [(2,)]
+        assert not await _latch_raw(db)
+    finally:
+        await db.close()
+
+
 async def test_confirm_pending_without_latch_degrades_and_still_latches(tmp_path):
     """(e) confirm_pending with NOTHING armed must not pre-approve a plan nobody has
     seen: the flag degrades to an ordinary pass, and an over-threshold plan computed by

@@ -212,6 +212,14 @@ export function createChromeMock(opts = {}) {
         await tick();
         return state.windows.map((w) => ({ ...w }));
       },
+      // chrome.windows.get(id) resolves to the Window or REJECTS ("No window with id: N")
+      // for a missing one — exactly what focus_window's existence guard relies on (§6).
+      get: async (windowId) => {
+        await tick();
+        const w = state.windows.find((x) => x.id === windowId);
+        if (!w) throw new Error(`No window with id: ${windowId}.`);
+        return { ...w };
+      },
       // windows.create resolves to the created Window WITH its `tabs` array — that is
       // how open_tab learns the id of the tab it just opened in a fresh window (§9,
       // the "browser with zero normal windows" branch).

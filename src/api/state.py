@@ -160,33 +160,48 @@ async def focus(request: Request) -> JSONResponse:
     await require_not_paused(request, force=forced)
 
     instance_id = body.get("instance")
-    tab_id = body.get("tabId")
     if not isinstance(instance_id, str) or not instance_id:
         raise HTTPException(status_code=422, detail="instance is required")
-    if not isinstance(tab_id, int) or isinstance(tab_id, bool):
-        raise HTTPException(status_code=422, detail="tabId (integer) is required")
+    # A focus targets EITHER one tab (activate it + raise its window) OR one whole
+    # window (raise it, touch nothing inside — the "click a space" jump). Exactly one
+    # id must be present: `{tabId}` is the existing per-tab jump (§10), `{windowId}`
+    # is the new per-window raise. `isinstance(x, int) and not isinstance(x, bool)`
+    # rejects `True`/`False`, which are ints in Python.
+    tab_id = body.get("tabId")
+    window_id = body.get("windowId")
+    tab_ok = isinstance(tab_id, int) and not isinstance(tab_id, bool)
+    window_ok = isinstance(window_id, int) and not isinstance(window_id, bool)
+    if not tab_ok and not window_ok:
+        raise HTTPException(status_code=422, detail="tabId or windowId (integer) is required")
+    if tab_ok and window_ok:
+        raise HTTPException(status_code=422, detail="exactly one of tabId or windowId")
 
     app = request.app
     settings = app.state.settings
+    if tab_ok:
+        command, params = protocol.CMD_FOCUS_TAB, {"tabId": tab_id}
+    else:
+        command, params = protocol.CMD_FOCUS_WINDOW, {"windowId": window_id}
     try:
         await send_command(
             app.state.ext_registry,
             app.state.db,
             instance_id,
-            protocol.CMD_FOCUS_TAB,
-            {"tabId": tab_id},
+            command,
+            params,
             cmd_timeout_ms=settings.cmd_timeout_ms,
             initiator="user",
         )
     except CommandError as exc:
-        # no_such_tab is a CLEAR error the page acts on: re-fetch /api/state and
-        # re-render (the mirror is stale — the tab is gone), never silent (§10).
-        if exc.code == protocol.ERR_NO_SUCH_TAB:
+        # A CLEAR "your picture is stale" error the page acts on: re-fetch /api/state
+        # and re-render, never silent (§10). For the tab path that is no_such_tab (the
+        # tab is gone); for the window path it is no_window (the window is gone).
+        if exc.code in (protocol.ERR_NO_SUCH_TAB, protocol.ERR_NO_WINDOW):
             return JSONResponse(
                 {"ok": False, "error": exc.code, "refetch": True}, status_code=409
             )
-        # Any other failure (no live socket, timeout, no_window, stale_session):
-        # the fallback "switch to <instance> manually" stays in the UI (§10). 502.
+        # Any other failure (no live socket, timeout, stale_session): the fallback
+        # "switch to <instance> manually" stays in the UI (§10). 502.
         return JSONResponse(
             {"ok": False, "error": exc.code, "message": exc.message}, status_code=502
         )

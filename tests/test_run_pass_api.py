@@ -63,6 +63,27 @@ def test_dry_run_returns_plan_without_writing(tmp_path):
         assert _q(db_path, "SELECT COUNT(*) FROM passes") == [(0,)]
 
 
+def test_run_all_flag_is_forwarded_to_the_runner(tmp_path, monkeypatch):
+    # The "выполнить все правила сейчас" button posts {run_all: true}; the endpoint must
+    # forward it to runner.run_pass as run_all=True (and defaults to False otherwise).
+    import src.api.run_pass as run_pass_mod
+
+    seen = {}
+
+    async def _fake_run_pass(db, registry, settings, **kw):
+        seen.update(kw)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(run_pass_mod.runner, "run_pass", _fake_run_pass)
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        client.post("/api/run_pass", headers=AUTH, json={"run_all": True})
+        assert seen["run_all"] is True
+        seen.clear()
+        client.post("/api/run_pass", headers=AUTH, json={})
+        assert seen["run_all"] is False
+
+
 def test_real_pass_with_no_ready_instances_is_not_ok(tmp_path):
     # §12: a pass that found nobody ready is NOT healthy (ok=0), but still records a
     # passes row so "ran empty" is distinguishable from "no passes".

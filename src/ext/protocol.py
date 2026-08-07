@@ -44,6 +44,10 @@ CMD_OPEN_TAB = "open_tab"
 CMD_CLOSE_TAB = "close_tab"
 CMD_GET_TAB = "get_tab"
 CMD_FOCUS_TAB = "focus_tab"
+# Raise a window to the foreground by id, changing NOTHING inside it (no tab is
+# activated). The startpage "click a space" jump uses this to bring a foreign
+# instance's browser to the front without touching its tabs (§10/§14.1).
+CMD_FOCUS_WINDOW = "focus_window"
 CMD_NAVIGATE_TAB = "navigate_tab"
 CMD_MERGE_WINDOWS = "merge_windows"
 CMD_EXECUTE_JS = "execute_js"

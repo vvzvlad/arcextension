@@ -138,6 +138,8 @@ export const CMD_OPEN_TAB = "open_tab";
 export const CMD_CLOSE_TAB = "close_tab";
 export const CMD_GET_TAB = "get_tab";
 export const CMD_FOCUS_TAB = "focus_tab";
+// Raise a window to the foreground by id, touching nothing inside it (§6).
+export const CMD_FOCUS_WINDOW = "focus_window";
 export const CMD_NAVIGATE_TAB = "navigate_tab";
 export const CMD_MERGE_WINDOWS = "merge_windows";
 export const CMD_EXECUTE_JS = "execute_js";

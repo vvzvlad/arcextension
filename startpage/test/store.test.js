@@ -6,7 +6,7 @@ import { makeChrome, makeFetch } from "./mocks.js";
 const NOW = 1_000_000;
 
 function storeWith({ chrome, calls, local }, fetchFn, extra = {}) {
-  return createStore({ chromeApi: chrome, fetchFn, now: () => NOW, staleMs: 3000, ...extra });
+  return createStore({ chromeApi: chrome, fetchFn, now: () => NOW, ...extra });
 }
 
 // --- offline-first: fresh profile, NO cache, NO network => still non-empty -----
@@ -344,7 +344,9 @@ describe("server clock offset (§10)", () => {
     expect(store.statusRows.value[0].status.state).toBe("ok");
   });
 
-  it("still reports a genuinely stale mirror as stale (the offset is not a blanket pass)", async () => {
+  it("a connected instance with an OLD snapshot is still 'на связи' (§62 item 1: no staleness)", async () => {
+    // Mirror-freshness is gone (issue #62 item 1): a connected instance reads "на связи"
+    // however old its last snapshot is. Reddens if the stale branch is reintroduced.
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const serverNow = NOW + 10_000;
     const { fetchFn } = makeFetch({
@@ -356,13 +358,14 @@ describe("server clock offset (§10)", () => {
     const store = storeWith(env, fetchFn);
     await store.init();
     await store.refresh();
-    expect(store.statusRows.value[0].status.state).toBe("stale");
+    expect(store.statusRows.value[0].status.state).toBe("ok");
+    expect(store.statusRows.value[0].status.label).toBe("на связи");
   });
 
   it("the 1s tick does NOT rebuild the foreign TAB LISTS (§10 promises hundreds of rows)", async () => {
-    // The status label needs the ticking clock; the grouped tab lists do not. Folding
-    // both into one computed made every second invalidate the whole foreign list and
-    // forced Vue to re-diff every v-for row. The tab arrays must keep their identity.
+    // The expensive grouping must keep its identity across a tick so Vue does not re-diff
+    // every v-for row. (Status is no longer time-dependent — §62 item 1 — but the tick
+    // still invalidates the cheap status layer, so the identity guarantee still matters.)
     let localNow = NOW;
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const { fetchFn } = makeFetch({
@@ -382,7 +385,6 @@ describe("server clock offset (§10)", () => {
       chromeApi: env.chrome,
       fetchFn,
       now: () => localNow,
-      staleMs: 3000,
     });
     await store.init();
     await store.refresh();
@@ -394,34 +396,11 @@ describe("server clock offset (§10)", () => {
     localNow = NOW + 60_000;
     store.tick();
 
-    // The clock-dependent layer DID update...
-    expect(store.foreignGroups.value[0].status.state).toBe("stale");
-    // ...while the expensive grouping was not recomputed at all.
+    // A connected instance stays "на связи" regardless of time...
+    expect(store.foreignGroups.value[0].status.state).toBe("ok");
+    // ...and the expensive grouping was not recomputed at all.
     expect(store.foreignTabGroups.value).toBe(listBefore);
     expect(store.foreignTabGroups.value[0].tabs).toBe(tabsBefore);
-  });
-
-  it("the labels RE-EVALUATE as time passes on an open page", async () => {
-    // A computed reading a plain now() is evaluated once and frozen: a page left open
-    // would keep saying "на связи" about an instance whose mirror aged out.
-    let localNow = NOW;
-    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
-    const { fetchFn } = makeFetch({
-      state: { status: 200, body: { ...instanceAt(NOW), server_now: NOW } },
-    });
-    const store = createStore({
-      chromeApi: env.chrome,
-      fetchFn,
-      now: () => localNow,
-      staleMs: 3000,
-    });
-    await store.init();
-    await store.refresh();
-    expect(store.statusRows.value[0].status.state).toBe("ok");
-
-    localNow = NOW + 60_000; // a minute passes with no new snapshot
-    store.tick();
-    expect(store.statusRows.value[0].status.state).toBe("stale");
   });
 });
 
@@ -457,78 +436,189 @@ describe("stopped verbs offer the human's force override (§7)", () => {
   });
 });
 
-// --- merge windows now (§9) ---------------------------------------------------
-describe("merge windows now (§9)", () => {
-  it("POSTs /api/instances/:id/merge_windows and reports {merged}", async () => {
-    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
-    const urls = [];
-    const { fetchFn } = makeFetch({
-      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
-      merge: { status: 200, body: { merged: 4 } },
-    });
-    const wrapped = async (url, opts) => {
-      urls.push(String(url));
-      return fetchFn(url, opts);
+// --- raise a space (§62 item 3): click an instance row => focus_window ---------
+describe("raise a space (§62 item 3)", () => {
+  function fleet(extra = {}) {
+    return {
+      instances: [
+        { id: "prox", title: "prox", connected: true, last_seen_at: NOW, snapshot_at: NOW, focused_window_id: 12 },
+        { id: "me", title: "me", connected: true, last_seen_at: NOW, snapshot_at: NOW, focused_window_id: 3 },
+        { id: "closed", title: "closed", connected: false, last_seen_at: NOW, snapshot_at: NOW, focused_window_id: 5 },
+        { id: "nowin", title: "nowin", connected: true, last_seen_at: NOW, snapshot_at: NOW, focused_window_id: null },
+      ],
+      tabs: [], quick_links: [], server_now: NOW, ...extra,
     };
-    const store = storeWith(env, wrapped);
-    await store.init();
-    await store.refresh();
+  }
 
-    const res = await store.mergeWindowsNow("prox");
-    expect(res).toEqual({ ok: true, merged: 4 });
-    expect(urls.some((u) => u.endsWith("/api/instances/prox/merge_windows"))).toBe(true);
-    expect(store.mergeResult.value).toEqual({ instanceId: "prox", merged: 4 });
-  });
-
-  it("a 423 merge offers the force override too", async () => {
+  it("raises a BACKGROUND instance, whose focused_window_id is null, by its busiest window", async () => {
+    // The regression this guards: `focused_window_id` means "the window on screen RIGHT
+    // NOW, null when the browser is unfocused" (§5). A foreign browser is unfocused
+    // exactly when you want to raise it, so gating on that field alone made the row dead
+    // in the only case it exists for. Every other fixture here hard-codes a number,
+    // which is a state a background instance is never in.
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const bodies = [];
-    const { fetchFn } = makeFetch({
-      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
-      merge: (opts, n) => {
+    const { fetchFn, counts } = makeFetch({
+      state: {
+        status: 200,
+        body: fleet({
+          tabs: [
+            { instance_id: "nowin", tab_id: 1, window_id: 71, url: "https://a/", title: "a" },
+            { instance_id: "nowin", tab_id: 2, window_id: 90, url: "https://b/", title: "b" },
+            { instance_id: "nowin", tab_id: 3, window_id: 90, url: "https://c/", title: "c" },
+            // A foreign tab of ANOTHER instance must not leak into the choice.
+            { instance_id: "prox", tab_id: 4, window_id: 55, url: "https://d/", title: "d" },
+          ],
+        }),
+      },
+      focus: (opts) => {
         bodies.push(JSON.parse(opts.body));
-        return n === 1
-          ? { status: 423, body: { error: "paused", until: NOW + 600_000 } }
-          : { status: 200, body: { merged: 2 } };
+        return { status: 200, body: { ok: true } };
       },
     });
     const store = storeWith(env, fetchFn);
     await store.init();
     await store.refresh();
 
-    const first = await store.mergeWindowsNow("prox");
-    expect(first).toEqual({ ok: false, paused: true });
-    expect(store.pauseBlock.value.verb).toBe("merge_windows");
-    expect(bodies[0].force).toBeUndefined();
+    // The row is offered, not disabled.
+    const row = store.statusRows.value.find((r) => r.id === "nowin");
+    expect(row.raisable).toBe(true);
 
-    await store.retryForced();
-    expect(bodies[1]).toEqual({ force: true });
-    expect(store.mergeResult.value).toEqual({ instanceId: "prox", merged: 2 });
+    const res = await store.raiseInstance("nowin");
+    expect(res).toEqual({ ok: true });
+    expect(counts.focus).toBe(1);
+    // Window 90 holds two tabs, 71 holds one => 90. Never 55 (another instance).
+    expect(bodies[0]).toEqual({ instance: "nowin", windowId: 90 });
   });
 
-  it("a 409 busy_dragging / stale-window RE-FETCHES state and is not shown as a failure", async () => {
-    // §9 says busy_dragging "провалом не считается", and the service answers 409+refetch
-    // for both it and no_window (_CLIENT_ERRORS in src/api/instances.py). §10 requires a
-    // re-read + re-render, not an error message about something that did not break.
+  it("stays non-actionable when the instance has no window at all", async () => {
+    // The honest null: connected, unfocused AND no mirrored tabs => nothing to raise.
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const { fetchFn, counts } = makeFetch({
-      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
-      merge: {
-        status: 409,
-        body: { ok: false, error: "busy_dragging", message: "dragging", refetch: true },
+      state: { status: 200, body: fleet() }, // tabs: []
+      focus: () => ({ status: 200, body: { ok: true } }),
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    expect(store.statusRows.value.find((r) => r.id === "nowin").raisable).toBe(false);
+    expect(await store.raiseInstance("nowin")).toEqual({ ok: false, nonActionable: true });
+    expect(counts.focus ?? 0).toBe(0); // nothing was sent (the mock counts on first call)
+  });
+
+  it("POSTs /api/focus with {instance, windowId} and NO tabId, reports ok", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const bodies = [];
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: fleet() },
+      focus: (opts) => {
+        bodies.push(JSON.parse(opts.body));
+        return { status: 200, body: { ok: true } };
       },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    const res = await store.raiseInstance("prox");
+    expect(res).toEqual({ ok: true });
+    expect(counts.focus).toBe(1);
+    expect(bodies[0]).toEqual({ instance: "prox", windowId: 12 });
+    expect(bodies[0].tabId).toBeUndefined();
+  });
+
+  it("statusRows mark raisable only for foreign, connected, windowed instances", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({ state: { status: 200, body: fleet() } });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    const byId = Object.fromEntries(store.statusRows.value.map((r) => [r.id, r]));
+    expect(byId.prox.raisable).toBe(true);      // foreign, connected, has a window
+    expect(byId.me.raisable).toBe(false);        // OWN browser — no-op
+    expect(byId.closed.raisable).toBe(false);    // disconnected — unreachable
+    expect(byId.nowin.raisable).toBe(false);     // no focused_window_id — nothing to raise
+  });
+
+  it("a non-raisable row (own / disconnected / no window) sends NO request", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({ state: { status: 200, body: fleet() } });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    expect((await store.raiseInstance("me")).nonActionable).toBe(true);
+    expect((await store.raiseInstance("nowin")).nonActionable).toBe(true);
+    expect(counts.focus).toBeUndefined();
+  });
+
+  it("a 409 no_window re-fetches state (the mirror's window is gone)", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: fleet() },
+      focus: { status: 409, body: { ok: false, error: "no_window", refetch: true } },
     });
     const store = storeWith(env, fetchFn);
     await store.init();
     await store.refresh();
 
     const before = counts.state;
-    const res = await store.mergeWindowsNow("prox");
+    const res = await store.raiseInstance("prox");
+    expect(res).toEqual({ ok: false, refetch: true });
+    expect(counts.state).toBe(before + 1);
+  });
+});
 
-    expect(res).toEqual({ ok: false, retryable: true });
-    expect(counts.state).toBe(before + 1); // re-fetched and re-rendered (§10)
-    expect(store.mergeResult.value.error).toBeUndefined();
-    expect(store.mergeResult.value.retryable).toContain("мышью");
+// --- raise an OWN window (§62 item 4): click a window header -------------------
+describe("raise own window (§62 item 4)", () => {
+  it("focuses the window and touches NO tab (active tab unchanged, newtab stays)", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+
+    await store.raiseOwnWindow(6);
+    expect(env.calls.winUpdate).toEqual([[6, { focused: true }]]);
+    // The whole point of item 4: no tab is activated and the newtab is not closed.
+    expect(env.calls.tabUpdate).toEqual([]);
+    expect(env.calls.tabRemove).toEqual([]);
+  });
+
+  it("a null windowId is a no-op (a search-only pseudo group)", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({ state: undefined });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.raiseOwnWindow(null);
+    expect(env.calls.winUpdate).toEqual([]);
+  });
+});
+
+// --- run all rules now (§62 item 5) -------------------------------------------
+describe("run all rules now (§62 item 5)", () => {
+  it("POSTs /api/run_pass {run_all:true} and surfaces the status", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const bodies = [];
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      runPass: (opts) => {
+        bodies.push(JSON.parse(opts.body));
+        return { status: 200, body: { status: "ok" } };
+      },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    const res = await store.runRulesNow();
+    expect(res).toEqual({ ok: true, status: "ok" });
+    expect(counts.runPass).toBe(1);
+    expect(bodies[0]).toEqual({ run_all: true });
+    expect(store.runNowResult.value).toEqual({ status: "ok" });
   });
 
   it("offline: no request, an explicit error", async () => {
@@ -536,9 +626,9 @@ describe("merge windows now (§9)", () => {
     const { fetchFn, counts } = makeFetch({ state: undefined });
     const store = storeWith(env, fetchFn);
     await store.init();
-    const res = await store.mergeWindowsNow("prox");
+    const res = await store.runRulesNow();
     expect(res.offline).toBe(true);
-    expect(counts.merge).toBeUndefined();
+    expect(counts.runPass).toBeUndefined();
   });
 });
 

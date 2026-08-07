@@ -7,6 +7,7 @@ import {
   CMD_CLOSE_TAB,
   CMD_GET_TAB,
   CMD_FOCUS_TAB,
+  CMD_FOCUS_WINDOW,
   CMD_NAVIGATE_TAB,
   CMD_MERGE_WINDOWS,
   CMD_EXECUTE_JS,
@@ -48,6 +49,7 @@ describe("stale_session rejects every verb without executing", () => {
     [CMD_CLOSE_TAB, { tabId: 1, expect: {} }],
     [CMD_GET_TAB, { tabId: 1 }],
     [CMD_FOCUS_TAB, { tabId: 1 }],
+    [CMD_FOCUS_WINDOW, { windowId: 1 }],
     [CMD_NAVIGATE_TAB, { tabId: 1, url: "https://x/" }],
     [CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }],
     [CMD_MOVE_TAB, { tabId: 1, windowId: 2 }],
@@ -539,6 +541,25 @@ describe("get / focus / navigate", () => {
     chromeWithTab();
     const res = await dispatchCommand(frame(CMD_FOCUS_TAB, { tabId: 42 }), ctx());
     expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("focus_window raises the window WITHOUT touching any tab", async () => {
+    chromeWithTab();
+    const tabUpdate = vi.spyOn(chrome.tabs, "update");
+    const winUpdate = vi.spyOn(chrome.windows, "update");
+    const res = await dispatchCommand(frame(CMD_FOCUS_WINDOW, { windowId: 3 }), ctx());
+    expect(res.ok).toBe(true);
+    expect(winUpdate).toHaveBeenCalledWith(3, { focused: true });
+    // The whole point of focus_window: no tab is activated (contrast focus_tab).
+    expect(tabUpdate).not.toHaveBeenCalled();
+  });
+
+  it("focus_window maps a missing window to no_window and updates nothing", async () => {
+    chromeWithTab();
+    const winUpdate = vi.spyOn(chrome.windows, "update");
+    const res = await dispatchCommand(frame(CMD_FOCUS_WINDOW, { windowId: 999 }), ctx());
+    expect(res.error.code).toBe("no_window");
+    expect(winUpdate).not.toHaveBeenCalled();
   });
 
   it("navigate_tab happy (http/https validated) updates the url", async () => {

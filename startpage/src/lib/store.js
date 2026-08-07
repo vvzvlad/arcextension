@@ -21,8 +21,9 @@ import {
   getIdentity,
   httpBaseFromServiceUrl,
   postFocus,
-  postMergeWindows,
+  postFocusWindow,
   postPause,
+  postRunPass,
   previewRule,
   queryBookmarks,
   queryHistory,
@@ -66,7 +67,6 @@ export function createStore(deps = {}) {
   const chromeApi = deps.chromeApi || (typeof chrome !== "undefined" ? chrome : undefined);
   const fetchFn = deps.fetchFn || (typeof fetch !== "undefined" ? fetch.bind(globalThis) : undefined);
   const now = deps.now || (() => Date.now());
-  const staleMs = deps.staleMs ?? 3000;
 
   // --- reactive state -------------------------------------------------------
   const ownInstanceId = ref(null);
@@ -163,7 +163,8 @@ export function createStore(deps = {}) {
   // never mutated in place, so shallow reactivity is all they need.
   const pendingOps = shallowRef([]);
   const inFlightOps = shallowRef([]);
-  const mergeResult = ref(null); // { instanceId, merged } | { instanceId, error }
+  // The "выполнить все правила сейчас" outcome (§62 item 5): { status } | { error }.
+  const runNowResult = ref(null);
 
   // --- rules editor state (§8/§10) — needs the network; degrades gracefully -----
   const rules = ref([]);
@@ -212,6 +213,30 @@ export function createStore(deps = {}) {
         ...(Array.isArray(plan.closure_examples) ? plan.closure_examples : []),
       ].slice(0, 5),
     };
+  }
+
+  // The window id to raise an instance BY. Prefers its foreground window when the
+  // mirror happens to know one, else the instance's busiest window from the tab list
+  // (ties -> smallest id, the same deterministic rule §9 uses to pick "the obvious
+  // window"). Returns null only when we know of no window at all — a connected
+  // instance with zero mirrored tabs, where there is genuinely nothing to raise.
+  function raisableWindowId(inst) {
+    if (!inst) return null;
+    if (inst.focused_window_id != null) return inst.focused_window_id;
+    const counts = new Map();
+    for (const t of foreignTabs.value) {
+      if (t.instance_id !== inst.id || t.window_id == null) continue;
+      counts.set(t.window_id, (counts.get(t.window_id) || 0) + 1);
+    }
+    let best = null;
+    let bestCount = -1;
+    for (const [wid, n] of counts) {
+      if (n > bestCount || (n === bestCount && wid < best)) {
+        best = wid;
+        bestCount = n;
+      }
+    }
+    return best;
   }
 
   function applyState(state) {
@@ -309,14 +334,31 @@ export function createStore(deps = {}) {
       ...g,
       // SERVER scale + the ticking clock: the label must be right despite clock drift
       // AND must keep updating while the page stays open.
-      status: instanceStatus(g.meta, serverNow(), staleMs),
+      status: instanceStatus(g.meta, serverNow()),
     })),
   );
   const statusRows = computed(() =>
     instances.value.map((i) => ({
       id: i.id,
       title: i.id, // the id IS the name (§6)
-      status: instanceStatus(i, serverNow(), staleMs),
+      status: instanceStatus(i, serverNow()),
+      // A "space" is RAISABLE (§62 item 3) only when it is a FOREIGN, connected instance
+      // we have SOME window id for: raising our own browser from its own newtab is a
+      // no-op, and a closed instance is unreachable.
+      //
+      // The window is NOT `focused_window_id` alone. That field means "the window on
+      // screen RIGHT NOW, null when the browser is unfocused" (§5, extension/src/
+      // snapshot.js) — and a foreign browser is unfocused exactly when you want to
+      // raise it, so the field is null precisely in the case this button exists for.
+      // Gating on it made the row dead most of the time and alive in a narrow window
+      // right after leaving that instance. Any window of the instance does the job:
+      // a single chrome.windows.update({focused:true}) raises the browser from ANY
+      // window state (ledger row 33а), so we fall back to one derived from its tabs.
+      focusedWindowId: raisableWindowId(i),
+      raisable:
+        i.id !== ownInstanceId.value &&
+        i.connected === true &&
+        raisableWindowId(i) != null,
     })),
   );
 
@@ -703,6 +745,23 @@ export function createStore(deps = {}) {
     }
   }
 
+  // Click a window-title header (§62 item 4): raise THIS browser's own window to the
+  // foreground and change NOTHING inside it — the active tab must stay the active tab.
+  // Unlike jumpOwn this NEVER calls tabs.update and NEVER closeSelf(): the newtab stays
+  // open and no tab is activated, so a plain windows.update({focused}) is the whole op.
+  async function raiseOwnWindow(windowId) {
+    fallbackMessage.value = "";
+    if (windowId == null) return;
+    try {
+      await chromeApi.windows.update(windowId, { focused: true });
+    } catch {
+      // The window was closed between the render and the click: re-read the LOCAL truth
+      // and re-render rather than sit silent (§10), same discipline as jumpOwn.
+      ownTabs.value = await queryOwnTabs(chromeApi).catch(() => []);
+      fallbackMessage.value = "Окно уже закрыто — список обновлён";
+    }
+  }
+
   async function jumpForeign(instanceId, tab, { force = false } = {}) {
     fallbackMessage.value = "";
     // Offline: a foreign jump is inactive (§10) — the instance is unreachable.
@@ -739,44 +798,71 @@ export function createStore(deps = {}) {
     fallbackMessage.value = `Переключитесь в ${instanceId} вручную`;
   }
 
-  // --- merge windows now (§9) -----------------------------------------------
-  // §9 promises this button explicitly: the pass folds an instance's windows only
-  // after an hour of idleness, and "ждать час не хочется" is a real case.
-  async function mergeWindowsNow(instanceId, { force = false } = {}) {
-    mergeResult.value = null;
+  // --- raise a space (§62 item 3) -------------------------------------------
+  // Click a foreign instance's status row to bring ITS browser to the foreground,
+  // touching nothing inside it. Mirrors jumpForeign's error handling but posts
+  // {windowId} (focus_window) instead of {tabId} (focus_tab). A non-raisable row (own
+  // browser, disconnected, or no known focused window) is a no-op — the template also
+  // disables it, and looking the id up here means a null windowId is never sent.
+  async function raiseInstance(instanceId, { force = false } = {}) {
+    fallbackMessage.value = "";
+    const inst = instances.value.find((i) => i.id === instanceId);
+    // Same resolution the `raisable` flag uses — never `focused_window_id` alone,
+    // which is null for any browser that is not on screen (see raisableWindowId).
+    const windowId = raisableWindowId(inst);
+    if (windowId == null || instanceId === ownInstanceId.value) {
+      return { ok: false, nonActionable: true };
+    }
     if (offline.value || !base || !token) {
-      offline.value = true;
-      mergeResult.value = { instanceId, error: "offline" };
+      fallbackMessage.value = `Переключитесь в ${instanceId} вручную`;
       return { ok: false, offline: true };
     }
-    const { status, body } = await postMergeWindows(fetchFn, base, token, instanceId, { force });
-    if (status >= 200 && status < 300) {
+    const { status, body } = await postFocusWindow(
+      fetchFn, base, token, instanceId, windowId, { force }
+    );
+    if (status === 200) {
       pauseBlock.value = null;
-      mergeResult.value = { instanceId, merged: (body && body.merged) ?? 0 };
-      return { ok: true, merged: mergeResult.value.merged };
+      return { ok: true };
     }
+    // no_window / refetch: the mirror's window is gone — re-read state and re-render.
+    if (status === 409 && body && (body.error === "no_window" || body.refetch)) {
+      pauseBlock.value = null;
+      await refresh();
+      return { ok: false, refetch: true };
+    }
+    // 423: the stop gate. Offer the human's own {force:true} override (§7).
     if (status === 423) {
       pauseBlock.value = {
-        verb: "merge_windows",
+        verb: "focus",
         since: (body && body.since) ?? stoppedAt.value ?? null,
-        retry: () => mergeWindowsNow(instanceId, { force: true }),
+        retry: () => raiseInstance(instanceId, { force: true }),
       };
       return { ok: false, paused: true };
     }
-    // 409 + refetch: the service's _CLIENT_ERRORS (src/api/instances.py) — `no_window`
-    // ("your picture of the windows is stale") and `busy_dragging` (§9 says explicitly
-    // that a drag "провалом не считается"). Neither is a breakage, and §10 requires the
-    // page to re-read state and re-render rather than show an error for something that
-    // did not break.
-    if (status === 409 && body && (body.refetch || body.error === "busy_dragging")) {
-      mergeResult.value =
-        body.error === "busy_dragging"
-          ? { instanceId, retryable: "вкладку держат мышью — попробуйте ещё раз" }
-          : { instanceId, retryable: "картина окон устарела — состояние обновлено" };
-      await refresh();
-      return { ok: false, retryable: true };
+    fallbackMessage.value = `Переключитесь в ${instanceId} вручную`;
+    return { ok: false };
+  }
+
+  // --- run all rules now (§62 item 5) ---------------------------------------
+  // POST /api/run_pass {run_all:true}: run one curator pass immediately, executing even
+  // an over-threshold plan in this one click (the server's run_all bypasses the
+  // MAX_ACTIONS_PER_PASS latch). The outcome (the pass status) is surfaced briefly the
+  // way the old merge button surfaced its result. Offline it no-ops with a note.
+  async function runRulesNow() {
+    runNowResult.value = null;
+    if (offline.value || !base || !token) {
+      offline.value = true;
+      runNowResult.value = { error: "offline" };
+      return { ok: false, offline: true };
     }
-    mergeResult.value = { instanceId, error: "HTTP " + status };
+    const { status, body } = await postRunPass(fetchFn, base, token, { runAll: true });
+    if (status >= 200 && status < 300) {
+      runNowResult.value = { status: (body && body.status) || "ok" };
+      // The pass may have changed the mirror (relocations/closes) and the latch — re-read.
+      await refresh();
+      return { ok: true, status: runNowResult.value.status };
+    }
+    runNowResult.value = { error: "HTTP " + status };
     return { ok: false };
   }
 
@@ -998,9 +1084,9 @@ export function createStore(deps = {}) {
     pauseError,
     pauseBlock,
     resuming,
-    // quick-link queue overlay (§10) + merge (§9)
+    // quick-link queue overlay (§10) + run-now outcome (§62 item 5)
     pendingOps,
-    mergeResult,
+    runNowResult,
     // rules editor state
     rules,
     rulesLoaded,
@@ -1034,13 +1120,15 @@ export function createStore(deps = {}) {
     unwatchBookmarkChanges,
     jumpOwn,
     jumpForeign,
+    raiseInstance,
+    raiseOwnWindow,
     setSearch,
     // stop/start methods (§7)
     pauseCurator,
     resumeCurator,
     retryForced,
-    // merge windows now (§9)
-    mergeWindowsNow,
+    // run all rules now (§62 item 5)
+    runRulesNow,
     // rules editor methods
     loadRules,
     previewRuleDraft,

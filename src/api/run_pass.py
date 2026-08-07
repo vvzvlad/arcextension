@@ -1,11 +1,14 @@
 """``POST /api/run_pass`` — trigger one curator pass (§7).
 
-Body (all optional): ``{dry_run?: bool, confirm_pending?: bool}``. ``dry_run`` takes
-the lease, requests snapshots and returns the plan WITHOUT writing actions and is NOT
-muted by a stop (looking at the plan is exactly why the stop is pressed).
-``confirm_pending`` confirms the over-threshold plan latched by the
+Body (all optional): ``{dry_run?: bool, confirm_pending?: bool, run_all?: bool}``.
+``dry_run`` takes the lease, requests snapshots and returns the plan WITHOUT writing
+actions and is NOT muted by a stop (looking at the plan is exactly why the stop is
+pressed). ``confirm_pending`` confirms the over-threshold plan latched by the
 ``MAX_ACTIONS_PER_PASS`` gate — the pass recomputes the plan at confirm time and
-executes it. A stopped curator answers ``{"status": "stopped", "since": <ms>}``.
+executes it. ``run_all`` (the "выполнить все правила сейчас" button) executes the
+freshly-decided plan in ONE pass even when it is over-threshold, bypassing ONLY that
+action-count latch — never a stop or a pause. A stopped curator answers
+``{"status": "stopped", "since": <ms>}``.
 Authed via ``require_api_caller`` (Bearer ADMIN_TOKEN or an instance secret — §35 §4);
 refuses degraded mode.
 """
@@ -41,6 +44,7 @@ async def run_pass_endpoint(request: Request) -> JSONResponse:
         app.state.settings,
         dry_run=bool(body.get("dry_run")),
         confirm_pending=bool(body.get("confirm_pending")),
+        run_all=bool(body.get("run_all")),
         clock_guard=getattr(app.state, "curator_clock", None),
     )
     return JSONResponse(result)
