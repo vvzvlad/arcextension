@@ -75,7 +75,7 @@ def _tiny_repo_extension(root: Path, *, commits: int = 1) -> Path:
     shallow clone on purpose (there `rev-list --count HEAD` answers 1 and the version
     would come out confidently wrong), and `actions/checkout` clones with `fetch-depth: 1`
     — so against `REPO_EXTENSION` there is legitimately no stamp in CI, and the assertions
-    would either die on a missing `version_name` or have to be skipped in exactly the
+    would either die on a missing stamp or have to be skipped in exactly the
     environment that matters most. A repo built here is non-shallow by construction and
     its commit count is the test's own choice.
 
@@ -295,38 +295,31 @@ def test_bundle_takes_no_key_file_and_nothing_stamps_a_manifest(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Build stamp: `version` / `version_name` in the BUILT bundle (never in extension/)
+# Build stamp: `version` in the BUILT bundle (never in extension/, never version_name)
 # --------------------------------------------------------------------------- #
 def _repo_manifest_text() -> str:
     return (REPO_EXTENSION / "manifest.json").read_text(encoding="utf-8")
 
 
-def test_stamp_build_identity_sets_both_fields_and_changes_nothing_else():
-    # Exactly two VALUES differ; every other key — including the `//`-comment keys that
+def test_stamp_build_identity_sets_the_version_and_changes_nothing_else():
+    # Exactly ONE value differs; every other key — including the `//`-comment keys that
     # carry the Russian prose — comes through with its value and its position intact. Note
     # this is a key-level guarantee, not a byte-level one: the file is re-serialised whole,
     # so the blank lines between the manifest's sections do not survive (documented in
     # stamp_build_identity). Redden: serialise with ensure_ascii=True, or drop/reorder any
     # other key.
     before_text = _repo_manifest_text()
-    after_text = core.stamp_build_identity(
-        before_text, version="0.1.130", version_name="0.1.130 · abc1234 · 2026-08-07 19:52"
-    )
+    after_text = core.stamp_build_identity(before_text, version="0.1.130.1952")
     before = json.loads(before_text)
     after = json.loads(after_text)
 
-    assert after["version"] == "0.1.130"
-    assert after["version_name"] == "0.1.130 · abc1234 · 2026-08-07 19:52"
-    # Everything else is identical, key for key and value for value.
-    assert {k: v for k, v in after.items() if k not in ("version", "version_name")} == \
+    assert after["version"] == "0.1.130.1952"
+    # Everything else is identical, key for key and value for value…
+    assert {k: v for k, v in after.items() if k != "version"} == \
            {k: v for k, v in before.items() if k != "version"}
-    # …and in the same order, with version_name inserted right after version.
-    expected_order = []
-    for key in before:
-        expected_order.append(key)
-        if key == "version":
-            expected_order.append("version_name")
-    assert list(after) == expected_order
+    # …and in the same order, with `version` still in its original slot (no field is
+    # inserted next to it anymore).
+    assert list(after) == list(before)
     # The Russian comment text survives UNESCAPED (ensure_ascii=False), not as \uXXXX.
     assert "«Читать и изменять закладки»" in after_text
     assert "\\u" not in after_text
@@ -334,17 +327,31 @@ def test_stamp_build_identity_sets_both_fields_and_changes_nothing_else():
     assert after["manifest_version"] == 3
 
 
+def test_stamp_build_identity_strips_an_inherited_version_name():
+    # A source manifest that somehow carries a `version_name` must NOT have it copied
+    # through: brave://extensions renders that field beside the extension NAME and a long
+    # value there wraps and truncates the name («arcextens... 0.1.135 · edd7787 · …»),
+    # which is the defect this scheme fixes. Stripping it makes the page fall back to
+    # `version`. Redden: pass unknown keys through untouched.
+    src = json.dumps({"name": "x", "version": "0.1.0", "version_name": "long display"})
+    after = json.loads(core.stamp_build_identity(src, version="0.1.130.1952"))
+    assert after["version"] == "0.1.130.1952"
+    assert "version_name" not in after
+
+
 @pytest.mark.parametrize(
     "bad",
     [
-        "0.1.65536",   # component over the spec maximum
-        "0.1.032",     # leading zero on a non-zero component
-        "0.0.0.0",     # all zero
-        "0",           # all zero (single component)
-        "0.1.2.3.4",   # more than four components
-        "0.1.x",       # not an integer
-        "0.1.-1",      # negative
-        "",            # empty
+        "0.1.65536",       # component over the spec maximum
+        "0.1.130.65536",   # …and over it in the new FOURTH component
+        "0.1.032",         # leading zero on a non-zero component
+        "0.1.130.0932",    # leading zero in the build-minute component
+        "0.0.0.0",         # all zero
+        "0",               # all zero (single component)
+        "0.1.2.3.4",       # more than four components
+        "0.1.x",           # not an integer
+        "0.1.-1",          # negative
+        "",                # empty
     ],
 )
 def test_stamp_build_identity_refuses_an_invalid_version(bad):
@@ -352,12 +359,15 @@ def test_stamp_build_identity_refuses_an_invalid_version(bad):
     # so it must raise here instead of producing an unloadable manifest. Redden: drop the
     # validate_manifest_version call from stamp_build_identity.
     with pytest.raises(ValueError):
-        core.stamp_build_identity(_repo_manifest_text(), version=bad, version_name="x")
+        core.stamp_build_identity(_repo_manifest_text(), version=bad)
 
 
 def test_stamp_build_identity_accepts_the_spec_edges():
-    # The mirror of the case above: legal versions must NOT be rejected.
-    for good in ("0.1.0.0", "65535.65535.65535.65535", "1", "0.0.1"):
+    # The mirror of the case above: legal versions must NOT be rejected. The four-component
+    # form the stamp now emits is first in the list — `<major>.<minor>.<count>.<HHMM>` —
+    # together with the two boundary minutes it can produce (00:00 -> 0, 23:59 -> 2359).
+    for good in ("0.1.135.2058", "0.1.135.0", "0.1.135.2359",
+                 "0.1.0.0", "65535.65535.65535.65535", "1", "0.0.1"):
         assert core.validate_manifest_version(good) == good
 
 
@@ -375,54 +385,55 @@ def test_copy_bundle_stamps_the_output_and_never_the_repo(tmp_path):
     # make every build dirty the working tree. Redden: stamp src instead of dst.
     repo_before = (REPO_EXTENSION / "manifest.json").read_bytes()
     out = tmp_path / "dist"
-    core.copy_bundle(
-        REPO_EXTENSION, out, version="0.1.130", version_name="0.1.130 · abc1234 · now"
-    )
+    core.copy_bundle(REPO_EXTENSION, out, version="0.1.130.1952")
 
     built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert built["version"] == "0.1.130"
-    assert built["version_name"] == "0.1.130 · abc1234 · now"
+    assert built["version"] == "0.1.130.1952"
+    assert "version_name" not in built
     assert (REPO_EXTENSION / "manifest.json").read_bytes() == repo_before
 
 
-def test_copy_bundle_rejects_a_half_given_stamp_before_copying_anything(tmp_path):
-    # The "both or neither" pairing check must run BEFORE shutil.copytree. Raising after it
-    # would leave a complete but UNSTAMPED bundle at --out, and the retry would then have
-    # to fight the leftovers with --force. Redden: move the check back below copytree.
+def test_copy_bundle_validates_the_version_before_copying_anything(tmp_path):
+    # EVERY argument check must run BEFORE shutil.copytree. `version` is validated inside
+    # stamp_build_identity, which runs AFTER the copy — so copy_bundle validates it up
+    # front too, or an illegal version would leave a complete but UNSTAMPED bundle at
+    # --out and the retry would have to fight the leftovers with --force. (This replaces
+    # the old "version and version_name must be given together" pairing check: with
+    # version_name gone there is no pair left, but the copy-nothing-before-validating
+    # property it protected is the same one asserted here.) Redden: move the
+    # validate_manifest_version call back below copytree.
     out = tmp_path / "dist"
-    with pytest.raises(ValueError, match="must be given together"):
-        core.copy_bundle(REPO_EXTENSION, out, version="0.1.130")
+    with pytest.raises(ValueError, match="exceeds the maximum"):
+        core.copy_bundle(REPO_EXTENSION, out, version="0.1.130.65536")
     assert not out.exists()
-    with pytest.raises(ValueError, match="must be given together"):
-        core.copy_bundle(REPO_EXTENSION, out, version_name="0.1.130 · abc1234 · now")
+    with pytest.raises(ValueError, match="1 to 4 dot-separated"):
+        core.copy_bundle(REPO_EXTENSION, out, version="0.1.130.1952.7")
     assert not out.exists()
 
 
 def test_replace_bundle_forwards_the_stamp(tmp_path):
     # `bundle --force` goes through replace_bundle, so the in-place rebuild — the one the
     # operator actually runs (make dev-bundle) — must stamp too. Redden: drop the
-    # version/version_name forwarding in replace_bundle.
+    # version forwarding in replace_bundle.
     out = tmp_path / "dist"
     core.copy_bundle(REPO_EXTENSION, out)
-    core.replace_bundle(
-        REPO_EXTENSION, out, version="0.1.131", version_name="0.1.131 · def5678-dirty · now"
-    )
+    core.replace_bundle(REPO_EXTENSION, out, version="0.1.131.2058")
     built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert built["version"] == "0.1.131"
-    assert built["version_name"] == "0.1.131 · def5678-dirty · now"
+    assert built["version"] == "0.1.131.2058"
+    assert "version_name" not in built
 
 
-def test_cli_bundle_stamps_version_and_version_name(tmp_path):
+def test_cli_bundle_stamps_the_version(tmp_path):
     # End to end through the CLI: the built manifest carries a version whose first two
-    # components come from the tracked literal, a third component that is the commit
-    # count, and a version_name naming that version plus a sha.
+    # components come from the tracked literal, a third component that is the commit count
+    # and a fourth that is the build minute.
     #
     # This builds a repo the TEST owns rather than REPO_EXTENSION, because the shape of
     # THIS project's clone must not decide whether the assertion below runs. build_stamp
     # degrades to no stamp on a shallow clone by design, and CI checks out with
-    # fetch-depth: 1 — so read against REPO_EXTENSION this test dies on a missing
-    # `version_name` in CI, and skipping instead would retire the format assertion in the
-    # one environment that publishes images. See _tiny_repo_extension.
+    # fetch-depth: 1 — so read against REPO_EXTENSION this test dies on a missing stamp in
+    # CI, and skipping instead would retire the format assertion in the one environment
+    # that publishes images. See _tiny_repo_extension.
     ext = _tiny_repo_extension(tmp_path, commits=3)
     out = tmp_path / "dist"
     assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(ext)]) == 0
@@ -430,35 +441,72 @@ def test_cli_bundle_stamps_version_and_version_name(tmp_path):
     base = json.loads((ext / "manifest.json").read_text())["version"]
     built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     major, minor = base.split(".")[:2]
-    # The EXACT count, not merely the prefix: the history is this test's own, so three
-    # commits on a `0.2.0` base is `0.2.3` and nothing else. Redden: derive the third
-    # component from anything but `git rev-list --count HEAD`.
-    assert built["version"] == f"{major}.{minor}.3"
+    # The full SHAPE of `version` is pinned, and it is pinned here on purpose: this is now
+    # the string a human reads off the extension card in brave://extensions (the manifest
+    # carries no version_name for the page to display instead), so changing the component
+    # count is a user-visible change and must be a deliberate one. Four integer components,
+    # nothing else — no sha, no date, no `-dirty`; those live in the CLI's printed summary.
+    assert re.fullmatch(r"\d+\.\d+\.\d+\.\d+", built["version"]), built["version"]
     core.validate_manifest_version(built["version"])  # raises if the CLI emitted junk
-    assert built["version_name"].startswith(built["version"])
-    # The full SHAPE of version_name is pinned here, and it is pinned here on purpose:
-    # this is the string a human reads off the extension card in brave://extensions, so
-    # dropping the sha, changing the ` · ` separator or appending a field is a
-    # user-visible change and must be a deliberate one. It is also the ONLY assertion that
-    # catches a MACHINE-CONSTANT value — a user name, an absolute build path — being
-    # smuggled into the stamp: the two-run reproducibility tests in
-    # tests/test_enroll_metrics_and_bundle.py compare two builds on the SAME machine, so
-    # by construction they can only see what varies BETWEEN runs and never this.
-    # Matches cli.build_stamp: `<version> · <short-sha> · %Y-%m-%d %H:%M`, where `version`
-    # is three integer components (core.validate_manifest_version) and the sha is
-    # `git rev-parse --short HEAD` at the fixture repo's pinned `core.abbrev` — a fixed
-    # length, not `{7,}`, which would have been the ambient `core.abbrev`'s answer rather
-    # than the stamp's. No `-dirty` alternative: the fixture repo is committed clean, so a
-    # marker here is a bare sha; the `-dirty` half is pinned by
-    # test_build_stamp_dirty_marker_only_looks_at_the_bundle.
-    assert re.fullmatch(
-        r"\d+\.\d+\.\d+ · [0-9a-f]{" + str(_FIXTURE_ABBREV) + r"} · "
-        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}",
-        built["version_name"],
-    ), built["version_name"]
+    count, minute = built["version"].split(".")[2:]
+    # The EXACT count, not merely the prefix: the history is this test's own, so three
+    # commits on a `0.2.0` base is `0.2.3.<minute>` and nothing else. Redden: derive the
+    # third component from anything but `git rev-list --count HEAD`.
+    assert f"{major}.{minor}.{count}" == f"{major}.{minor}.3"
+    # The build minute is a wall clock, so it is pinned by RANGE rather than by value:
+    # `HH*100 + MM` lives in 0..2359. Redden: emit `%H%M` as a zero-padded string (`0930`)
+    # and the leading zero makes validate_manifest_version reject the whole version above.
+    assert 0 <= int(minute) <= 2359, minute
     assert built["manifest_version"] == 3  # still a loadable MV3 bundle
     # The tracked literal is NOT bumped by a build.
     assert json.loads((ext / "manifest.json").read_text())["version"] == base
+
+
+def test_cli_bundle_writes_no_version_name_and_a_short_version(tmp_path):
+    # THE defect this scheme fixes. brave://extensions renders `version_name` when present,
+    # and it renders it in the slot BESIDE THE EXTENSION NAME — a slot with roughly ten
+    # characters of room. The 35-character human-readable stamp that used to live there
+    # («0.1.135 · edd7787 · 2026-08-07 20:58») wrapped to two lines and truncated the name
+    # itself, so the card read «arcextens... 0.1.135 · edd7787 · 2026-08-07 20:58» while
+    # every neighbouring extension showed its full name and a compact version. With no
+    # `version_name` the page falls back to `version` ("if no version_name is present, the
+    # version field will be used for display purposes as well"). Redden: re-add
+    # `version_name` to the stamp — which would silently truncate the name again, with no
+    # other test noticing.
+    ext = _tiny_repo_extension(tmp_path, commits=3)
+    out = tmp_path / "dist"
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(ext)]) == 0
+
+    built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert "version_name" not in built
+    # …and what the card DOES render stays inside that budget: `0.1.135.2058` is twelve
+    # characters, and the ceiling here is what stops the identity creeping back into the
+    # rendered field one component at a time.
+    assert len(built["version"]) <= 16, built["version"]
+
+
+def test_cli_bundle_prints_the_sha_and_the_dirty_flag(tmp_path, capsys):
+    # The sha, the `-dirty` marker and the full build date left the manifest because they
+    # do not fit the card — they must NOT have left the operator's screen with it. The
+    # terminal output of `make dev-bundle` is now the only place the full build identity
+    # is reported, alongside the version to compare against the card. Redden: drop the
+    # `build          : ...` line from cmd_bundle.
+    ext = _tiny_repo_extension(tmp_path, commits=3)
+    (ext / "background.js").write_text("// uncommitted\n", encoding="utf-8")
+    out = tmp_path / "dist"
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(ext)]) == 0
+
+    printed = capsys.readouterr().out
+    built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    # The version the card will show is printed verbatim — that comparison is the point.
+    assert built["version"] in printed
+    # The marker keeps its SHAPE, not merely its presence: `-dirty` QUALIFIES THE SHA and
+    # must stay glued to it (see test_build_stamp_dirty_marker_only_looks_at_the_bundle).
+    assert re.search(
+        r"commit [0-9a-f]{" + str(_FIXTURE_ABBREV) + r"}-dirty, built "
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}",
+        printed,
+    ), printed
 
 
 def test_cli_bundle_still_builds_when_git_is_unavailable(tmp_path, monkeypatch, capsys):
@@ -478,6 +526,11 @@ def test_cli_bundle_still_builds_when_git_is_unavailable(tmp_path, monkeypatch, 
 
     assert (out / "manifest.json").read_bytes() == (REPO_EXTENSION / "manifest.json").read_bytes()
     built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    # Untouched: the BASE literal comes through unstamped, and no display field is invented
+    # to stand in for the missing stamp.
+    assert built["version"] == json.loads(
+        (REPO_EXTENSION / "manifest.json").read_text(encoding="utf-8")
+    )["version"]
     assert "version_name" not in built
     assert "build stamp unavailable" in capsys.readouterr().err
 
@@ -553,25 +606,30 @@ def test_build_stamp_dirty_marker_only_looks_at_the_bundle(tmp_path):
     ext = _tiny_repo_extension(tmp_path)
     (ext.parent / "scratch.txt").write_text("not part of the bundle", encoding="utf-8")
 
+    # The marker moved out of the manifest with the rest of the human-readable identity,
+    # so it is asserted where it now lives: `build_stamp`'s second return value, which
+    # cmd_bundle prints (and which nothing stamps into the version anymore — a numeric
+    # manifest version cannot carry a `-dirty` suffix).
     stamp = cli.build_stamp(ext)
     assert stamp is not None
     assert "-dirty" not in stamp[1]
+    # A clean tree's marker is a BARE sha, pinned by shape so a silently empty marker or
+    # an always-appended suffix cannot pass.
+    assert re.fullmatch(r"[0-9a-f]{" + str(_FIXTURE_ABBREV) + r"}", stamp[1]), stamp[1]
 
     # A change INSIDE the bundle is exactly what the marker is for.
     (ext / "background.js").write_text("// uncommitted\n", encoding="utf-8")
     stamp = cli.build_stamp(ext)
     assert stamp is not None
     # The whole SHAPE is pinned, not just the marker's presence: `-dirty` QUALIFIES THE
-    # SHA and must stay glued to it. Read off the extension card, `abc1234-dirty` says
-    # "this build is that commit plus uncommitted edits", while a trailing ` · -dirty`
-    # field reads as a separate token about the build in general. Presence alone leaves
-    # that free to move. Same format as the clean-build regex in
-    # test_cli_bundle_stamps_version_and_version_name, with the marker added.
+    # SHA and must stay glued to it. `abc1234-dirty` says "this build is that commit plus
+    # uncommitted edits", while a separate ` · -dirty` token reads as a statement about
+    # the build in general. Presence alone leaves that free to move.
     assert re.fullmatch(
-        r"\d+\.\d+\.\d+ · [0-9a-f]{" + str(_FIXTURE_ABBREV) + r"}-dirty · "
-        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}",
-        stamp[1],
+        r"[0-9a-f]{" + str(_FIXTURE_ABBREV) + r"}-dirty", stamp[1]
     ), stamp[1]
+    # …and the marker stays OUT of the version, which is the field the card renders.
+    assert "dirty" not in stamp[0]
 
 
 def test_build_stamp_ignores_a_repo_that_does_not_track_the_manifest(tmp_path):

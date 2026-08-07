@@ -34,8 +34,8 @@ DEFAULT_APP_VERSION = "0.1.0"
 # made bundles non-interchangeable: a bundle configured for one host/id was NOT the same
 # artefact as another, so the universal build stamps no configuration at all.
 #
-# It does stamp build IDENTITY — `version`/`version_name`; `stamp_build_identity` below
-# carries the argument for why that is a different kind of thing. Note the price: the
+# It does stamp build IDENTITY — `version`, and ONLY `version`; `stamp_build_identity`
+# below carries the argument for why that is a different kind of thing. Note the price: the
 # stamped manifest is RE-SERIALISED as a whole, so the built manifest.json is not a
 # byte-for-byte copy of the source one — in particular the blank lines separating the
 # manifest's sections do not survive, and `diff dist/manifest.json extension/manifest.json`
@@ -298,8 +298,8 @@ def validate_manifest_version(version: str) -> str:
     return version
 
 
-def stamp_build_identity(manifest_text: str, *, version: str, version_name: str) -> str:
-    """Return *manifest_text* with ``version``/``version_name`` set to the build stamp.
+def stamp_build_identity(manifest_text: str, *, version: str) -> str:
+    """Return *manifest_text* with ``version`` set to the build stamp, and no other field.
 
     What this stamps is build IDENTITY, and that is deliberately NOT what the deleted
     ``stamp_manifest(manifest, host, key_b64)`` used to stamp. A baked-in ``<host>`` or
@@ -310,42 +310,41 @@ def stamp_build_identity(manifest_text: str, *, version: str, version_name: str)
     grow a ``host=``/``key=`` parameter here: that would put configuration stamping back
     under an identity name, which is exactly the conflation the rename undid.
 
-    ``version_name`` is the field brave://extensions RENDERS when present ("will be used
-    for display purposes if present"), so it carries the human-readable build identity;
-    ``version`` stays machine-ordered so the scheme still advances per commit for anything
-    that reads only it.
+    ``version_name`` is NOT written, and any inherited one is REMOVED. That field is the one
+    brave://extensions renders when present, and the extensions page renders it in the slot
+    BESIDE THE EXTENSION NAME — a slot with roughly ten characters of room. A human-readable
+    stamp there (``0.1.135 · edd7787 · 2026-08-07 20:58``, 35 characters) wrapped to two
+    lines and truncated the name itself, so the card read «arcextens… 0.1.135 · edd7787 · …».
+    With no ``version_name`` the page falls back to ``version`` ("if no version_name is
+    present, the version field will be used for display purposes as well"), which is exactly
+    how every other extension's card renders. So the build identity has to fit INSIDE the
+    version, and the short sha, the ``-dirty`` marker and the full build date deliberately
+    do not travel in the manifest at all — the terminal output of ``make dev-bundle`` is
+    where the full identity is printed. Do not re-add ``version_name``: it truncates the
+    name again, silently.
 
-    Pure text in, pure text out — the caller supplies the two values, this never reads git
-    or the clock.
+    Pure text in, pure text out — the caller supplies the value, this never reads git or
+    the clock.
 
-    The file is RE-SERIALISED WHOLE, not patched in place: the text is parsed, the two
-    values are set and ``json.dumps(indent=2, ensure_ascii=False)`` writes it back out.
-    That is the robust path — the output is always valid JSON, every key keeps its value
-    and its order, and the Russian prose in the ``//``-comment keys stays unescaped. It is
-    NOT byte-surgical though: the blank lines separating the manifest's sections do not
-    survive the round-trip, so ``diff dist/manifest.json extension/manifest.json`` shows
-    the reflow as well as the two stamped values — more than two changed lines, by design.
+    The file is RE-SERIALISED WHOLE, not patched in place: the text is parsed, the value is
+    set and ``json.dumps(indent=2, ensure_ascii=False)`` writes it back out. That is the
+    robust path — the output is always valid JSON, every key keeps its value and its order,
+    and the Russian prose in the ``//``-comment keys stays unescaped. It is NOT
+    byte-surgical though: the blank lines separating the manifest's sections do not survive
+    the round-trip, so ``diff dist/manifest.json extension/manifest.json`` shows the reflow
+    as well as the stamped value — more than one changed line, by design.
     """
     validate_manifest_version(version)
-    if not version_name.strip():
-        raise ValueError("version_name must not be empty")
 
     data = json.loads(manifest_text)
     if not isinstance(data, dict):
         raise ValueError("manifest.json must contain a JSON object")
 
-    # Rebuild the mapping so `version_name` lands next to `version` instead of at the end:
-    # json.dumps preserves insertion order, and the two belong together in a diff.
-    stamped: dict = {}
-    for key, value in data.items():
-        if key == "version":
-            stamped["version"] = version
-            stamped["version_name"] = version_name
-        elif key != "version_name":
-            stamped[key] = value
-    if "version" not in stamped:  # a manifest without one: append rather than fail
-        stamped["version"] = version
-        stamped["version_name"] = version_name
+    # A dict comprehension keeps insertion order, and assigning an EXISTING key keeps its
+    # position — so `version` stays where the source manifest put it (and is appended only
+    # if the source had none) while any `version_name` is dropped.
+    stamped = {key: value for key, value in data.items() if key != "version_name"}
+    stamped["version"] = version
 
     return json.dumps(stamped, indent=2, ensure_ascii=False) + "\n"
 
@@ -376,34 +375,32 @@ def copy_bundle(
     dst_extension_dir: str | Path,
     *,
     version: str | None = None,
-    version_name: str | None = None,
 ) -> None:
     """Copy the extension bundle, skipping dev cruft and any source instance.json.
 
     Used by the universal ``bundle`` build (§9) to materialise the ONE fleet-wide
     bundle every instance loads. The repo's own ``extension/`` is only READ here.
 
-    With *version*/*version_name* given, the COPY's ``manifest.json`` is stamped with the
-    build identity (:func:`stamp_build_identity`) — the source manifest is never written.
-    With both left ``None`` this is a verbatim copy and nothing is rewritten at all.
+    With *version* given, the COPY's ``manifest.json`` is stamped with the build identity
+    (:func:`stamp_build_identity`) — the source manifest is never written. With it left
+    ``None`` this is a verbatim copy and nothing is rewritten at all.
     """
     src = Path(src_extension_dir)
     # EVERY argument check runs before a single byte is copied. A raise after copytree
     # would leave a complete but unstamped bundle sitting at the destination, and the
-    # retry would then need --force to get past its own leftovers.
-    if (version is None) != (version_name is None):
-        raise ValueError("version and version_name must be given together")
+    # retry would then need --force to get past its own leftovers. `version` is therefore
+    # validated HERE and not only inside stamp_build_identity, which runs after the copy.
+    if version is not None:
+        validate_manifest_version(version)
     if not (src / "manifest.json").is_file():
         raise ValueError(f"{src} is not an extension bundle (no manifest.json)")
     shutil.copytree(src, dst_extension_dir, ignore=_COPY_IGNORE)
-    if version is None or version_name is None:  # verbatim copy: nothing is rewritten
+    if version is None:  # verbatim copy: nothing is rewritten
         return
     dst_manifest = Path(dst_extension_dir) / "manifest.json"
     dst_manifest.write_text(
         stamp_build_identity(
-            dst_manifest.read_text(encoding="utf-8"),
-            version=version,
-            version_name=version_name,
+            dst_manifest.read_text(encoding="utf-8"), version=version
         ),
         encoding="utf-8",
     )
@@ -419,7 +416,6 @@ def replace_bundle(
     dst_extension_dir: str | Path,
     *,
     version: str | None = None,
-    version_name: str | None = None,
 ) -> None:
     """Rebuild an EXISTING bundle dir IN PLACE, keeping its path and never half-writing it.
 
@@ -445,8 +441,8 @@ def replace_bundle(
     even there the previous tree still exists under the staging dir until step (4).
     Anything that fails earlier leaves the existing bundle exactly as it was.
 
-    *version*/*version_name* are forwarded to :func:`copy_bundle`, so the staged tree is
-    already stamped before the swap — the live bundle is never a stamped-in-place tree.
+    *version* is forwarded to :func:`copy_bundle`, so the staged tree is already stamped
+    before the swap — the live bundle is never a stamped-in-place tree.
     """
     src = Path(src_extension_dir).resolve()
     dst = Path(dst_extension_dir).resolve()
@@ -468,9 +464,7 @@ def replace_bundle(
 
     try:
         # Validates the source and does all the copying while dst is still untouched.
-        copy_bundle(
-            src_extension_dir, new_tree, version=version, version_name=version_name
-        )
+        copy_bundle(src_extension_dir, new_tree, version=version)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -594,7 +588,7 @@ def generate_instance(
     # dev-bundle` rebuilds the shared bundle and touches no instance, so from the next
     # rebuild on this plist names an older build. That is acceptable because the plist is
     # not where anyone checks which build is loaded — the extension card in
-    # brave://extensions is (it renders the manifest's `version_name`) and it stays the
+    # brave://extensions is (it renders the manifest's `version`) and it stays the
     # source of truth. What this does buy is that a freshly generated .app does not
     # advertise a version the bundle never had. An unstamped/hand-made bundle (no readable
     # `version`) falls back to DEFAULT_APP_VERSION.

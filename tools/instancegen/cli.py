@@ -31,9 +31,6 @@ _DEFAULT_EXTENSION_DIR = _REPO_ROOT / "extension"
 # Seconds any single `git` call gets before the stamp is given up on. A build must never
 # hang on a wedged git (a stale index.lock, a network-backed worktree).
 _GIT_TIMEOUT = 10
-# Separator between the three facts in `version_name`. A middle dot reads well on the
-# extension card and cannot be confused with the dots inside the version itself.
-_STAMP_SEP = " · "
 
 
 def _git(repo_dir: Path, *argv: str) -> str:
@@ -52,21 +49,36 @@ def _git(repo_dir: Path, *argv: str) -> str:
     return out.stdout.strip()
 
 
-def build_stamp(extension_dir: str | Path) -> tuple[str, str] | None:
-    """The ``(version, version_name)`` build stamp for a source ``extension/``, or ``None``.
+def build_stamp(extension_dir: str | Path) -> tuple[str, str, str] | None:
+    """The ``(version, marker, built_at)`` build stamp for a source ``extension/``, or ``None``.
 
     This is where the ENVIRONMENT is read — git and the clock — deliberately here and not
     in :mod:`core`, which stays pure text + filesystem.
 
-      * ``version``      = ``<major>.<minor>.<commit-count>``, with ``<major>.<minor>``
+      * ``version``  = ``<major>.<minor>.<commit-count>.<HHMM>``, with ``<major>.<minor>``
         taken from the tracked manifest's own ``version`` literal (that literal is the
-        BASE and is never rewritten in the repo) and the count from
-        ``git rev-list --count HEAD``. Machine-ordered: it advances with every commit,
-        which is what ties a loaded bundle to a point in history.
-      * ``version_name`` = that version, the short sha with a ``-dirty`` suffix when the
-        working tree has uncommitted changes, and the build time. This is the field the
-        extensions page displays, and the ``dirty`` marker is the point of it: without one,
-        a build from a modified tree is indistinguishable from the committed code.
+        BASE and is never rewritten in the repo), the count from
+        ``git rev-list --count HEAD`` and ``<HHMM>`` the build's wall-clock hour and minute
+        as ONE integer (20:58 -> ``2058``, 09:30 -> ``930``, 00:05 -> ``5``). The count
+        advances with every commit, which ties a loaded bundle to a point in history; the
+        minute is what makes two builds of the SAME commit distinguishable, which is the
+        entire point of the stamp — the operator compares the extension card against what
+        ``make dev-bundle`` just printed. Four integer components, each within the spec's
+        0..65535, twelve characters or so: it fits the narrow slot the extensions page
+        gives a version.
+      * ``marker``   = the short sha, with ``-dirty`` glued to it when the working tree has
+        uncommitted changes. This is TERMINAL-ONLY output.
+      * ``built_at`` = the same wall clock as ``<HHMM>``, spelled out for a human
+        (``%Y-%m-%d %H:%M``). Also TERMINAL-ONLY.
+
+    Only ``version`` reaches the manifest. The sha, the ``-dirty`` marker and the full date
+    deliberately do NOT: the extensions page renders the version beside the extension NAME,
+    in a slot with room for a version and nothing else, and a longer string wrapped and
+    truncated the name itself (see :func:`core.stamp_build_identity`). They are still part
+    of the build identity, so :func:`cmd_bundle` prints them — the terminal output of
+    ``make dev-bundle`` is where the full identity lives, and the ``-dirty`` marker in
+    particular is the only thing that tells a build from a modified tree apart from the
+    committed code.
 
     A build must NEVER fail over this. No git on PATH, not a git repo, an empty or broken
     repo, a shallow clone, a manifest that is not a JSON object, a git that hangs — every
@@ -127,19 +139,25 @@ def build_stamp(extension_dir: str | Path) -> tuple[str, str] | None:
         # Clamped, not wrapped: the spec caps a component at 65535 and an over-long
         # history must degrade to a pinned ceiling, never to an unloadable manifest.
         count = max(0, min(count, core.MANIFEST_VERSION_MAX_COMPONENT))
-        version = core.validate_manifest_version(f"{head[0]}.{head[1]}.{count}")
-        marker = f"{sha}-dirty" if dirty else sha
-        stamp = _STAMP_SEP.join(
-            [version, marker, datetime.now().strftime("%Y-%m-%d %H:%M")]
+        # ONE clock read for both the version's `<HHMM>` and the printed date, so the two
+        # can never name different minutes across a tick.
+        now = datetime.now()
+        # str(int), so no component ever carries a leading zero (09:30 -> `930`, which the
+        # spec accepts while `0930` it would reject), and 0..2359 is far under 65535.
+        minute_of_day = now.hour * 100 + now.minute
+        version = core.validate_manifest_version(
+            f"{head[0]}.{head[1]}.{count}.{minute_of_day}"
         )
+        marker = f"{sha}-dirty" if dirty else sha
+        built_at = now.strftime("%Y-%m-%d %H:%M")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         print(
             f"note: build stamp unavailable ({type(exc).__name__}: {exc}) — "
-            "manifest.json copied verbatim, version/version_name not stamped",
+            "manifest.json copied verbatim, version not stamped",
             file=sys.stderr,
         )
         return None
-    return version, stamp
+    return version, marker, built_at
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -193,14 +211,14 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     secret are entered per profile, not baked in. It also needs no signing key: the
     manifest carries no ``key`` and no ``<host>``. NO ``instance.json`` is written.
 
-    The one thing the copy rewrites is the manifest's build IDENTITY — ``version`` and the
-    displayed ``version_name`` (:func:`build_stamp`) — so the extension card in
-    brave://extensions says which build is loaded and the operator can tell whether
-    pressing "Обновить" after ``make dev-bundle`` actually took. That is not
-    configuration: two bundles differing only in the stamp behave identically, so any two
-    runs are still byte-identical everywhere else and off the same commit differ only in
-    ``version_name``'s build time (acc 16). If the stamp cannot be computed the manifest is
-    copied verbatim and the build still succeeds.
+    The one thing the copy rewrites is the manifest's build IDENTITY — ``version``, and
+    nothing else (:func:`build_stamp`) — so the extension card in brave://extensions says
+    which build is loaded and the operator can tell whether pressing "Обновить" after
+    ``make dev-bundle`` actually took. That is not configuration: two bundles differing
+    only in the stamp behave identically, so any two runs are still byte-identical
+    everywhere else and off the same commit differ only in ``version``'s trailing build
+    minute (acc 16). If the stamp cannot be computed the manifest is copied verbatim and
+    the build still succeeds.
 
     An existing ``--out`` is refused unless ``--force``, which rebuilds THAT SAME PATH via
     :func:`core.replace_bundle` (staged copy + swap). In place is the only correct way to
@@ -222,7 +240,8 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         )
     # None on any git/environment trouble -> a verbatim copy, never a failed build.
     stamp = build_stamp(args.extension_dir)
-    version, version_name = stamp if stamp else (None, None)
+    # Only `version` is stamped into the manifest; `marker`/`built_at` are printed below.
+    version = stamp[0] if stamp else None
 
     # Copy the repo bundle into --out (dev cruft + any stray instance.json skipped).
     # NOTE: --out IS the extension bundle root — manifest.json + all code land here and
@@ -232,13 +251,9 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         # (see core.replace_bundle). Files from the previous build that this one does not
         # emit — a renamed hashed chunk, say — are gone, because it is a replace and not
         # a merge.
-        core.replace_bundle(
-            args.extension_dir, out_dir, version=version, version_name=version_name
-        )
+        core.replace_bundle(args.extension_dir, out_dir, version=version)
     else:
-        core.copy_bundle(
-            args.extension_dir, out_dir, version=version, version_name=version_name
-        )
+        core.copy_bundle(args.extension_dir, out_dir, version=version)
 
     if rebuilt_in_place:
         print(f"Rebuilt universal bundle IN PLACE -> {out_dir}")
@@ -249,10 +264,16 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         )
     else:
         print(f"Built universal bundle -> {out_dir}")
-    if version_name is not None:
-        # Printed so the operator can compare it against the extension card AFTER the
-        # reload — that comparison is the whole point of the stamp.
-        print(f"  version        : {version}  (version_name: {version_name})")
+    if stamp is not None:
+        version, marker, built_at = stamp
+        # The version is printed so the operator can compare it against the extension card
+        # AFTER the reload — that comparison is the whole point of the stamp, and the card
+        # shows exactly this string (the manifest carries no version_name to display
+        # instead). The sha, the `-dirty` marker and the full date do NOT fit that card,
+        # so the terminal is the only place they are reported: `-dirty` is what tells a
+        # build from a modified tree apart from the committed code.
+        print(f"  version        : {version}   <- this is what the extension card shows")
+        print(f"  build          : commit {marker}, built {built_at}")
     else:
         print("  version        : NOT stamped (see the note above) — manifest copied verbatim")
     print("  NO instance.json written (universal build — serviceUrl/token are per-profile)")

@@ -10,8 +10,8 @@ Covers:
     series per coarse reason (so the §37 alert can key on ``reason="enroll_bad_code"``),
     and the empty-breakdown case emitting a still-valid exposition.
   * ``instancegen bundle`` — a hostless, key-free, instance.json-free universal bundle
-    that any two runs produce byte-for-byte identically apart from the wall clock inside
-    the manifest's ``version_name``, which the build stamps on purpose (acc 16). That one
+    that any two runs produce byte-for-byte identically apart from the build minute inside
+    the manifest's ``version``, which the build stamps on purpose (acc 16). That one
     value is normalised, not skipped: every file, including ``manifest.json``, is compared.
 
 Each assertion is written so that removing the guard it names reddens the test.
@@ -217,17 +217,21 @@ def test_auth_rejections_empty_breakdown_is_valid_exposition():
 # --------------------------------------------------------------------------- #
 # instancegen bundle — universal, hostless, key-free, no instance.json
 # --------------------------------------------------------------------------- #
-# The wall clock the build stamps into `version_name` (`%Y-%m-%d %H:%M`) — the ONE thing in
-# a built tree that is allowed to differ between two runs.
-_BUILD_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+# The build minute the stamp puts in `version`'s FOURTH component (`<HH*100+MM>`) — the ONE
+# thing in a built tree that is allowed to differ between two runs. Anchored to the
+# `"version"` line so the `"//version"` prose above it is never touched, and requiring all
+# four components so an unstamped (verbatim-copied) manifest simply does not match.
+_BUILD_MINUTE_RE = re.compile(
+    r'^(\s*"version": "\d+\.\d+\.\d+)\.\d+"', re.MULTILINE
+)
 
 
-def _without_build_time(text: str) -> str:
-    """*text* with the build stamp's wall clock replaced by a constant.
+def _without_build_minute(text: str) -> str:
+    """*text* with the build stamp's trailing build minute replaced by a constant.
 
-    Normalising the timestamp — rather than dropping the field or the whole file — is what
-    keeps everything else under comparison: the REST of `version_name`, `version`, key
-    order, indentation and `ensure_ascii`.
+    Normalising that one component — rather than dropping the field or the whole file — is
+    what keeps everything else under comparison: the rest of `version`, key order,
+    indentation and `ensure_ascii`.
 
     Be precise about what that buys. These are TWO BUILDS ON THE SAME MACHINE, so what
     they can see is exactly what DIFFERS BETWEEN RUNS: a uuid4, a pid, a random salt, a
@@ -235,16 +239,17 @@ def _without_build_time(text: str) -> str:
     reddens them. A value that is CONSTANT on one machine — a user name, the absolute
     build directory, the hostname — is invisible to a two-run comparison by construction
     and always will be; it would be stamped identically into both builds. That half of the
-    guarantee is carried instead by the version_name FORMAT assertion in
-    `tests/test_instancegen.py::test_cli_bundle_stamps_version_and_version_name`, which
-    pins the whole shape of the string and so rejects an extra field regardless of whether
-    it varies.
+    guarantee is carried instead by the FORMAT assertions in
+    `tests/test_instancegen.py::test_cli_bundle_stamps_the_version` and
+    `::test_cli_bundle_writes_no_version_name_and_a_short_version`, which pin the whole
+    shape of the stamped version — four integer components and nothing else — and so reject
+    an extra field regardless of whether it varies.
     """
-    return _BUILD_TIME_RE.sub("<time>", text)
+    return _BUILD_MINUTE_RE.sub(r'\1.<minute>"', text)
 
 
 def _manifest_text(root: Path) -> str:
-    """The built manifest's TEXT, timestamp-normalised. Nothing else is dropped.
+    """The built manifest's TEXT, build-minute-normalised. Nothing else is dropped.
 
     Deliberately NOT a parsed dict: the digest this replaces held key order, indentation and
     `ensure_ascii`, and comparing dicts would let a re-serialisation with `sort_keys=True`
@@ -252,7 +257,7 @@ def _manifest_text(root: Path) -> str:
     present: built from a tarball with no `.git`, the build degrades to a verbatim copy and
     these tests must still be testing reproducibility, not the availability of git.
     """
-    return _without_build_time((root / "manifest.json").read_text(encoding="utf-8"))
+    return _without_build_minute((root / "manifest.json").read_text(encoding="utf-8"))
 
 
 def _content_digest(root: Path) -> list[tuple[str, str]]:
@@ -261,7 +266,7 @@ def _content_digest(root: Path) -> list[tuple[str, str]]:
     Compares file CONTENTS only (not mtimes/metadata), which is what "byte-identical"
     means for a reproducible build. No file is excluded — a skip list would leave the
     guarantee with a file-sized hole. `manifest.json`, the one file the build rewrites, is
-    hashed with only its build timestamp normalised, so it is held to the same bar as the
+    hashed with only its build minute normalised, so it is held to the same bar as the
     rest of the tree.
     """
     digests = []
@@ -302,10 +307,10 @@ def test_bundle_two_runs_byte_identical(tmp_path):
     for d in (d1, d2):
         cli.main(["bundle", "--out", str(d), "--extension-dir", str(REPO_EXTENSION)])
     # A copy with no CONFIGURATION stamped into it -> identical trees, WHOLE tree included
-    # (acc 16). The single licensed variation is the build stamp's wall clock, normalised
-    # inside the digest; `version`, the rest of `version_name` and every byte of every other
+    # (acc 16). The single licensed variation is the build stamp's trailing minute,
+    # normalised inside the digest; the rest of `version` and every byte of every other
     # file must match. Redden: reintroduce any stamping step whose input can vary between
-    # runs — of anything else, or of `version`, or of the non-clock part of `version_name`.
+    # runs — of anything else, or of `version`'s first three components.
     assert _content_digest(d1) == _content_digest(d2)
     # The same guarantee for the one rewritten file, compared as TEXT so a failure reads as
     # a diff instead of a hash mismatch.
@@ -375,7 +380,7 @@ def test_bundle_force_rebuilds_the_same_path_byte_for_byte(tmp_path):
     ) == 0
 
     assert live.is_dir()
-    # Whole-tree comparison, manifest.json included: only the stamp's wall clock is
+    # Whole-tree comparison, manifest.json included: only the stamp's build minute is
     # normalised (same rule as the two-runs test above).
     assert _content_digest(live) == _content_digest(reference)
     assert _manifest_text(live) == _manifest_text(reference)
