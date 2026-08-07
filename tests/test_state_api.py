@@ -348,6 +348,80 @@ def test_focus_no_such_tab_is_clear_error(tmp_path):
             ws.__exit__(None, None, None)
 
 
+# --- POST /api/focus windowId path => focus_window {windowId} ---------------
+def test_focus_sends_focus_window_and_returns_ok(tmp_path):
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect_fresh(client, db_path, tabs=[])
+        try:
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(
+                lambda: client.post(
+                    "/api/focus", json={"instance": "i1", "windowId": 7}, headers=AUTH
+                )
+            )
+            cmd = _recv(ws)
+            # The window path raises the window and NEVER carries a tabId (§10).
+            assert cmd["type"] == "command" and cmd["command"] == "focus_window"
+            assert cmd["params"] == {"windowId": 7}
+            assert cmd["sessionId"] == "sess-1"
+            ws.send_json({"type": "response", "id": cmd["id"], "ok": True, "result": {}})
+            resp = fut.result(timeout=5)
+            assert resp.status_code == 200 and resp.json() == {"ok": True}
+        finally:
+            ws.__exit__(None, None, None)
+
+
+# --- POST /api/focus windowId gone => clear 409 so the page re-fetches -------
+def test_focus_no_window_is_clear_error(tmp_path):
+    app = create_app(_settings(tmp_path))
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        ws = _connect_fresh(client, db_path, tabs=[])
+        try:
+            pool = ThreadPoolExecutor(1)
+            fut = pool.submit(
+                lambda: client.post(
+                    "/api/focus", json={"instance": "i1", "windowId": 999}, headers=AUTH
+                )
+            )
+            cmd = _recv(ws)
+            ws.send_json({
+                "type": "response", "id": cmd["id"], "ok": False,
+                "error": {"code": "no_window", "message": "gone"},
+            })
+            resp = fut.result(timeout=5)
+            assert resp.status_code == 409
+            body = resp.json()
+            assert body["ok"] is False
+            assert body["error"] == "no_window"
+            assert body["refetch"] is True
+        finally:
+            ws.__exit__(None, None, None)
+
+
+# --- POST /api/focus validation: exactly one of tabId / windowId ------------
+def test_focus_requires_exactly_one_target(tmp_path):
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        # Neither present => 422 naming the two targets (string detail => plain text).
+        neither = client.post("/api/focus", headers=AUTH, json={"instance": "i1"})
+        assert neither.status_code == 422
+        assert "windowId" in neither.text
+        # Both present => 422 "exactly one".
+        both = client.post(
+            "/api/focus", headers=AUTH, json={"instance": "i1", "tabId": 1, "windowId": 2}
+        )
+        assert both.status_code == 422
+        assert "exactly one" in both.text
+        # A boolean is not a valid integer target (bool is an int in Python).
+        boolean = client.post(
+            "/api/focus", headers=AUTH, json={"instance": "i1", "windowId": True}
+        )
+        assert boolean.status_code == 422
+
+
 # --- POST /api/focus with no live socket => 502, not a hang -----------------
 def test_focus_no_connection_is_502(tmp_path):
     app = create_app(_settings(tmp_path, cmd_timeout_ms=300))

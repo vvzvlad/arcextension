@@ -336,6 +336,12 @@
       }
       .sp-status-name { font-weight: 600; color: var(--sp-text); }
       .sp-sub { color: var(--sp-secondary); }
+      /* A raisable "space" chip (§62 item 3) and a window-title header (item 4) invite a
+         click: pointer cursor + a subtle hover. Non-raisable rows keep the default. */
+      .sp-status-row.is-raisable { cursor: pointer; }
+      .sp-status-row.is-raisable:hover { background: var(--sp-hover); }
+      .sp-sec-head.is-raisable { cursor: pointer; }
+      .sp-sec-head.is-raisable:hover { background: var(--sp-hover); }
       /* The latch row carries the plan counts next to the confirm button, so it
          wraps and the counts take a line of their own. */
       .sp-pause-row { flex-wrap: wrap; max-width: 100%; }
@@ -421,7 +427,7 @@
         .sp-cols > .sp-card:last-child { display: none; }
       }
     </style>
-    <script type="module" crossorigin src="./assets/index-BRn-23jc.js"></script>
+    <script type="module" crossorigin src="./assets/index-FGI59Nvn.js"></script>
   </head>
   <body>
     <!-- Offline-first: this root is populated by the SFC-precompiled app; the very

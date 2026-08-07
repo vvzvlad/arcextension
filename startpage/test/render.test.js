@@ -762,35 +762,132 @@ describe("bookmark editing (§10 favourites column)", () => {
   });
 });
 
-// --- §9: the promised "merge windows now" button ------------------------------
-describe("merge windows now (§9)", () => {
-  it("renders a merge button per instance and shows the {merged} answer", async () => {
+// --- §62 item 2: the «Слить окна» button is GONE from the startpage -----------
+describe("no merge button on the startpage (§62 item 2)", () => {
+  it("renders no merge-windows button (the server endpoint stays, the UI does not)", async () => {
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const { fetchFn } = makeFetch({
       state: {
         status: 200,
         body: {
           instances: [
-            { id: "prox", title: "Prox", connected: true, snapshot_at: 1_000_000, last_seen_at: 1_000_000 },
+            { id: "prox", title: "Prox", connected: true, snapshot_at: 1_000_000, last_seen_at: 1_000_000, focused_window_id: 8 },
           ],
-          tabs: [],
-          quick_links: [],
-          server_now: 1_000_000,
+          tabs: [], quick_links: [], server_now: 1_000_000,
         },
       },
-      merge: { status: 200, body: { merged: 4 } },
+    });
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
+    });
+    await flushPromises();
+    expect(wrapper.find('[data-role="merge-windows"]').exists()).toBe(false);
+  });
+});
+
+// --- §62 item 3: clicking a space raises that instance's browser --------------
+describe("click a space to raise its browser (§62 item 3)", () => {
+  it("a foreign row POSTs /api/focus with {windowId} and no tabId", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const bodies = [];
+    const { fetchFn } = makeFetch({
+      state: {
+        status: 200,
+        body: {
+          instances: [
+            { id: "prox", title: "Prox", connected: true, snapshot_at: 1_000_000, last_seen_at: 1_000_000, focused_window_id: 8 },
+          ],
+          tabs: [], quick_links: [], server_now: 1_000_000,
+        },
+      },
+      focus: (opts) => {
+        bodies.push(JSON.parse(opts.body));
+        return { status: 200, body: { ok: true } };
+      },
     });
     const wrapper = mount(App, {
       props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
     });
     await flushPromises();
 
-    const btn = wrapper.find('[data-role="merge-windows"]');
+    const row = wrapper.find('[data-role="space-row"][data-instance="prox"]');
+    expect(row.exists()).toBe(true);
+    await row.trigger("click");
+    await flushPromises();
+
+    expect(bodies[0]).toEqual({ instance: "prox", windowId: 8 });
+  });
+});
+
+// --- §62 item 4: clicking a window-title header raises that own window ---------
+describe("click a window header to raise the window (§62 item 4)", () => {
+  it("focuses the own window and does NOT activate a tab", async () => {
+    const env = makeChrome({
+      tabs: [{ id: 1, windowId: 5, url: "https://own/a", title: "A", active: true }],
+      messages: { get_identity: { instanceId: "me" } },
+    });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+    });
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
+    });
+    await flushPromises();
+
+    const head = wrapper.find('[data-role="own-window-head"]');
+    expect(head.exists()).toBe(true);
+    await head.trigger("click");
+    await flushPromises();
+
+    expect(env.calls.winUpdate).toEqual([[5, { focused: true }]]);
+    expect(env.calls.tabUpdate).toEqual([]); // active tab unchanged (item 4)
+  });
+});
+
+// --- §62 item 5: «выполнить все правила сейчас» runs a pass --------------------
+describe("run all rules now button (§62 item 5)", () => {
+  it("POSTs /api/run_pass {run_all:true} on one click", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const bodies = [];
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+      runPass: (opts) => {
+        bodies.push(JSON.parse(opts.body));
+        return { status: 200, body: { status: "ok" } };
+      },
+    });
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
+    });
+    await flushPromises();
+
+    const btn = wrapper.find('[data-role="run-rules-now"]');
     expect(btn.exists()).toBe(true);
     await btn.trigger("click");
     await flushPromises();
 
-    expect(wrapper.find('[data-role="merge-result"]').text()).toContain("4");
+    expect(bodies[0]).toEqual({ run_all: true });
+    expect(wrapper.find('[data-role="run-now-result"]').text()).toContain("ok");
+  });
+
+  it("shows a non-contradictory note when the pass did not run (e.g. stopped)", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+      runPass: () => ({ status: 200, body: { status: "stopped" } }),
+    });
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
+    });
+    await flushPromises();
+
+    await wrapper.find('[data-role="run-rules-now"]').trigger("click");
+    await flushPromises();
+
+    // The old wording said «проход запущен: stopped» — a "started: stopped" contradiction.
+    const text = wrapper.find('[data-role="run-now-result"]').text();
+    expect(text).toContain("не выполнен");
+    expect(text).not.toContain("проход запущен");
   });
 });
 

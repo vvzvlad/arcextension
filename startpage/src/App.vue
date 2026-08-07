@@ -312,9 +312,14 @@ export default {
       store.resumePending.value ? planGateNotice(store.pendingPlan.value) : null,
     );
 
-    // --- merge windows now (§9) --------------------------------------------
-    async function onMergeWindows(instanceId) {
-      await store.mergeWindowsNow(instanceId);
+    // --- raise a space / run all rules now (§62 items 3 & 5) ---------------
+    async function onRaiseInstance(row) {
+      // Only a raisable row acts (own browser / disconnected / no window => no-op).
+      if (!row.raisable) return;
+      await store.raiseInstance(row.id);
+    }
+    async function onRunRulesNow() {
+      await store.runRulesNow();
     }
 
     // --- stop gate override (§7) -------------------------------------------
@@ -544,7 +549,8 @@ export default {
       serverDateTime,
       onPause,
       onResume,
-      onMergeWindows,
+      onRaiseInstance,
+      onRunRulesNow,
       onForce,
     };
   },
@@ -739,7 +745,15 @@ export default {
               :key="w.windowId == null ? 'w' + i : w.windowId"
               class="sp-sec"
             >
-              <div class="sp-sec-head is-sticky">
+              <!-- Click the header to RAISE this own window (§62 item 4) without changing
+                   the active tab inside it (contrast the per-tab jumpOwn below, which
+                   activates a tab and closes the newtab). A null windowId (a search-only
+                   pseudo-group) simply no-ops in raiseOwnWindow. -->
+              <div
+                class="sp-sec-head is-sticky is-raisable"
+                data-role="own-window-head"
+                @click="store.raiseOwnWindow(w.windowId)"
+              >
                 <i class="sp-dot ok"></i>
                 <!-- `w.ordinal`, NOT the index in this v-for: the list is FILTERED by the
                      search box, so numbering by position renumbered the windows on every
@@ -909,31 +923,41 @@ export default {
         <span v-if="store.pauseError.value" class="sp-sub sp-pause-error">{{ store.pauseError.value }}</span>
       </div>
 
-      <div v-for="row in store.statusRows.value" :key="row.id" class="sp-status-row">
-        <span class="sp-dot" :class="row.status.state"></span>
-        <span class="sp-status-name">{{ row.title }}</span>
-        <span class="sp-sub">— {{ row.status.label }}</span>
-        <!-- §9 promises this button explicitly: the pass folds windows only after an
-             hour of idleness, and "ждать час не хочется" is a real case. -->
+      <!-- Run all rules NOW (§62 item 5): one click runs a curator pass that executes
+           even an over-threshold plan (run_all bypasses the MAX_ACTIONS_PER_PASS latch
+           server-side), no second confirm needed. Disabled offline. -->
+      <div class="sp-status-row" data-role="run-now-row">
+        <span class="sp-dot ok"></span>
+        <span class="sp-status-name">Правила</span>
         <button
           class="sp-btn"
           type="button"
-          data-role="merge-windows"
-          :data-instance="row.id"
+          data-role="run-rules-now"
           :disabled="store.offline.value"
-          @click="onMergeWindows(row.id)"
-        >Слить окна</button>
-        <span
-          v-if="store.mergeResult.value && store.mergeResult.value.instanceId === row.id"
-          class="sp-sub"
-          data-role="merge-result"
-        >
-          <!-- retryable (§9/§10): busy_dragging or a stale window picture — nothing
-               broke, so it must not read as a failure. -->
-          <template v-if="store.mergeResult.value.retryable">— {{ store.mergeResult.value.retryable }}</template>
-          <template v-else-if="store.mergeResult.value.error">— слияние не удалось: {{ store.mergeResult.value.error }}</template>
-          <template v-else>— слито вкладок: {{ store.mergeResult.value.merged }}</template>
+          @click="onRunRulesNow"
+        >Выполнить все правила сейчас</button>
+        <span v-if="store.runNowResult.value" class="sp-sub" data-role="run-now-result">
+          <template v-if="store.runNowResult.value.error">— не удалось: {{ store.runNowResult.value.error }}</template>
+          <template v-else-if="store.runNowResult.value.status === 'ok'">— проход выполнен: {{ store.runNowResult.value.status }}</template>
+          <template v-else>— проход не выполнен: {{ store.runNowResult.value.status }}</template>
         </span>
+      </div>
+
+      <!-- Click a space (§62 item 3): raise that instance's browser to the foreground,
+           creating no tabs. A row is clickable only when raisable (foreign, connected,
+           known focused window); own/disconnected rows are inert. -->
+      <div
+        v-for="row in store.statusRows.value"
+        :key="row.id"
+        class="sp-status-row"
+        :class="{ 'is-raisable': row.raisable && !store.offline.value }"
+        :data-role="'space-row'"
+        :data-instance="row.id"
+        @click="onRaiseInstance(row)"
+      >
+        <span class="sp-dot" :class="row.status.state"></span>
+        <span class="sp-status-name">{{ row.title }}</span>
+        <span class="sp-sub">— {{ row.status.label }}</span>
       </div>
       <div v-if="store.statusRows.value.length === 0" class="sp-empty">Других инстансов пока нет</div>
 

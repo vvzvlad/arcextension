@@ -244,10 +244,18 @@ async def run_pass(
     db, registry, settings, *,
     dry_run: bool = False,
     confirm_pending: bool = False,
+    run_all: bool = False,
     clock_guard=None,
     now: int | None = None,
 ) -> dict:
-    """Run one curator pass. Returns a status/plan/counts dict (for the endpoint)."""
+    """Run one curator pass. Returns a status/plan/counts dict (for the endpoint).
+
+    ``run_all`` (the startpage "выполнить все правила сейчас" button, §7) bypasses ONLY
+    the ``MAX_ACTIONS_PER_PASS`` threshold gate: a freshly-decided plan executes in this
+    one pass even when it is over-threshold, and it clears the resume_pending latch the
+    same way a confirmed pass does. It never bypasses a stop or a pause — those are the
+    owner's emergency brakes, not the action-count safety valve run_all opens.
+    """
     now = now if now is not None else _now_ms()
 
     # --- step 0: server-clock check (§7) — the FIRST thing, before the lease ---
@@ -430,8 +438,13 @@ async def run_pass(
         # own target verification already protects against stale relocate rows. The
         # abandon bookkeeping runs for the same reason: it retires rows decide() has
         # already proven stale, destroying nothing.
+        # ``run_all`` opens the same execute path a ``confirm_pending`` click takes, so
+        # an over-threshold plan runs in this one pass instead of arming/refreshing the
+        # latch. It clears the latch below exactly like the confirm path (via the
+        # execute branch's ``_clear_deferred_plan``), which is why it is checked HERE and
+        # not by early-returning: an already-armed latch does not divert the pass.
         countable = _countable(decisions)
-        if countable > settings.max_actions_per_pass and not confirm_pending:
+        if countable > settings.max_actions_per_pass and not confirm_pending and not run_all:
             deferred_plan = _plan(decisions, settings.max_actions_per_pass)
             # Say it out loud: arming (unarmed -> armed) is an event the operator
             # wants in the log, a refresh is routine chatter. Step 1 already read

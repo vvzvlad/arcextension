@@ -28,6 +28,7 @@ import {
   CMD_CLOSE_TAB,
   CMD_GET_TAB,
   CMD_FOCUS_TAB,
+  CMD_FOCUS_WINDOW,
   CMD_NAVIGATE_TAB,
   CMD_MERGE_WINDOWS,
   CMD_EXECUTE_JS,
@@ -110,6 +111,8 @@ export async function dispatchCommand(frame, ctx = {}) {
         return Array.isArray(params.items) ? await getTabBulk(params) : await getTab(params);
       case CMD_FOCUS_TAB:
         return await focusTab(params);
+      case CMD_FOCUS_WINDOW:
+        return await focusWindow(params);
       case CMD_NAVIGATE_TAB:
         return await navigateTab(params);
       case CMD_MERGE_WINDOWS:
@@ -398,6 +401,23 @@ async function focusTab(params) {
   }
   await chrome.tabs.update(params.tabId, { active: true });
   await chrome.windows.update(tab.windowId, { focused: true });
+  return ok({ ok: true });
+}
+
+// focus_window {windowId} -> raise the window to the foreground, changing NOTHING
+// inside it. Unlike focus_tab this NEVER touches a tab (no chrome.tabs.update): the
+// startpage "click a space" jump wants the browser in front without activating any
+// tab, so the window's own active tab and idle clocks stay exactly as they were. A
+// window that vanished between the mirror snapshot and the command is `no_window`,
+// which the service maps to a 409 refetch (§10) — the same "your picture is stale"
+// signal focus_tab's no_such_tab carries.
+async function focusWindow(params) {
+  try {
+    await chrome.windows.get(params.windowId);
+  } catch {
+    return fail(ERR_NO_WINDOW, `no such window: ${params.windowId}`);
+  }
+  await chrome.windows.update(params.windowId, { focused: true });
   return ok({ ok: true });
 }
 

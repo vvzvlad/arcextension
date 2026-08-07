@@ -255,18 +255,39 @@ export async function postFocus(fetchFn, base, token, instance, tabId, { force =
   return { status: resp.status, body };
 }
 
-// "Слить окна сейчас" (§9): fold this instance's normal windows into one NOW instead
-// of waiting for the pass's hour-long idle delay. Answers `{merged: <int>}`; `force`
-// carries the same §7 pause exception as postFocus.
-export async function postMergeWindows(fetchFn, base, token, instanceId, { force = false } = {}) {
-  const resp = await fetchFn(
-    base + "/api/instances/" + encodeURIComponent(instanceId) + "/merge_windows",
-    {
-      method: "POST",
-      headers: authHeaders(token),
-      body: JSON.stringify(force ? { force: true } : {}),
-    },
-  );
+// Click a space (§62 item 3): raise a foreign instance's browser to the foreground by
+// window id, WITHOUT touching any tab inside it (POST /api/focus with {windowId}). Same
+// shape as postFocus — Bearer auth, returns {status, body}, and the same §7 `force`
+// pause exception. The server dispatches this to the extension's focus_window verb.
+export async function postFocusWindow(
+  fetchFn, base, token, instance, windowId, { force = false } = {}
+) {
+  const payload = { instance, windowId };
+  if (force) payload.force = true;
+  const resp = await fetchFn(base + "/api/focus", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify(payload),
+  });
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch {
+    body = null;
+  }
+  return { status: resp.status, body };
+}
+
+// "выполнить все правила сейчас" (§62 item 5): run one curator pass NOW. `runAll`
+// forwards to the server's run_all flag, which executes an over-threshold plan in one
+// pass instead of latching behind the MAX_ACTIONS_PER_PASS confirm gate. Returns
+// {status, body} so the store surfaces the outcome without throwing on a non-2xx.
+export async function postRunPass(fetchFn, base, token, { runAll = false } = {}) {
+  const resp = await fetchFn(base + "/api/run_pass", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(runAll ? { run_all: true } : {}),
+  });
   const body = await resp.json().catch(() => null);
   return { status: resp.status, body };
 }

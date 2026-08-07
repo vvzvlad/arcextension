@@ -245,6 +245,12 @@ export function makeFetch(routes = {}) {
       const v = await (typeof r === "function" ? r(opts, counts.merge) : r);
       return jsonResponse((v && v.status) ?? 200, (v && v.body) ?? { merged: 0 });
     }
+    if (u.includes("/api/run_pass")) {
+      counts.runPass = (counts.runPass || 0) + 1;
+      const r = routes.runPass;
+      const v = await (typeof r === "function" ? r(opts, counts.runPass) : r);
+      return jsonResponse((v && v.status) ?? 200, (v && v.body) ?? { status: "ok" });
+    }
     if (u.includes("/api/pause")) {
       const method = (opts && opts.method ? opts.method : "POST").toUpperCase();
       if (method === "DELETE") {

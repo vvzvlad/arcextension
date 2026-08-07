@@ -1,20 +1,18 @@
-// Instance status — the FOUR states the status bar must distinguish (§10), so an
-// auth reject, a stale mirror, a closed browser and "never seen" never all look
-// like one grey instance. A fifth, healthy, value ('ok') is the connected+fresh
-// default. Pure so the classification is unit-testable without a clock.
+// Instance status — the states the status bar must distinguish (§10), so an auth
+// reject, a closed browser and "never seen" never all look like one grey instance.
+// A healthy value ('ok', "на связи") is the connected default. Pure so the
+// classification is unit-testable without a clock.
 //
 //   rejected — reject_reason set (auth / protocol / origin / duplicate), with time
 //   never    — never seen (no last_seen_at)
 //   closed   — seen before but not currently connected (browser closed)
-//   stale    — connected but the mirror is older than STATE_FRESH-ish (half-open)
-//   ok       — connected and fresh
-
-// `now` MUST be in the SERVER clock scale (store.serverNow(), derived from
-// StateResponse.server_now): `snapshot_at` / `last_seen_at` are server stamps, and
-// comparing them to the laptop's Date.now() turns a couple of seconds of clock drift
-// into "зеркало устарело" on every instance forever — or hides a real half-open
-// socket. The store owns the offset; this function stays pure.
-export function instanceStatus(inst, now, staleMs) {
+//   ok       — connected
+//
+// There is deliberately NO "stale" (mirror-freshness) state anymore (issue #62 item 1):
+// a connected instance reads "на связи" regardless of how old its last snapshot is. The
+// background single-flight refresh (src/api/state.py) keeps the mirror current on its
+// own, so surfacing mirror age here only produced flapping "зеркало устарело" chatter.
+export function instanceStatus(inst, now) {
   if (!inst) return { state: "never", label: "никогда не подключался" };
   if (inst.reject_reason) {
     return { state: "rejected", label: `отклонён: ${inst.reject_reason}`, at: inst.reject_at };
@@ -24,9 +22,6 @@ export function instanceStatus(inst, now, staleMs) {
   }
   if (!inst.connected) {
     return { state: "closed", label: "закрыт", at: inst.last_seen_at };
-  }
-  if (inst.snapshot_at == null || now - inst.snapshot_at >= staleMs) {
-    return { state: "stale", label: "подключён, зеркало устарело", at: inst.snapshot_at };
   }
   return { state: "ok", label: "на связи", at: inst.snapshot_at };
 }
