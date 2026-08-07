@@ -78,9 +78,14 @@ class Settings(BaseSettings):
     # carries a random id (never the ADMIN_TOKEN); this is how long that id stays valid in
     # the in-memory session store before a re-login is required. Enforced SERVER-side (the
     # cookie Max-Age is only a browser hint), and a rotated ADMIN_TOKEN invalidates every
-    # session immediately regardless of this. 720 minutes = 12h: an unhurried operator
-    # workday, bounded so a walked-away session does not stay open indefinitely.
-    admin_session_ttl_min: int = Field(default=720, ge=1)
+    # session immediately regardless of this.
+    # 365 days. The cookie is signed and stateless, so it survives the restarts that
+    # used to log the owner out («он должен блядь быть вечным, я не хочу его вводить
+    # еще раз»); the remaining expiry is a bound, not a schedule. NOT infinite on
+    # purpose: a stateless cookie has no server-side revoke, so its lifetime is the
+    # only thing that eventually retires a copy someone walked off with. Rotating
+    # ADMIN_TOKEN kills every cookie immediately and is the real revoke.
+    admin_session_ttl_min: int = Field(default=525_600, ge=1)
     # Ceiling on simultaneously-open /ext sockets that have been accepted but have not
     # yet completed a hello/enroll (§2). Refused BEFORE accept() (a handshake rejection,
     # no TLS session), so a flood of opened-but-silent sockets cannot exhaust memory or

@@ -30,6 +30,11 @@ from starlette.testclient import TestClient
 from src.api import admin_session
 
 
+def _now_ms_for_test() -> int:
+    import time
+    return int(time.time() * 1000)
+
+
 def create_app_for(tmp_path, **over):
     from src.app import create_app
     return create_app(make_settings(tmp_path, pass_interval_min=100_000, **over))
@@ -233,22 +238,49 @@ def test_token_rotation_invalidates_cookie(tmp_path):
 
 
 # --- (5) logout drops the session server-side --------------------------------
-def test_logout_revokes_session_server_side(tmp_path):
-    """Acc 5. Reddens if logout only clears the client cookie but leaves the id live in the
-    store (a replayed cookie would still open /admin)."""
+def test_logout_clears_the_browser_cookie_but_cannot_un_sign_it(tmp_path):
+    """Acc 5, restated for a SIGNED cookie. Server-side revoke no longer exists: nothing
+    is stored, so a copy someone already took stays valid until it expires. What logout
+    still guarantees is that THIS browser is logged out. The real revoke is rotating
+    ADMIN_TOKEN — pinned by the test below. Reddens if logout stops clearing the cookie."""
     app = create_app_for(tmp_path)
     with _tc(app) as client:
         _login(client)
         sid = _session_value(client)
         assert client.get("/admin").status_code == 200
-        # Same-origin signal: logout is a cookie-path mutating verb behind the CSRF gate.
         assert client.post(
             "/admin/logout", headers={"Sec-Fetch-Site": "same-origin"}
         ).status_code == 200
-        # Replay the captured id explicitly: it must be gone from the SERVER store, not just
-        # the client jar. The console body is what must not come back — the status is the
-        # browser-facing hop to the login form.
-        _console_refused(client, headers={"Cookie": f"{admin_session.COOKIE_NAME}={sid}"})
+        # This browser is out: its jar no longer carries a usable session.
+        _console_refused(client)
+        # And the honest limitation, asserted rather than implied: the captured value is
+        # still cryptographically valid, because a signed cookie cannot be un-signed.
+        assert admin_session.validate(app, sid) is True
+
+
+def test_rotating_admin_token_invalidates_every_outstanding_cookie(tmp_path):
+    """Acc 4, and the ONLY real revoke a stateless cookie has. The signing key is derived
+    from ADMIN_TOKEN, so changing the token changes the key and every cookie signed under
+    the old one fails verification. Reddens if the key stops depending on the token."""
+    app = create_app_for(tmp_path)
+    with _tc(app):
+        sid = admin_session.create(app)
+        assert admin_session.validate(app, sid) is True
+        app.state.settings.admin_token = app.state.settings.admin_token + "-rotated"
+        assert admin_session.validate(app, sid) is False
+
+
+def test_a_tampered_cookie_is_refused(tmp_path):
+    """The expiry lives INSIDE the signed payload, so extending it in the browser breaks
+    the signature. Reddens if validate() ever parses the payload before verifying it."""
+    app = create_app_for(tmp_path)
+    with _tc(app):
+        sid = admin_session.create(app)
+        payload, _, sig = sid.rpartition(".")
+        assert admin_session.validate(app, payload + "." + sig[:-2] + "xx") is False
+        assert admin_session.validate(app, "garbage") is False
+        assert admin_session.validate(app, "") is False
+        assert admin_session.validate(app, None) is False
 
 
 # --- (6) the console renders as text, not markup -----------------------------
@@ -468,8 +500,9 @@ def test_session_expiry_unit(tmp_path):
         ttl_ms = app.state.settings.admin_session_ttl_min * 60_000
         assert admin_session.validate(app, sid, now=t0 + ttl_ms - 1) is True
         assert admin_session.validate(app, sid, now=t0 + ttl_ms) is False  # boundary: expired
-        # And it was evicted on the failed touch (drop-on-touch), so it stays invalid.
-        assert admin_session.validate(app, sid, now=t0) is False
+        # A signed cookie carries its own expiry, so validity is a pure function of `now`:
+        # asking again earlier answers True. There is no server-side entry to evict.
+        assert admin_session.validate(app, sid, now=t0) is True
 
 
 def test_session_expiry_through_request(tmp_path):
@@ -480,10 +513,11 @@ def test_session_expiry_through_request(tmp_path):
         _login(client)
         sid = _session_value(client)
         assert client.get("/admin").status_code == 200
-        # Force the stored entry into the past.
-        expires_at, fp = client.app.state.admin_sessions[sid]
-        client.app.state.admin_sessions[sid] = (0, fp)
-        _console_refused(client)  # stale cookie -> no console, back to the login form
+        # Mint a cookie that is already expired and present it: there is no server-side
+        # entry to age, the expiry rides inside the signed payload.
+        ttl_ms = client.app.state.settings.admin_session_ttl_min * 60_000
+        stale = admin_session.create(client.app, now=_now_ms_for_test() - ttl_ms - 1000)
+        _console_refused(client, headers={"Cookie": f"{admin_session.COOKIE_NAME}={stale}"})
 
 
 # --- wrong-token login -------------------------------------------------------
@@ -776,21 +810,18 @@ def test_logout_requires_same_origin(tmp_path):
         assert client.get("/admin").status_code == 200
 
 
-def test_expired_session_swept_on_create(tmp_path):
-    """An expired, NEVER-re-presented session id is physically removed from the store on the
-    next create() (bounded store). Reddens if create() stops sweeping — the id would linger
-    forever."""
+def test_a_cookie_survives_a_service_restart(tmp_path):
+    """The reason this stopped being an in-memory store. A fresh app object — what a
+    container restart produces — must still accept a cookie minted by the previous one,
+    because nothing about it lived in that process. Reddens if session state comes back."""
     app = create_app_for(tmp_path)
     with _tc(app):
-        t0 = 1_000_000
-        stale = admin_session.create(app, now=t0)
-        # Force it expired without ever validating (re-presenting) it.
-        _exp, fp = app.state.admin_sessions[stale]
-        app.state.admin_sessions[stale] = (t0, fp)  # expires_at in the past
-        # A fresh login well after t0 must sweep the stale id out.
-        fresh = admin_session.create(app, now=t0 + 10_000)
-        assert stale not in app.state.admin_sessions
-        assert fresh in app.state.admin_sessions
+        sid = admin_session.create(app)
+    # A brand-new app over the SAME settings: the signing key is derived from ADMIN_TOKEN,
+    # which the restart does not change.
+    restarted = create_app_for(tmp_path)
+    with _tc(restarted):
+        assert admin_session.validate(restarted, sid) is True
 
 
 # --- assets are public + carry CSP -------------------------------------------
