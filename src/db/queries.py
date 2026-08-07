@@ -337,15 +337,17 @@ def insert_admin_audit(
     live vocabulary — the column comment in ``_V2_STATEMENTS`` is frozen at what
     migration step 2 shipped and cannot be corrected in place:
 
-    * ``admin``  — an ADMIN_TOKEN caller acting through ``/admin``;
+    * ``admin``  — an ADMIN_TOKEN caller: the console over ``/admin``, and equally curl or
+      the MCP agent presenting that token to ``POST /api/enroll/window``. The token is the
+      identity here, not the door;
     * ``system`` — the service's own enrollment writes (the ``enroll`` row a browser's
       accepted ``enroll_request`` produces, which no human issued);
     * ``user``   — an enrolled instance acting as the human at the keyboard, i.e. the
       startpage button behind ``POST /api/enroll/window`` (§13).
 
-    ``admin`` and ``user`` both write ``window_open``, so the initiator is the one
-    signal telling a window armed in the console apart from one armed from a browser
-    (:func:`src.api.guards.initiator_for`). Returns the new row id.
+    ``admin`` and ``user`` both write ``window_open``, so the initiator is the one signal
+    telling a window armed by the ADMIN_TOKEN apart from one armed by a browser's own
+    secret (:func:`src.api.guards.initiator_for`). Returns the new row id.
     """
     cur = conn.execute(
         "INSERT INTO admin_audit (ts, action, install_uuid, instance_id, initiator, detail) "
