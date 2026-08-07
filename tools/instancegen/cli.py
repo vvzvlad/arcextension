@@ -15,8 +15,11 @@ letting Chromium derive it from the load path is fine.
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from . import core, macos
@@ -24,6 +27,86 @@ from . import core, macos
 # The repo's extension bundle, resolved relative to this file (…/tools/instancegen).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_EXTENSION_DIR = _REPO_ROOT / "extension"
+
+# Seconds any single `git` call gets before the stamp is given up on. A build must never
+# hang on a wedged git (a stale index.lock, a network-backed worktree).
+_GIT_TIMEOUT = 10
+# Separator between the three facts in `version_name`. A middle dot reads well on the
+# extension card and cannot be confused with the dots inside the version itself.
+_STAMP_SEP = " · "
+
+
+def _git(repo_dir: Path, *argv: str) -> str:
+    """Run one git command in *repo_dir* and return its stripped stdout.
+
+    Raises on anything that is not a clean success — the single caller turns every failure
+    into "no stamp".
+    """
+    out = subprocess.run(
+        ["git", "-C", str(repo_dir), *argv],
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+def build_stamp(extension_dir: str | Path) -> tuple[str, str] | None:
+    """The ``(version, version_name)`` build stamp for a source ``extension/``, or ``None``.
+
+    This is where the ENVIRONMENT is read — git and the clock — deliberately here and not
+    in :mod:`core`, which stays pure text + filesystem.
+
+      * ``version``      = ``<major>.<minor>.<commit-count>``, with ``<major>.<minor>``
+        taken from the tracked manifest's own ``version`` literal (that literal is the
+        BASE and is never rewritten in the repo) and the count from
+        ``git rev-list --count HEAD``. Machine-ordered: it advances with every commit,
+        which is what ties a loaded bundle to a point in history.
+      * ``version_name`` = that version, the short sha with a ``-dirty`` suffix when the
+        working tree has uncommitted changes, and the build time. This is the field the
+        extensions page displays, and the ``dirty`` marker is the point of it: without one,
+        a build from a modified tree is indistinguishable from the committed code.
+
+    A build must NEVER fail over this. No git on PATH, not a git repo, an empty or broken
+    repo, a git that hangs — every one of them returns ``None`` (the caller then copies the
+    manifest verbatim, exactly as before the stamp existed) with a note on stderr so the
+    degrade is visible rather than silent.
+
+    git runs against the repo the SOURCE ``extension/`` lives in (``git -C``), not the
+    process CWD: ``make dev-bundle`` may be invoked from anywhere.
+    """
+    extension_dir = Path(extension_dir).resolve()
+    try:
+        manifest = json.loads(
+            (extension_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        base = str(manifest["version"])
+        # First two components of the base literal; a shorter base is padded with 0.
+        head = (base.split(".") + ["0", "0"])[:2]
+
+        count = int(_git(extension_dir, "rev-list", "--count", "HEAD"))
+        sha = _git(extension_dir, "rev-parse", "--short", "HEAD")
+        # --porcelain covers staged, unstaged and untracked-but-not-ignored files; dist/
+        # is gitignored, so a build never marks itself dirty.
+        dirty = bool(_git(extension_dir, "status", "--porcelain"))
+
+        # Clamped, not wrapped: the spec caps a component at 65535 and an over-long
+        # history must degrade to a pinned ceiling, never to an unloadable manifest.
+        count = max(0, min(count, core.MANIFEST_VERSION_MAX_COMPONENT))
+        version = core.validate_manifest_version(f"{head[0]}.{head[1]}.{count}")
+        marker = f"{sha}-dirty" if dirty else sha
+        stamp = _STAMP_SEP.join(
+            [version, marker, datetime.now().strftime("%Y-%m-%d %H:%M")]
+        )
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(
+            f"note: build stamp unavailable ({type(exc).__name__}: {exc}) — "
+            "manifest.json copied verbatim, version/version_name not stamped",
+            file=sys.stderr,
+        )
+        return None
+    return version, stamp
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -70,14 +153,21 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_bundle(args: argparse.Namespace) -> int:
-    """Build the UNIVERSAL extension bundle (§9) — a plain copy, nothing stamped.
+    """Build the UNIVERSAL extension bundle (§9) — a copy plus the build stamp.
 
     Like ``generate`` this needs NO token, NO service URL and NO instanceId: with
     enrollment (§7, issue #35) the build is universal — serviceUrl and the per-install
     secret are entered per profile, not baked in. It also needs no signing key: the
-    manifest carries no ``key`` and no ``<host>``, so the whole build is
-    ``copy_bundle`` and nothing else. NO ``instance.json`` is written, and any two runs
-    are byte-identical because a copy has no inputs to vary (acc 16).
+    manifest carries no ``key`` and no ``<host>``. NO ``instance.json`` is written.
+
+    The one thing the copy rewrites is the manifest's build IDENTITY — ``version`` and the
+    displayed ``version_name`` (:func:`build_stamp`) — so the extension card in
+    brave://extensions says which build is loaded and the operator can tell whether
+    pressing "Обновить" after ``make dev-bundle`` actually took. That is not
+    configuration: two bundles differing only in the stamp behave identically, so any two
+    runs are still byte-identical everywhere else and off the same commit differ only in
+    ``version_name``'s build time (acc 16). If the stamp cannot be computed the manifest is
+    copied verbatim and the build still succeeds.
 
     An existing ``--out`` is refused unless ``--force``, which rebuilds THAT SAME PATH via
     :func:`core.replace_bundle` (staged copy + swap). In place is the only correct way to
@@ -97,6 +187,10 @@ def cmd_bundle(args: argparse.Namespace) -> int:
             "chrome-extension:// id is the hash of this path, so a new path means a new "
             "id, a new origin and an empty chrome.storage.local (enrolment lost)."
         )
+    # None on any git/environment trouble -> a verbatim copy, never a failed build.
+    stamp = build_stamp(args.extension_dir)
+    version, version_name = stamp if stamp else (None, None)
+
     # Copy the repo bundle into --out (dev cruft + any stray instance.json skipped).
     # NOTE: --out IS the extension bundle root — manifest.json + all code land here and
     # this whole tree ships to Chrome fleet-wide.
@@ -105,9 +199,13 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         # (see core.replace_bundle). Files from the previous build that this one does not
         # emit — a renamed hashed chunk, say — are gone, because it is a replace and not
         # a merge.
-        core.replace_bundle(args.extension_dir, out_dir)
+        core.replace_bundle(
+            args.extension_dir, out_dir, version=version, version_name=version_name
+        )
     else:
-        core.copy_bundle(args.extension_dir, out_dir)
+        core.copy_bundle(
+            args.extension_dir, out_dir, version=version, version_name=version_name
+        )
 
     if rebuilt_in_place:
         print(f"Rebuilt universal bundle IN PLACE -> {out_dir}")
@@ -118,6 +216,12 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         )
     else:
         print(f"Built universal bundle -> {out_dir}")
+    if version_name is not None:
+        # Printed so the operator can compare it against the extension card AFTER the
+        # reload — that comparison is the whole point of the stamp.
+        print(f"  version        : {version}  (version_name: {version_name})")
+    else:
+        print("  version        : NOT stamped (see the note above) — manifest copied verbatim")
     print("  NO instance.json written (universal build — serviceUrl/token are per-profile)")
     print(
         "  The chrome-extension:// id is Chromium's hash of this dir's absolute path, so "

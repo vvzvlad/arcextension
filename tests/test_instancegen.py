@@ -206,12 +206,18 @@ def test_cli_generate_runs_end_to_end(tmp_path):
 # --------------------------------------------------------------------------- #
 # No signing key anywhere: not in the CLI, not in the module, not in the manifest
 # --------------------------------------------------------------------------- #
-def test_bundle_takes_no_key_file_and_nothing_stamps_a_manifest(tmp_path):
+def test_bundle_takes_no_key_file_and_stamps_no_configuration(tmp_path):
     """The key existed only to PIN the extension id for `EXT_ALLOWED_ORIGINS`.
 
     That allow-list is gone (src/api/cors.py), so the whole key layer went with it: no
-    `--key-file` flag, no `keys` module, no stamping helpers, and no `key` field in the
-    repo manifest. Redden: reintroduce any of them and one of these assertions fails.
+    `--key-file` flag, no `keys` module, no key/host stamping helpers, and no `key` field
+    in the repo manifest. Redden: reintroduce any of them and one of these assertions
+    fails.
+
+    `core.stamp_manifest` is NOT in the gone list and must not be added back to it: it
+    stamps build IDENTITY (version/version_name), not CONFIGURATION. What made a bundle
+    non-interchangeable was a baked-in host or id; two bundles differing only in their
+    version stamp behave identically.
     """
     parser = cli.build_parser()
     with pytest.raises(SystemExit):  # argparse exits 2 on an unknown option
@@ -222,13 +228,185 @@ def test_bundle_takes_no_key_file_and_nothing_stamps_a_manifest(tmp_path):
     import tools.instancegen as instancegen
 
     assert not hasattr(instancegen, "keys")
-    for gone in ("KEY_PLACEHOLDER", "HOST_PLACEHOLDER", "stamp_manifest",
+    for gone in ("KEY_PLACEHOLDER", "HOST_PLACEHOLDER",
                  "stamp_bundle_manifest", "write_private_bytes"):
         assert not hasattr(core, gone), gone
 
     manifest = json.loads((REPO_EXTENSION / "manifest.json").read_text())
     assert "key" not in manifest
     assert "//key" not in manifest
+
+
+# --------------------------------------------------------------------------- #
+# Build stamp: `version` / `version_name` in the BUILT bundle (never in extension/)
+# --------------------------------------------------------------------------- #
+def _repo_manifest_text() -> str:
+    return (REPO_EXTENSION / "manifest.json").read_text(encoding="utf-8")
+
+
+def test_stamp_manifest_sets_both_fields_and_changes_nothing_else():
+    # The stamp must be surgical: exactly two values differ, every other key — including
+    # the `//`-comment keys that carry the Russian prose — comes through untouched.
+    # Redden: serialise with ensure_ascii=True, or drop/reorder any other key.
+    before_text = _repo_manifest_text()
+    after_text = core.stamp_manifest(
+        before_text, version="0.1.130", version_name="0.1.130 · abc1234 · 2026-08-07 19:52"
+    )
+    before = json.loads(before_text)
+    after = json.loads(after_text)
+
+    assert after["version"] == "0.1.130"
+    assert after["version_name"] == "0.1.130 · abc1234 · 2026-08-07 19:52"
+    # Everything else is identical, key for key and value for value.
+    assert {k: v for k, v in after.items() if k not in ("version", "version_name")} == \
+           {k: v for k, v in before.items() if k != "version"}
+    # …and in the same order, with version_name inserted right after version.
+    expected_order = []
+    for key in before:
+        expected_order.append(key)
+        if key == "version":
+            expected_order.append("version_name")
+    assert list(after) == expected_order
+    # The Russian comment text survives UNESCAPED (ensure_ascii=False), not as \uXXXX.
+    assert "«Читать и изменять закладки»" in after_text
+    assert "\\u" not in after_text
+    # manifest_version 3 is untouched — the output is still a loadable MV3 manifest.
+    assert after["manifest_version"] == 3
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "0.1.65536",   # component over the spec maximum
+        "0.1.032",     # leading zero on a non-zero component
+        "0.0.0.0",     # all zero
+        "0",           # all zero (single component)
+        "0.1.2.3.4",   # more than four components
+        "0.1.x",       # not an integer
+        "0.1.-1",      # negative
+        "",            # empty
+    ],
+)
+def test_stamp_manifest_refuses_an_invalid_version(bad):
+    # An invalid `version` does not degrade — Chrome refuses to load the extension at all —
+    # so it must raise here instead of producing an unloadable manifest. Redden: drop the
+    # validate_manifest_version call from stamp_manifest.
+    with pytest.raises(ValueError):
+        core.stamp_manifest(_repo_manifest_text(), version=bad, version_name="x")
+
+
+def test_stamp_manifest_accepts_the_spec_edges():
+    # The mirror of the case above: legal versions must NOT be rejected.
+    for good in ("0.1.0.0", "65535.65535.65535.65535", "1", "0.0.1"):
+        assert core.validate_manifest_version(good) == good
+
+
+def test_copy_bundle_without_a_stamp_is_still_verbatim(tmp_path):
+    # The no-regression pin: every existing caller passes no stamp and must keep getting a
+    # byte-identical manifest. Redden: stamp unconditionally in copy_bundle.
+    out = tmp_path / "dist"
+    core.copy_bundle(REPO_EXTENSION, out)
+    assert (out / "manifest.json").read_bytes() == (REPO_EXTENSION / "manifest.json").read_bytes()
+
+
+def test_copy_bundle_stamps_the_output_and_never_the_repo(tmp_path):
+    # The stamp lands in the OUTPUT manifest only. The repo's own extension/ is READ-ONLY
+    # to this module (module docstring), and a build that bumped the tracked manifest would
+    # make every build dirty the working tree. Redden: stamp src instead of dst.
+    repo_before = (REPO_EXTENSION / "manifest.json").read_bytes()
+    out = tmp_path / "dist"
+    core.copy_bundle(
+        REPO_EXTENSION, out, version="0.1.130", version_name="0.1.130 · abc1234 · now"
+    )
+
+    built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert built["version"] == "0.1.130"
+    assert built["version_name"] == "0.1.130 · abc1234 · now"
+    assert (REPO_EXTENSION / "manifest.json").read_bytes() == repo_before
+
+
+def test_replace_bundle_forwards_the_stamp(tmp_path):
+    # `bundle --force` goes through replace_bundle, so the in-place rebuild — the one the
+    # operator actually runs (make dev-bundle) — must stamp too. Redden: drop the
+    # version/version_name forwarding in replace_bundle.
+    out = tmp_path / "dist"
+    core.copy_bundle(REPO_EXTENSION, out)
+    core.replace_bundle(
+        REPO_EXTENSION, out, version="0.1.131", version_name="0.1.131 · def5678-dirty · now"
+    )
+    built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert built["version"] == "0.1.131"
+    assert built["version_name"] == "0.1.131 · def5678-dirty · now"
+
+
+def test_cli_bundle_stamps_version_and_version_name(tmp_path):
+    # End to end through the CLI against the real repo: the built manifest carries a
+    # version whose first two components come from the tracked literal, a third component
+    # that is the commit count, and a version_name naming that version plus a sha.
+    out = tmp_path / "dist"
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)]) == 0
+
+    base = json.loads((REPO_EXTENSION / "manifest.json").read_text())["version"]
+    built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    major, minor = base.split(".")[:2]
+    assert built["version"].startswith(f"{major}.{minor}.")
+    core.validate_manifest_version(built["version"])  # raises if the CLI emitted junk
+    assert built["version_name"].startswith(built["version"])
+    assert built["manifest_version"] == 3  # still a loadable MV3 bundle
+    # The tracked literal is NOT bumped by a build.
+    assert json.loads((REPO_EXTENSION / "manifest.json").read_text())["version"] == base
+
+
+def test_cli_bundle_still_builds_when_git_is_unavailable(tmp_path, monkeypatch, capsys):
+    # A build must NEVER fail over the stamp: no git, not a repo, a broken repo — all
+    # degrade to the verbatim copy this tool did before the stamp existed, with a note on
+    # stderr. Redden: let build_stamp propagate instead of returning None.
+    def no_git(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(cli.subprocess, "run", no_git)
+    out = tmp_path / "dist"
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)]) == 0
+
+    assert (out / "manifest.json").read_bytes() == (REPO_EXTENSION / "manifest.json").read_bytes()
+    built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert "version_name" not in built
+    assert "build stamp unavailable" in capsys.readouterr().err
+
+
+def test_build_stamp_returns_none_outside_a_git_repo(tmp_path, capsys):
+    # A source extension/ that is not in a git repo at all (an unpacked tarball) — the
+    # other half of the fallback, exercised without monkeypatching git away.
+    src = tmp_path / "extension"
+    src.mkdir()
+    (src / "manifest.json").write_text(json.dumps({"name": "x", "version": "0.1.0"}))
+    # tmp_path is outside any working tree, so `git -C` walks up and finds no repo.
+    assert cli.build_stamp(src) is None
+    assert "build stamp unavailable" in capsys.readouterr().err
+
+
+def test_generated_app_reports_the_bundles_version(tmp_path):
+    # The .app's CFBundleShortVersionString/CFBundleVersion must agree with the bundle its
+    # launcher loads, instead of a frozen literal. Redden: hard-code the version in
+    # build_info_plist's caller again.
+    bundle = tmp_path / "dist"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text(json.dumps({"name": "x", "version": "0.1.130"}))
+    res = core.generate_instance(
+        out_root=tmp_path / "inst", bundle_dir=bundle, instance_id="main", title="Main"
+    )
+    plist = res.paths.info_plist.read_text()
+    assert "<string>0.1.130</string>" in plist
+    assert "<string>0.1.0</string>" not in plist
+
+
+def test_generated_app_falls_back_when_the_bundle_has_no_version(tmp_path):
+    # An unstamped/hand-made bundle dir still produces a valid Info.plist.
+    bundle = _make_bundle(tmp_path)  # no `version` key at all
+    res = core.generate_instance(
+        out_root=tmp_path / "inst", bundle_dir=bundle, instance_id="main", title="Main"
+    )
+    assert f"<string>{core.DEFAULT_APP_VERSION}</string>" in res.paths.info_plist.read_text()
 
 
 # --------------------------------------------------------------------------- #

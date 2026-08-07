@@ -10,7 +10,8 @@ Covers:
     series per coarse reason (so the §37 alert can key on ``reason="enroll_bad_code"``),
     and the empty-breakdown case emitting a still-valid exposition.
   * ``instancegen bundle`` — a hostless, key-free, instance.json-free universal bundle
-    that any two runs produce byte-for-byte identically (acc 16).
+    that any two runs produce byte-for-byte identically apart from the manifest's build
+    stamp, whose ``version_name`` carries the build time on purpose (acc 16).
 
 Each assertion is written so that removing the guard it names reddens the test.
 """
@@ -214,17 +215,30 @@ def test_auth_rejections_empty_breakdown_is_valid_exposition():
 # --------------------------------------------------------------------------- #
 # instancegen bundle — universal, hostless, key-free, no instance.json
 # --------------------------------------------------------------------------- #
-def _content_digest(root: Path) -> list[tuple[str, str]]:
+def _content_digest(root: Path, *, skip: tuple[str, ...] = ()) -> list[tuple[str, str]]:
     """Sorted (relpath, sha256-of-contents) for every file under *root*.
 
     Compares file CONTENTS only (not mtimes/metadata), which is what "byte-identical"
-    means for a reproducible build.
+    means for a reproducible build. *skip* drops relpaths from the comparison — used for
+    `manifest.json`, the ONE file the build rewrites (the version stamp carries a build
+    timestamp by design, so two runs a minute apart differ there and only there).
     """
     return [
         (str(p.relative_to(root)), hashlib.sha256(p.read_bytes()).hexdigest())
         for p in sorted(root.rglob("*"))
-        if p.is_file()
+        if p.is_file() and str(p.relative_to(root)) not in skip
     ]
+
+
+def _manifest_without_build_time(root: Path) -> dict:
+    """A built manifest with only the wall-clock part of the stamp dropped.
+
+    `version` is deterministic (base major.minor + commit count) and must match between
+    runs; `version_name` embeds the build time and must not.
+    """
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest.pop("version_name", None), "the build must stamp a version_name"
+    return manifest
 
 
 def test_bundle_produces_a_hostless_key_free_manifest_no_instance_json(tmp_path):
@@ -251,9 +265,15 @@ def test_bundle_two_runs_byte_identical(tmp_path):
     d2 = tmp_path / "b2"
     for d in (d1, d2):
         cli.main(["bundle", "--out", str(d), "--extension-dir", str(REPO_EXTENSION)])
-    # A timestamp-free copy with nothing stamped into it -> identical trees (acc 16).
-    # Redden: reintroduce any stamping step whose input can vary between runs.
-    assert _content_digest(d1) == _content_digest(d2)
+    # A copy with no CONFIGURATION stamped into it -> identical trees (acc 16). The one
+    # exception is manifest.json's build stamp, which is identity rather than
+    # configuration: `version` is still deterministic (asserted below), only
+    # `version_name`'s build time can vary between two runs. Redden: reintroduce any
+    # stamping step whose input can vary between runs — of anything else, or of `version`.
+    assert _content_digest(d1, skip=("manifest.json",)) == _content_digest(
+        d2, skip=("manifest.json",)
+    )
+    assert _manifest_without_build_time(d1) == _manifest_without_build_time(d2)
 
 
 def test_bundle_writes_no_secret_material_beside_or_inside_the_output(tmp_path):
@@ -319,7 +339,12 @@ def test_bundle_force_rebuilds_the_same_path_byte_for_byte(tmp_path):
     ) == 0
 
     assert live.is_dir()
-    assert _content_digest(live) == _content_digest(reference)
+    # manifest.json is skipped for the same reason as in the two-runs test: its stamped
+    # `version_name` carries the build time. `version` and every other key must match.
+    assert _content_digest(live, skip=("manifest.json",)) == _content_digest(
+        reference, skip=("manifest.json",)
+    )
+    assert _manifest_without_build_time(live) == _manifest_without_build_time(reference)
     # The dir is a NEW inode (it was swapped, not merged into) at the SAME path…
     assert live.stat().st_ino != before_inode
     # …and nothing was left beside it — a leftover staging dir would sit in this parent.

@@ -114,6 +114,12 @@ bundle: install ## Build the shared universal bundle (vars: OUT)
 #     on the extension's card at brave://extensions (chrome://extensions). And if the
 #     manifest's permission set changed, the browser holds the NEW permissions back until
 #     they are confirmed there by hand — until then those capabilities silently do nothing.
+#
+#     To CONFIRM the reload took: this target prints the build stamp it wrote
+#     (`0.1.<commit-count> · <short-sha>[-dirty] · <build time>`) and the extension card
+#     shows the same string — that is the manifest's `version_name`, which is the field
+#     the extensions page displays. Different string on the card => the reload did not
+#     happen. The tracked extension/manifest.json is never rewritten by this.
 dev-bundle: OUT ?= dist
 .PHONY: dev-bundle
 dev-bundle: startpage install ## Rebuild the bundle the browser loads, in place (vars: OUT, default dist)

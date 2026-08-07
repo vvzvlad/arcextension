@@ -7,6 +7,7 @@ Everything here runs on Linux/CI without a browser or a mac. The macOS-only real
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -23,10 +24,21 @@ from pathlib import Path
 # is fine (AGENTS.md); override with --brave-binary.
 DEFAULT_BRAVE_BINARY = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
 
-# No manifest placeholders remain: `<host>` went with issue #35 (the manifest is hostless,
-# only `<all_urls>`), and the `key` field went with the extension-id pinning (there is no
-# origin allow-list left to pin an id for — see src/api/cors.py). `bundle` therefore COPIES
-# the manifest verbatim and stamps nothing.
+# Fallback CFBundleShortVersionString/CFBundleVersion for the .app when the bundle it wraps
+# carries no readable `version` (an unstamped or hand-made bundle dir).
+DEFAULT_APP_VERSION = "0.1.0"
+
+# No manifest CONFIGURATION placeholders remain: `<host>` went with issue #35 (the manifest
+# is hostless, only `<all_urls>`), and the `key` field went with the extension-id pinning
+# (there is no origin allow-list left to pin an id for — see src/api/cors.py). That is what
+# made bundles non-interchangeable: a bundle configured for one host/id was NOT the same
+# artefact as another, so the universal build had to stamp nothing.
+#
+# `bundle` does stamp two fields, and they are a different kind of thing: `version` and
+# `version_name` are build IDENTITY, not configuration (`stamp_manifest` below). Two
+# bundles that differ only in them behave identically — the stamp changes nothing the
+# extension reads or does; it only lets a human look at the card in brave://extensions and
+# tell WHICH build is loaded. Everything else is still copied verbatim.
 
 # Directory name of an instance's empty --user-data-dir under the output root.
 _PROFILE_DIRNAME = "profile"
@@ -147,9 +159,14 @@ def build_info_plist(
     bundle_id: str,
     executable_name: str,
     icon_name: str,
-    version: str = "0.1.0",
+    version: str = DEFAULT_APP_VERSION,
 ) -> str:
-    """A minimal but valid ``Info.plist`` for the ``.app`` wrapper."""
+    """A minimal but valid ``Info.plist`` for the ``.app`` wrapper.
+
+    *version* is the bundle's stamped ``version`` (see :func:`stamp_manifest`), passed in
+    by :func:`generate_instance` so the ``.app`` reports the same build as the extension
+    it launches. The default keeps the function usable on its own, without a stamp.
+    """
     entries = {
         "CFBundleName": title,
         "CFBundleDisplayName": title,
@@ -228,18 +245,130 @@ def _solid_rgba_png(size: int, rgba: tuple[int, int, int, int]) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# Build stamp (pure text; the environment is read in `cli`, never here)
+# --------------------------------------------------------------------------- #
+# Chrome's rules for manifest `version`
+# (https://developer.chrome.com/docs/extensions/reference/manifest/version): one to four
+# dot-separated integers, each 0..65535 inclusive, a non-zero component must not carry a
+# leading zero (`032` is rejected), and they must not be all zero (`0.0.0.0` is rejected,
+# `0.1.0.0` is fine). An invalid version does not degrade — the browser refuses to load
+# the extension at all — so it is validated here rather than written out and discovered
+# on the extensions page.
+MANIFEST_VERSION_MAX_COMPONENT = 65535
+_VERSION_COMPONENT_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
+
+
+def validate_manifest_version(version: str) -> str:
+    """Return *version* unchanged, or raise ``ValueError`` describing what is illegal."""
+    parts = version.split(".")
+    if not 1 <= len(parts) <= 4:
+        raise ValueError(
+            f"invalid manifest version {version!r}: expected 1 to 4 dot-separated "
+            f"integers, got {len(parts)}"
+        )
+    for part in parts:
+        if not _VERSION_COMPONENT_RE.match(part):
+            raise ValueError(
+                f"invalid manifest version {version!r}: component {part!r} must be a "
+                "non-negative integer with no leading zero"
+            )
+        if int(part) > MANIFEST_VERSION_MAX_COMPONENT:
+            raise ValueError(
+                f"invalid manifest version {version!r}: component {part!r} exceeds the "
+                f"maximum {MANIFEST_VERSION_MAX_COMPONENT}"
+            )
+    if all(int(part) == 0 for part in parts):
+        raise ValueError(f"invalid manifest version {version!r}: must not be all zero")
+    return version
+
+
+def stamp_manifest(manifest_text: str, *, version: str, version_name: str) -> str:
+    """Return *manifest_text* with ``version``/``version_name`` set to the build stamp.
+
+    ``version_name`` is the field brave://extensions RENDERS when present ("will be used
+    for display purposes if present"), so it carries the human-readable build identity;
+    ``version`` stays machine-ordered so the scheme still advances per commit for anything
+    that reads only it.
+
+    Pure text in, pure text out — the caller supplies the two values, this never reads git
+    or the clock. Re-serialised with the manifest's own formatting: 2-space indent and
+    ``ensure_ascii=False``, because the ``//``-prefixed comment keys hold Russian prose and
+    escaping it would rewrite most of the file for no reason.
+    """
+    validate_manifest_version(version)
+    if not version_name.strip():
+        raise ValueError("version_name must not be empty")
+
+    data = json.loads(manifest_text)
+    if not isinstance(data, dict):
+        raise ValueError("manifest.json must contain a JSON object")
+
+    # Rebuild the mapping so `version_name` lands next to `version` instead of at the end:
+    # json.dumps preserves insertion order, and the two belong together in a diff.
+    stamped: dict = {}
+    for key, value in data.items():
+        if key == "version":
+            stamped["version"] = version
+            stamped["version_name"] = version_name
+        elif key != "version_name":
+            stamped[key] = value
+    if "version" not in stamped:  # a manifest without one: append rather than fail
+        stamped["version"] = version
+        stamped["version_name"] = version_name
+
+    return json.dumps(stamped, indent=2, ensure_ascii=False) + "\n"
+
+
+def manifest_version(bundle_dir: str | Path) -> str | None:
+    """The ``version`` of a BUILT bundle's manifest, or ``None`` if it has none/unreadable.
+
+    Read-only. Used to make the ``.app`` wrapper report the same build as the bundle its
+    launcher loads.
+    """
+    try:
+        data = json.loads((Path(bundle_dir) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    version = data.get("version") if isinstance(data, dict) else None
+    return version if isinstance(version, str) and version else None
+
+
+# --------------------------------------------------------------------------- #
 # Bundle copy
 # --------------------------------------------------------------------------- #
-def copy_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path) -> None:
+def copy_bundle(
+    src_extension_dir: str | Path,
+    dst_extension_dir: str | Path,
+    *,
+    version: str | None = None,
+    version_name: str | None = None,
+) -> None:
     """Copy the extension bundle, skipping dev cruft and any source instance.json.
 
     Used by the universal ``bundle`` build (§9) to materialise the ONE fleet-wide
     bundle every instance loads. The repo's own ``extension/`` is only READ here.
+
+    With *version*/*version_name* given, the COPY's ``manifest.json`` is stamped with the
+    build identity (:func:`stamp_manifest`) — the source manifest is never written. With
+    both left ``None`` this is a verbatim copy and nothing is rewritten at all.
     """
     src = Path(src_extension_dir)
     if not (src / "manifest.json").is_file():
         raise ValueError(f"{src} is not an extension bundle (no manifest.json)")
     shutil.copytree(src, dst_extension_dir, ignore=_COPY_IGNORE)
+    if version is None and version_name is None:
+        return
+    if version is None or version_name is None:
+        raise ValueError("version and version_name must be given together")
+    dst_manifest = Path(dst_extension_dir) / "manifest.json"
+    dst_manifest.write_text(
+        stamp_manifest(
+            dst_manifest.read_text(encoding="utf-8"),
+            version=version,
+            version_name=version_name,
+        ),
+        encoding="utf-8",
+    )
 
 
 # Prefix of the staging dir `replace_bundle` builds into. Dotted so it is inconspicuous
@@ -247,7 +376,13 @@ def copy_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path) ->
 _REBUILD_STAGING_PREFIX = ".rebuild-"
 
 
-def replace_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path) -> None:
+def replace_bundle(
+    src_extension_dir: str | Path,
+    dst_extension_dir: str | Path,
+    *,
+    version: str | None = None,
+    version_name: str | None = None,
+) -> None:
     """Rebuild an EXISTING bundle dir IN PLACE, keeping its path and never half-writing it.
 
     The destination path MUST survive the rebuild unchanged, and that is the whole point:
@@ -271,6 +406,9 @@ def replace_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path)
     The only lossy window is between (2) and (3) — two renames in one directory — and
     even there the previous tree still exists under the staging dir until step (4).
     Anything that fails earlier leaves the existing bundle exactly as it was.
+
+    *version*/*version_name* are forwarded to :func:`copy_bundle`, so the staged tree is
+    already stamped before the swap — the live bundle is never a stamped-in-place tree.
     """
     src = Path(src_extension_dir).resolve()
     dst = Path(dst_extension_dir).resolve()
@@ -292,7 +430,9 @@ def replace_bundle(src_extension_dir: str | Path, dst_extension_dir: str | Path)
 
     try:
         # Validates the source and does all the copying while dst is still untouched.
-        copy_bundle(src_extension_dir, new_tree)
+        copy_bundle(
+            src_extension_dir, new_tree, version=version, version_name=version_name
+        )
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -411,12 +551,16 @@ def generate_instance(
         encoding="utf-8",
     )
     paths.launcher.chmod(0o755)
+    # The .app reports the version of the bundle it actually launches, read from that
+    # bundle's stamped manifest — not a literal that would go stale the moment the bundle
+    # is rebuilt. An unstamped/hand-made bundle falls back to DEFAULT_APP_VERSION.
     paths.info_plist.write_text(
         build_info_plist(
             title,
             bundle_identifier(instance_id),
             paths.launcher.name,
             paths.icon_png.name,
+            version=manifest_version(bundle_dir) or DEFAULT_APP_VERSION,
         ),
         encoding="utf-8",
     )
