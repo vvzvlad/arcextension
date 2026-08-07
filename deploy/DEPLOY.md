@@ -2,7 +2,7 @@
 
 Operator guide for `docker-compose.yml` (the Traefik web-service variant). Design
 references are docs/architecture.md **§3** and **§12 «Безопасность»**. Pull the
-prebuilt image from `ghcr.io`; do **not** build on prod.
+prebuilt image from the Gitea registry; do **not** build on prod.
 
 All placeholders in the deploy files are `XXX` — replace them at deploy time from a
 secret store. Never commit a real secret.
@@ -83,7 +83,7 @@ git rev-parse HEAD        # ...the same sha? then you are looking at your code.
   failing.
 - **`revision: "unknown"`** means the image was built without the stamp (a hand-rolled
   `docker build` with no `--build-arg`, or a local `make run`). It is not an error, but
-  from a ghcr image it means CI did not build it — treat the container as unidentified.
+  from a registry image it means CI did not build it — treat the container as unidentified.
 - **Without HTTP at all** (the container will not start): the same value is the standard
   OCI label — `docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' curator`.
 

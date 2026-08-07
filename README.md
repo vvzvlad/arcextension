@@ -93,16 +93,17 @@ make dev-bundle            # OUT=dist по умолчанию — ровно т�
 
 ## Развёртывание
 
-Прод — Docker: готовый образ из `ghcr.io`, на проде ничего не собирается.
+Прод — Docker: готовый образ из реестра Gitea, на проде ничего не собирается.
 [`docker-compose.yml`](docker-compose.yml) в корне — шаблон, все секреты в нём
 плейсхолдеры `XXX`. Переменные в проде задаются в `environment:` compose-файла
 (`.env` — только для локального запуска). Ниже порядок шагов и ссылки; конкретные
 значения, пороги и процедуры живут в рунбуке [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
 
-**Откуда образ. Рабочий тег — `:develop`.** GitHub Actions
-([`.github/workflows/ghcr-check-publish.yml`](.github/workflows/ghcr-check-publish.yml))
-на пуш в `develop` собирает и публикует `ghcr.io/vvzvlad/arcextension:develop` — это
-тот образ, который стоит на проде. Сборка зависит от джобы тестов (в неё же входит
+**Откуда образ. Рабочий тег — `:develop`.** Gitea Actions
+([`.gitea/workflows/image-check-publish.yml`](.gitea/workflows/image-check-publish.yml))
+на пуш в `develop` собирает и публикует `gitea.vvzvlad.xyz/vvzvlad/arcextension:develop`
+— это тот образ, который стоит на проде. Пайплайн переехал с GitHub Actions и ghcr.io:
+адрес в compose — справочный, живой стек настроен в Portainer и несёт свой. Сборка зависит от джобы тестов (в неё же входит
 `make alerts`), так что красные тесты или сломанные правила алертов образа не дают.
 Контейнер несёт метку watchtower, поэтому новый образ доезжает **сам**, без ручной
 команды: слияние в `develop` — это и есть выкатка. Руками, если ждать некогда —
