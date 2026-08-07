@@ -98,11 +98,17 @@ def _tiny_repo_extension(root: Path, *, commits: int = 1) -> Path:
             ["git", "-C", str(repo), *argv], check=True, capture_output=True, text=True
         )
 
-    git("init", "-q")
+    # --template= (empty) neutralises a global `init.templateDir`, whose hooks and
+    # `info/exclude` would otherwise be copied into this repo — the same class of ambient
+    # config as the identity/signing/abbrev settings below.
+    git("init", "-q", "--template=")
     git("config", "user.email", "test@example.com")
     git("config", "user.name", "test")
     git("config", "commit.gpgsign", "false")
     git("config", "core.abbrev", str(_FIXTURE_ABBREV))
+    # A global ignore file matching anything the fixture writes (e.g. `background.js`)
+    # would hide it from `git status --porcelain` and silently kill the `-dirty` assertion.
+    git("config", "core.excludesFile", "/dev/null")
     git("add", "-A")
     # --no-verify so a globally configured `core.hooksPath` cannot run someone's
     # pre-commit hook here and fail the fixture.
@@ -555,7 +561,17 @@ def test_build_stamp_dirty_marker_only_looks_at_the_bundle(tmp_path):
     (ext / "background.js").write_text("// uncommitted\n", encoding="utf-8")
     stamp = cli.build_stamp(ext)
     assert stamp is not None
-    assert "-dirty" in stamp[1]
+    # The whole SHAPE is pinned, not just the marker's presence: `-dirty` QUALIFIES THE
+    # SHA and must stay glued to it. Read off the extension card, `abc1234-dirty` says
+    # "this build is that commit plus uncommitted edits", while a trailing ` · -dirty`
+    # field reads as a separate token about the build in general. Presence alone leaves
+    # that free to move. Same format as the clean-build regex in
+    # test_cli_bundle_stamps_version_and_version_name, with the marker added.
+    assert re.fullmatch(
+        r"\d+\.\d+\.\d+ · [0-9a-f]{" + str(_FIXTURE_ABBREV) + r"}-dirty · "
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}",
+        stamp[1],
+    ), stamp[1]
 
 
 def test_build_stamp_ignores_a_repo_that_does_not_track_the_manifest(tmp_path):
