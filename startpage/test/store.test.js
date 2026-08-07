@@ -450,6 +450,63 @@ describe("raise a space (§62 item 3)", () => {
     };
   }
 
+  it("raises a BACKGROUND instance, whose focused_window_id is null, by its busiest window", async () => {
+    // The regression this guards: `focused_window_id` means "the window on screen RIGHT
+    // NOW, null when the browser is unfocused" (§5). A foreign browser is unfocused
+    // exactly when you want to raise it, so gating on that field alone made the row dead
+    // in the only case it exists for. Every other fixture here hard-codes a number,
+    // which is a state a background instance is never in.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const bodies = [];
+    const { fetchFn, counts } = makeFetch({
+      state: {
+        status: 200,
+        body: fleet({
+          tabs: [
+            { instance_id: "nowin", tab_id: 1, window_id: 71, url: "https://a/", title: "a" },
+            { instance_id: "nowin", tab_id: 2, window_id: 90, url: "https://b/", title: "b" },
+            { instance_id: "nowin", tab_id: 3, window_id: 90, url: "https://c/", title: "c" },
+            // A foreign tab of ANOTHER instance must not leak into the choice.
+            { instance_id: "prox", tab_id: 4, window_id: 55, url: "https://d/", title: "d" },
+          ],
+        }),
+      },
+      focus: (opts) => {
+        bodies.push(JSON.parse(opts.body));
+        return { status: 200, body: { ok: true } };
+      },
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    // The row is offered, not disabled.
+    const row = store.statusRows.value.find((r) => r.id === "nowin");
+    expect(row.raisable).toBe(true);
+
+    const res = await store.raiseInstance("nowin");
+    expect(res).toEqual({ ok: true });
+    expect(counts.focus).toBe(1);
+    // Window 90 holds two tabs, 71 holds one => 90. Never 55 (another instance).
+    expect(bodies[0]).toEqual({ instance: "nowin", windowId: 90 });
+  });
+
+  it("stays non-actionable when the instance has no window at all", async () => {
+    // The honest null: connected, unfocused AND no mirrored tabs => nothing to raise.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: fleet() }, // tabs: []
+      focus: () => ({ status: 200, body: { ok: true } }),
+    });
+    const store = storeWith(env, fetchFn);
+    await store.init();
+    await store.refresh();
+
+    expect(store.statusRows.value.find((r) => r.id === "nowin").raisable).toBe(false);
+    expect(await store.raiseInstance("nowin")).toEqual({ ok: false, nonActionable: true });
+    expect(counts.focus ?? 0).toBe(0); // nothing was sent (the mock counts on first call)
+  });
+
   it("POSTs /api/focus with {instance, windowId} and NO tabId, reports ok", async () => {
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const bodies = [];

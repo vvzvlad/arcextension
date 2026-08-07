@@ -215,6 +215,30 @@ export function createStore(deps = {}) {
     };
   }
 
+  // The window id to raise an instance BY. Prefers its foreground window when the
+  // mirror happens to know one, else the instance's busiest window from the tab list
+  // (ties -> smallest id, the same deterministic rule §9 uses to pick "the obvious
+  // window"). Returns null only when we know of no window at all — a connected
+  // instance with zero mirrored tabs, where there is genuinely nothing to raise.
+  function raisableWindowId(inst) {
+    if (!inst) return null;
+    if (inst.focused_window_id != null) return inst.focused_window_id;
+    const counts = new Map();
+    for (const t of foreignTabs.value) {
+      if (t.instance_id !== inst.id || t.window_id == null) continue;
+      counts.set(t.window_id, (counts.get(t.window_id) || 0) + 1);
+    }
+    let best = null;
+    let bestCount = -1;
+    for (const [wid, n] of counts) {
+      if (n > bestCount || (n === bestCount && wid < best)) {
+        best = wid;
+        bestCount = n;
+      }
+    }
+    return best;
+  }
+
   function applyState(state) {
     instances.value = state.instances || [];
     // Own tabs come from chrome.tabs.query; the client filters its own instance out
@@ -319,14 +343,22 @@ export function createStore(deps = {}) {
       title: i.id, // the id IS the name (§6)
       status: instanceStatus(i, serverNow()),
       // A "space" is RAISABLE (§62 item 3) only when it is a FOREIGN, connected instance
-      // with a known foreground window: raising our own browser from its own newtab is a
-      // no-op, a closed instance is unreachable, and a null focused_window_id has no
-      // window to raise. Carried here so the template can disable non-actionable rows.
-      focusedWindowId: i.focused_window_id ?? null,
+      // we have SOME window id for: raising our own browser from its own newtab is a
+      // no-op, and a closed instance is unreachable.
+      //
+      // The window is NOT `focused_window_id` alone. That field means "the window on
+      // screen RIGHT NOW, null when the browser is unfocused" (§5, extension/src/
+      // snapshot.js) — and a foreign browser is unfocused exactly when you want to
+      // raise it, so the field is null precisely in the case this button exists for.
+      // Gating on it made the row dead most of the time and alive in a narrow window
+      // right after leaving that instance. Any window of the instance does the job:
+      // a single chrome.windows.update({focused:true}) raises the browser from ANY
+      // window state (ledger row 33а), so we fall back to one derived from its tabs.
+      focusedWindowId: raisableWindowId(i),
       raisable:
         i.id !== ownInstanceId.value &&
         i.connected === true &&
-        i.focused_window_id != null,
+        raisableWindowId(i) != null,
     })),
   );
 
@@ -775,7 +807,9 @@ export function createStore(deps = {}) {
   async function raiseInstance(instanceId, { force = false } = {}) {
     fallbackMessage.value = "";
     const inst = instances.value.find((i) => i.id === instanceId);
-    const windowId = inst ? inst.focused_window_id : null;
+    // Same resolution the `raisable` flag uses — never `focused_window_id` alone,
+    // which is null for any browser that is not on screen (see raisableWindowId).
+    const windowId = raisableWindowId(inst);
     if (windowId == null || instanceId === ownInstanceId.value) {
       return { ok: false, nonActionable: true };
     }
