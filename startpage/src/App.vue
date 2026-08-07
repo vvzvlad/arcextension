@@ -322,6 +322,19 @@ export default {
       await store.runRulesNow();
     }
 
+    // --- открыть регистрацию нового браузера (§13) --------------------------
+    async function onOpenEnrollment() {
+      await store.openEnrollment();
+    }
+    // How long the window the last click armed stays open, in whole minutes. Derived
+    // HERE and not inline in the template: the template renders text, it does not do
+    // arithmetic. Floored at 1 so a window with seconds left never reads as "0 мин".
+    const enrollWindowMinutes = computed(() => {
+      const result = store.enrollWindow.value;
+      const seconds = result && typeof result.seconds === "number" ? result.seconds : 0;
+      return Math.max(1, Math.round(seconds / 60));
+    });
+
     // --- stop gate override (§7) -------------------------------------------
     async function onForce() {
       await store.retryForced();
@@ -551,6 +564,8 @@ export default {
       onResume,
       onRaiseInstance,
       onRunRulesNow,
+      onOpenEnrollment,
+      enrollWindowMinutes,
       onForce,
     };
   },
@@ -940,6 +955,42 @@ export default {
           <template v-if="store.runNowResult.value.error">— не удалось: {{ store.runNowResult.value.error }}</template>
           <template v-else-if="store.runNowResult.value.status === 'ok'">— проход выполнен: {{ store.runNowResult.value.status }}</template>
           <template v-else>— проход не выполнен: {{ store.runNowResult.value.status }}</template>
+        </span>
+      </div>
+
+      <!-- Регистрация нового браузера (§13). The page arms the window ITSELF instead of
+           just linking to the console: the code has to reach the clipboard inside THIS
+           document's user activation, and a tab that /admin opened carries none — the
+           click would open a console and copy nothing. The code is therefore printed
+           right here as the clipboard's fallback: a refused write (plain http, a lapsed
+           activation) must still leave the human able to read what to type. The Админка
+           link is the way to everything else the console does; it is absent when no
+           service address is configured, rather than pointing nowhere. -->
+      <div class="sp-status-row" data-role="enroll-window-row">
+        <span class="sp-dot ok"></span>
+        <span class="sp-status-name">Новый браузер</span>
+        <button
+          class="sp-btn"
+          type="button"
+          data-role="open-enrollment"
+          :disabled="store.offline.value"
+          @click="onOpenEnrollment"
+        >Открыть регистрацию и скопировать код</button>
+        <a
+          v-if="store.adminUrl.value"
+          class="sp-btn sp-btn-ghost"
+          data-role="admin-link"
+          :href="store.adminUrl.value"
+          target="_blank"
+          rel="noopener noreferrer"
+        >Админка</a>
+        <span v-if="store.enrollWindow.value" class="sp-sub" data-role="enroll-window-result">
+          <template v-if="store.enrollWindow.value.error">— не удалось: {{ store.enrollWindow.value.error }}</template>
+          <template v-else>— код {{ store.enrollWindow.value.code }}, окно открыто на {{ enrollWindowMinutes }} мин<template
+            v-if="store.enrollWindow.value.copied"
+          >, скопирован</template><template
+            v-else
+          > — скопировать не удалось, выделите код и скопируйте вручную</template></template>
         </span>
       </div>
 

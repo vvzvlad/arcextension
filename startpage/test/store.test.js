@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 
 import { createStore } from "../src/lib/store.js";
-import { makeChrome, makeFetch } from "./mocks.js";
+import { makeChrome, makeClipboard, makeFetch } from "./mocks.js";
 
 const NOW = 1_000_000;
 
@@ -629,6 +629,99 @@ describe("run all rules now (§62 item 5)", () => {
     const res = await store.runRulesNow();
     expect(res.offline).toBe(true);
     expect(counts.runPass).toBeUndefined();
+  });
+});
+
+// --- открыть регистрацию + скопировать код (§13) ------------------------------
+// One click has to do BOTH halves: arm the window server-side and put the code on the
+// clipboard. The tests below pin each half separately, and — most importantly — pin that
+// the two are not welded together: a clipboard that refuses must not cost the human the
+// code, because the window is already open by then.
+describe("open enrollment window (§13)", () => {
+  it("arms the window and writes the returned code to the clipboard", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: { status: 200, body: { code: "K7M2PQ", until: NOW + 600_000, seconds_remaining: 600 } },
+    });
+    const { clipboard, writes } = makeClipboard();
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+    await store.refresh();
+
+    const res = await store.openEnrollment();
+    expect(res).toEqual({ ok: true, code: "K7M2PQ", copied: true });
+    expect(counts.enrollWindow).toBe(1);
+    // EXACTLY the code the server minted — not a truncation, not a formatted line.
+    expect(writes).toEqual(["K7M2PQ"]);
+    expect(store.enrollWindow.value).toEqual({ code: "K7M2PQ", seconds: 600, copied: true });
+  });
+
+  it("a REJECTED clipboard write still exposes the code and does not throw", async () => {
+    // The window is open server-side by the time writeText runs, so losing the code to an
+    // exception would leave an armed window and nothing to type into it. Reddens if the
+    // try/catch around the clipboard is removed, or if `copied:false` stops carrying the
+    // code alongside it.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: { status: 200, body: { code: "R4T9WX", until: NOW + 600_000, seconds_remaining: 600 } },
+    });
+    const { clipboard, writes } = makeClipboard({ fails: true });
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+    await store.refresh();
+
+    const res = await store.openEnrollment();
+    expect(res).toEqual({ ok: true, code: "R4T9WX", copied: false });
+    expect(writes).toEqual(["R4T9WX"]); // it was ATTEMPTED, and it rejected
+    expect(store.enrollWindow.value).toEqual({ code: "R4T9WX", seconds: 600, copied: false });
+  });
+
+  it("a non-2xx surfaces an error and copies nothing", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: { status: 503, body: null },
+    });
+    const { clipboard, writes } = makeClipboard();
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+    await store.refresh();
+
+    const res = await store.openEnrollment();
+    expect(res).toEqual({ ok: false });
+    expect(store.enrollWindow.value).toEqual({ error: "HTTP 503" });
+    expect(writes).toEqual([]);
+  });
+
+  it("offline (no credential): no request, an explicit error", async () => {
+    const env = makeChrome({ tabs: [], credential: null, messages: {} });
+    const { fetchFn, counts } = makeFetch({ state: undefined });
+    const { clipboard, writes } = makeClipboard();
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+
+    const res = await store.openEnrollment();
+    expect(res).toEqual({ ok: false, offline: true });
+    expect(store.enrollWindow.value).toEqual({ error: "offline" });
+    expect(counts.enrollWindow).toBeUndefined();
+    expect(writes).toEqual([]);
+  });
+
+  it("adminUrl follows the configured address, and is null without one", async () => {
+    // The console link must lead to THIS deployment's /admin — derived from the same
+    // http(s) base the /api calls use (wss://host/ -> https://host) — and must not exist
+    // at all on a profile with no address, where it would point nowhere.
+    const configured = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const withAddress = storeWith(configured, makeFetch({ state: undefined }).fetchFn);
+    await withAddress.init();
+    expect(withAddress.adminUrl.value).toBe("https://host/admin");
+
+    const bare = makeChrome({ tabs: [], credential: null, messages: {} });
+    const without = storeWith(bare, makeFetch({ state: undefined }).fetchFn);
+    await without.init();
+    expect(without.adminUrl.value).toBe(null);
   });
 });
 

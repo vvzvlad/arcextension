@@ -209,6 +209,23 @@ export function makeChrome(opts = {}) {
   };
 }
 
+// The clipboard the enrollment button writes to (§13). Records every write so a test can
+// assert the code REALLY reached it, and `fails: true` makes writeText reject — the case
+// the browser produces outside a secure context or after the click's user activation has
+// lapsed, and the one where the page still has to show the code.
+export function makeClipboard({ fails = false } = {}) {
+  const writes = [];
+  return {
+    writes,
+    clipboard: {
+      writeText: async (text) => {
+        writes.push(text);
+        if (fails) throw new Error("clipboard write refused");
+      },
+    },
+  };
+}
+
 // A fetch router keyed by URL substring. Each route is a value or a (url,opts)=>value
 // returning { ok, status, json }. Records call counts per route name.
 //
@@ -244,6 +261,15 @@ export function makeFetch(routes = {}) {
       const r = routes.merge;
       const v = await (typeof r === "function" ? r(opts, counts.merge) : r);
       return jsonResponse((v && v.status) ?? 200, (v && v.body) ?? { merged: 0 });
+    }
+    if (u.includes("/api/enroll/window")) {
+      counts.enrollWindow = (counts.enrollWindow || 0) + 1;
+      const r = routes.enrollWindow;
+      const v = await (typeof r === "function" ? r(opts, counts.enrollWindow) : r);
+      return jsonResponse(
+        (v && v.status) ?? 200,
+        (v && v.body) ?? { code: "ABC234", until: 1_000_600_000, seconds_remaining: 600 },
+      );
     }
     if (u.includes("/api/run_pass")) {
       counts.runPass = (counts.runPass || 0) + 1;

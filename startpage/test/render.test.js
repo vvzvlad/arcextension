@@ -3,7 +3,7 @@ import { mount, flushPromises } from "@vue/test-utils";
 
 import App from "../src/App.vue";
 import { formatDateTime } from "../src/lib/status.js";
-import { makeChrome, makeFetch } from "./mocks.js";
+import { makeChrome, makeClipboard, makeFetch } from "./mocks.js";
 
 // SFC render smoke: the precompiled component renders a NON-EMPTY root from LOCAL
 // sources even with no cache and no network (offline-first, §10). This is the
@@ -888,6 +888,84 @@ describe("run all rules now button (§62 item 5)", () => {
     const text = wrapper.find('[data-role="run-now-result"]').text();
     expect(text).toContain("не выполнен");
     expect(text).not.toContain("проход запущен");
+  });
+});
+
+// --- §13: «открыть регистрацию и скопировать код» + the console link -----------
+describe("open enrollment window row (§13)", () => {
+  it("one click arms the window, copies the code and prints it in the row", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+      enrollWindow: { status: 200, body: { code: "K7M2PQ", until: 1_600_000, seconds_remaining: 600 } },
+    });
+    const { clipboard, writes } = makeClipboard();
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000, clipboard } },
+    });
+    await flushPromises();
+
+    expect(wrapper.find('[data-role="enroll-window-row"]').exists()).toBe(true);
+    const btn = wrapper.find('[data-role="open-enrollment"]');
+    expect(btn.exists()).toBe(true);
+    await btn.trigger("click");
+    await flushPromises();
+
+    expect(counts.enrollWindow).toBe(1);
+    expect(writes).toEqual(["K7M2PQ"]);
+    // The code is PRINTED, not merely copied: the clipboard is not a place the human can
+    // look, and the row is (see the fallback case below).
+    const result = wrapper.find('[data-role="enroll-window-result"]');
+    expect(result.text()).toContain("K7M2PQ");
+    expect(result.text()).toContain("10 мин");
+    expect(result.text()).toContain("скопирован");
+  });
+
+  it("a refused clipboard write still shows the code, with the manual-copy hint", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+      enrollWindow: { status: 200, body: { code: "R4T9WX", until: 1_600_000, seconds_remaining: 600 } },
+    });
+    const { clipboard } = makeClipboard({ fails: true });
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000, clipboard } },
+    });
+    await flushPromises();
+
+    await wrapper.find('[data-role="open-enrollment"]').trigger("click");
+    await flushPromises();
+
+    const text = wrapper.find('[data-role="enroll-window-result"]').text();
+    expect(text).toContain("R4T9WX");
+    expect(text).toContain("вручную");
+  });
+
+  it("the Админка link points at this deployment's console", async () => {
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+    });
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
+    });
+    await flushPromises();
+
+    const link = wrapper.find('[data-role="admin-link"]');
+    expect(link.exists()).toBe(true);
+    expect(link.attributes("href")).toBe("https://host/admin");
+  });
+
+  it("no configured address => no link at all (never a dead one)", async () => {
+    const env = makeChrome({ tabs: [], credential: null, messages: {} });
+    const { fetchFn } = makeFetch({ state: undefined });
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000 } },
+    });
+    await flushPromises();
+
+    expect(wrapper.find('[data-role="enroll-window-row"]').exists()).toBe(true);
+    expect(wrapper.find('[data-role="admin-link"]').exists()).toBe(false);
   });
 });
 

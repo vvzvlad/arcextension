@@ -39,6 +39,7 @@ from src.api.admin_page import (
     logout_submit,
 )
 from src.api.cors import CountingCORSMiddleware, cors_kwargs
+from src.api.enroll import open_enroll_window_api
 from src.api.exemptions import create_exemption, delete_exemption, list_exemptions
 from src.api.guards import require_operational
 from src.api.instances import merge_windows_endpoint
@@ -263,6 +264,12 @@ def create_app(settings) -> Starlette:
         # shift + an immediate confirming pass). Both are exceptions to the stop gate.
         Route("/api/pause", pause_endpoint, methods=["POST"]),
         Route("/api/pause", resume_endpoint, methods=["DELETE"]),
+        # Arm the enrollment window from the STARTPAGE (§13): the «открыть регистрацию и
+        # скопировать код» button, which needs the code back IN the clicking page (the
+        # clipboard write lives inside its user activation). Same core as the admin verb
+        # below, but authed by require_api_caller — so an INSTANCE secret opens it too.
+        # What that widens, and why it is accepted, is written out in src/api/enroll.py.
+        Route("/api/enroll/window", open_enroll_window_api, methods=["POST"]),
         # Enrollment JSON API (§13). ADMIN-only (ADMIN_TOKEN / MCP): the operator opens /
         # reads / closes the enrollment window and lists/revokes instances. There is no
         # approve/reject pair and no pending list — an enroll_request with a valid code

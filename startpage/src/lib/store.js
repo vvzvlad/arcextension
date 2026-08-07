@@ -20,6 +20,7 @@ import {
   getCredential,
   getIdentity,
   httpBaseFromServiceUrl,
+  postEnrollWindow,
   postFocus,
   postFocusWindow,
   postPause,
@@ -67,6 +68,10 @@ export function createStore(deps = {}) {
   const chromeApi = deps.chromeApi || (typeof chrome !== "undefined" ? chrome : undefined);
   const fetchFn = deps.fetchFn || (typeof fetch !== "undefined" ? fetch.bind(globalThis) : undefined);
   const now = deps.now || (() => Date.now());
+  // The clipboard is INJECTED like every other capability here: the enrollment button
+  // writes the code to it, and a test must be able to observe that write (and to make it
+  // reject). The page passes nothing and gets the real `navigator.clipboard`.
+  const clipboard = deps.clipboard || (typeof navigator !== "undefined" ? navigator.clipboard : null);
 
   // --- reactive state -------------------------------------------------------
   const ownInstanceId = ref(null);
@@ -165,6 +170,12 @@ export function createStore(deps = {}) {
   const inFlightOps = shallowRef([]);
   // The "выполнить все правила сейчас" outcome (§62 item 5): { status } | { error }.
   const runNowResult = ref(null);
+  // The /admin console's address, derived from the CONFIGURED service address — null when
+  // no address is configured, so the page never renders a link that leads nowhere.
+  const adminUrl = ref(null);
+  // The last «открыть регистрацию» outcome (§13): { code, seconds, copied } | { error }.
+  // `code` is exposed even when the clipboard write failed — see openEnrollment.
+  const enrollWindow = ref(null);
 
   // --- rules editor state (§8/§10) — needs the network; degrades gracefully -----
   const rules = ref([]);
@@ -447,10 +458,13 @@ export function createStore(deps = {}) {
     if (cred && cred.serviceUrl && cred.secret) {
       base = httpBaseFromServiceUrl(cred.serviceUrl);
       token = cred.secret;
+      // The console hangs directly off the same http(s) base the /api calls use.
+      adminUrl.value = base + "/admin";
       hasAddress.value = true;
     } else {
       base = null;
       token = null;
+      adminUrl.value = null;
     }
 
     // FIRST PAINT — local sources only (§10). Own tabs + bookmarks + history + the
@@ -866,6 +880,45 @@ export function createStore(deps = {}) {
     return { ok: false };
   }
 
+  // --- открыть регистрацию нового браузера (§13) ----------------------------
+  // POST /api/enroll/window: arm the enrollment window AND copy the code it mints, in
+  // ONE click. Both halves happen here rather than on /admin because the clipboard write
+  // needs THIS document's user activation — a console tab the click merely opened has
+  // none, and the human would be left copying by hand anyway.
+  //
+  // The instance secret is what authenticates this (the same Bearer every other verb on
+  // this page uses); the server's /api/enroll/window accepts it where /admin does not.
+  // What that widens is written down in src/api/enroll.py.
+  async function openEnrollment() {
+    enrollWindow.value = null;
+    if (offline.value || !base || !token) {
+      offline.value = true;
+      enrollWindow.value = { error: "offline" };
+      return { ok: false, offline: true };
+    }
+    const { status, body } = await postEnrollWindow(fetchFn, base, token);
+    if (status < 200 || status >= 300 || !body || !body.code) {
+      enrollWindow.value = { error: "HTTP " + status };
+      return { ok: false };
+    }
+    // The clipboard is BEST-EFFORT and its failure must cost nothing. writeText rejects
+    // outside a secure context (plain http) and whenever the activation has lapsed, and
+    // the object is absent entirely in some embeddings — so the call is wrapped, and the
+    // code is kept on `enrollWindow` EITHER WAY. The window is already open server-side
+    // at this point; losing the code to an exception in a click handler would mean the
+    // human has an armed window and no idea what to type. The console's own copy button
+    // catches for exactly the same reason (templates/app.js).
+    let copied = false;
+    try {
+      await clipboard.writeText(body.code);
+      copied = true;
+    } catch {
+      copied = false;
+    }
+    enrollWindow.value = { code: body.code, seconds: body.seconds_remaining, copied };
+    return { ok: true, code: body.code, copied };
+  }
+
   // Re-issue the verb the stop gate refused, this time with {force:true} (§7).
   async function retryForced() {
     const blocked = pauseBlock.value;
@@ -1087,6 +1140,9 @@ export function createStore(deps = {}) {
     // quick-link queue overlay (§10) + run-now outcome (§62 item 5)
     pendingOps,
     runNowResult,
+    // enrollment button (§13): the console's address + the last arm outcome
+    adminUrl,
+    enrollWindow,
     // rules editor state
     rules,
     rulesLoaded,
@@ -1129,6 +1185,8 @@ export function createStore(deps = {}) {
     retryForced,
     // run all rules now (§62 item 5)
     runRulesNow,
+    // открыть регистрацию + скопировать код (§13)
+    openEnrollment,
     // rules editor methods
     loadRules,
     previewRuleDraft,

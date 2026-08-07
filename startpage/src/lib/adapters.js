@@ -292,6 +292,20 @@ export async function postRunPass(fetchFn, base, token, { runAll = false } = {})
   return { status: resp.status, body };
 }
 
+// «Открыть регистрацию» (§13): arm the enrollment window and get the freshly minted code
+// BACK IN THIS PAGE. The code has to travel to the caller — not merely be armed on the
+// server — because the startpage copies it to the clipboard inside the same click handler,
+// and `navigator.clipboard.writeText` only works while that click's user activation is
+// alive. No request body: the window has no parameters (its length is server config).
+export async function postEnrollWindow(fetchFn, base, token) {
+  const resp = await fetchFn(base + "/api/enroll/window", {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  const body = await resp.json().catch(() => null);
+  return { status: resp.status, body };
+}
+
 // Ask the SW (which owns the offline queue, §6/§10) to enqueue a quick-link op.
 // Best-effort: the UI has already updated optimistically, so a failed message must
 // not throw into the click handler.
