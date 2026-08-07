@@ -294,7 +294,7 @@ admin_audit(                            -- след действий опера�
   action TEXT NOT NULL,
   install_uuid TEXT,
   instance_id TEXT,
-  initiator TEXT NOT NULL,              -- кто действовал: admin | system | user
+  initiator TEXT NOT NULL,              -- кто действовал: admin | system
   detail TEXT
 )
 CREATE INDEX admin_audit_ts ON admin_audit(ts);
@@ -314,6 +314,11 @@ UPDATE instances SET status='revoked' WHERE secret_hash IS NULL;
                                         -- каждая доенролловая строка (включая MAIN)
                                         -- переходит в 'revoked' и требует переподтверждения
 ```
+
+Комментарий про `initiator` выше — отгруженный, а не актуальный: начиная с §13 у
+`window_open` появился третий инициатор, `user` (кнопка на стартпейдже через `POST
+/api/enroll/window`); действующий словарь описан в докстринге `insert_admin_audit`
+(`src/db/queries.py`).
 
 **Миграция 3 — enrollment в один шаг (§6).** Одобрение убрано: окно enrollment и есть
 разрешение, а `instance_id` приносит браузер. Отсюда обе потери — очередь заявок и

@@ -941,15 +941,22 @@ describe("open enrollment window row (§13)", () => {
     expect(text).toContain("вручную");
   });
 
-  it("the code LEAVES the row once the window's deadline passes", async () => {
+  it("the code LEAVES the row once the window's SERVER deadline passes", async () => {
     // A newtab lives for hours. Without this the row would still read «код K7M2PQ, окно
     // открыто на 10 мин, скопирован» an hour after the window closed — three claims, all
     // dead, about a code nothing accepts anymore. The server core refuses to surface a
     // dead code (src/curator/enroll.py: a closed window reads code=None) and the page
-    // must not re-introduce what the core refuses to do. The deadline is compared against
-    // the SERVER-adjusted clock (clockTick + serverOffset), which the page already keeps.
+    // must not re-introduce what the core refuses to do.
+    //
+    // The two clocks are driven APART on purpose — the laptop runs an hour AHEAD of the
+    // server (server_now 1_000_000 against a local 4_600_000 => serverOffset -3_600_000)
+    // — and `until` is stated in the SERVER scale, the scale it arrives in. With the
+    // clocks aligned this test passes on ANY implementation, including the two that are
+    // wrong: comparing against Date.now(), or losing serverOffset. Both would read the
+    // window as long closed here and fail the first assertion below. That is the whole
+    // point of store.js's clock section (§10): comparing two clocks is forbidden.
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
-    let clock = 1_000_000;
+    let clock = 4_600_000;
     const { fetchFn } = makeFetch({
       state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
       enrollWindow: { status: 200, body: { code: "K7M2PQ", until: 1_600_000, seconds_remaining: 600 } },
@@ -964,8 +971,9 @@ describe("open enrollment window row (§13)", () => {
     await flushPromises();
     expect(wrapper.find('[data-role="enroll-window-result"]').text()).toContain("K7M2PQ");
 
-    // One second past the deadline. The page's own 1 s tick is what re-reads the clock.
-    clock = 1_600_001;
+    // One second past the deadline ON THE SERVER's clock: local 5_200_001 + (-3_600_000)
+    // = 1_600_001. The page's own 1 s tick is what re-reads the clock.
+    clock = 5_200_001;
     wrapper.vm.store.tick();
     await flushPromises();
 
@@ -973,6 +981,45 @@ describe("open enrollment window row (§13)", () => {
     expect(text).not.toContain("K7M2PQ");
     expect(text).not.toContain("скопирован");
     expect(text).toContain("окно закрылось");
+  });
+
+  it("the row says «открываю окно…» while the arm is in flight", async () => {
+    // `openEnrollment` nulls `enrollWindow` first and the button greys out on the same
+    // latch, so a server that accepts the connection and never answers used to leave a
+    // grey button next to an empty row — indistinguishable from a click that was
+    // swallowed. Reddens if the in-flight branch (or the `enrolling` half of the span's
+    // v-if) goes away.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    let release;
+    const inFlight = new Promise((resolve) => {
+      release = resolve;
+    });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+      enrollWindow: async () => {
+        await inFlight;
+        return { status: 200, body: { code: "K7M2PQ", until: 1_600_000, seconds_remaining: 600 } };
+      },
+    });
+    const { clipboard } = makeClipboard();
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => 1_000_000, clipboard } },
+    });
+    await flushPromises();
+    // Nothing to say before the first click: no result, no spinner.
+    expect(wrapper.find('[data-role="enroll-window-result"]').exists()).toBe(false);
+
+    await wrapper.find('[data-role="open-enrollment"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-role="open-enrollment"]').attributes("disabled")).toBeDefined();
+    expect(wrapper.find('[data-role="enroll-window-result"]').text()).toContain("открываю окно");
+
+    release();
+    await flushPromises();
+    // …and the moment it lands the spinner is replaced by the code, not stacked with it.
+    const text = wrapper.find('[data-role="enroll-window-result"]').text();
+    expect(text).toContain("K7M2PQ");
+    expect(text).not.toContain("открываю окно");
   });
 
   it("the Админка link points at this deployment's console", async () => {

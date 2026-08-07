@@ -353,13 +353,16 @@
       .sp-pending-plan {
         flex-basis: 100%; max-width: 70ch; line-height: 1.45; font-size: 11px;
       }
-      /* The enrollment row is the LONGEST thing in the status bar — a name, a 37-character
-         button, the console link and a result up to ~96 characters — and .sp-status-row is
-         a nowrap flex row, so without this it runs off the strip instead of taking a
-         second line. Same treatment as the latch row above, for the same reason, with the
-         result taking a full row of its own like the plan does. */
-      .sp-enroll-row { flex-wrap: wrap; max-width: 100%; }
-      .sp-enroll-result {
+      /* The «Новый браузер» row (data-role="enroll-window-row") is the LONGEST thing in the
+         status bar — a name, a 37-character button, the console link and a result up to
+         ~96 characters — and .sp-status-row is a nowrap flex row, so without this it runs
+         off the strip instead of taking a second line. Same treatment as the latch row
+         above, for the same reason, with the result taking a full row of its own like the
+         plan does. The name is deliberately NOT .sp-enroll-row: that class is already on
+         the §7 enrollment BANNER, which is a short one-line row and must keep the default
+         nowrap/width it has always had. */
+      .sp-enroll-window-row { flex-wrap: wrap; max-width: 100%; }
+      .sp-enroll-window-result {
         flex-basis: 100%; max-width: 70ch; line-height: 1.45; font-size: 11px;
       }
       /* "Других инстансов пока нет" is the ONE .sp-empty that does not live inside a

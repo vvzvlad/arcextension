@@ -214,7 +214,7 @@ _V2_STATEMENTS: list[str] = [
         action TEXT NOT NULL,
         install_uuid TEXT,
         instance_id TEXT,
-        initiator TEXT NOT NULL,              -- who acted: admin | system | user
+        initiator TEXT NOT NULL,              -- who acted: admin | system
         detail TEXT
     )
     """,

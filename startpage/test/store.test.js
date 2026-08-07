@@ -730,8 +730,14 @@ describe("open enrollment window (§13)", () => {
     // that rejection escapes openEnrollment into the click handler while `enrollWindow`
     // has already been nulled, so the human clicks and sees NOTHING at all.
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    // The service dies BETWEEN the first refresh and the click — the exact ordering that
+    // leaves a live button in front of a dead service.
+    let serviceUp = true;
     const { fetchFn } = makeFetch({
-      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      state: () => {
+        if (!serviceUp) throw new TypeError("Failed to fetch");
+        return { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } };
+      },
       enrollWindow: () => {
         throw new TypeError("Failed to fetch");
       },
@@ -742,14 +748,70 @@ describe("open enrollment window (§13)", () => {
     await store.refresh();
     expect(store.offline.value).toBe(false); // the button is live: this is the hole
 
+    serviceUp = false;
     // Does NOT throw — the store catches, the adapter stays thin (the refresh() division).
     const res = await store.openEnrollment();
     expect(res).toEqual({ ok: false });
     expect(store.enrollWindow.value).toEqual({ error: "нет связи" });
+    // The re-probe confirmed the service really is gone, so `offline` is set — by
+    // refresh(), which owns that verdict, and not by the catch itself.
     expect(store.offline.value).toBe(true);
     expect(writes).toEqual([]);
     // …and the latch is released, so the next click is not locked out by the failure.
     expect(store.enrolling.value).toBe(false);
+  });
+
+  it("a rejected arm does NOT latch the page offline when the service is still there", async () => {
+    // The rejection branch must not decide liveness on its own. Nothing on this page can
+    // clear `offline` once it is set: jumpForeign/raiseInstance/runRulesNow early-return
+    // on it, the resume button is :disabled by it, and App.vue's own refresh runs at mount
+    // only — so a hard `offline = true` here means one click during a container restart
+    // greys out every button until the tab is reloaded. Reddens if the catch sets the flag
+    // instead of re-probing through refresh().
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: () => {
+        throw new TypeError("Failed to fetch");
+      },
+    });
+    const { clipboard } = makeClipboard();
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+    await store.refresh();
+    const stateCalls = counts.state;
+
+    const res = await store.openEnrollment();
+    expect(res).toEqual({ ok: false });
+    expect(store.enrollWindow.value).toEqual({ error: "нет связи" });
+    // The re-probe happened…
+    expect(counts.state).toBe(stateCalls + 1);
+    // …and it answered, so the page is NOT offline: the human can click again, jump, resume.
+    expect(store.offline.value).toBe(false);
+  });
+
+  it("no `until` in the body: the deadline is derived from seconds_remaining", async () => {
+    // The only safety net on the whole expiry path — without a deadline the row can never
+    // stop showing a dead code. No server sends a body without `until` today, which is
+    // precisely why nothing else exercises this branch. The clocks are driven APART so the
+    // assertion pins the SERVER scale: a fallback built on the local clock would land on
+    // 5_200_000 here, not 1_600_000.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: { status: 200, body: { code: "K7M2PQ", seconds_remaining: 600 } },
+    });
+    const { clipboard } = makeClipboard();
+    // Local clock 3_600_000 ms AHEAD of the server's => serverOffset === -3_600_000.
+    const store = storeWith(env, fetchFn, { clipboard, now: () => NOW + 3_600_000 });
+    await store.init();
+    await store.refresh();
+
+    const res = await store.openEnrollment();
+    expect(res.ok).toBe(true);
+    expect(store.enrollWindow.value).toEqual({
+      code: "K7M2PQ", seconds: 600, until: NOW + 600_000, copied: true,
+    });
   });
 
   it("a second click while the first arm is in flight is refused (no dead-code race)", async () => {
@@ -795,7 +857,9 @@ describe("open enrollment window (§13)", () => {
 
     const res = await store.openEnrollment();
     expect(res).toEqual({ ok: false, offline: true });
-    expect(store.enrollWindow.value).toEqual({ error: "offline" });
+    // ONE name for one event: the same words the fetch-rejection branch writes, and
+    // Russian like the rest of the row. «offline» rendered as «не удалось: offline».
+    expect(store.enrollWindow.value).toEqual({ error: "нет связи" });
     expect(counts.enrollWindow).toBeUndefined();
     expect(writes).toEqual([]);
   });

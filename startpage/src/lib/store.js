@@ -908,7 +908,11 @@ export function createStore(deps = {}) {
     enrollWindow.value = null;
     if (offline.value || !base || !token) {
       offline.value = true;
-      enrollWindow.value = { error: "offline" };
+      // The SAME words the fetch-rejection branch below uses. The human meets one event —
+      // "the service is not answering" — and giving it two names («offline» here, «нет
+      // связи» twenty lines down) only makes the row look like it is reporting two
+      // different faults. Russian, too: the row it lands in is Russian throughout.
+      enrollWindow.value = { error: "нет связи" };
       return { ok: false, offline: true };
     }
     enrolling.value = true;
@@ -922,8 +926,16 @@ export function createStore(deps = {}) {
         // refresh(). Unhandled, the rejection would escape the click handler while
         // `enrollWindow` is already nulled, so the human clicks and sees NOTHING. The
         // STORE catches and the adapter stays thin — the same division refresh() uses.
+        //
+        // The verdict on liveness is refresh()'s to make, NOT this branch's. Setting
+        // `offline` here would LATCH the page: every path that clears the flag is
+        // unreachable while it is set (jumpForeign/raiseInstance/runRulesNow early-return
+        // on it, the resume button is :disabled by it, App.vue's refresh is mount-only),
+        // so one click during a container restart greys out the whole page until the tab
+        // is reloaded. Re-probing instead sets the same flag when the service really is
+        // down AND clears it when the failure was a blip.
         enrollWindow.value = { error: "нет связи" };
-        offline.value = true;
+        await refresh();
         return { ok: false };
       }
       if (status < 200 || status >= 300) {

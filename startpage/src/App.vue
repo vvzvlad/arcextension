@@ -985,7 +985,7 @@ export default {
            outlives the window by hours, and a dead code described as live is worse than
            no code. The Админка link is the way to everything else the console does; it is
            absent when no service address is configured, rather than pointing nowhere. -->
-      <div class="sp-status-row sp-enroll-row" data-role="enroll-window-row">
+      <div class="sp-status-row sp-enroll-window-row" data-role="enroll-window-row">
         <span class="sp-dot ok"></span>
         <span class="sp-status-name">Новый браузер</span>
         <button
@@ -1003,8 +1003,20 @@ export default {
           target="_blank"
           rel="noopener noreferrer"
         >Админка</a>
-        <span v-if="store.enrollWindow.value" class="sp-sub sp-enroll-result" data-role="enroll-window-result">
-          <template v-if="store.enrollWindow.value.error">— не удалось: {{ store.enrollWindow.value.error }}</template>
+        <!-- In flight the row says so. `openEnrollment` nulls `enrollWindow` before the
+             request and the button greys out on the same latch, so without this branch a
+             server that accepts the connection and never answers leaves a dead-looking
+             row: a grey button, nothing beside it and no way to tell a click that was
+             swallowed from one still being served. `enrolling` therefore opens the span
+             too — it is the only state where the span has something to say and
+             `enrollWindow` is empty. -->
+        <span
+          v-if="store.enrolling.value || store.enrollWindow.value"
+          class="sp-sub sp-enroll-window-result"
+          data-role="enroll-window-result"
+        >
+          <template v-if="store.enrolling.value">— открываю окно…</template>
+          <template v-else-if="store.enrollWindow.value.error">— не удалось: {{ store.enrollWindow.value.error }}</template>
           <template v-else-if="enrollWindowClosed">— окно закрылось, откройте заново</template>
           <template v-else>— код {{ store.enrollWindow.value.code }}, окно открыто<template
             v-if="enrollWindowMinutes"
