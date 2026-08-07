@@ -57,6 +57,61 @@ def _gen(out_root, instance_id, *, title=None, bundle_dir=None, **kw):
     )
 
 
+# Short-sha length the fixture repo below pins via `core.abbrev`. Git's default is `auto`
+# — a length derived from the repo's object count — and a developer or a runner may also
+# set `core.abbrev` globally, in which case `git rev-parse --short HEAD` obeys THAT
+# (`core.abbrev=4` really does answer a 4-character sha). Pinning it on the fixture repo
+# makes the sha a known quantity, so the format assertion tests the stamp instead of the
+# ambient config. 12 is far above git's minimum of 4 and unambiguous in a tiny repo.
+_FIXTURE_ABBREV = 12
+
+
+def _tiny_repo_extension(root: Path, *, commits: int = 1) -> Path:
+    """A real, NON-shallow git repo with an `extension/` bundle inside it.
+
+    Every test that asserts on a real build stamp owns its repository instead of reading
+    the project's own `extension/`, because THE SHAPE OF THIS PROJECT'S CLONE MUST NOT
+    DECIDE WHETHER THE ASSERTION RUNS. `cli.build_stamp` degrades to "no stamp" on a
+    shallow clone on purpose (there `rev-list --count HEAD` answers 1 and the version
+    would come out confidently wrong), and `actions/checkout` clones with `fetch-depth: 1`
+    — so against `REPO_EXTENSION` there is legitimately no stamp in CI, and the assertions
+    would either die on a missing `version_name` or have to be skipped in exactly the
+    environment that matters most. A repo built here is non-shallow by construction and
+    its commit count is the test's own choice.
+
+    It is a real repo rather than a stub because the `-dirty` marker is about what git
+    reports for a real working tree.
+
+    Identity, signing and hooks are configured LOCALLY on this repo, so it commits in a
+    sandbox with no global git config and never inherits the developer's or the runner's.
+    """
+    repo = root / "repo"
+    ext = repo / "extension"
+    ext.mkdir(parents=True)
+    (ext / "manifest.json").write_text(
+        json.dumps({"name": "x", "version": "0.2.0", "manifest_version": 3}),
+        encoding="utf-8",
+    )
+
+    def git(*argv):
+        subprocess.run(
+            ["git", "-C", str(repo), *argv], check=True, capture_output=True, text=True
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "test")
+    git("config", "commit.gpgsign", "false")
+    git("config", "core.abbrev", str(_FIXTURE_ABBREV))
+    git("add", "-A")
+    # --no-verify so a globally configured `core.hooksPath` cannot run someone's
+    # pre-commit hook here and fail the fixture.
+    git("commit", "-qm", "init", "--no-verify")
+    for n in range(1, commits):
+        git("commit", "-qm", f"c{n}", "--allow-empty", "--no-verify")
+    return ext
+
+
 # --------------------------------------------------------------------------- #
 # generate writes NO extension copy and NO instance.json (issue #37, acc 3)
 # --------------------------------------------------------------------------- #
@@ -352,16 +407,27 @@ def test_replace_bundle_forwards_the_stamp(tmp_path):
 
 
 def test_cli_bundle_stamps_version_and_version_name(tmp_path):
-    # End to end through the CLI against the real repo: the built manifest carries a
-    # version whose first two components come from the tracked literal, a third component
-    # that is the commit count, and a version_name naming that version plus a sha.
+    # End to end through the CLI: the built manifest carries a version whose first two
+    # components come from the tracked literal, a third component that is the commit
+    # count, and a version_name naming that version plus a sha.
+    #
+    # This builds a repo the TEST owns rather than REPO_EXTENSION, because the shape of
+    # THIS project's clone must not decide whether the assertion below runs. build_stamp
+    # degrades to no stamp on a shallow clone by design, and CI checks out with
+    # fetch-depth: 1 — so read against REPO_EXTENSION this test dies on a missing
+    # `version_name` in CI, and skipping instead would retire the format assertion in the
+    # one environment that publishes images. See _tiny_repo_extension.
+    ext = _tiny_repo_extension(tmp_path, commits=3)
     out = tmp_path / "dist"
-    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)]) == 0
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(ext)]) == 0
 
-    base = json.loads((REPO_EXTENSION / "manifest.json").read_text())["version"]
+    base = json.loads((ext / "manifest.json").read_text())["version"]
     built = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     major, minor = base.split(".")[:2]
-    assert built["version"].startswith(f"{major}.{minor}.")
+    # The EXACT count, not merely the prefix: the history is this test's own, so three
+    # commits on a `0.2.0` base is `0.2.3` and nothing else. Redden: derive the third
+    # component from anything but `git rev-list --count HEAD`.
+    assert built["version"] == f"{major}.{minor}.3"
     core.validate_manifest_version(built["version"])  # raises if the CLI emitted junk
     assert built["version_name"].startswith(built["version"])
     # The full SHAPE of version_name is pinned here, and it is pinned here on purpose:
@@ -372,16 +438,21 @@ def test_cli_bundle_stamps_version_and_version_name(tmp_path):
     # smuggled into the stamp: the two-run reproducibility tests in
     # tests/test_enroll_metrics_and_bundle.py compare two builds on the SAME machine, so
     # by construction they can only see what varies BETWEEN runs and never this.
-    # Matches cli.build_stamp: `<version> · <short-sha>[-dirty] · %Y-%m-%d %H:%M`, where
-    # `version` is three integer components (core.validate_manifest_version) and the sha is
-    # `git rev-parse --short HEAD` (7 hex digits, more in a big repo).
+    # Matches cli.build_stamp: `<version> · <short-sha> · %Y-%m-%d %H:%M`, where `version`
+    # is three integer components (core.validate_manifest_version) and the sha is
+    # `git rev-parse --short HEAD` at the fixture repo's pinned `core.abbrev` — a fixed
+    # length, not `{7,}`, which would have been the ambient `core.abbrev`'s answer rather
+    # than the stamp's. No `-dirty` alternative: the fixture repo is committed clean, so a
+    # marker here is a bare sha; the `-dirty` half is pinned by
+    # test_build_stamp_dirty_marker_only_looks_at_the_bundle.
     assert re.fullmatch(
-        r"\d+\.\d+\.\d+ · [0-9a-f]{7,}(?:-dirty)? · \d{4}-\d{2}-\d{2} \d{2}:\d{2}",
+        r"\d+\.\d+\.\d+ · [0-9a-f]{" + str(_FIXTURE_ABBREV) + r"} · "
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}",
         built["version_name"],
     ), built["version_name"]
     assert built["manifest_version"] == 3  # still a loadable MV3 bundle
     # The tracked literal is NOT bumped by a build.
-    assert json.loads((REPO_EXTENSION / "manifest.json").read_text())["version"] == base
+    assert json.loads((ext / "manifest.json").read_text())["version"] == base
 
 
 def test_cli_bundle_still_builds_when_git_is_unavailable(tmp_path, monkeypatch, capsys):
@@ -466,33 +537,6 @@ def test_build_stamp_degrades_on_a_shallow_clone(tmp_path, monkeypatch, capsys):
     assert "build stamp unavailable" in err
     # Named, so the test cannot pass because some other git call happened to fail.
     assert "shallow clone" in err
-
-
-def _tiny_repo_extension(root: Path) -> Path:
-    """A real one-commit git repo with an `extension/` bundle inside it.
-
-    The `-dirty` marker is about what git reports for a REAL working tree, so this uses a
-    real repo rather than a stub.
-    """
-    repo = root / "repo"
-    ext = repo / "extension"
-    ext.mkdir(parents=True)
-    (ext / "manifest.json").write_text(
-        json.dumps({"name": "x", "version": "0.2.0"}), encoding="utf-8"
-    )
-
-    def git(*argv):
-        subprocess.run(
-            ["git", "-C", str(repo), *argv], check=True, capture_output=True, text=True
-        )
-
-    git("init", "-q")
-    git("config", "user.email", "test@example.com")
-    git("config", "user.name", "test")
-    git("config", "commit.gpgsign", "false")
-    git("add", "-A")
-    git("commit", "-qm", "init")
-    return ext
 
 
 def test_build_stamp_dirty_marker_only_looks_at_the_bundle(tmp_path):
