@@ -294,7 +294,7 @@ admin_audit(                            -- след действий опера�
   action TEXT NOT NULL,
   install_uuid TEXT,
   instance_id TEXT,
-  initiator TEXT NOT NULL,              -- кто действовал: admin | system
+  initiator TEXT NOT NULL,              -- кто действовал: admin | system | user
   detail TEXT
 )
 CREATE INDEX admin_audit_ts ON admin_audit(ts);
@@ -1416,8 +1416,15 @@ http-адрес сайта, опечатка) от ненастроенного:
   `/admin`.
 
   **Путь не бесшумен, но и не виден там, где смотрят.** `admin_audit` пишет `window_open`
-  с `initiator='admin'` и `enroll` с `initiator='system'`, поэтому enrollment, случившийся
-  во время стопа, виден в аудите. В `actions` он не виден никак: форсированное действие ложится как
+  на каждое открытие окна и `enroll` с `initiator='system'`, поэтому enrollment,
+  случившийся во время стопа, виден в аудите. У `window_open` два возможных `initiator`, и
+  дверей тоже две: `initiator='admin'` — окно открыли с `/admin` по `ADMIN_TOKEN`,
+  `initiator='user'` — окно открыли кнопкой на стартпейдже через `POST
+  /api/enroll/window` под секретом инстанса (§13), и в этой строке ещё стоит
+  `instance_id` — какой именно браузер это сделал. Стоп-гейта нет **ни на той, ни на
+  другой** двери, так что регистрация нового браузера возможна во время стопа обоими
+  путями; грепать `initiator='admin'` недостаточно, искать надо `action='window_open'`.
+  В `actions` он не виден никак: форсированное действие ложится как
   `initiator=user`. Значит, разбирая «почему вкладка пропала во время стопа», читать надо
   **оба** журнала, и `admin_audit` — первым.
 - **Стоп бессрочен** и снимается только руками. Прежняя редакция делала паузу
@@ -2155,6 +2162,7 @@ worker'у, сливается `POST /api/quick_links/ops` с `Idempotency-Key`. 
 | POST | `/api/quick_links/ops` | массив операций |
 | POST | `/api/instances/:id/merge_windows` | → `{merged}` (немедленно, §9) |
 | POST/DELETE | `/api/pause` | `{}` → `{stopped_at}` (бессрочный стоп) / DELETE — старт + немедленный подтверждающий проход |
+| POST | `/api/enroll/window` | тела нет → `{code, until, seconds_remaining}`; открывает окно регистрации со стартпейджа (§13). Гейты: `require_api_caller` (секрет инстанса **или** `ADMIN_TOKEN`) + `require_operational`; стоп-гейта нет. **Выдаёт разрешение подключить новый браузер** — ответ несёт живой код и потому идёт с `Cache-Control: no-store` |
 
 ```
 StateResponse = {

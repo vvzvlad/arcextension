@@ -322,17 +322,33 @@ export default {
       await store.runRulesNow();
     }
 
-    // --- открыть регистрацию нового браузера (§13) --------------------------
+    // --- open the enrollment window for a new browser (§13) -----------------
     async function onOpenEnrollment() {
       await store.openEnrollment();
     }
     // How long the window the last click armed stays open, in whole minutes. Derived
     // HERE and not inline in the template: the template renders text, it does not do
-    // arithmetic. Floored at 1 so a window with seconds left never reads as "0 мин".
+    // arithmetic. Floored at 1 so a window with seconds left never reads as "0 мин", and
+    // NULL when the server sent no usable duration — the row then drops the "на N мин"
+    // clause entirely instead of inventing «1 мин» for a window of unknown length.
     const enrollWindowMinutes = computed(() => {
       const result = store.enrollWindow.value;
-      const seconds = result && typeof result.seconds === "number" ? result.seconds : 0;
-      return Math.max(1, Math.round(seconds / 60));
+      if (!result || typeof result.seconds !== "number" || !(result.seconds > 0)) return null;
+      return Math.max(1, Math.round(result.seconds / 60));
+    });
+    // An armed window EXPIRES, and the row has to expire with it: a newtab lives for
+    // hours, and an hour later «код K7M2PQ, окно открыто на 10 мин, скопирован» would be
+    // three lies in one line. `until` is a SERVER deadline, so it is compared against the
+    // store's server-adjusted clock (`clockTick` + `serverOffset`) — the same scale
+    // `serverDateTime` renders from — and NOT against Date.now(). Reading `serverNow()`
+    // is what makes this recompute on the 1 s tick this component already runs, so no
+    // second timer is introduced. Past the deadline the code leaves the screen: the core
+    // never surfaces a dead code either (src/curator/enroll.py: a closed window reads
+    // `code=None`), and the client must not re-introduce what it refuses to do.
+    const enrollWindowClosed = computed(() => {
+      const result = store.enrollWindow.value;
+      if (!result || result.error || typeof result.until !== "number") return false;
+      return store.serverNow() >= result.until;
     });
 
     // --- stop gate override (§7) -------------------------------------------
@@ -566,6 +582,7 @@ export default {
       onRunRulesNow,
       onOpenEnrollment,
       enrollWindowMinutes,
+      enrollWindowClosed,
       onForce,
     };
   },
@@ -963,17 +980,19 @@ export default {
            document's user activation, and a tab that /admin opened carries none — the
            click would open a console and copy nothing. The code is therefore printed
            right here as the clipboard's fallback: a refused write (plain http, a lapsed
-           activation) must still leave the human able to read what to type. The Админка
-           link is the way to everything else the console does; it is absent when no
-           service address is configured, rather than pointing nowhere. -->
-      <div class="sp-status-row" data-role="enroll-window-row">
+           activation) must still leave the human able to read what to type. It leaves the
+           screen the moment the window's deadline passes (enrollWindowClosed): this tab
+           outlives the window by hours, and a dead code described as live is worse than
+           no code. The Админка link is the way to everything else the console does; it is
+           absent when no service address is configured, rather than pointing nowhere. -->
+      <div class="sp-status-row sp-enroll-row" data-role="enroll-window-row">
         <span class="sp-dot ok"></span>
         <span class="sp-status-name">Новый браузер</span>
         <button
           class="sp-btn"
           type="button"
           data-role="open-enrollment"
-          :disabled="store.offline.value"
+          :disabled="store.offline.value || store.enrolling.value"
           @click="onOpenEnrollment"
         >Открыть регистрацию и скопировать код</button>
         <a
@@ -984,9 +1003,12 @@ export default {
           target="_blank"
           rel="noopener noreferrer"
         >Админка</a>
-        <span v-if="store.enrollWindow.value" class="sp-sub" data-role="enroll-window-result">
+        <span v-if="store.enrollWindow.value" class="sp-sub sp-enroll-result" data-role="enroll-window-result">
           <template v-if="store.enrollWindow.value.error">— не удалось: {{ store.enrollWindow.value.error }}</template>
-          <template v-else>— код {{ store.enrollWindow.value.code }}, окно открыто на {{ enrollWindowMinutes }} мин<template
+          <template v-else-if="enrollWindowClosed">— окно закрылось, откройте заново</template>
+          <template v-else>— код {{ store.enrollWindow.value.code }}, окно открыто<template
+            v-if="enrollWindowMinutes"
+          > на {{ enrollWindowMinutes }} мин</template><template
             v-if="store.enrollWindow.value.copied"
           >, скопирован</template><template
             v-else

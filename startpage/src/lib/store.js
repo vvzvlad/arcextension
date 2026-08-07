@@ -173,9 +173,21 @@ export function createStore(deps = {}) {
   // The /admin console's address, derived from the CONFIGURED service address — null when
   // no address is configured, so the page never renders a link that leads nowhere.
   const adminUrl = ref(null);
-  // The last «открыть регистрацию» outcome (§13): { code, seconds, copied } | { error }.
+  // The last «открыть регистрацию» outcome (§13):
+  // { code, seconds, until, copied } | { error }.
   // `code` is exposed even when the clipboard write failed — see openEnrollment.
+  // `until` is the SERVER deadline and is kept, not dropped: an armed window expires while
+  // this tab stays open for hours, and the code must leave the screen with it (App.vue
+  // compares it against the server-adjusted clock). The core never surfaces a dead code
+  // either — a closed window reads `code=None` in src/curator/enroll.py.
   const enrollWindow = ref(null);
+  // In-flight latch for openEnrollment, the same shape `resuming` uses above. A copy
+  // button is the most double-clicked control on any page, and two arms in flight are not
+  // just a wasted request: EVERY arm mints a new code and kills the previous one, so if
+  // the two responses land out of order the FIRST arm's — by then dead — code overwrites
+  // the second's, and the row shows it, calls it copied and calls the window open, while
+  // the only live code is the one that was thrown away. One arm at a time.
+  const enrolling = ref(false);
 
   // --- rules editor state (§8/§10) — needs the network; degrades gracefully -----
   const rules = ref([]);
@@ -880,7 +892,7 @@ export function createStore(deps = {}) {
     return { ok: false };
   }
 
-  // --- открыть регистрацию нового браузера (§13) ----------------------------
+  // --- open the enrollment window for a new browser (§13) -------------------
   // POST /api/enroll/window: arm the enrollment window AND copy the code it mints, in
   // ONE click. Both halves happen here rather than on /admin because the clipboard write
   // needs THIS document's user activation — a console tab the click merely opened has
@@ -890,33 +902,79 @@ export function createStore(deps = {}) {
   // this page uses); the server's /api/enroll/window accepts it where /admin does not.
   // What that widens is written down in src/api/enroll.py.
   async function openEnrollment() {
+    // See `enrolling` above: a second click while the first arm is in flight would race
+    // two live codes against each other, and the loser is the one left on screen.
+    if (enrolling.value) return { ok: false };
     enrollWindow.value = null;
     if (offline.value || !base || !token) {
       offline.value = true;
       enrollWindow.value = { error: "offline" };
       return { ok: false, offline: true };
     }
-    const { status, body } = await postEnrollWindow(fetchFn, base, token);
-    if (status < 200 || status >= 300 || !body || !body.code) {
-      enrollWindow.value = { error: "HTTP " + status };
-      return { ok: false };
-    }
-    // The clipboard is BEST-EFFORT and its failure must cost nothing. writeText rejects
-    // outside a secure context (plain http) and whenever the activation has lapsed, and
-    // the object is absent entirely in some embeddings — so the call is wrapped, and the
-    // code is kept on `enrollWindow` EITHER WAY. The window is already open server-side
-    // at this point; losing the code to an exception in a click handler would mean the
-    // human has an armed window and no idea what to type. The console's own copy button
-    // catches for exactly the same reason (templates/app.js).
-    let copied = false;
+    enrolling.value = true;
     try {
-      await clipboard.writeText(body.code);
-      copied = true;
-    } catch {
-      copied = false;
+      let status, body;
+      try {
+        ({ status, body } = await postEnrollWindow(fetchFn, base, token));
+      } catch {
+        // A dead service rejects the fetch outright (`TypeError: Failed to fetch`), and
+        // the button is live in exactly that state — `offline` only flips after a failed
+        // refresh(). Unhandled, the rejection would escape the click handler while
+        // `enrollWindow` is already nulled, so the human clicks and sees NOTHING. The
+        // STORE catches and the adapter stays thin — the same division refresh() uses.
+        enrollWindow.value = { error: "нет связи" };
+        offline.value = true;
+        return { ok: false };
+      }
+      if (status < 200 || status >= 300) {
+        enrollWindow.value = { error: "HTTP " + status };
+        return { ok: false };
+      }
+      if (!body || !body.code) {
+        // A 2xx with no readable code is NOT a failed arm: the window is open server-side
+        // and only the code failed to reach us (the adapter swallows a parse error and
+        // hands back a null body). Collapsing this into "HTTP 200" told the human the
+        // click failed while a live window stood open — a lie in both directions.
+        enrollWindow.value = {
+          error: "сервер не вернул код, но окно могло открыться — проверьте в админке",
+        };
+        return { ok: false };
+      }
+      // The clipboard is BEST-EFFORT and its failure must cost nothing. writeText rejects
+      // outside a secure context (plain http) and whenever the activation has lapsed, and
+      // the object is absent entirely in some embeddings — so the call is wrapped, and the
+      // code is kept on `enrollWindow` EITHER WAY. The window is already open server-side
+      // at this point; losing the code to an exception in a click handler would mean the
+      // human has an armed window and no idea what to type. The console's own copy button
+      // catches for exactly the same reason (templates/app.js).
+      let copied = false;
+      try {
+        await clipboard.writeText(body.code);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+      // The deadline is kept in the SERVER scale, the scale it arrives in. A body without
+      // one (no server sends that today — the handler always answers with `until`) still
+      // gets a deadline derived from `seconds_remaining`, so the row can always expire:
+      // "the code disappears when the window closes" must not depend on a field being
+      // present.
+      const until =
+        typeof body.until === "number"
+          ? body.until
+          : typeof body.seconds_remaining === "number"
+            ? serverNow() + body.seconds_remaining * 1000
+            : null;
+      enrollWindow.value = {
+        code: body.code,
+        seconds: body.seconds_remaining,
+        until,
+        copied,
+      };
+      return { ok: true, code: body.code, copied };
+    } finally {
+      enrolling.value = false;
     }
-    enrollWindow.value = { code: body.code, seconds: body.seconds_remaining, copied };
-    return { ok: true, code: body.code, copied };
   }
 
   // Re-issue the verb the stop gate refused, this time with {force:true} (§7).
@@ -1140,9 +1198,11 @@ export function createStore(deps = {}) {
     // quick-link queue overlay (§10) + run-now outcome (§62 item 5)
     pendingOps,
     runNowResult,
-    // enrollment button (§13): the console's address + the last arm outcome
+    // enrollment button (§13): the console's address, the last arm outcome, and the
+    // in-flight latch the button disables itself with
     adminUrl,
     enrollWindow,
+    enrolling,
     // rules editor state
     rules,
     rulesLoaded,
@@ -1185,7 +1245,7 @@ export function createStore(deps = {}) {
     retryForced,
     // run all rules now (§62 item 5)
     runRulesNow,
-    // открыть регистрацию + скопировать код (§13)
+    // open the enrollment window + copy the code (§13)
     openEnrollment,
     // rules editor methods
     loadRules,

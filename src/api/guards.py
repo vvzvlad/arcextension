@@ -87,13 +87,16 @@ class Caller:
 
 
 def initiator_for(caller: Caller) -> str:
-    """Map an ``/api/*`` caller to the ``actions.initiator`` it writes (issue #35 §5).
+    """Map an ``/api/*`` caller to the ``initiator`` it writes (issue #35 §5).
 
     An instance caller is the human at the startpage → ``'user'`` (§7's forced-button
     initiator). An admin caller is an ADMIN_TOKEN-authenticated ``/api/*`` write →
     ``'admin'`` (distinct from ``'mcp'``, the MCP transport, and ``'curator'``, the
-    autonomous pass). Only the mutating force-verbs (restore, undo, merge_windows) use
-    this; ``/api/focus`` still writes nothing.
+    autonomous pass). TWO journals take the value: the mutating force-verbs (restore, undo,
+    merge_windows) write it to ``actions.initiator``, and ``POST /api/enroll/window``
+    (:mod:`src.api.enroll`) writes it to ``admin_audit.initiator``, where it is the one
+    signal telling a window armed from a browser apart from one armed in the console.
+    ``/api/focus`` still writes nothing.
     """
     return "user" if caller.kind == "instance" else "admin"
 

@@ -14,10 +14,16 @@ What each test pins:
   read path, not through the response we just parsed;
 * ADMIN_TOKEN works too — this is not an instance-only verb;
 * anonymous / garbage Bearer → 401;
+* a REVOKED or still-PENDING instance secret → 401, and nothing is armed. This is the
+  boundary between "an accepted trade-off" (an active instance may arm a window) and
+  "revoke does not work";
 * the AUDIT distinguishes the two callers: 'user' for the startpage, 'admin' for
-  ADMIN_TOKEN. This is the one signal an operator has that a window was armed from a
-  browser rather than from the console, and it reddens if ``initiator_for(caller)`` is
-  ever replaced by a hard-coded "admin";
+  ADMIN_TOKEN, and it names WHICH instance armed it. This is the one signal an operator
+  has that a window was armed from a browser rather than from the console, and it reddens
+  if ``initiator_for(caller)`` is ever replaced by a hard-coded "admin" or if the
+  ``instance_id`` stops being written;
+* the response carrying the LIVE code says ``Cache-Control: no-store``;
+* the stop gate is deliberately ABSENT: arming works while the curator is stopped;
 * degraded mode refuses the write (503);
 * every open mints a FRESH code, so a previous window's code cannot be re-used.
 """
@@ -88,6 +94,26 @@ def test_instance_secret_arms_the_window(tmp_path):
         assert body["until"] > 0
 
 
+def test_the_live_code_response_is_never_cached(tmp_path):
+    """The body carries the LIVE window code — the whole permission to enrol — so it must
+    say ``no-store``.
+
+    ``AdminSecurityHeadersMiddleware`` puts that directive on ``GET /admin/enroll/window``
+    for exactly this payload, but it matches on the ``/admin`` prefix and this route is
+    under ``/api``, so the header has to be set by the handler. Without it the default
+    cache heuristics let a browser or an intermediary write the code to disk, where it
+    outlives both the window and the session. ``no-cache`` would NOT do: it still permits
+    a stored copy.
+    """
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        headers = _active_instance(db_path)
+        resp = client.post("/api/enroll/window", headers=headers)
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-store"
+
+
 def test_the_returned_code_is_the_one_the_server_holds(tmp_path):
     """The code the page copies is the code an enrolling browser must type.
 
@@ -132,27 +158,90 @@ def test_missing_or_garbage_bearer_is_401(tmp_path):
         assert state["open"] is False
 
 
+def test_a_revoked_or_pending_secret_cannot_arm_anything(tmp_path):
+    """A secret whose row is NOT active opens nothing — 401, and no window.
+
+    This is THE boundary the trade-off in ``src/api/enroll.py`` rests on. Letting an
+    instance secret arm a window is defensible only while a revoke really takes that power
+    away: if a revoked secret could still arm, the window it opens would let its holder
+    enrol a fresh identity, and revoke would be decoration. ``pending`` is the same gate
+    from the other side — a row that has not been admitted yet must not act like one that
+    has. ``require_api_caller`` matches ONLY ``status='active'``; this reddens the moment
+    that narrowing is lost.
+    """
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        for iid, status in (("gone", "revoked"), ("waiting", "pending")):
+            _seed_instance(db_path, iid, status=status, secret_hash=secret_hash_for(iid))
+            resp = client.post(
+                "/api/enroll/window", headers=instance_headers(secret_for(iid))
+            )
+            assert resp.status_code == 401, f"{status} secret must not arm a window"
+
+        # Asserted through the server's own read path: a handler that armed and THEN
+        # refused would leave a live window behind a 401.
+        state = client.get("/admin/enroll/window", headers=admin_headers()).json()
+        assert state["open"] is False
+
+
+# --- the stop gate is deliberately absent ------------------------------------
+def test_arming_works_while_the_curator_is_stopped(tmp_path):
+    """The emergency stop does NOT gate this verb, and that is a decision, not an oversight.
+
+    §7's stop silences the curator's AUTOMATION; enrolling a browser is an operator action,
+    so it stays legal while stopped — which also means the startpage button keeps working
+    exactly when the human most needs a way in. Nothing else pins this: without the test,
+    adding ``require_not_paused`` here (an easy "for consistency" edit) would make the
+    button answer 423 while the stop is on, silently, and the module docstring would go
+    stale with no test reddening.
+    """
+    app = create_app_for(tmp_path)
+    db_path = str(tmp_path / "curator.db")
+    with TestClient(app) as client:
+        headers = _active_instance(db_path)
+        assert client.post("/api/pause", headers=headers).status_code == 200
+
+        resp = client.post("/api/enroll/window", headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["code"]
+        # The window really is open — not a 200 over a no-op.
+        state = client.get("/admin/enroll/window", headers=admin_headers()).json()
+        assert state["open"] is True
+
+
 # --- the audit trail ---------------------------------------------------------
 def test_audit_initiator_tells_the_startpage_apart_from_the_console(tmp_path):
-    """An instance-armed window audits as 'user'; an ADMIN_TOKEN-armed one as 'admin'.
+    """An instance-armed window audits as 'user' AND names the instance; an ADMIN_TOKEN-armed
+    one as 'admin' with no instance.
 
     THE pin on the trade-off this verb accepts (see src/api/enroll.py): letting an
     instance secret arm a window is only defensible while the trail says WHICH kind of
-    caller did it. Both halves are asserted, so replacing ``initiator_for(caller)`` with a
-    hard-coded ``"admin"`` reddens on the first assertion and a hard-coded ``"user"`` on
-    the second.
+    caller did it — and WHICH browser. Both halves are asserted, so replacing
+    ``initiator_for(caller)`` with a hard-coded ``"admin"`` reddens on the first assertion
+    and a hard-coded ``"user"`` on the second. ``instance_id`` is asserted with them: the
+    column exists and the caller carries the id, and without it an operator investigating a
+    stray enrollment reads "some browser armed a window" and cannot tell whose secret
+    leaked. It is ``None`` for an ADMIN_TOKEN caller, which is not an instance at all.
     """
     app = create_app_for(tmp_path)
     db_path = str(tmp_path / "curator.db")
     with TestClient(app) as client:
         headers = _active_instance(db_path)
         assert client.post("/api/enroll/window", headers=headers).status_code == 200
-        rows = _q(db_path, "SELECT action, initiator FROM admin_audit ORDER BY id")
-        assert rows == [("window_open", "user")]
+        rows = _q(
+            db_path, "SELECT action, initiator, instance_id FROM admin_audit ORDER BY id"
+        )
+        assert rows == [("window_open", "user", "startpage")]
 
         assert client.post("/api/enroll/window", headers=admin_headers()).status_code == 200
-        rows = _q(db_path, "SELECT action, initiator FROM admin_audit ORDER BY id")
-        assert rows == [("window_open", "user"), ("window_open", "admin")]
+        rows = _q(
+            db_path, "SELECT action, initiator, instance_id FROM admin_audit ORDER BY id"
+        )
+        assert rows == [
+            ("window_open", "user", "startpage"),
+            ("window_open", "admin", None),
+        ]
 
 
 # --- degraded mode -----------------------------------------------------------

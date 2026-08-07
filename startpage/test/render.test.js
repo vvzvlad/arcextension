@@ -941,6 +941,40 @@ describe("open enrollment window row (§13)", () => {
     expect(text).toContain("вручную");
   });
 
+  it("the code LEAVES the row once the window's deadline passes", async () => {
+    // A newtab lives for hours. Without this the row would still read «код K7M2PQ, окно
+    // открыто на 10 мин, скопирован» an hour after the window closed — three claims, all
+    // dead, about a code nothing accepts anymore. The server core refuses to surface a
+    // dead code (src/curator/enroll.py: a closed window reads code=None) and the page
+    // must not re-introduce what the core refuses to do. The deadline is compared against
+    // the SERVER-adjusted clock (clockTick + serverOffset), which the page already keeps.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    let clock = 1_000_000;
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: 1_000_000 } },
+      enrollWindow: { status: 200, body: { code: "K7M2PQ", until: 1_600_000, seconds_remaining: 600 } },
+    });
+    const { clipboard } = makeClipboard();
+    const wrapper = mount(App, {
+      props: { deps: { chromeApi: env.chrome, fetchFn, now: () => clock, clipboard } },
+    });
+    await flushPromises();
+
+    await wrapper.find('[data-role="open-enrollment"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-role="enroll-window-result"]').text()).toContain("K7M2PQ");
+
+    // One second past the deadline. The page's own 1 s tick is what re-reads the clock.
+    clock = 1_600_001;
+    wrapper.vm.store.tick();
+    await flushPromises();
+
+    const text = wrapper.find('[data-role="enroll-window-result"]').text();
+    expect(text).not.toContain("K7M2PQ");
+    expect(text).not.toContain("скопирован");
+    expect(text).toContain("окно закрылось");
+  });
+
   it("the Админка link points at this deployment's console", async () => {
     const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
     const { fetchFn } = makeFetch({

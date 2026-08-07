@@ -632,7 +632,7 @@ describe("run all rules now (§62 item 5)", () => {
   });
 });
 
-// --- открыть регистрацию + скопировать код (§13) ------------------------------
+// --- open the enrollment window + copy the code (§13) -------------------------
 // One click has to do BOTH halves: arm the window server-side and put the code on the
 // clipboard. The tests below pin each half separately, and — most importantly — pin that
 // the two are not welded together: a clipboard that refuses must not cost the human the
@@ -654,7 +654,11 @@ describe("open enrollment window (§13)", () => {
     expect(counts.enrollWindow).toBe(1);
     // EXACTLY the code the server minted — not a truncation, not a formatted line.
     expect(writes).toEqual(["K7M2PQ"]);
-    expect(store.enrollWindow.value).toEqual({ code: "K7M2PQ", seconds: 600, copied: true });
+    // `until` is KEPT: the row has to be able to stop showing the code when the window
+    // closes, and only the server deadline says when that is.
+    expect(store.enrollWindow.value).toEqual({
+      code: "K7M2PQ", seconds: 600, until: NOW + 600_000, copied: true,
+    });
   });
 
   it("a REJECTED clipboard write still exposes the code and does not throw", async () => {
@@ -675,7 +679,9 @@ describe("open enrollment window (§13)", () => {
     const res = await store.openEnrollment();
     expect(res).toEqual({ ok: true, code: "R4T9WX", copied: false });
     expect(writes).toEqual(["R4T9WX"]); // it was ATTEMPTED, and it rejected
-    expect(store.enrollWindow.value).toEqual({ code: "R4T9WX", seconds: 600, copied: false });
+    expect(store.enrollWindow.value).toEqual({
+      code: "R4T9WX", seconds: 600, until: NOW + 600_000, copied: false,
+    });
   });
 
   it("a non-2xx surfaces an error and copies nothing", async () => {
@@ -693,6 +699,91 @@ describe("open enrollment window (§13)", () => {
     expect(res).toEqual({ ok: false });
     expect(store.enrollWindow.value).toEqual({ error: "HTTP 503" });
     expect(writes).toEqual([]);
+  });
+
+  it("a 2xx with no code says the window may be open, not that the click failed", async () => {
+    // The window IS armed at this point — only the code failed to come back (an
+    // unparsable body reaches the store as `null` through the adapter, the same branch an
+    // empty object takes). The old code collapsed this into «не удалось: HTTP 200»:
+    // a lie in both directions, because a live window stood open while the human was
+    // told nothing happened.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: { status: 200, body: {} },
+    });
+    const { clipboard, writes } = makeClipboard();
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+    await store.refresh();
+
+    const res = await store.openEnrollment();
+    expect(res).toEqual({ ok: false });
+    expect(store.enrollWindow.value.error).toContain("сервер не вернул код");
+    expect(store.enrollWindow.value.error).not.toContain("HTTP");
+    expect(writes).toEqual([]);
+  });
+
+  it("a fetch that REJECTS leaves a note in the row instead of escaping the click", async () => {
+    // A dead service rejects outright (`TypeError: Failed to fetch`), and the button is
+    // LIVE in exactly that state — `offline` only flips after a failed refresh(). Unhandled,
+    // that rejection escapes openEnrollment into the click handler while `enrollWindow`
+    // has already been nulled, so the human clicks and sees NOTHING at all.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    const { fetchFn } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: () => {
+        throw new TypeError("Failed to fetch");
+      },
+    });
+    const { clipboard, writes } = makeClipboard();
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+    await store.refresh();
+    expect(store.offline.value).toBe(false); // the button is live: this is the hole
+
+    // Does NOT throw — the store catches, the adapter stays thin (the refresh() division).
+    const res = await store.openEnrollment();
+    expect(res).toEqual({ ok: false });
+    expect(store.enrollWindow.value).toEqual({ error: "нет связи" });
+    expect(store.offline.value).toBe(true);
+    expect(writes).toEqual([]);
+    // …and the latch is released, so the next click is not locked out by the failure.
+    expect(store.enrolling.value).toBe(false);
+  });
+
+  it("a second click while the first arm is in flight is refused (no dead-code race)", async () => {
+    // Copy buttons get double-clicked more than any other control, and two arms in flight
+    // are not merely a wasted request: every arm mints a NEW code and kills the previous
+    // one, so if the responses land out of order the first arm's — by then dead — code
+    // overwrites the second's, and the row shows it, calls it copied and calls the window
+    // open. Reddens if the `enrolling` latch is removed.
+    const env = makeChrome({ tabs: [], messages: { get_identity: { instanceId: "me" } } });
+    let release;
+    const inFlight = new Promise((resolve) => {
+      release = resolve;
+    });
+    const { fetchFn, counts } = makeFetch({
+      state: { status: 200, body: { instances: [], tabs: [], quick_links: [], server_now: NOW } },
+      enrollWindow: async () => {
+        await inFlight;
+        return { status: 200, body: { code: "K7M2PQ", until: NOW + 600_000, seconds_remaining: 600 } };
+      },
+    });
+    const { clipboard, writes } = makeClipboard();
+    const store = storeWith(env, fetchFn, { clipboard });
+    await store.init();
+    await store.refresh();
+
+    const first = store.openEnrollment(); // not awaited: still in flight
+    expect(store.enrolling.value).toBe(true);
+    expect(await store.openEnrollment()).toEqual({ ok: false }); // the second click
+
+    release();
+    expect(await first).toEqual({ ok: true, code: "K7M2PQ", copied: true });
+    expect(counts.enrollWindow).toBe(1); // ONE arm, so exactly one live code
+    expect(writes).toEqual(["K7M2PQ"]);
+    expect(store.enrolling.value).toBe(false); // released for the next click
   });
 
   it("offline (no credential): no request, an explicit error", async () => {

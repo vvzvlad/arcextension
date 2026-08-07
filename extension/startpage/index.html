@@ -298,6 +298,11 @@
         font: 600 11px/1 var(--sp-font); cursor: pointer;
       }
       .sp-btn:disabled { opacity: 0.45; cursor: default; }
+      /* One .sp-btn is an <a> (the «Админка» pill), and the other thirteen are <button>s,
+         which carry no underline of their own. There is no global link reset on this page
+         — `text-decoration: none` appears exactly once, on .sp-item-title — so without
+         this the pill alone would render underlined through its own background. */
+      a.sp-btn { text-decoration: none; }
       .sp-btn-ghost { background: var(--sp-accent-soft); color: var(--sp-accent); }
       .sp-icon-btn {
         width: 18px; height: 18px; flex: none;
@@ -346,6 +351,15 @@
          wraps and the counts take a line of their own. */
       .sp-pause-row { flex-wrap: wrap; max-width: 100%; }
       .sp-pending-plan {
+        flex-basis: 100%; max-width: 70ch; line-height: 1.45; font-size: 11px;
+      }
+      /* The enrollment row is the LONGEST thing in the status bar — a name, a 37-character
+         button, the console link and a result up to ~96 characters — and .sp-status-row is
+         a nowrap flex row, so without this it runs off the strip instead of taking a
+         second line. Same treatment as the latch row above, for the same reason, with the
+         result taking a full row of its own like the plan does. */
+      .sp-enroll-row { flex-wrap: wrap; max-width: 100%; }
+      .sp-enroll-result {
         flex-basis: 100%; max-width: 70ch; line-height: 1.45; font-size: 11px;
       }
       /* "Других инстансов пока нет" is the ONE .sp-empty that does not live inside a
@@ -427,7 +441,7 @@
         .sp-cols > .sp-card:last-child { display: none; }
       }
     </style>
-    <script type="module" crossorigin src="./assets/index-DdSNBXFV.js"></script>
+    <script type="module" crossorigin src="./assets/index-4hcOUdcz.js"></script>
   </head>
   <body>
     <!-- Offline-first: this root is populated by the SFC-precompiled app; the very
