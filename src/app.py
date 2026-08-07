@@ -16,6 +16,7 @@ from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
+from starlette.responses import RedirectResponse
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route, WebSocketRoute
 
@@ -204,6 +205,17 @@ def create_app(settings) -> Starlette:
             await db.close()
 
     routes = [
+        # `/` exists ONLY so the bare service address opens something. Typing the host
+        # into a browser used to answer a naked "Not Found", which reads as "the service
+        # is down" — the operator then has to KNOW that the console lives at /admin and
+        # that an unauthenticated visit needs /admin/login. That is internal routing
+        # knowledge, and nothing should require it. The redirect lands on /admin, which
+        # already forwards an unauthenticated browser to the login form (303, see
+        # src/api/admin_page.py), so one hop covers both the logged-in and the logged-out
+        # case. 307 (not 303) because it is a permanent-shaped GET redirect that must not
+        # be cached as permanent: the console path may move, and a 301 would stick in
+        # every browser forever.
+        Route("/", lambda _r: RedirectResponse("/admin", status_code=307), methods=["GET"]),
         Route("/healthz", healthz, methods=["GET"]),
         # Prometheus scrape (§12): SEPARATE METRICS_TOKEN Bearer, read-only, and
         # served even in degraded mode. Pass/instance gauges are computed at scrape

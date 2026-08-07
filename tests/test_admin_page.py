@@ -91,6 +91,23 @@ def _console_refused(client, **kw):
 
 
 # --- (1) unauthenticated GET /admin -----------------------------------------
+def test_root_redirects_to_the_console(tmp_path):
+    """`/` must open SOMETHING. A bare "Not Found" on the service address reads as
+    "the service is down", and forces the operator to know that the console lives at
+    /admin and that a logged-out visit needs /admin/login. Nothing should require that
+    knowledge. One hop to /admin covers both cases — /admin itself forwards a
+    logged-out browser to the login form."""
+    app = create_app_for(tmp_path)
+    with TestClient(app) as client:
+        resp = client.get("/", follow_redirects=False)
+        assert resp.status_code == 307
+        assert resp.headers["location"] == "/admin"
+        # And the hop actually lands somewhere useful for a logged-out browser.
+        landed = client.get("/", follow_redirects=True)
+        assert landed.status_code == 200
+        assert "/admin/login" in str(landed.url)
+
+
 def test_admin_page_refuses_console_and_points_at_the_login_form(tmp_path):
     """Acc 1, amended: the PAGE refuses by sending the human to the login form.
 

@@ -764,8 +764,20 @@ describe("service address gate (§7)", () => {
     expect(st.addressError).toBe("insecure");
   });
 
-  it("refuses an http(s) site URL where the socket URL belongs", async () => {
+  it("DIALS an https:// site URL as wss:// — same TLS, same host", async () => {
+    // Pasting the service URL out of the address bar is how this field actually gets
+    // filled. https:// is not a security problem (it is the very TLS the gate demands),
+    // so it is upgraded rather than refused.
     await chrome.storage.local.set({ serviceAddress: "https://curator.example" });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    expect(conn.ws).not.toBe(null);
+    expect(conn.ws.url).toBe("wss://curator.example/ext");
+    expect((await conn.getConnectionState()).addressError).toBe(null);
+  });
+
+  it("refuses a plaintext http:// site URL where the socket URL belongs", async () => {
+    await chrome.storage.local.set({ serviceAddress: "http://curator.example" });
     const conn = makeConnection();
     await conn.ensureSocket();
     expect(conn.ws).toBe(null);

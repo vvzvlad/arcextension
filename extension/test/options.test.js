@@ -33,7 +33,10 @@ describe("serviceAddressError", () => {
     ["ws://curator.lan:8000", "insecure"],
     ["ws://localhost.evil.example", "insecure"], // a loopback-LOOKING host is not loopback
     ["http://curator.example", "http-scheme"],
-    ["https://curator.example", "http-scheme"],
+    // https:// is ACCEPTED and dialled as wss:// — same TLS, same host. Pasting the
+    // service URL out of the address bar is the normal way to fill this field.
+    ["https://curator.example", null],
+    ["http://curator.example", "http-scheme"], // plaintext: still refused
     // A SCHEME-LESS address is now the normal way to fill the field: the only scheme
     // that could have been meant is added by the gate itself, so these are accepted
     // (they used to be "malformed" — a demand for a prefix that had no alternative).
@@ -89,6 +92,12 @@ describe("normalizeServiceAddress", () => {
     ["LOCALHOST:8000", "ws://LOCALHOST:8000"], // host case is the URL parser's business
     // An EXPLICIT scheme is never rewritten: backward compatibility for every address
     // already stored, and the refusals below must keep their reason.
+    // ...with ONE exception: https:// is the same TLS on the same host, so it is
+    // upgraded rather than refused. This is the address people actually paste.
+    ["https://curator.nebula.lc", "wss://curator.nebula.lc"],
+    ["https://curator.nebula.lc:8443/ext", "wss://curator.nebula.lc:8443/ext"],
+    ["HTTPS://curator.nebula.lc", "wss://curator.nebula.lc"], // scheme case-insensitive
+    ["http://curator.nebula.lc", "http://curator.nebula.lc"], // untouched => still refused
     ["wss://curator.nebula.lc", "wss://curator.nebula.lc"],
     ["wss://curator.nebula.lc:8443/ext", "wss://curator.nebula.lc:8443/ext"],
     ["ws://curator.lan:8000", "ws://curator.lan:8000"],

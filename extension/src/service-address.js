@@ -46,6 +46,12 @@ const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
 export function normalizeServiceAddress(raw) {
   const value = typeof raw === "string" ? raw.trim() : "";
   if (!value) return "";
+  // An explicit scheme is kept — EXCEPT https://, which is upgraded to wss://.
+  // Refusing https:// was pedantry, not safety: it is the same TLS the gate
+  // demands, on the same host, and the operator who pastes the service URL out
+  // of the address bar means exactly the socket we would dial. http:// stays
+  // refused — that one really is plaintext, which is what this gate exists for.
+  if (/^https:\/\//i.test(value)) return value.replace(/^https:/i, "wss:");
   if (HAS_SCHEME.test(value)) return value; // explicit scheme: never rewritten
   const bare = value.replace(/^\/+/, ""); // tolerate a protocol-relative "//host"
   let hostname;
