@@ -19,6 +19,7 @@ Each test is written to redden if its guard is removed (noted inline).
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -206,18 +207,12 @@ def test_cli_generate_runs_end_to_end(tmp_path):
 # --------------------------------------------------------------------------- #
 # No signing key anywhere: not in the CLI, not in the module, not in the manifest
 # --------------------------------------------------------------------------- #
-def test_bundle_takes_no_key_file_and_stamps_no_configuration(tmp_path):
+def test_bundle_takes_no_key_file_and_nothing_stamps_a_manifest(tmp_path):
     """The key existed only to PIN the extension id for `EXT_ALLOWED_ORIGINS`.
 
     That allow-list is gone (src/api/cors.py), so the whole key layer went with it: no
-    `--key-file` flag, no `keys` module, no key/host stamping helpers, and no `key` field
-    in the repo manifest. Redden: reintroduce any of them and one of these assertions
-    fails.
-
-    `core.stamp_manifest` is NOT in the gone list and must not be added back to it: it
-    stamps build IDENTITY (version/version_name), not CONFIGURATION. What made a bundle
-    non-interchangeable was a baked-in host or id; two bundles differing only in their
-    version stamp behave identically.
+    `--key-file` flag, no `keys` module, no stamping helpers, and no `key` field in the
+    repo manifest. Redden: reintroduce any of them and one of these assertions fails.
     """
     parser = cli.build_parser()
     with pytest.raises(SystemExit):  # argparse exits 2 on an unknown option
@@ -228,7 +223,7 @@ def test_bundle_takes_no_key_file_and_stamps_no_configuration(tmp_path):
     import tools.instancegen as instancegen
 
     assert not hasattr(instancegen, "keys")
-    for gone in ("KEY_PLACEHOLDER", "HOST_PLACEHOLDER",
+    for gone in ("KEY_PLACEHOLDER", "HOST_PLACEHOLDER", "stamp_manifest",
                  "stamp_bundle_manifest", "write_private_bytes"):
         assert not hasattr(core, gone), gone
 
@@ -244,12 +239,15 @@ def _repo_manifest_text() -> str:
     return (REPO_EXTENSION / "manifest.json").read_text(encoding="utf-8")
 
 
-def test_stamp_manifest_sets_both_fields_and_changes_nothing_else():
-    # The stamp must be surgical: exactly two values differ, every other key — including
-    # the `//`-comment keys that carry the Russian prose — comes through untouched.
-    # Redden: serialise with ensure_ascii=True, or drop/reorder any other key.
+def test_stamp_build_identity_sets_both_fields_and_changes_nothing_else():
+    # Exactly two VALUES differ; every other key — including the `//`-comment keys that
+    # carry the Russian prose — comes through with its value and its position intact. Note
+    # this is a key-level guarantee, not a byte-level one: the file is re-serialised whole,
+    # so the blank lines between the manifest's sections do not survive (documented in
+    # stamp_build_identity). Redden: serialise with ensure_ascii=True, or drop/reorder any
+    # other key.
     before_text = _repo_manifest_text()
-    after_text = core.stamp_manifest(
+    after_text = core.stamp_build_identity(
         before_text, version="0.1.130", version_name="0.1.130 · abc1234 · 2026-08-07 19:52"
     )
     before = json.loads(before_text)
@@ -287,15 +285,15 @@ def test_stamp_manifest_sets_both_fields_and_changes_nothing_else():
         "",            # empty
     ],
 )
-def test_stamp_manifest_refuses_an_invalid_version(bad):
+def test_stamp_build_identity_refuses_an_invalid_version(bad):
     # An invalid `version` does not degrade — Chrome refuses to load the extension at all —
     # so it must raise here instead of producing an unloadable manifest. Redden: drop the
-    # validate_manifest_version call from stamp_manifest.
+    # validate_manifest_version call from stamp_build_identity.
     with pytest.raises(ValueError):
-        core.stamp_manifest(_repo_manifest_text(), version=bad, version_name="x")
+        core.stamp_build_identity(_repo_manifest_text(), version=bad, version_name="x")
 
 
-def test_stamp_manifest_accepts_the_spec_edges():
+def test_stamp_build_identity_accepts_the_spec_edges():
     # The mirror of the case above: legal versions must NOT be rejected.
     for good in ("0.1.0.0", "65535.65535.65535.65535", "1", "0.0.1"):
         assert core.validate_manifest_version(good) == good
@@ -323,6 +321,19 @@ def test_copy_bundle_stamps_the_output_and_never_the_repo(tmp_path):
     assert built["version"] == "0.1.130"
     assert built["version_name"] == "0.1.130 · abc1234 · now"
     assert (REPO_EXTENSION / "manifest.json").read_bytes() == repo_before
+
+
+def test_copy_bundle_rejects_a_half_given_stamp_before_copying_anything(tmp_path):
+    # The "both or neither" pairing check must run BEFORE shutil.copytree. Raising after it
+    # would leave a complete but UNSTAMPED bundle at --out, and the retry would then have
+    # to fight the leftovers with --force. Redden: move the check back below copytree.
+    out = tmp_path / "dist"
+    with pytest.raises(ValueError, match="must be given together"):
+        core.copy_bundle(REPO_EXTENSION, out, version="0.1.130")
+    assert not out.exists()
+    with pytest.raises(ValueError, match="must be given together"):
+        core.copy_bundle(REPO_EXTENSION, out, version_name="0.1.130 · abc1234 · now")
+    assert not out.exists()
 
 
 def test_replace_bundle_forwards_the_stamp(tmp_path):
@@ -361,10 +372,14 @@ def test_cli_bundle_still_builds_when_git_is_unavailable(tmp_path, monkeypatch, 
     # A build must NEVER fail over the stamp: no git, not a repo, a broken repo — all
     # degrade to the verbatim copy this tool did before the stamp existed, with a note on
     # stderr. Redden: let build_stamp propagate instead of returning None.
+    #
+    # The seam patched is the MODULE's own `_git`, not stdlib `subprocess.run`: replacing
+    # the latter would swap it out for every other consumer for the duration of the test
+    # and tie this test to subprocess internals it does not care about.
     def no_git(*_args, **_kwargs):
         raise FileNotFoundError("git")
 
-    monkeypatch.setattr(cli.subprocess, "run", no_git)
+    monkeypatch.setattr(cli, "_git", no_git)
     out = tmp_path / "dist"
     assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(REPO_EXTENSION)]) == 0
 
@@ -376,13 +391,125 @@ def test_cli_bundle_still_builds_when_git_is_unavailable(tmp_path, monkeypatch, 
 
 def test_build_stamp_returns_none_outside_a_git_repo(tmp_path, capsys):
     # A source extension/ that is not in a git repo at all (an unpacked tarball) — the
-    # other half of the fallback, exercised without monkeypatching git away.
+    # other half of the fallback, exercised without monkeypatching git away. `ls-files
+    # --error-unmatch` makes this hold even when tmp_path DOES sit inside some unrelated
+    # working tree: no repo tracks this manifest, so there is nothing to trust.
     src = tmp_path / "extension"
     src.mkdir()
     (src / "manifest.json").write_text(json.dumps({"name": "x", "version": "0.1.0"}))
-    # tmp_path is outside any working tree, so `git -C` walks up and finds no repo.
     assert cli.build_stamp(src) is None
     assert "build stamp unavailable" in capsys.readouterr().err
+
+
+def test_build_stamp_degrades_when_the_manifest_is_not_a_json_object(tmp_path, capsys):
+    # A manifest.json that is valid JSON but NOT an object (an array, a string, null) must
+    # reach the same fallback as a missing git. `manifest["version"]` on a list raises
+    # TypeError, which is not in build_stamp's except tuple — so before the explicit check
+    # this killed the build with a traceback, and it used to build fine (copy_bundle only
+    # requires manifest.json to BE a file). Redden: index the parsed JSON before the
+    # isinstance check.
+    src = tmp_path / "extension"
+    src.mkdir()
+    (src / "manifest.json").write_text('["not", "an", "object"]', encoding="utf-8")
+
+    assert cli.build_stamp(src) is None
+    err = capsys.readouterr().err
+    assert "build stamp unavailable" in err
+    # Named specifically, so this pins the isinstance check and not some git failure.
+    assert "must contain a JSON object" in err
+
+
+def test_cli_bundle_survives_a_manifest_that_is_not_a_json_object(tmp_path, capsys):
+    # …and the whole build still succeeds, producing the verbatim copy it produced before
+    # the stamp existed. This is the REGRESSION the type check prevents.
+    src = tmp_path / "extension"
+    src.mkdir()
+    (src / "manifest.json").write_text('["not", "an", "object"]', encoding="utf-8")
+    out = tmp_path / "dist"
+
+    assert cli.main(["bundle", "--out", str(out), "--extension-dir", str(src)]) == 0
+    assert (out / "manifest.json").read_bytes() == (src / "manifest.json").read_bytes()
+    assert "build stamp unavailable" in capsys.readouterr().err
+
+
+def test_build_stamp_degrades_on_a_shallow_clone(tmp_path, monkeypatch, capsys):
+    # `git rev-list --count HEAD` returns 1 on a `--depth 1` clone and exits 0, so nothing
+    # fails and the stamp comes out confidently WRONG (0.1.1 instead of 0.1.131). Nothing
+    # would reach stderr either. actions/checkout defaults to fetch-depth: 1, so any CI
+    # bundle build would ship that. Redden: drop the is-shallow-repository check.
+    answers = {
+        ("ls-files", "--error-unmatch", "--", "manifest.json"): "manifest.json",
+        ("rev-parse", "--is-shallow-repository"): "true",
+        ("rev-list", "--count", "HEAD"): "1",  # the lie a shallow clone tells
+        ("rev-parse", "--short", "HEAD"): "abc1234",
+    }
+    monkeypatch.setattr(cli, "_git", lambda _repo_dir, *argv: answers.get(argv, ""))
+
+    assert cli.build_stamp(REPO_EXTENSION) is None
+    err = capsys.readouterr().err
+    assert "build stamp unavailable" in err
+    # Named, so the test cannot pass because some other git call happened to fail.
+    assert "shallow clone" in err
+
+
+def _tiny_repo_extension(root: Path) -> Path:
+    """A real one-commit git repo with an `extension/` bundle inside it.
+
+    The `-dirty` marker is about what git reports for a REAL working tree, so this uses a
+    real repo rather than a stub.
+    """
+    repo = root / "repo"
+    ext = repo / "extension"
+    ext.mkdir(parents=True)
+    (ext / "manifest.json").write_text(
+        json.dumps({"name": "x", "version": "0.2.0"}), encoding="utf-8"
+    )
+
+    def git(*argv):
+        subprocess.run(
+            ["git", "-C", str(repo), *argv], check=True, capture_output=True, text=True
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "test")
+    git("config", "commit.gpgsign", "false")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    return ext
+
+
+def test_build_stamp_dirty_marker_only_looks_at_the_bundle(tmp_path):
+    # `git status --porcelain` with no pathspec counts `??` untracked entries anywhere in
+    # the repo, so one scratch file would glue `-dirty` onto every build from then on and
+    # the marker would stop distinguishing a modified tree from committed code — its whole
+    # job. Redden: drop the `-- <extension_dir>` pathspec.
+    ext = _tiny_repo_extension(tmp_path)
+    (ext.parent / "scratch.txt").write_text("not part of the bundle", encoding="utf-8")
+
+    stamp = cli.build_stamp(ext)
+    assert stamp is not None
+    assert "-dirty" not in stamp[1]
+
+    # A change INSIDE the bundle is exactly what the marker is for.
+    (ext / "background.js").write_text("// uncommitted\n", encoding="utf-8")
+    stamp = cli.build_stamp(ext)
+    assert stamp is not None
+    assert "-dirty" in stamp[1]
+
+
+def test_build_stamp_ignores_a_repo_that_does_not_track_the_manifest(tmp_path):
+    # git walks UP from `-C`, so a source tree unpacked inside an unrelated working tree
+    # would get a successful rev-list from THAT repo — a confidently wrong stamp with
+    # nothing to degrade on. `ls-files --error-unmatch` is what refuses it. Redden: drop
+    # that call and this untracked-but-inside-a-repo bundle gets stamped from the host repo.
+    ext = _tiny_repo_extension(tmp_path)
+    stray = ext.parent / "unpacked" / "extension"
+    stray.mkdir(parents=True)
+    (stray / "manifest.json").write_text(
+        json.dumps({"name": "x", "version": "0.3.0"}), encoding="utf-8"
+    )
+    assert cli.build_stamp(stray) is None
 
 
 def test_generated_app_reports_the_bundles_version(tmp_path):
@@ -407,6 +534,22 @@ def test_generated_app_falls_back_when_the_bundle_has_no_version(tmp_path):
         out_root=tmp_path / "inst", bundle_dir=bundle, instance_id="main", title="Main"
     )
     assert f"<string>{core.DEFAULT_APP_VERSION}</string>" in res.paths.info_plist.read_text()
+
+
+def test_generated_app_truncates_a_four_component_version_for_the_plist(tmp_path):
+    # A Chrome manifest `version` may carry FOUR components; Apple allows at most three in
+    # CFBundleShortVersionString/CFBundleVersion, so writing all four out makes a formally
+    # invalid plist. Same "validate what you write" reasoning as validate_manifest_version.
+    # Redden: pass `version` through to build_info_plist untruncated.
+    bundle = tmp_path / "dist"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text(json.dumps({"name": "x", "version": "1.2.3.4"}))
+    res = core.generate_instance(
+        out_root=tmp_path / "inst", bundle_dir=bundle, instance_id="main", title="Main"
+    )
+    plist = res.paths.info_plist.read_text()
+    assert "<string>1.2.3</string>" in plist
+    assert "1.2.3.4" not in plist
 
 
 # --------------------------------------------------------------------------- #

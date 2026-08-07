@@ -69,9 +69,16 @@ def build_stamp(extension_dir: str | Path) -> tuple[str, str] | None:
         a build from a modified tree is indistinguishable from the committed code.
 
     A build must NEVER fail over this. No git on PATH, not a git repo, an empty or broken
-    repo, a git that hangs — every one of them returns ``None`` (the caller then copies the
-    manifest verbatim, exactly as before the stamp existed) with a note on stderr so the
-    degrade is visible rather than silent.
+    repo, a shallow clone, a manifest that is not a JSON object, a git that hangs — every
+    one of them returns ``None`` (the caller then copies the manifest verbatim, exactly as
+    before the stamp existed) with a note on stderr so the degrade is visible rather than
+    silent.
+
+    That fallback is not free, and the cost lands where the operator is told to look: an
+    unstamped bundle shows the base literal on the extension card ("arcextension 0.1.0"),
+    which is indistinguishable from an older build that did not reload — the exact question
+    the stamp exists to answer. The stderr note is the ONLY signal that this happened. The
+    verbatim copy is kept anyway, deliberately: a build must not fail over its own identity.
 
     git runs against the repo the SOURCE ``extension/`` lives in (``git -C``), not the
     process CWD: ``make dev-bundle`` may be invoked from anywhere.
@@ -81,15 +88,41 @@ def build_stamp(extension_dir: str | Path) -> tuple[str, str] | None:
         manifest = json.loads(
             (extension_dir / "manifest.json").read_text(encoding="utf-8")
         )
+        # Explicit, because `manifest["version"]` on a list/str/None raises TypeError,
+        # which is NOT in the except tuple below: a manifest.json that is valid JSON but
+        # not an object would kill the whole build instead of degrading to a verbatim copy.
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest.json must contain a JSON object")
         base = str(manifest["version"])
         # First two components of the base literal; a shorter base is padded with 0.
         head = (base.split(".") + ["0", "0"])[:2]
 
+        # Confirm THIS repo actually tracks THIS manifest before believing anything it
+        # says. `git -C` pins the starting directory but git still walks UP from there, so
+        # a source tree unpacked inside an unrelated working tree ($HOME under a dotfiles
+        # repo, a TMPDIR inside one) would otherwise get a successful answer from that
+        # foreign repo — a confidently wrong stamp with no failure to degrade on. A
+        # non-zero exit here is caught below like any other git trouble.
+        _git(extension_dir, "ls-files", "--error-unmatch", "--", "manifest.json")
+        if _git(extension_dir, "rev-parse", "--is-shallow-repository") == "true":
+            # `rev-list --count HEAD` answers 1 on a `--depth 1` clone and exits 0, so
+            # nothing fails and the version comes out quietly wrong (0.1.1 for a
+            # 131-commit history). actions/checkout defaults to fetch-depth: 1, so a CI
+            # bundle build would ship exactly that. Degrade instead.
+            raise ValueError(
+                "shallow clone: `rev-list --count` is not the real commit count"
+            )
+
         count = int(_git(extension_dir, "rev-list", "--count", "HEAD"))
         sha = _git(extension_dir, "rev-parse", "--short", "HEAD")
-        # --porcelain covers staged, unstaged and untracked-but-not-ignored files; dist/
-        # is gitignored, so a build never marks itself dirty.
-        dirty = bool(_git(extension_dir, "status", "--porcelain"))
+        # --porcelain covers staged, unstaged and untracked-but-not-ignored files, but the
+        # pathspec limits it to what actually SHIPS in the bundle. With no pathspec any
+        # scratch file anywhere in the repo (`??` entries count) would glue `-dirty` onto
+        # every build from then on, and the marker would stop telling a modified tree from
+        # committed code — which is its entire job.
+        dirty = bool(
+            _git(extension_dir, "status", "--porcelain", "--", str(extension_dir))
+        )
 
         # Clamped, not wrapped: the spec caps a component at 65535 and an over-long
         # history must degrade to a pinned ceiling, never to an unloadable manifest.

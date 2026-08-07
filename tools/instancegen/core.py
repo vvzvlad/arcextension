@@ -32,13 +32,14 @@ DEFAULT_APP_VERSION = "0.1.0"
 # is hostless, only `<all_urls>`), and the `key` field went with the extension-id pinning
 # (there is no origin allow-list left to pin an id for — see src/api/cors.py). That is what
 # made bundles non-interchangeable: a bundle configured for one host/id was NOT the same
-# artefact as another, so the universal build had to stamp nothing.
+# artefact as another, so the universal build stamps no configuration at all.
 #
-# `bundle` does stamp two fields, and they are a different kind of thing: `version` and
-# `version_name` are build IDENTITY, not configuration (`stamp_manifest` below). Two
-# bundles that differ only in them behave identically — the stamp changes nothing the
-# extension reads or does; it only lets a human look at the card in brave://extensions and
-# tell WHICH build is loaded. Everything else is still copied verbatim.
+# It does stamp build IDENTITY — `version`/`version_name`; `stamp_build_identity` below
+# carries the argument for why that is a different kind of thing. Note the price: the
+# stamped manifest is RE-SERIALISED as a whole, so the built manifest.json is not a
+# byte-for-byte copy of the source one — in particular the blank lines separating the
+# manifest's sections do not survive, and `diff dist/manifest.json extension/manifest.json`
+# shows that reflow on top of the two stamped values. Every OTHER file is copied verbatim.
 
 # Directory name of an instance's empty --user-data-dir under the output root.
 _PROFILE_DIRNAME = "profile"
@@ -154,6 +155,18 @@ def bundle_identifier(instance_id: str) -> str:
     return f"xyz.arcextension.instance.{slugify(instance_id)}"
 
 
+# Apple allows at most THREE integers in CFBundleShortVersionString/CFBundleVersion, while
+# a Chrome manifest `version` may carry four. The fourth component is dropped rather than
+# written out: same "validate what you write" reasoning as `validate_manifest_version` —
+# emitting a formally invalid plist and finding out later is the failure mode to avoid.
+_APP_VERSION_MAX_COMPONENTS = 3
+
+
+def _app_version(version: str) -> str:
+    """*version* truncated to the three components Apple's plist version keys allow."""
+    return ".".join(version.split(".")[:_APP_VERSION_MAX_COMPONENTS])
+
+
 def build_info_plist(
     title: str,
     bundle_id: str,
@@ -163,10 +176,13 @@ def build_info_plist(
 ) -> str:
     """A minimal but valid ``Info.plist`` for the ``.app`` wrapper.
 
-    *version* is the bundle's stamped ``version`` (see :func:`stamp_manifest`), passed in
-    by :func:`generate_instance` so the ``.app`` reports the same build as the extension
-    it launches. The default keeps the function usable on its own, without a stamp.
+    *version* is the version of the bundle this ``.app`` launches (see
+    :func:`bundle_version`), passed in by :func:`generate_instance`. It is truncated to at
+    most three components before it reaches the plist: a four-part manifest version is
+    legal for Chrome but not for Apple, and writing all four produces a formally invalid
+    plist. The default keeps the function usable on its own, without a bundle to read.
     """
+    plist_version = _app_version(version)
     entries = {
         "CFBundleName": title,
         "CFBundleDisplayName": title,
@@ -174,8 +190,8 @@ def build_info_plist(
         "CFBundleExecutable": executable_name,
         "CFBundleIconFile": icon_name,
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": version,
-        "CFBundleVersion": version,
+        "CFBundleShortVersionString": plist_version,
+        "CFBundleVersion": plist_version,
         "CFBundleInfoDictionaryVersion": "6.0",
         "LSMinimumSystemVersion": "11.0",
     }
@@ -282,8 +298,17 @@ def validate_manifest_version(version: str) -> str:
     return version
 
 
-def stamp_manifest(manifest_text: str, *, version: str, version_name: str) -> str:
+def stamp_build_identity(manifest_text: str, *, version: str, version_name: str) -> str:
     """Return *manifest_text* with ``version``/``version_name`` set to the build stamp.
+
+    What this stamps is build IDENTITY, and that is deliberately NOT what the deleted
+    ``stamp_manifest(manifest, host, key_b64)`` used to stamp. A baked-in ``<host>`` or
+    signing key is CONFIGURATION: it made two bundles different artefacts, which is why the
+    universal build stamps none of it. Two bundles that differ only in their version behave
+    identically — the stamp changes nothing the extension reads or does, it only lets a
+    human look at the card in brave://extensions and tell WHICH build is loaded. Do not
+    grow a ``host=``/``key=`` parameter here: that would put configuration stamping back
+    under an identity name, which is exactly the conflation the rename undid.
 
     ``version_name`` is the field brave://extensions RENDERS when present ("will be used
     for display purposes if present"), so it carries the human-readable build identity;
@@ -291,9 +316,15 @@ def stamp_manifest(manifest_text: str, *, version: str, version_name: str) -> st
     that reads only it.
 
     Pure text in, pure text out — the caller supplies the two values, this never reads git
-    or the clock. Re-serialised with the manifest's own formatting: 2-space indent and
-    ``ensure_ascii=False``, because the ``//``-prefixed comment keys hold Russian prose and
-    escaping it would rewrite most of the file for no reason.
+    or the clock.
+
+    The file is RE-SERIALISED WHOLE, not patched in place: the text is parsed, the two
+    values are set and ``json.dumps(indent=2, ensure_ascii=False)`` writes it back out.
+    That is the robust path — the output is always valid JSON, every key keeps its value
+    and its order, and the Russian prose in the ``//``-comment keys stays unescaped. It is
+    NOT byte-surgical though: the blank lines separating the manifest's sections do not
+    survive the round-trip, so ``diff dist/manifest.json extension/manifest.json`` shows
+    the reflow as well as the two stamped values — more than two changed lines, by design.
     """
     validate_manifest_version(version)
     if not version_name.strip():
@@ -319,10 +350,14 @@ def stamp_manifest(manifest_text: str, *, version: str, version_name: str) -> st
     return json.dumps(stamped, indent=2, ensure_ascii=False) + "\n"
 
 
-def manifest_version(bundle_dir: str | Path) -> str | None:
+def bundle_version(bundle_dir: str | Path) -> str | None:
     """The ``version`` of a BUILT bundle's manifest, or ``None`` if it has none/unreadable.
 
-    Read-only. Used to make the ``.app`` wrapper report the same build as the bundle its
+    Named for the bundle, not the manifest: the manifest has a key literally called
+    ``manifest_version`` whose value is the MV3 marker ``3``, and a ``manifest_version()``
+    returning ``"0.1.131"`` reads like that at every call site.
+
+    Read-only. Used to make the ``.app`` wrapper report the version of the bundle its
     launcher loads.
     """
     try:
@@ -349,20 +384,23 @@ def copy_bundle(
     bundle every instance loads. The repo's own ``extension/`` is only READ here.
 
     With *version*/*version_name* given, the COPY's ``manifest.json`` is stamped with the
-    build identity (:func:`stamp_manifest`) — the source manifest is never written. With
-    both left ``None`` this is a verbatim copy and nothing is rewritten at all.
+    build identity (:func:`stamp_build_identity`) — the source manifest is never written.
+    With both left ``None`` this is a verbatim copy and nothing is rewritten at all.
     """
     src = Path(src_extension_dir)
+    # EVERY argument check runs before a single byte is copied. A raise after copytree
+    # would leave a complete but unstamped bundle sitting at the destination, and the
+    # retry would then need --force to get past its own leftovers.
+    if (version is None) != (version_name is None):
+        raise ValueError("version and version_name must be given together")
     if not (src / "manifest.json").is_file():
         raise ValueError(f"{src} is not an extension bundle (no manifest.json)")
     shutil.copytree(src, dst_extension_dir, ignore=_COPY_IGNORE)
-    if version is None and version_name is None:
+    if version is None or version_name is None:  # verbatim copy: nothing is rewritten
         return
-    if version is None or version_name is None:
-        raise ValueError("version and version_name must be given together")
     dst_manifest = Path(dst_extension_dir) / "manifest.json"
     dst_manifest.write_text(
-        stamp_manifest(
+        stamp_build_identity(
             dst_manifest.read_text(encoding="utf-8"),
             version=version,
             version_name=version_name,
@@ -551,16 +589,22 @@ def generate_instance(
         encoding="utf-8",
     )
     paths.launcher.chmod(0o755)
-    # The .app reports the version of the bundle it actually launches, read from that
-    # bundle's stamped manifest — not a literal that would go stale the moment the bundle
-    # is rebuilt. An unstamped/hand-made bundle falls back to DEFAULT_APP_VERSION.
+    # The .app reports the version the shared bundle carried AT INSTANCE-GENERATION TIME,
+    # read from that bundle's manifest. It is a SNAPSHOT, not a live reading: `make
+    # dev-bundle` rebuilds the shared bundle and touches no instance, so from the next
+    # rebuild on this plist names an older build. That is acceptable because the plist is
+    # not where anyone checks which build is loaded — the extension card in
+    # brave://extensions is (it renders the manifest's `version_name`) and it stays the
+    # source of truth. What this does buy is that a freshly generated .app does not
+    # advertise a version the bundle never had. An unstamped/hand-made bundle (no readable
+    # `version`) falls back to DEFAULT_APP_VERSION.
     paths.info_plist.write_text(
         build_info_plist(
             title,
             bundle_identifier(instance_id),
             paths.launcher.name,
             paths.icon_png.name,
-            version=manifest_version(bundle_dir) or DEFAULT_APP_VERSION,
+            version=bundle_version(bundle_dir) or DEFAULT_APP_VERSION,
         ),
         encoding="utf-8",
     )
