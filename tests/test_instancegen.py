@@ -19,6 +19,7 @@ Each test is written to redden if its guard is removed (noted inline).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -363,6 +364,21 @@ def test_cli_bundle_stamps_version_and_version_name(tmp_path):
     assert built["version"].startswith(f"{major}.{minor}.")
     core.validate_manifest_version(built["version"])  # raises if the CLI emitted junk
     assert built["version_name"].startswith(built["version"])
+    # The full SHAPE of version_name is pinned here, and it is pinned here on purpose:
+    # this is the string a human reads off the extension card in brave://extensions, so
+    # dropping the sha, changing the ` · ` separator or appending a field is a
+    # user-visible change and must be a deliberate one. It is also the ONLY assertion that
+    # catches a MACHINE-CONSTANT value — a user name, an absolute build path — being
+    # smuggled into the stamp: the two-run reproducibility tests in
+    # tests/test_enroll_metrics_and_bundle.py compare two builds on the SAME machine, so
+    # by construction they can only see what varies BETWEEN runs and never this.
+    # Matches cli.build_stamp: `<version> · <short-sha>[-dirty] · %Y-%m-%d %H:%M`, where
+    # `version` is three integer components (core.validate_manifest_version) and the sha is
+    # `git rev-parse --short HEAD` (7 hex digits, more in a big repo).
+    assert re.fullmatch(
+        r"\d+\.\d+\.\d+ · [0-9a-f]{7,}(?:-dirty)? · \d{4}-\d{2}-\d{2} \d{2}:\d{2}",
+        built["version_name"],
+    ), built["version_name"]
     assert built["manifest_version"] == 3  # still a loadable MV3 bundle
     # The tracked literal is NOT bumped by a build.
     assert json.loads((REPO_EXTENSION / "manifest.json").read_text())["version"] == base

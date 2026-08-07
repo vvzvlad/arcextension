@@ -226,9 +226,19 @@ def _without_build_time(text: str) -> str:
     """*text* with the build stamp's wall clock replaced by a constant.
 
     Normalising the timestamp — rather than dropping the field or the whole file — is what
-    keeps everything else under comparison: the REST of `version_name` (a user name, a
-    uuid4 or an absolute build path smuggled in there would still redden), `version`, key
+    keeps everything else under comparison: the REST of `version_name`, `version`, key
     order, indentation and `ensure_ascii`.
+
+    Be precise about what that buys. These are TWO BUILDS ON THE SAME MACHINE, so what
+    they can see is exactly what DIFFERS BETWEEN RUNS: a uuid4, a pid, a random salt, a
+    counter, an unnormalised clock — any of those smuggled anywhere into the built tree
+    reddens them. A value that is CONSTANT on one machine — a user name, the absolute
+    build directory, the hostname — is invisible to a two-run comparison by construction
+    and always will be; it would be stamped identically into both builds. That half of the
+    guarantee is carried instead by the version_name FORMAT assertion in
+    `tests/test_instancegen.py::test_cli_bundle_stamps_version_and_version_name`, which
+    pins the whole shape of the string and so rejects an extra field regardless of whether
+    it varies.
     """
     return _BUILD_TIME_RE.sub("<time>", text)
 
