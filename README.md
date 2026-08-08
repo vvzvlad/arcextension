@@ -101,7 +101,7 @@ make dev-bundle            # OUT=dist по умолчанию — ровно т�
 
 **Откуда образ. Рабочий тег — `:develop`.** Gitea Actions
 ([`.gitea/workflows/image-check-publish.yml`](.gitea/workflows/image-check-publish.yml))
-на пуш в `develop` собирает и публикует `gitea.vvzvlad.xyz/vvzvlad/arcextension:develop`
+на пуш в `develop` собирает и публикует `gitea.vvzvlad.xyz/projects/arcextension:develop`
 — это тот образ, который стоит на проде. Пайплайн переехал с GitHub Actions и ghcr.io:
 адрес в compose — справочный, живой стек настроен в Portainer и несёт свой. Сборка зависит от джобы тестов (в неё же входит
 `make alerts`), так что красные тесты или сломанные правила алертов образа не дают.

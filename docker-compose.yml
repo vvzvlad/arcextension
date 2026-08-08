@@ -31,7 +31,11 @@ services:
     # ⚠️ This file is a REFERENCE, not the deployed stack: the live container is
     # configured in Portainer and carries its own image address. Editing this line
     # does not redeploy anything — change it in Portainer too, or it drifts again.
-    image: gitea.vvzvlad.xyz/vvzvlad/arcextension:develop
+    # The org is `projects`, not `vvzvlad`: the workflow builds the path from
+    # `github.repository`, which is `projects/arcextension`, and the live container
+    # on nebula pulls exactly that. The `vvzvlad/...` spelling here published
+    # nowhere and matched nothing.
+    image: gitea.vvzvlad.xyz/projects/arcextension:develop
     container_name: curator
     restart: always
     # The app runs as non-root user `app` (uid 1000): the entrypoint starts as

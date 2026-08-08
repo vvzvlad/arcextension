@@ -1,0 +1,141 @@
+name: Tests
+
+# Split out from image-check-publish.yml on purpose: that workflow must never
+# run on pull_request, because a PR build would push the `:develop` tag prod
+# deploys from and watchtower on nebula would pick it up within seconds. Tests
+# alone are safe here and are what a PR actually needs — without this workflow a
+# broken test only surfaces after the merge into develop.
+#
+# `develop` is this repository's default branch and the only long-lived one:
+# there is no `main` yet (it is reserved for releases), so a PR here targets
+# `develop`, not `main`.
+on:
+  # Manual re-run: without it a run that flaked on runner networking could only be
+  # retried by pushing an empty commit to the PR branch. Safe to expose here — this
+  # workflow touches no registry and no secrets, it only runs the test suites.
+  workflow_dispatch:
+  pull_request:
+    branches: [ "develop" ]
+
+permissions:
+  contents: read   # checkout
+
+# Unlike the image workflow, cancelling is right here: these jobs produce no
+# artifacts, so a superseded test run is just wasted runner time.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Keep these three jobs byte-identical to their twins in image-check-publish.yml:
+# the PR gate and the post-merge gate must be the same gate, or a PR goes green
+# on a weaker check than the one that guards the image.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: pip install -r requirements-dev.txt
+
+    - name: Run tests
+      env:
+        METRICS_TOKEN: test-metrics-token   # required ENV so importing settings works
+        ADMIN_TOKEN: test-admin-token       # required + must differ from METRICS_TOKEN (§13)
+      run: pytest --tb=short -q
+
+    # The alert rules (§12) live in this job, not a job of their own, so `build:
+    # needs: test` keeps gating the image on them as well: a rule file that no longer
+    # parses leaves the deployed curator with NO alerts at all, which is a worse state
+    # to ship than a failed build. promtool is not a Python dep and cannot come from
+    # requirements-dev.txt, so it is fetched here — pinned to the Prometheus LTS line,
+    # because an unpinned "latest" makes the meaning of a green run drift.
+    - name: Install promtool
+      env:
+        PROMETHEUS_VERSION: "3.5.5"   # LTS
+      run: |
+        mkdir -p "$HOME/.local/bin"
+        curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+          | tar -xz -C "$HOME/.local/bin" --strip-components=1 \
+              "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+        "$HOME/.local/bin/promtool" --version
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    # Through `make alerts`, never a hand-copied promtool line: the target IS the
+    # definition of "validated" (schema check + the fire/stay-quiet cases in
+    # deploy/alerts_test.yml), and a duplicate here would drift from what an operator
+    # runs locally. CI=true flips the target's "promtool missing -> skip and exit 0"
+    # branch into a hard failure, so a runner that failed to fetch the binary cannot
+    # report a skip as a pass. (GitHub already exports CI=true; set explicitly so the
+    # dependency is visible rather than inherited.)
+    - name: Validate the Prometheus alert rules
+      env:
+        CI: "true"
+      run: make alerts
+
+  # Extension (MV3) tests: independent Node/vitest toolchain under extension/.
+  # Present here so a PR is checked against the same suites a push to `develop`
+  # runs — a PR that only touches extension/ would otherwise have no gate at all.
+  extension-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install and test the extension
+      working-directory: extension
+      run: |
+        npm ci || npm install
+        npm test
+
+  # Startpage (Vue 3 + Vite) tests: build INTO extension/startpage, then the three
+  # §10 build gates and the vitest suite (the render smoke test loads the built
+  # bundle, so the build must run first). Independent of the Python image build.
+  startpage-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Build, gate and test the startpage
+      working-directory: startpage
+      run: |
+        npm ci || npm install
+        npm run build
+        npm run gates
+        npm test
+
+    # The build writes into the TRACKED extension/startpage. A fresh build must match
+    # what is committed — otherwise editing startpage/src/* without rebuilding ships a
+    # stale newtab and no gate above catches it (the gates run over whatever was built,
+    # not over the committed artifact). The Vite build is byte-reproducible on the
+    # pinned toolchain (verified), so comparing the tree against HEAD is the gate; a
+    # drift means "run `npm --prefix startpage run build` and commit the result".
+    #
+    # `git status --porcelain`, NOT `git diff --exit-code`: THE CHUNK FILENAME CARRIES A
+    # CONTENT HASH (assets/index-<hash>.js), so a changed bundle is never a modification
+    # of a tracked file — it is a DELETED old chunk plus a brand new UNTRACKED one. `git
+    # diff` does not look at untracked files at all, so it would report the new chunk as
+    # nothing and pass; a forgotten `git add` would then ship an index.html pointing at a
+    # chunk that is not in the repo — an empty newtab on a green CI run. Do not
+    # "simplify" this back to git diff.
+    - name: Fail if the committed startpage bundle is stale (drift from a fresh build)
+      run: |
+        if [ -n "$(git status --porcelain -- extension/startpage)" ]; then
+          git status --porcelain -- extension/startpage
+          echo "::error::extension/startpage is out of date vs a fresh build — run 'npm --prefix startpage run build' and commit extension/startpage."
+          exit 1
+        fi
