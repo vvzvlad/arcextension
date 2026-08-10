@@ -170,6 +170,12 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if args.icon:
         icon_png = Path(args.icon).read_bytes()
 
+    # `~` is expanded and the path made absolute HERE: the launcher is a script run from
+    # an arbitrary CWD by launchd, and `~` inside the sh-quoted literal would never expand.
+    sync_extensions = args.sync_extensions
+    if sync_extensions is not None:
+        sync_extensions = Path(sync_extensions).expanduser().resolve()
+
     result = core.generate_instance(
         out_root=out_root,
         bundle_dir=bundle_dir,
@@ -178,6 +184,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
         brave_binary=args.brave_binary,
         icon_source_png=icon_png,
         overwrite=args.overwrite,
+        sync_extensions_from=sync_extensions,
     )
 
     icns = macos.build_icns(
@@ -190,6 +197,11 @@ def cmd_generate(args: argparse.Namespace) -> int:
     print(f"  profile        : {p.profile_dir}  (empty; install_uuid born here)")
     print(f"  app bundle     : {p.app_dir}")
     print(f"  launcher       : {p.launcher}")
+    if sync_extensions is not None:
+        print(f"  sync extensions: {sync_extensions}  (re-read at EVERY launch, so they "
+              "keep updating with the main browser)")
+        print("                   state is NOT copied — they start logged-out "
+              "(--no-sync-extensions to skip)")
     # No extension id is printed: it is Chromium's hash of the shared bundle's load path
     # and nothing consumes it anymore (no origin allow-list, no CORS list to update).
     print(f"  icon (.icns)   : {icns.reason}")
@@ -328,6 +340,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="rebuild an existing instance's .app (the profile is KEPT)",
+    )
+    # ON by default: an instance with the curator bundle and NONE of the owner's 26 other
+    # extensions is not a usable browser. Both options write the same dest, so the last
+    # one on the command line wins; argparse takes the default from the FIRST action that
+    # declares one, hence SUPPRESS on the opt-out.
+    g.add_argument(
+        "--sync-extensions",
+        dest="sync_extensions",
+        default=core.DEFAULT_MAIN_EXTENSIONS_DIR,
+        metavar="PATH",
+        help="the MAIN Brave profile's Extensions dir, also loaded unpacked (default: "
+        f"{core.DEFAULT_MAIN_EXTENSIONS_DIR}). Re-read at every launch, so the instance "
+        "follows the main browser's updates; extension STATE is not copied",
+    )
+    g.add_argument(
+        "--no-sync-extensions",
+        dest="sync_extensions",
+        action="store_const",
+        const=None,
+        default=argparse.SUPPRESS,
+        help="load ONLY the curator bundle (no main-profile extensions)",
     )
     g.set_defaults(func=cmd_generate)
 

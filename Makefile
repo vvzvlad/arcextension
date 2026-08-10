@@ -133,11 +133,22 @@ dev-bundle: startpage install ## Rebuild the bundle the browser loads, in place 
 #    and NO instance.json are written — the launcher's --load-extension points at the
 #    shared BUNDLE_DIR, so every instance loads the same dir (one id/origin).
 #      make instance INSTANCE_ID=main BUNDLE_DIR=~/dist OUT=~/instances [TITLE="Curator Main"]
+#
+#    By default the launcher ALSO loads the main Brave profile's store-installed
+#    extensions (Bitwarden, DeepL, …) unpacked, keeping their real chrome-extension:// ids
+#    and re-reading that profile at every launch, so they follow the main browser's
+#    updates instead of freezing at generation time. It does NOT carry their STATE (Local
+#    Extension Settings): they arrive logged-out and unconfigured, deliberately — copying
+#    it would share one vault session across every space.
+#      SYNC_EXTENSIONS=<path>  another profile's Extensions dir
+#      NO_SYNC_EXTENSIONS=1    curator bundle only
 .PHONY: instance
-instance: install ## Generate an instance .app (vars: INSTANCE_ID BUNDLE_DIR OUT [TITLE])
+instance: install ## Generate an instance .app (vars: INSTANCE_ID BUNDLE_DIR OUT [TITLE] [SYNC_EXTENSIONS|NO_SYNC_EXTENSIONS])
 	$(PY) -m tools.generate_instance generate \
 		--instance-id "$(INSTANCE_ID)" --bundle-dir "$(BUNDLE_DIR)" --out "$(OUT)" \
-		$(if $(TITLE),--title "$(TITLE)",)
+		$(if $(TITLE),--title "$(TITLE)",) \
+		$(if $(SYNC_EXTENSIONS),--sync-extensions "$(SYNC_EXTENSIONS)",) \
+		$(if $(NO_SYNC_EXTENSIONS),--no-sync-extensions,)
 
 # --- Housekeeping ------------------------------------------------------------
 .PHONY: clean
