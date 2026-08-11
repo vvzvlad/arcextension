@@ -1293,17 +1293,30 @@ _STORE_ID_2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 _CURATOR_ID = "cccccccccccccccccccccccccccccccc"
 
 
+def _install_unpacked(source: Path, ext_id: str, version="1.0.0_0") -> Path:
+    """Make *ext_id* look INSTALLED in a source profile, the way the browser leaves it.
+
+    A `<version>/manifest.json`, because that — not a bare `Extensions/<id>` — is what the
+    launcher itself treats as an installed extension (`core._render_extension_sync`), and
+    the copy's eligibility filter now uses the same definition.
+    """
+    d = source / state.EXTENSIONS_DIRNAME / ext_id / version
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text(json.dumps({"name": ext_id, "version": "1.0.0"}))
+    return d
+
+
 def _fake_source_profile(tmp_path) -> Path:
     """A main profile's `Default` dir with both kinds of extension in it.
 
-    `_STORE_ID` has an `Extensions/` dir and BOTH state dirs; `_STORE_ID_2` has an
-    `Extensions/` dir and only `Local Extension Settings` (nothing ever used
-    chrome.storage.sync — the common case); `_CURATOR_ID` has state but NO `Extensions/`
-    dir, exactly like the curator extension in the owner's real profile.
+    `_STORE_ID` is installed unpacked and has BOTH state dirs; `_STORE_ID_2` is installed
+    and has only `Local Extension Settings` (nothing ever used chrome.storage.sync — the
+    common case); `_CURATOR_ID` has state but NO `Extensions/` dir at all, exactly like the
+    curator extension in the owner's real profile.
     """
     source = tmp_path / "main" / "Default"
     for ext_id in (_STORE_ID, _STORE_ID_2):
-        (source / "Extensions" / ext_id / "1.0.0_0").mkdir(parents=True)
+        _install_unpacked(source, ext_id)
     for ext_id in (_STORE_ID, _STORE_ID_2, _CURATOR_ID):
         d = source / state.LOCAL_SETTINGS_DIRNAME / ext_id
         d.mkdir(parents=True)
@@ -1443,6 +1456,40 @@ def test_copy_state_only_refuses_an_id_that_has_no_extensions_dir(tmp_path, monk
     assert (_local(inst, _CURATOR_ID) / "000001.log").read_text() == "instance-install-uuid"
 
 
+def test_copy_state_only_tells_a_typo_apart_from_an_identity_clone(tmp_path, monkeypatch):
+    """The three refusals `--only` can have are three DIFFERENT sentences.
+
+    All three used to be one: "no Extensions/<id> dir … its storage holds THIS install's
+    identity". So a one-character typo in Bitwarden's id told the owner he had nearly
+    overwritten his own `install_uuid` — a security incident report for a slip of the
+    finger, which is how a real refusal stops being read.
+
+    Redden: collapse any two cases back into one message.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    # An id installed in the source but with NO stored state: nothing to copy, no drama.
+    installed_no_state = "dddddddddddddddddddddddddddddddd"
+    _install_unpacked(source, installed_no_state)
+
+    typo = _STORE_ID[:-1] + "x"
+    with pytest.raises(state.StateCopyRefused) as typo_exc:
+        _copy(tmp_path, source, inst, monkeypatch, only=[typo])
+    with pytest.raises(state.StateCopyRefused) as empty_exc:
+        _copy(tmp_path, source, inst, monkeypatch, only=[installed_no_state])
+    with pytest.raises(state.StateCopyRefused) as identity_exc:
+        _copy(tmp_path, source, inst, monkeypatch, only=[_CURATOR_ID])
+
+    # A typo is called a typo, and is NOT accused of cloning an identity.
+    assert "TYPO" in str(typo_exc.value)
+    assert "install_uuid" not in str(typo_exc.value)
+    # An installed extension with no state has nothing to copy — also not an identity case.
+    assert "NOTHING to copy" in str(empty_exc.value)
+    assert "install_uuid" not in str(empty_exc.value)
+    # Only the real case keeps the identity wording.
+    assert "install_uuid and enrollment secret" in str(identity_exc.value)
+
+
 def test_copy_state_refuses_while_brave_is_running_and_copies_nothing(
     tmp_path, monkeypatch
 ):
@@ -1459,10 +1506,10 @@ def test_copy_state_refuses_while_brave_is_running_and_copies_nothing(
     inst = _instance_with_state(tmp_path)
     before = _snapshot(inst)
     running = [
-        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser "
+        "93062 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "32643 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser "
         f"--user-data-dir={inst}/profile --load-extension=/x",
-        "/Applications/Brave Browser.app/…/Brave Browser Helper --type=renderer",
+        "1464 /Applications/Brave Browser.app/…/Brave Browser Helper --type=renderer",
     ]
     with pytest.raises(state.StateCopyRefused) as excinfo:
         _copy(tmp_path, source, inst, monkeypatch, running=running)
@@ -1474,6 +1521,9 @@ def test_copy_state_refuses_while_brave_is_running_and_copies_nothing(
     assert "the MAIN Brave profile" in message
     assert f"{inst}/profile" in message
     assert "renderer" not in message
+    # …and it names them by PID, so a refusal is something the operator can act on.
+    assert "pid 93062" in message
+    assert "pid 32643" in message
 
 
 def test_copy_state_refuses_when_the_process_check_itself_fails(tmp_path, monkeypatch):
@@ -1568,7 +1618,9 @@ def test_cli_copy_state_exits_non_zero_while_brave_runs(tmp_path, monkeypatch):
     inst = _instance_with_state(tmp_path)
     monkeypatch.setattr(
         state, "running_brave_processes",
-        lambda *a, **kw: ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+        lambda *a, **kw: [
+            "93062 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+        ],
     )
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["copy-state", "--instance-dir", str(inst), "--from", str(source)])
@@ -1579,3 +1631,477 @@ def test_cli_copy_state_has_no_force_option(tmp_path):
     # The guard protects live databases and must have no bypass. Redden: add --force.
     with pytest.raises(SystemExit):
         cli.main(["copy-state", "--instance-dir", str(tmp_path), "--force"])
+
+
+# --------------------------------------------------------------------------- #
+# The running-browser guard: every branch of the pgrep exit code
+# --------------------------------------------------------------------------- #
+class _FakeCompletedProcess:
+    """Just enough of `subprocess.CompletedProcess` for the guard to read."""
+
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _fake_pgrep(monkeypatch, returncode, stdout="", stderr=""):
+    monkeypatch.setattr(
+        state.subprocess,
+        "run",
+        lambda *a, **kw: _FakeCompletedProcess(returncode, stdout, stderr),
+    )
+
+
+def test_pgrep_exit_1_is_the_only_all_clear(monkeypatch):
+    """Exit 1 with no output is pgrep POSITIVELY answering "nothing matched" — the one
+    outcome that may authorise the copy.
+
+    Redden: treat any empty stdout as an all-clear (which is what the old code did) and
+    the three tests below stop reddening.
+    """
+    _fake_pgrep(monkeypatch, 1)
+    assert state.running_brave_processes() == []
+
+
+@pytest.mark.parametrize("code", [2, 3])
+def test_pgrep_error_exit_refuses_instead_of_reading_empty_stdout(monkeypatch, code):
+    """THE fail-open that mattered: `pgrep` exits 2 on a bad pattern and 3 on a fatal
+    error, BOTH with empty stdout.
+
+    The old guard never looked at `returncode` at all — it parsed stdout, found nothing and
+    reported "Brave is not running", which lets the copy run onto live LevelDBs. Reproduced
+    on the real machine: `pgrep -fl "["` exits 2 and prints nothing.
+
+    Redden: drop the `returncode not in (0, 1)` check — the call returns `[]` and this
+    test fails.
+    """
+    _fake_pgrep(monkeypatch, code, stderr="pgrep: bad pattern")
+    with pytest.raises(state.StateCopyRefused) as excinfo:
+        state.running_brave_processes()
+    assert f"exited {code}" in str(excinfo.value)
+
+
+def test_pgrep_exit_0_with_no_output_refuses(monkeypatch):
+    """Exit 0 means "matched". Printing nothing after that contradicts it, and a process
+    check that contradicts itself is not an answer.
+
+    Redden: return `[]` when stdout is empty regardless of the exit code.
+    """
+    _fake_pgrep(monkeypatch, 0, stdout="\n  \n")
+    with pytest.raises(state.StateCopyRefused, match="printed nothing"):
+        state.running_brave_processes()
+
+
+def test_pgrep_unparseable_line_counts_as_a_running_process(monkeypatch):
+    """A matched line that cannot be parsed is PROOF of a live process, never a nothing.
+
+    The old code silently DISCARDED any line without a space (`if " " in line`), so a
+    single unusual line could empty the whole result and open the guard.
+
+    Redden: filter unparseable lines out of `running_brave_processes` or out of
+    `browsers_to_quit` — the copy would then proceed with a browser alive.
+    """
+    _fake_pgrep(monkeypatch, 0, stdout="not-a-pgrep-line\n")
+    running = state.running_brave_processes()
+    assert running == ["not-a-pgrep-line"]
+    labels = state.browsers_to_quit(running)
+    assert len(labels) == 1
+    assert "UNPARSEABLE" in labels[0]
+
+
+def test_pgrep_helpers_and_shims_are_labelled_apart_from_browsers():
+    """A crashpad handler or a PWA shim is not "the MAIN Brave profile".
+
+    Six of the 84 matches on the owner's machine are type-less non-browsers
+    (`chrome_crashpad_handler`, `app_mode_loader`). Calling them "the MAIN Brave profile"
+    told the operator to quit a browser that was not running, with no pid and deliberately
+    no --force to get past it.
+
+    Redden: label every type-less process "the MAIN Brave profile" again.
+    """
+    labels = state.browsers_to_quit([
+        "93062 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "93222 /Applications/Brave Browser.app/…/Helpers/chrome_crashpad_handler "
+        "--monitor-self-annotation=ptype=crashpad-handler",
+        "93223 /Users/x/Brave Browser Apps.localized/Home Assistant.app/Contents/MacOS/"
+        "app_mode_loader --launched-by-chrome-process-id=93062",
+    ])
+    joined = "\n".join(labels)
+    assert "pid 93062" in joined and "the MAIN Brave profile" in joined
+    for pid, name in (("93222", "chrome_crashpad_handler"), ("93223", "app_mode_loader")):
+        assert f"pid {pid}  {name}" in joined
+        # …and the shims are NOT sold as the main browser.
+        assert f"pid {pid}  {name} — the MAIN" not in joined
+    assert "helper/PWA shim" in joined
+
+
+def _write_launcher(inst: Path, bundle: Path, *, brave_binary=None, sync_from=None):
+    """Write a REAL generated launcher into an instance dir (not a hand-made stand-in).
+
+    `core.render_launcher_script` is what `generate` emits, so parsing it in the tests is
+    parsing the thing the parser has to handle.
+    """
+    launcher = inst / "curator.app" / "Contents" / "MacOS" / "run"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text(
+        core.render_launcher_script(
+            brave_binary or core.DEFAULT_BRAVE_BINARY,
+            inst / "profile",
+            bundle,
+            sync_extensions_from=sync_from,
+        )
+    )
+    return launcher
+
+
+def test_pgrep_searches_for_the_instances_own_brave_binary(tmp_path, monkeypatch):
+    """`generate --brave-binary` means an instance may exec a Brave the guard never greps
+    for — and an invisible browser is a live database copied from under it.
+
+    Redden: grep only for `core.DEFAULT_BRAVE_BINARY`'s name and the second pattern below
+    is never searched for.
+    """
+    other = str(tmp_path / "Brave Nightly.app" / "Contents" / "MacOS" / "Brave Nightly")
+    inst = _instance_with_state(tmp_path)
+    _write_launcher(inst, tmp_path / "dist", brave_binary=other)
+
+    assert state.instance_brave_binaries(inst) == [other]
+
+    patterns = []
+
+    def record(argv, **_kwargs):
+        patterns.append(argv[-1])
+        return _FakeCompletedProcess(1)
+
+    monkeypatch.setattr(state.subprocess, "run", record)
+    source = _fake_source_profile(tmp_path)
+    state.copy_extension_state(source_default_dir=source, instance_dir=inst)
+    assert patterns == ["Brave Browser", "Brave Nightly"]
+
+
+# --------------------------------------------------------------------------- #
+# The identity guard's two layers
+# --------------------------------------------------------------------------- #
+def test_chromium_unpacked_id_matches_the_real_deployment():
+    """The id derivation must be the REAL one before anything is excluded by it.
+
+    Chromium hashes the absolute load path with SHA-256, takes 16 bytes and maps each
+    nibble 0-15 onto 'a'-'p'. Pinned against the id the owner's browsers actually show for
+    `/Users/vvzvlad/Data/Projects/arcextension/dist`, because a derivation that is merely
+    plausible would exclude the WRONG id — i.e. silently do nothing.
+
+    Redden: change the byte count, the alphabet or the hash.
+    """
+    assert state.chromium_unpacked_extension_id(
+        "/Users/vvzvlad/Data/Projects/arcextension/dist"
+    ) == "enhmndaehfanaeinicoffekhbepjhkmf"
+
+
+def test_copy_state_excludes_the_bundle_this_instance_loads_unpacked(
+    tmp_path, monkeypatch
+):
+    """POSITIVE layer: the curator's id is derived from THIS instance's launcher and
+    excluded by name — it does not depend on the source profile lacking a directory.
+
+    The source below is rigged so the negative layer would PASS the id: it has a full
+    `Extensions/<id>/<version>/manifest.json`. Only the derived id keeps it out.
+
+    Redden: drop `exclude_ids` from `eligible_extension_ids` and the instance's own
+    identity marker below is overwritten by the main browser's storage.
+    """
+    bundle = tmp_path / "dist"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text(json.dumps({"name": "curator"}))
+    curator_id = state.chromium_unpacked_extension_id(str(bundle))
+
+    source = _fake_source_profile(tmp_path)
+    _install_unpacked(source, curator_id)  # the negative layer alone would allow it
+    d = source / state.LOCAL_SETTINGS_DIRNAME / curator_id
+    d.mkdir(parents=True)
+    (d / "000003.ldb").write_text("MAIN browser identity")
+
+    inst = _instance_with_state(tmp_path)
+    own = inst / "profile" / "Default" / state.LOCAL_SETTINGS_DIRNAME / curator_id
+    own.mkdir(parents=True)
+    (own / "000001.log").write_text("instance-install-uuid")
+    _write_launcher(inst, bundle)
+
+    assert state.instance_unpacked_extension_ids(inst) == [curator_id]
+    copied = _copy(tmp_path, source, inst, monkeypatch)
+    assert curator_id not in [c.extension_id for c in copied]
+    assert (own / "000001.log").read_text() == "instance-install-uuid"
+    assert not (own / "000003.ldb").exists()
+
+    # Named explicitly it is refused too, and by the layer that actually knows why.
+    with pytest.raises(state.StateCopyRefused, match="THIS INSTANCE loads unpacked"):
+        _copy(tmp_path, source, inst, monkeypatch, only=[curator_id])
+
+
+def test_copy_state_unpacked_id_is_read_through_the_sync_launcher_form(tmp_path):
+    """With `--sync-extensions` on, the launcher reads `--load-extension="$EXTS"` and the
+    path is in the `EXTS=` assignment above it. Both forms must be understood.
+
+    Redden: only handle the literal `--load-extension=<path>` form and the id comes back
+    empty for every instance generated with the DEFAULT settings (sync is on by default).
+    """
+    bundle = tmp_path / "dist"
+    bundle.mkdir()
+    inst = tmp_path / "inst"
+    _write_launcher(inst, bundle, sync_from=tmp_path / "main" / "Extensions")
+    assert state.instance_unpacked_load_paths(inst) == [str(bundle)]
+    assert state.instance_unpacked_extension_ids(inst) == [
+        state.chromium_unpacked_extension_id(str(bundle))
+    ]
+
+
+def test_copy_state_requires_a_real_manifest_not_a_bare_extensions_dir(
+    tmp_path, monkeypatch
+):
+    """NEGATIVE layer, tightened: an EMPTY or half-removed `Extensions/<id>` is not an
+    installed extension.
+
+    The launcher only loads a version dir once it finds `<version>/manifest.json`, so that
+    is what "installed" means on both sides. `mkdir Extensions/<curator id>` used to be
+    enough to defeat the only guard standing between the curator's storage — this
+    install's `install_uuid` and enrollment secret — and the copy.
+
+    Redden: go back to `(extensions / entry.name).is_dir()`.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    # Half-removed: the id dir and a version dir exist, but no manifest inside.
+    (source / state.EXTENSIONS_DIRNAME / _CURATOR_ID / "9.9.9_0").mkdir(parents=True)
+
+    copied = _copy(tmp_path, source, inst, monkeypatch)
+    assert _CURATOR_ID not in [c.extension_id for c in copied]
+    assert (_local(inst, _CURATOR_ID) / "000001.log").read_text() == "instance-install-uuid"
+
+
+def test_copy_state_does_not_follow_a_symlinked_extensions_dir(tmp_path, monkeypatch):
+    """`Path.is_dir()` follows symlinks, so a symlinked `Extensions/<id>` pointing at any
+    real extension satisfied the guard.
+
+    Redden: drop the `is_symlink()` checks in `is_installed_unpacked`.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    (source / state.EXTENSIONS_DIRNAME / _CURATOR_ID).symlink_to(
+        source / state.EXTENSIONS_DIRNAME / _STORE_ID, target_is_directory=True
+    )
+
+    copied = _copy(tmp_path, source, inst, monkeypatch)
+    assert _CURATOR_ID not in [c.extension_id for c in copied]
+    assert (_local(inst, _CURATOR_ID) / "000001.log").read_text() == "instance-install-uuid"
+
+
+# --------------------------------------------------------------------------- #
+# Failing part-way, disk space, stale staging
+# --------------------------------------------------------------------------- #
+def test_copy_state_names_the_id_it_died_on_and_the_ids_already_committed(
+    tmp_path, monkeypatch, capsys
+):
+    """The loop commits PER ID, so a failure half-way leaves a half-migrated profile — and
+    the previous state of the ids already done is gone.
+
+    An `OSError` from `shutil` is not `StateCopyRefused`, so the CLI used to hand the
+    operator a raw traceback and no idea which ids had already moved.
+
+    Redden: let the OSError propagate untouched, or drop the stderr report.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+
+    calls = []
+    real_copytree = shutil.copytree
+
+    def fail_on_the_second(src, dst, *args, **kwargs):
+        calls.append(src)
+        if len(calls) > 1:
+            raise OSError(28, "No space left on device")
+        return real_copytree(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(state.shutil, "copytree", fail_on_the_second)
+    with pytest.raises(state.StateCopyRefused) as excinfo:
+        _copy(tmp_path, source, inst, monkeypatch)
+
+    first, second = sorted([_STORE_ID, _STORE_ID_2])
+    assert second in str(excinfo.value)          # the id it died on
+    assert first in str(excinfo.value)           # …and what is already committed
+    assert first in capsys.readouterr().err      # printed before it propagated, too
+
+
+def test_copy_state_refuses_when_the_destination_has_no_room(tmp_path, monkeypatch):
+    """~130 MB moving onto a full disk must be refused UP FRONT, not discovered per id.
+
+    Redden: drop the disk check — the copy then dies part-way through with an ENOSPC and a
+    half-migrated profile.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+
+    class _FullDisk:
+        total, used, free = 100, 100, 0
+
+    monkeypatch.setattr(state.shutil, "disk_usage", lambda _p: _FullDisk())
+    with pytest.raises(state.StateCopyRefused, match="free"):
+        _copy(tmp_path, source, inst, monkeypatch)
+    # Nothing moved: the instance still holds only what it had.
+    assert (_local(inst, _STORE_ID) / "000001.log").read_text() == "instance-own-state"
+
+
+def test_copy_state_sweeps_stale_staging_dirs_left_by_a_killed_run(tmp_path, monkeypatch):
+    """A SIGKILL between staging and swap leaves `.rebuild-XXXX/new/` holding a PARTIAL
+    copy of the vault next to the real one, and nothing ever removed it.
+
+    Redden: drop the sweep and the leftover below survives the run.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    settings = inst / "profile" / "Default" / state.LOCAL_SETTINGS_DIRNAME
+    stale = settings / ".rebuild-deadbeef" / "new"
+    stale.mkdir(parents=True)
+    (stale / "000003.ldb").write_text("half a vault")
+
+    plan = state.plan_extension_state_copy(
+        source_default_dir=source, instance_dir=inst
+    )
+    assert plan.stale_staging == (settings / ".rebuild-deadbeef",)
+
+    _copy(tmp_path, source, inst, monkeypatch)
+    assert not (settings / ".rebuild-deadbeef").exists()
+    # The real destinations are untouched by the sweep.
+    assert (_local(inst, _STORE_ID) / "000003.ldb").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# CLI: path refusals, the empty --only, and --dry-run
+# --------------------------------------------------------------------------- #
+def test_cli_copy_state_refuses_a_source_that_is_not_a_brave_profile(tmp_path):
+    """`FROM=` pointing anywhere else is a clean refusal naming the dir to pass.
+
+    Redden: drop the `Extensions/` check on the source — the run then reports "nothing
+    eligible" and exits 0, which reads as "there was nothing to copy".
+    """
+    inst = _instance_with_state(tmp_path)
+    not_a_profile = tmp_path / "somewhere"
+    not_a_profile.mkdir()
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([
+            "copy-state", "--instance-dir", str(inst), "--from", str(not_a_profile),
+        ])
+    assert "is not a Brave profile" in str(excinfo.value)
+
+
+def test_cli_copy_state_refuses_an_instance_dir_without_a_profile(tmp_path):
+    """`INSTANCE_DIR` must be an instance ROOT, not the `.app` and not the profile itself.
+
+    Redden: drop the `profile/` check and the copy creates `<whatever>/profile/Default/…`,
+    i.e. a vault copy in a directory the operator merely mistyped.
+    """
+    source = _fake_source_profile(tmp_path)
+    bare = tmp_path / "not-an-instance"
+    bare.mkdir()
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([
+            "copy-state", "--instance-dir", str(bare), "--from", str(source),
+        ])
+    assert "INSTANCE_DIR must be an instance root" in str(excinfo.value)
+    assert not (bare / "profile").exists()
+
+
+@pytest.mark.parametrize("value", ["", " ", ",", " , "])
+def test_cli_copy_state_refuses_an_empty_only(tmp_path, value):
+    """An EMPTY `--only` is MISSING configuration, never "all 21 of them" (AGENTS.md).
+
+    `make instance-state ONLY=` must reach this, which is why the Makefile passes `--only`
+    whenever the variable is DEFINED instead of whenever it is non-empty.
+
+    Redden: treat an empty id list as `None` and an unset shell variable silently copies
+    every eligible extension — including the crypto wallet.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([
+            "copy-state", "--instance-dir", str(tmp_path), "--only", value,
+        ])
+    assert "empty id list" in str(excinfo.value)
+
+
+def test_makefile_passes_only_whenever_it_is_defined(tmp_path):
+    """`$(if $(ONLY),…)` turned `ONLY=` into "copy all 21", defeating the CLI's own guard.
+
+    Asserted against the Makefile text rather than by running make: the bug is exactly the
+    `$(if $(ONLY),…)` shape, and `$(origin ONLY)` is what tells "defined but empty" from
+    "not given at all".
+
+    Redden: go back to `$(if $(ONLY),--only "$(ONLY)",)`.
+    """
+    makefile = (Path(__file__).resolve().parents[1] / "Makefile").read_text()
+    assert '$(if $(ONLY),--only' not in makefile
+    assert '$(filter-out undefined,$(origin ONLY)),--only "$(ONLY)"' in makefile
+    # INSTANCE_DIR is validated in the target, not passed through empty.
+    assert 'test -n "$(INSTANCE_DIR)"' in makefile
+
+
+def test_cli_copy_state_dry_run_writes_nothing_and_explains_the_exclusions(
+    tmp_path, monkeypatch, capsys
+):
+    """`--dry-run` answers "which ids, how big, what is skipped and why" BEFORE 130 MB of
+    encrypted vault moves — the warnings used to print only after it already had.
+
+    It also must not refuse on a running browser: that is the moment the operator is
+    deciding whether to quit it. Redden: make the dry run take the copy path, or drop the
+    exclusion reasons.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    before = _snapshot(inst)
+    monkeypatch.setattr(
+        state, "running_brave_processes",
+        lambda *a, **kw: [
+            "93062 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+        ],
+    )
+
+    assert cli.main([
+        "copy-state", "--instance-dir", str(inst), "--from", str(source), "--dry-run",
+    ]) == 0
+
+    assert _snapshot(inst) == before  # not one byte written, Brave running or not
+    printed = capsys.readouterr().out
+    assert "DRY RUN" in printed
+    assert _STORE_ID in printed and _STORE_ID_2 in printed
+    # …and the excluded id is listed WITH its reason.
+    assert _CURATOR_ID in printed
+    assert "per-install IDENTITY" in printed
+    # Sizes and the disk headroom are shown before anything is committed to.
+    assert "total:" in printed and "disk :" in printed
+    # A running browser is REPORTED, not raised.
+    assert "would REFUSE" in printed and "pid 93062" in printed
+
+
+def test_cli_copy_state_states_the_appid_and_names_metamask(tmp_path, monkeypatch, capsys):
+    """Two corrections to what the operator is told, both about what is NOT local.
+
+    The text used to state as FACT that "logging out here does not log the others out".
+    That holds for the local LevelDBs; it does not follow for the SERVER, because the
+    copied Bitwarden storage carries its `appId` — the device identifier a refresh token is
+    bound to — so both profiles become one device server-side. That half was never
+    verified, so it is qualified rather than asserted. And only Bitwarden was named while
+    MetaMask is eligible too, its storage holding an encrypted SEED vault.
+
+    Redden: re-assert the logout claim, or drop MetaMask from the paragraph.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    monkeypatch.setattr(state, "running_brave_processes", lambda *a, **kw: [])
+
+    assert cli.main([
+        "copy-state", "--instance-dir", str(inst), "--from", str(source),
+    ]) == 0
+    printed = capsys.readouterr().out
+    assert "NOT VERIFIED" in printed and "appId" in printed
+    assert "logging out here does not log the others out" not in printed
+    assert "MetaMask" in printed
+    assert "nkbihfbeogaeaoehlefnkodbefgpgknn" in printed
+    assert "SEED VAULT" in printed

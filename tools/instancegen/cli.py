@@ -363,19 +363,116 @@ def _human_bytes(count: int) -> str:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+# The paragraph every run ends with — the things that are not reversible by an undo and
+# must therefore be stated before the operator discovers them.
+#
+# The DIVERGENCE claim is deliberately split in two, because the earlier text asserted
+# both halves as one fact ("logging out here does not log the others out"). The LOCAL half
+# is certain: a LevelDB has one writer, the two profiles hold two independent copies, and a
+# vault entry added in one is invisible to the other. The SERVER half is not the same
+# claim. The Bitwarden storage carries an `appId` — the device identifier the server binds
+# a device and its refresh token to — and it was CONFIRMED present in the owner's real
+# `Local Extension Settings/nngceckbapebfimnlniiiahkandclblb` before this text was written,
+# so after the copy both profiles present the SAME device identity. What that does to a
+# "log out" / "deauthorize sessions" / device-approval action was NOT tested (it would take
+# a live account), so the consequence is named as unverified rather than asserted either
+# way. Do not re-collapse these two into one sentence.
+_COPY_TERMS = (
+    "This is a ONE-TIME COPY, not a sync. Two browsers cannot share one LevelDB (single "
+    "writer,\nlock-protected — a symlink would only make the instance see broken "
+    "storage), so the two profiles\nhold two independent copies from now on: a vault "
+    "entry added in one does not appear in the other.\nRe-run this to re-align them (it "
+    "overwrites, it does not merge).\n"
+    "The copied Bitwarden storage carries its `appId` (checked: it is there), the device "
+    "identifier the\nserver ties a device and its refresh token to — so server-side the "
+    "two profiles are now ONE\ndevice. What that does to a logout, a session revoke or a "
+    "device-approval prompt in one is\nNOT VERIFIED: it was not tested. Assume they are "
+    "one device until you have checked.\n"
+    "The account and the ENCRYPTED VAULT came along, so the full login (email + master "
+    "password +\n2FA) is not needed again. Whether the vault comes up UNLOCKED is your "
+    "Bitwarden vault-timeout\nsetting's business: with «Never» + «Lock» the derived key is "
+    "persisted and it should; otherwise\nyou are asked for the master password once.\n"
+    "Bitwarden is NOT the only extension this moves. MetaMask "
+    "(nkbihfbeogaeaoehlefnkodbefgpgknn) is\nstore-installed and therefore eligible too, "
+    "and its chrome.storage.local holds the wallet's\nENCRYPTED SEED VAULT — use --only if "
+    "you want the password manager without the wallet.\n"
+    "So the encrypted vault(s) now exist in this instance's profile TOO — one more copy on "
+    "this disk,\nalongside the main profile and every other instance you run this for."
+)
+
+
+def _print_plan_rows(rows) -> None:
+    """The `<id>  <size>  Local+Sync` table shared by the dry run and the real run."""
+    for ext_id, size, parts in rows:
+        # Which of the two dirs is involved, spelled short: `Local` is chrome.storage.local,
+        # `Sync` is chrome.storage.sync (often absent, and then simply not listed).
+        short = "+".join(part.split()[0] for part in parts)
+        print(f"  {ext_id}  {_human_bytes(size):>9}  {short}")
+
+
+def _cmd_copy_state_dry_run(args: argparse.Namespace, only: list[str] | None) -> int:
+    """List what a real run WOULD copy and what it would skip, touching nothing.
+
+    This exists because the warnings below used to print only AFTER ~130 MB of encrypted
+    vault had already been written into a second profile — i.e. the operator learned what
+    the command does at the one moment he could no longer decide not to. A dry run answers
+    "which ids, how big, what is excluded and why" first.
+
+    It deliberately does NOT refuse on a running browser or on a full disk: both are the
+    real run's refusals, and a dry run that dies on them cannot do its job (Brave is
+    running precisely when the operator is deciding whether to quit it). Both are REPORTED
+    instead.
+    """
+    plan = state.plan_extension_state_copy(
+        source_default_dir=args.source,
+        instance_dir=args.instance_dir,
+        only=only,
+    )
+    print("DRY RUN — nothing was read into, written to or deleted from any profile.")
+    print(f"Would copy extension state: {plan.source}")
+    print(f"                         -> {plan.destination}")
+    _print_plan_rows(
+        [(item.extension_id, item.bytes_to_copy, item.parts) for item in plan.selected]
+    )
+    if not plan.selected:
+        print("  (nothing eligible — see the exclusions below)")
+    print(f"  total: {_human_bytes(plan.total_bytes)} across "
+          f"{len(plan.selected)} extension(s)")
+    print(f"  disk : {_human_bytes(plan.peak_bytes)} needed at peak (the copy plus the "
+          f"one tree being staged), {_human_bytes(plan.free_bytes)} free"
+          f"{'' if plan.fits else '  <-- DOES NOT FIT; the real run would refuse'}")
+    if plan.excluded:
+        print(f"\nExcluded ({len(plan.excluded)} id(s) that have stored state):")
+        for ext_id, reason in plan.excluded:
+            print(f"  {ext_id}\n      {reason}")
+    if plan.stale_staging:
+        print(f"\nStale staging dirs a real run would sweep ({len(plan.stale_staging)}):")
+        for path in plan.stale_staging:
+            print(f"  {path}")
+    try:
+        running = state.running_brave_processes(plan.brave_binaries)
+    except state.StateCopyRefused as exc:
+        print(f"\nNOTE: the real run would REFUSE — {exc}")
+    else:
+        if running:
+            quit_these = state.browsers_to_quit(
+                running, [Path(b).name for b in plan.brave_binaries]
+            )
+            print(f"\nNOTE: the real run would REFUSE — Brave is running "
+                  f"({len(running)} process(es)). Quit:")
+            for label in quit_these or ["every Brave process"]:
+                print(f"  {label}")
+    print("\n" + _COPY_TERMS)
+    return 0
+
+
 def cmd_copy_state(args: argparse.Namespace) -> int:
     """Copy the store-installed extensions' STATE from the main profile into an instance.
 
     This is the answer to "can the state come across too" — and the answer is "once, by
-    copy". :mod:`.state` carries the full argument; the three things the operator must be
-    told are printed below every run, because they are not reversible by an undo:
-
-    * it is a ONE-TIME COPY and cannot be a live sync (a LevelDB has a single writer, so
-      two browsers cannot share one directory and a symlink only breaks the second one) —
-      from here on the profiles diverge;
-    * it removes the full login but not necessarily the unlock: whether the vault comes up
-      unlocked is the vault-timeout setting's business, not this tool's;
-    * the encrypted vault now sits in one more profile on this disk.
+    copy". :mod:`.state` carries the full argument; the things the operator must be told
+    are printed below every run (``_COPY_TERMS``), because they are not reversible by an
+    undo. ``--dry-run`` prints the same terms plus the plan, and writes nothing.
     """
     only = None
     if args.only is not None:
@@ -389,6 +486,8 @@ def cmd_copy_state(args: argparse.Namespace) -> int:
             )
 
     try:
+        if args.dry_run:
+            return _cmd_copy_state_dry_run(args, only)
         copied = state.copy_extension_state(
             source_default_dir=args.source,
             instance_dir=args.instance_dir,
@@ -403,29 +502,16 @@ def cmd_copy_state(args: argparse.Namespace) -> int:
     profile = Path(args.instance_dir).expanduser().resolve() / "profile"
     print(f"Copied extension state: {source}")
     print(f"                     -> {profile}")
-    for item in copied:
-        # Which of the two dirs came along, spelled short: `Local` is chrome.storage.local,
-        # `Sync` is chrome.storage.sync (often absent, and then simply not listed).
-        parts = "+".join(part.split()[0] for part in item.parts)
-        print(f"  {item.extension_id}  {_human_bytes(item.bytes_copied):>9}  {parts}")
+    _print_plan_rows(
+        [(item.extension_id, item.bytes_copied, item.parts) for item in copied]
+    )
     if not copied:
-        print("  (nothing eligible — no extension has both stored state and an "
-              f"{state.EXTENSIONS_DIRNAME}/<id> dir in that profile)")
+        print("  (nothing eligible — no extension has both stored state and an installed "
+              f"{state.EXTENSIONS_DIRNAME}/<id>/<version>/manifest.json in that profile; "
+              "run again with --dry-run to see why each id was skipped)")
     print(f"  total: {_human_bytes(sum(i.bytes_copied for i in copied))} across "
           f"{len(copied)} extension(s)")
-    print(
-        "\nThis is a ONE-TIME COPY, not a sync. Two browsers cannot share one LevelDB "
-        "(single writer,\nlock-protected — a symlink would only make the instance see "
-        "broken storage), so the profiles\nDIVERGE from now on: logging out here does not "
-        "log the others out, and a vault change in one\ndoes not propagate. Re-run this to "
-        "re-align them (it overwrites, it does not merge).\n"
-        "The account and the ENCRYPTED VAULT came along, so the full login (email + master "
-        "password +\n2FA) is not needed again. Whether the vault comes up UNLOCKED is your "
-        "Bitwarden vault-timeout\nsetting's business: with «Never» + «Lock» the derived key "
-        "is persisted and it should; otherwise\nyou are asked for the master password once."
-        "\nThe encrypted vault now exists in this instance's profile TOO — one more copy on "
-        "this disk,\nalongside the main profile and every other instance you run this for."
-    )
+    print("\n" + _COPY_TERMS)
     return 0
 
 
@@ -545,6 +631,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="ID,ID",
         help="restrict the copy to these extension ids (default: every eligible one)",
+    )
+    # NOT the opposite of --force. It writes nothing at all, which is why it is safe to
+    # run while Brave is up — and running it first is the point: the terms of this copy
+    # are otherwise only printed once ~130 MB of encrypted vault has already moved.
+    s.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="list what WOULD be copied (ids, sizes, total) and what is excluded and "
+        "why, then exit without touching anything",
     )
     # Deliberately NO --force: the running-browser check guards live LevelDB databases,
     # and a snapshot taken under their own writer can be corrupt. Quitting Brave is the

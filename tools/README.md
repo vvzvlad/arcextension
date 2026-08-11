@@ -177,40 +177,79 @@ stderr. The mtime glob stays anyway, on three reasons:
 
 ## Copying extension state into an instance (`make instance-state`)
 
-`make instance-state INSTANCE_DIR=~/Applications/infra [FROM=<Default dir>] [ONLY=id,id]`
-copies the store extensions' state — `Local Extension Settings/<id>` and, when it exists,
-`Sync Extension Settings/<id>` — from the main profile into one instance, so Bitwarden and
-friends come up logged in. The destination path is identical to the source's because the
-ids are (each store manifest carries a `key`, so Chromium hashes that, not the load path).
-**Quit Brave first** — the main browser *and* every instance `.app`: these are live
-LevelDB databases, a snapshot taken under their own writer can be corrupt, and the command
-refuses to run while any Brave process is alive. There is deliberately **no `--force`**.
+```bash
+# Look before you leap: lists the ids, their sizes, the total and every exclusion
+# with its reason, and writes nothing. Safe to run with Brave up.
+make instance-state INSTANCE_DIR=~/Applications/infra DRY_RUN=1
 
-Four things it is important not to misread:
+# The real thing (quit Brave first).
+make instance-state INSTANCE_DIR=~/Applications/infra
+make instance-state INSTANCE_DIR=~/Applications/infra ONLY=<bitwarden id>
+```
+
+It copies the store extensions' state — `Local Extension Settings/<id>` and, when it
+exists, `Sync Extension Settings/<id>` — from the main profile (`FROM=<Default dir>`) into
+one instance, so Bitwarden and friends come up logged in. The destination path is identical
+to the source's because the ids are (each store manifest carries a `key`, so Chromium
+hashes that, not the load path). **Quit Brave first** — the main browser *and* every
+instance `.app`: these are live LevelDB databases, a snapshot taken under their own writer
+can be corrupt, and the command refuses to run while any Brave process is alive. There is
+deliberately **no `--force`**. The refusal names each process by **pid**, and says which of
+them are browsers to quit and which are helpers/PWA shims to kill.
+
+Five things it is important not to misread:
 
 - **It is a ONE-TIME COPY and cannot be a live sync.** A LevelDB has a single writer and is
   lock-protected, so two browsers cannot share one directory — a symlink would only make
-  the instance see broken storage. The profiles **diverge** afterwards: a logout or a vault
-  change in one does not reach the others. Re-run to re-align (it overwrites, never merges).
-- **Only ids with an `Extensions/<id>` dir in the SOURCE profile are copied**, and that is
-  the safety filter, not tidiness. The curator extension is loaded unpacked from a shared
-  directory, so it has **no** `Extensions/` dir in any profile while carrying the **same**
-  id in all of them, and its `chrome.storage.local` holds *that instance's* `install_uuid`
-  and per-install secret. A blanket copy would overwrite the instance's identity with the
-  main browser's and the service would see a different install. No id is hard-coded; Brave's
-  component extensions are excluded by the same rule (on the owner's profile: 21 of 28 state
-  dirs are eligible).
+  the instance see broken storage. The two profiles hold **independent** copies afterwards:
+  a vault entry added in one does not appear in the other. Re-run to re-align (it
+  overwrites, never merges).
+- **Locally independent is not server-side independent.** The copied Bitwarden storage
+  carries its `appId` — the device identifier the server ties a device and its refresh token
+  to (confirmed present in the real storage) — so after the copy the two profiles present
+  the **same device identity**. What that does to a logout, a "deauthorize sessions" or a
+  device-approval prompt in one profile was **not verified**; assume they are one device
+  until you have checked. (The previous wording asserted that "logging out here does not log
+  the others out". That was only ever true of the local databases.)
+- **Two layers decide what may be copied**, and they are the safety filter, not tidiness.
+  (1) The source must really have the extension **installed unpacked** —
+  `Extensions/<id>/<version>/manifest.json`, the launcher's own definition of installed —
+  and symlinks are not followed, so an empty or half-removed `Extensions/<id>` does not
+  qualify. (2) The extension **this instance loads unpacked** is excluded by its derived id:
+  Chromium's id for an unpacked dir is `sha256(absolute load path)`, first 16 bytes, each
+  nibble mapped `0-15 → a-p`, and that id is read out of the instance's own launcher. The
+  curator extension is loaded unpacked from a shared directory, so it has no `Extensions/`
+  dir in any profile while carrying the **same** id in all of them, and its
+  `chrome.storage.local` holds *that instance's* `install_uuid` and per-install secret — a
+  blanket copy would overwrite the instance's identity with the main browser's and the
+  service would see a different install. No id is hard-coded by either layer (on the owner's
+  profile: 21 of 28 state dirs are eligible, and the curator is excluded by both).
 - **It removes the login, not necessarily the unlock.** The account and the encrypted vault
   come along, so email + master password + 2FA are not needed again. Whether the vault comes
   up **unlocked** is the Bitwarden vault-timeout setting's business: with «Never» + «Lock»
   the derived key is persisted and it should; otherwise the master password is asked once.
-- **The encrypted vault then exists in one more profile on this disk** — the main profile
-  plus every instance this is run for.
+- **Bitwarden is not the only one, and the vaults then exist in one more profile on this
+  disk.** MetaMask (`nkbihfbeogaeaoehlefnkodbefgpgknn`) is store-installed and therefore
+  eligible too, and its `chrome.storage.local` holds the wallet's **encrypted seed vault**.
+  Use `ONLY=` if you want the password manager without the wallet.
 
 Each `<id>` directory is **replaced**, not merged (mixing fresh `.ldb` files with a stale
 `MANIFEST` yields a database that is neither), through the same stage-and-swap as
-`bundle --force`, so an interrupted copy leaves the instance's previous state intact. The
+`bundle --force`, so an interrupted copy leaves *that id's* previous state intact. The
 source profile is **only ever read**.
+
+**The commit is per id, not per run.** If the copy dies half-way (a full disk, a permission
+error), the ids it already finished are already replaced and their previous state is gone.
+That list is printed on stderr before the error propagates, so a half-migrated profile is at
+least a *known* half-migrated profile — and re-running is safe, because the copy overwrites.
+The total size is checked against `df` on the destination up front (the copy plus the one
+tree being staged), so "no space left on device" half-way through should not happen at all.
+
+**Stale staging dirs are swept at the start of every run.** The stage-and-swap builds into
+`<destination>/.rebuild-XXXX/new/`; a `SIGKILL` or a power cut between the build and the
+swap leaves that directory behind holding a **partial copy of the vault**, next to the real
+one, and nothing else ever removes it. Every run deletes the `.rebuild-*` dirs it finds
+beside the two destinations before it starts (`--dry-run` lists them instead).
 
 ## Manual acceptance (needs a real browser + service — NOT covered by pytest)
 

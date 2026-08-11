@@ -136,9 +136,11 @@ def render_launcher_script(
     comment in the generated script for why. What it does NOT carry is extension STATE:
     the vault session, the per-extension settings and the local storage all live in the
     profile's ``Local Extension Settings``, which stays empty in a fresh instance. So the
-    extensions arrive installed but logged-out and unconfigured. That is deliberate and
-    is not a gap to be closed: copying that state would share ONE Bitwarden vault session
-    across every space.
+    extensions arrive installed but logged-out and unconfigured. That is the DEFAULT
+    because it is the safe one, not because the state must stay put: ``copy-state`` /
+    ``make instance-state`` copies it into ONE chosen instance on request, once, with
+    every Brave quit (:mod:`.state`). What is deliberately not on offer is a live shared
+    session — a LevelDB has a single writer, so the profiles diverge from the copy on.
 
     Two costs of this mechanism are STATED here rather than fixed, because fixing either
     one costs more than it buys:
@@ -542,6 +544,37 @@ def copy_bundle(
 # Prefix of the staging dir `replace_tree` builds into. Dotted so it is inconspicuous
 # next to the target, and distinctive so a leftover from a crashed rebuild is obvious.
 _REBUILD_STAGING_PREFIX = ".rebuild-"
+
+
+def stale_staging_dirs(parent: str | Path) -> list[Path]:
+    """Leftover ``.rebuild-*`` staging dirs in *parent* — never a live one's.
+
+    :func:`replace_tree` removes its own staging dir on every path it can control, but not
+    on the one it cannot: a ``SIGKILL`` (or a power cut) between the build and the swap
+    leaves ``.rebuild-XXXX/new/`` sitting next to the target with a PARTIAL copy of
+    whatever was being replaced — for :mod:`.state` that is a partial copy of an encrypted
+    vault, left in the profile forever, because nothing else ever looks for it.
+
+    Only real directories whose name carries the prefix are reported; a symlink with that
+    name is left alone rather than followed, since deleting through one would reach outside
+    the profile. This never runs concurrently with a live ``replace_tree``: the caller
+    sweeps BEFORE it starts copying, and the copy refuses to run at all while a browser is
+    alive.
+    """
+    parent = Path(parent)
+    if not parent.is_dir():
+        return []
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return []
+    return sorted(
+        child
+        for child in children
+        if child.name.startswith(_REBUILD_STAGING_PREFIX)
+        and not child.is_symlink()
+        and child.is_dir()
+    )
 
 
 def replace_tree(dst: str | Path, build: Callable[[Path], None]) -> None:
