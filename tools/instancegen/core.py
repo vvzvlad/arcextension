@@ -110,21 +110,6 @@ def instance_paths(out_root: str | Path, instance_id: str, title: str) -> Instan
 # --------------------------------------------------------------------------- #
 # Launcher + Info.plist
 # --------------------------------------------------------------------------- #
-def build_launch_command(
-    brave_binary: str,
-    profile_dir: str | Path,
-    extension_dir: str | Path,
-    extra_flags: list[str] | None = None,
-) -> list[str]:
-    """The argv the launcher execs: Brave + the two per-instance flags (§13)."""
-    return [
-        brave_binary,
-        f"--user-data-dir={profile_dir}",
-        f"--load-extension={extension_dir}",
-        *(extra_flags or []),
-    ]
-
-
 def render_launcher_script(
     brave_binary: str,
     profile_dir: str | Path,
@@ -153,6 +138,32 @@ def render_launcher_script(
     extensions arrive installed but logged-out and unconfigured. That is deliberate and
     is not a gap to be closed: copying that state would share ONE Bitwarden vault session
     across every space.
+
+    Two costs of this mechanism are STATED here rather than fixed, because fixing either
+    one costs more than it buys:
+
+    **(a) The mtime heuristic picks the newest version dir ON DISK, which is not
+    necessarily the version the main browser has ACTIVE.** Chromium unpacks an update
+    ahead of time and activates it later, recording the pending one under
+    ``idle_install_info`` in ``Secure Preferences``. Measured on the owner's real profile:
+    uBlock Origin active 1.72.2 / on disk 1.73.0, MetaMask active 13.41.0.0 / on disk
+    13.42.0.0 — 2 of 26 diverged that day. Usually this only means "slightly newer". The
+    edge that must be named: ``idle_install_info`` is ALSO where Chromium parks an update
+    requesting NEW PERMISSIONS the user has not approved yet, and a ``--load-extension``
+    extension is granted its manifest's permissions with no prompt at all — so an instance
+    can run a permission set the main browser is deliberately holding back. Being
+    authoritative would mean reading ``Secure Preferences``, i.e. parsing JSON in POSIX sh:
+    either a Python dependency at LAUNCH time, or resolving the versions once at generation
+    time — and freezing is exactly the behaviour re-resolving at every launch exists to
+    avoid. The trade-off is accepted knowingly, not overlooked.
+
+    **(b) A directory under ``Extensions/`` does not mean the extension is ENABLED.**
+    Disabling an extension in ``brave://extensions`` writes ``state``/``disable_reasons``
+    into prefs and LEAVES the directory on disk; an uninstalled one also lingers there
+    until garbage collection. The glob loads both, and ``--load-extension`` activates what
+    it is given unconditionally — so an extension the owner disabled in the main browser
+    stays alive in every instance, and one they removed can come back until Chromium
+    collects the dir. Filtering would need the same ``Secure Preferences`` JSON as (a).
     """
     flags = " ".join(_sh_quote(f) for f in (extra_flags or []))
     flags_line = f"  {flags} \\\n" if flags else ""
@@ -189,6 +200,10 @@ def _render_extension_sync(
     with no error anywhere. Chromium never auto-updates a ``--load-extension`` extension,
     so re-reading the main profile at each launch is the ONLY thing that keeps these
     current.
+
+    The version dir is picked by MTIME, and EVERY candidate is walked newest-first until
+    one that actually carries a ``manifest.json`` is found — see the trade-offs (a) and (b)
+    in :func:`render_launcher_script` for what that heuristic can and cannot know.
     """
     return (
         "\n"
@@ -200,17 +215,31 @@ def _render_extension_sync(
         "# Chromium hashes that key instead of the load path. Extension STATE does NOT\n"
         "# come along (Local Extension Settings stays empty) — logged-out by design.\n"
         "# The curator bundle is FIRST and is loaded even with no main profile present.\n"
+        "# Two things this cannot know: whether the newest dir on disk is the version the\n"
+        "# main browser has ACTIVE (an update pending a permission prompt sits on disk\n"
+        "# already), and whether an extension is ENABLED there at all (a disabled or\n"
+        "# uninstalled one keeps its dir). Both would need Secure Preferences parsed.\n"
         f"EXTS={_sh_quote(str(extension_dir))}\n"
         f"MAIN={_sh_quote(str(main_extensions_dir))}\n"
         'if [ -d "$MAIN" ]; then\n'
         '  for d in "$MAIN"/*/; do\n'
         "    id=${d%/}; id=${id##*/}\n"
-        "    # Not extensions: Chromium's staging dir and macOS clutter.\n"
-        '    case "$id" in Temp|.*) continue ;; esac\n'
+        "    # Not an extension: Chromium's staging dir. Dotted entries need no case of\n"
+        "    # their own — POSIX `*` never expands to a leading dot.\n"
+        '    case "$id" in Temp) continue ;; esac\n'
         "    # Newest by MTIME, not by name: several ids keep 2-3 version dirs side by\n"
-        "    # side and `<version>_0` sorts wrongly (1.10.0_0 < 1.9.0_0).\n"
-        '    v=$(ls -dt "$d"*/ 2>/dev/null | head -1)\n'
-        '    [ -n "$v" ] && [ -f "${v}manifest.json" ] && EXTS="$EXTS,${v%/}"\n'
+        "    # side and `<version>_0` sorts wrongly (1.10.0_0 < 1.9.0_0). Every candidate\n"
+        "    # is tried, newest first, and the first one that really is an extension wins:\n"
+        "    # the newest dir is NOT always loadable — deleting the files inside an old\n"
+        "    # version dir raises that dir's mtime above the live one, so a main browser\n"
+        "    # collecting an old version (or killed mid-cleanup) puts a manifest-less dir\n"
+        "    # on top. Testing only the first candidate dropped the whole extension.\n"
+        '    v=$(ls -dt "$d"*/ 2>/dev/null | while IFS= read -r c; do\n'
+        '      [ -f "${c}manifest.json" ] || continue\n'
+        "      printf '%s\\n' \"$c\"\n"
+        "      break\n"
+        "    done)\n"
+        '    if [ -n "$v" ]; then EXTS="$EXTS,${v%/}"; fi\n'
         "  done\n"
         "fi\n"
     )
@@ -583,8 +612,18 @@ def _clear_instance_dir_keeping_profile(root: Path) -> None:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class GenerateResult:
+    """What ``generate`` produced: the instance's paths, and nothing that duplicates them.
+
+    There is deliberately NO ``launch_command`` here anymore. It used to carry the argv
+    ``build_launch_command`` reconstructed — Brave plus the two per-instance flags — and
+    with extension sync on that reconstruction became a LIE: the launcher resolves
+    ``--load-extension`` at launch time into the bundle plus ~26 main-profile dirs, while
+    the field still named the bundle alone. An operator copying it got a browser without
+    Bitwarden and concluded the sync was broken. The launcher script is the single source
+    of truth for the argv, so ``paths.launcher`` is what callers are given.
+    """
+
     paths: InstancePaths
-    launch_command: list[str]
 
 
 def generate_instance(
@@ -620,6 +659,11 @@ def generate_instance(
     launch — see :func:`render_launcher_script`. Their STATE is NOT carried over: a fresh
     instance's ``Local Extension Settings`` is empty, so they arrive logged-out and
     unconfigured, deliberately (one shared vault session across every space is not wanted).
+
+    Neither *bundle_dir* nor *sync_extensions_from* may contain a COMMA: Chromium splits
+    ``--load-extension`` on commas, so one in either operator-chosen path would cut every
+    entry built from it into nonexistent halves — with sync on that is all ~27 extensions
+    at once, silently.
     """
     paths = instance_paths(out_root, instance_id, title)
 
@@ -636,6 +680,22 @@ def generate_instance(
             "shared universal bundle first with `instancegen bundle`"
         )
 
+    # Chromium splits `--load-extension` on COMMAS. Extension ids and `<version>_0` dir
+    # names cannot contain one, but these two paths are operator-chosen — and a single
+    # comma anywhere in the main-profile path poisons EVERY entry the launcher builds
+    # under it (~27 at once), each half naming a directory that does not exist, with the
+    # browser reporting nothing. Refuse the path instead of generating that launcher.
+    for option, path in (
+        ("--bundle-dir", bundle_dir),
+        ("--sync-extensions", sync_extensions_from),
+    ):
+        if path is not None and "," in str(path):
+            raise ValueError(
+                f"{option} path contains a comma ({path}) — Chromium splits "
+                "--load-extension on commas, so every path baked from it would be cut "
+                "into pieces that do not exist. Move or rename the directory."
+            )
+
     if paths.root.exists():
         if not overwrite:
             raise FileExistsError(
@@ -650,9 +710,6 @@ def generate_instance(
     paths.profile_dir.mkdir(parents=True, exist_ok=True)
 
     # 2. The .app wrapper: launcher (loads the SHARED bundle), Info.plist, icon source.
-    launch_command = build_launch_command(
-        brave_binary, paths.profile_dir, bundle_dir, extra_flags
-    )
     paths.launcher.parent.mkdir(parents=True, exist_ok=True)
     paths.launcher.write_text(
         render_launcher_script(
@@ -686,4 +743,4 @@ def generate_instance(
         icon_source_png if icon_source_png is not None else instance_icon_png(title)
     )
 
-    return GenerateResult(paths=paths, launch_command=launch_command)
+    return GenerateResult(paths=paths)

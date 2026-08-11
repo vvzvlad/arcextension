@@ -749,20 +749,37 @@ def _stub_brave(tmp_path) -> Path:
     return stub
 
 
-def _run_launcher(launcher: Path) -> list[str]:
-    """Run *launcher* under plain `sh` and return the argv the stub Brave saw."""
+def _run_launcher(launcher: Path, *, shell: str = "sh", locale: str | None = None) -> list[str]:
+    """Run *launcher* under *shell* and return the argv the stub Brave saw.
+
+    *locale* sets `LC_ALL` for the run: glob expansion is sorted by the current collating
+    sequence, so the ORDER in which the launcher walks the main profile's ids — and hence
+    which id happens to be the loop's last iteration — is locale-dependent (`C` puts
+    `Temp` first, `en_US.UTF-8` puts it between `bbb` and `zzz-…`). The degradation tests
+    must not depend on which one the developer's machine happens to use.
+    """
+    env = dict(os.environ)
+    if locale is not None:
+        env["LC_ALL"] = locale
     out = subprocess.run(
-        ["sh", str(launcher)], capture_output=True, text=True, check=True
+        [shell, str(launcher)], capture_output=True, text=True, check=True, env=env
     )
     return out.stdout.splitlines()
 
 
-def _loaded_extensions(launcher: Path) -> list[str]:
+def _loaded_extensions(launcher: Path, **kw) -> list[str]:
     """The `--load-extension` value the launcher actually passed, split into paths."""
-    argv = _run_launcher(launcher)
+    argv = _run_launcher(launcher, **kw)
     flags = [a for a in argv if a.startswith("--load-extension=")]
     assert len(flags) == 1, argv
     return flags[0].split("=", 1)[1].split(",")
+
+
+def _sync_instance(tmp_path, ext: Path, bundle: Path | None = None, name="inst"):
+    """Generate an instance whose launcher syncs *ext* and execs the argv-printing stub."""
+    return _gen(tmp_path / name, "alpha",
+                bundle_dir=bundle if bundle is not None else _make_bundle(tmp_path),
+                brave_binary=str(_stub_brave(tmp_path)), sync_extensions_from=ext)
 
 
 def _fake_main_profile(tmp_path) -> Path:
@@ -770,17 +787,29 @@ def _fake_main_profile(tmp_path) -> Path:
 
     Mirrors what the owner's profile actually contains: several ids, one of them keeping
     THREE version dirs side by side (old versions are not collected immediately), plus
-    Chromium's `Temp` staging dir and a `.DS_Store`. `bbb`'s newest dir by MTIME is
-    `1.10.0_0` while the lexicographically LAST one is `1.9.0_0` — sorting by name picks
-    the wrong (older) one, which is the entire reason the launcher sorts by mtime.
+    Chromium's `Temp` staging dir. `bbb`'s newest dir by MTIME is `1.10.0_0` while the
+    lexicographically LAST one is `1.9.0_0` — sorting by name picks the wrong (older) one,
+    which is the entire reason the launcher sorts by mtime.
+
+    Two entries are deliberately degenerate:
+
+    * `.hidden/` is a hidden DIRECTORY carrying a perfectly good manifest, and it must
+      still not be loaded — POSIX `*` never expands to a leading dot, so `"$MAIN"/*/`
+      never yields it. That is why the launcher's `case` needs no `.*` branch: a branch
+      for it would be dead code (the `.DS_Store` this fixture used to plant could not
+      have reached it either, being a FILE that `*/` cannot match).
+    * `zzz-nomanifest/` has a version dir with NO manifest.json, and is named to sort
+      LAST under every collation (`z` follows both `T`/`Temp` and every other id in C and
+      in en_US.UTF-8). So the id whose manifest check fails is always the loop's FINAL
+      iteration, deterministically — the point at which a non-zero status from the loop
+      body would reach `set -eu` and kill the launcher before it ever execs Brave.
     """
     ext = tmp_path / "main" / "Extensions"
     for rel in ("aaa/1.0.0_0", "bbb/1.2.0_0", "bbb/1.9.0_0", "bbb/1.10.0_0",
-                "Temp/9.9.9_0", "nomanifest/1.0.0_0"):
+                "Temp/9.9.9_0", ".hidden/1.0.0_0", "zzz-nomanifest/1.0.0_0"):
         (ext / rel).mkdir(parents=True)
-        if not rel.startswith("nomanifest/"):
+        if not rel.startswith("zzz-nomanifest/"):
             (ext / rel / "manifest.json").write_text('{"name": "x", "key": "k"}')
-    (ext / ".DS_Store").write_text("mac clutter")
     # mtimes: oldest 1.2.0_0, then 1.9.0_0, newest 1.10.0_0 (name order says otherwise).
     for name, stamp in (("1.2.0_0", 1_700_000_000), ("1.9.0_0", 1_700_001_000),
                         ("1.10.0_0", 1_700_002_000)):
@@ -788,21 +817,62 @@ def _fake_main_profile(tmp_path) -> Path:
     return ext
 
 
-def test_launcher_loads_main_profile_extensions_newest_version_by_mtime(tmp_path):
+# Both collations the fixture's ordering claim covers: `C` walks `Temp` FIRST, a UTF-8
+# collation walks it in the middle. Either way `zzz-nomanifest` is last (see
+# `_fake_main_profile`). A machine without en_US.UTF-8 silently falls back to C, which
+# only makes the run a duplicate of the first — never a false pass.
+_COLLATIONS = ["C", "en_US.UTF-8"]
+
+
+@pytest.mark.parametrize("locale", _COLLATIONS)
+def test_launcher_loads_main_profile_extensions_newest_version_by_mtime(tmp_path, locale):
     """The curator bundle FIRST, then one dir per real extension id, newest by mtime.
 
-    Redden: sort by name instead of mtime (picks bbb/1.9.0_0), drop the `Temp`/dotfile
-    case, or drop the manifest.json check (adds `nomanifest`).
+    Redden: sort by name instead of mtime (picks bbb/1.9.0_0), drop the `Temp` case, or
+    drop the manifest.json check (adds `zzz-nomanifest`). The hidden `.hidden/` dir is
+    absent because of the glob itself; redden that by globbing dotfiles too.
+
+    Run under both collations because the walk order — and therefore which id lands in
+    the loop's last, `set -e`-exposed iteration — is the locale's choice, not ours.
     """
     ext = _fake_main_profile(tmp_path)
     bundle = _make_bundle(tmp_path)
-    res = _gen(tmp_path / "inst", "alpha", bundle_dir=bundle,
-               brave_binary=str(_stub_brave(tmp_path)), sync_extensions_from=ext)
-    assert _loaded_extensions(res.paths.launcher) == [
+    res = _sync_instance(tmp_path, ext, bundle)
+    assert _loaded_extensions(res.paths.launcher, locale=locale) == [
         str(bundle.resolve()),          # the curator bundle is always first
         str(ext / "aaa" / "1.0.0_0"),
         str(ext / "bbb" / "1.10.0_0"),  # NOT 1.9.0_0, which sorts last by name
-        # no Temp/, no .DS_Store, no nomanifest/
+        # no Temp/, no .hidden/, no zzz-nomanifest/
+    ]
+
+
+@pytest.mark.parametrize("shell", ["sh", "dash"])
+def test_launcher_falls_back_when_the_newest_version_dir_has_no_manifest(tmp_path, shell):
+    """One unloadable version dir must not drop the extension — the sibling next to it wins.
+
+    This is a REAL state, not a hypothetical: the main browser garbage-collecting an old
+    version deletes the files inside that dir, which RAISES its mtime above the live one,
+    so for a moment the newest dir on disk is a manifest-less husk (a browser killed
+    mid-cleanup leaves it that way permanently). Taking only the first candidate meant the
+    extension — as likely Bitwarden as anything else — was absent from the instance
+    entirely, with nothing said anywhere.
+
+    Redden: take `ls -dt … | head -1` and test that single candidate.
+    """
+    if shutil.which(shell) is None:  # pragma: no cover - dash is not on every box
+        pytest.skip(f"{shell} is not installed here")
+    ext = tmp_path / "main" / "Extensions"
+    good = ext / "bitwarden" / "1.0.0_0"
+    husk = ext / "bitwarden" / "1.1.0_0" / "_metadata"  # newer, no manifest.json
+    good.mkdir(parents=True)
+    (good / "manifest.json").write_text('{"name": "x", "key": "k"}')
+    husk.mkdir(parents=True)
+    os.utime(good.parent / "1.0.0_0", (1_700_000_000, 1_700_000_000))
+    os.utime(good.parent / "1.1.0_0", (1_700_009_000, 1_700_009_000))
+    bundle = _make_bundle(tmp_path)
+    res = _sync_instance(tmp_path, ext, bundle)
+    assert _loaded_extensions(res.paths.launcher, shell=shell) == [
+        str(bundle.resolve()), str(good)
     ]
 
 
@@ -815,8 +885,7 @@ def test_launcher_re_resolves_extensions_at_every_launch(tmp_path):
     """
     ext = _fake_main_profile(tmp_path)
     bundle = _make_bundle(tmp_path)
-    res = _gen(tmp_path / "inst", "alpha", bundle_dir=bundle,
-               brave_binary=str(_stub_brave(tmp_path)), sync_extensions_from=ext)
+    res = _sync_instance(tmp_path, ext, bundle)
     assert str(ext / "aaa" / "1.0.0_0") in _loaded_extensions(res.paths.launcher)
 
     # The main browser updates `aaa` and collects the old version — no regeneration here.
@@ -828,32 +897,98 @@ def test_launcher_re_resolves_extensions_at_every_launch(tmp_path):
     assert str(ext / "aaa" / "1.0.0_0") not in loaded
 
 
+def _snapshot(tree: Path) -> dict[str, tuple[float, int]]:
+    """(relative path) -> (mtime, size) for every entry under *tree*, dirs included."""
+    return {
+        str(p.relative_to(tree)): (p.stat().st_mtime, p.stat().st_size)
+        for p in sorted(tree.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize("locale", _COLLATIONS)
+def test_launcher_never_writes_into_the_main_profile(tmp_path, locale):
+    """THE safety property of this feature: the main profile is READ, never touched.
+
+    That profile is the owner's real browser — its extension dirs, and the browser that
+    owns them, are live while an instance runs. The launcher must only ever glob and
+    `[ -f ]` in there: no copy, no temp file, no reordered dir, not even a `mkdir -p` on a
+    missing path. Asserted as a full before/after snapshot of (relpath, mtime, size) —
+    every entry, files and directories both.
+
+    Redden: make the launcher (or the generator) write anything under `$MAIN` — a
+    `mkdir -p "$MAIN"`, a staging copy of an extension, a cached list of resolved dirs.
+    """
+    ext = _fake_main_profile(tmp_path)
+    before = _snapshot(ext)
+    res = _sync_instance(tmp_path, ext)
+    _run_launcher(res.paths.launcher, locale=locale)
+    assert _snapshot(ext) == before
+
+
 @pytest.mark.parametrize("state", ["missing", "empty"])
 def test_launcher_still_loads_the_bundle_without_a_usable_main_profile(tmp_path, state):
     """No main profile (or an empty one) must not abort the launcher under `set -eu`.
 
     An instance on a machine without that profile has to come up exactly as it did
     before this feature. Redden: drop the `[ -d "$MAIN" ]` guard, or let the failing
-    `ls` / the false test at the end of the loop body kill the shell.
+    `ls` / a false test at the end of the loop body kill the shell.
     """
     ext = tmp_path / "main" / "Extensions"
     if state == "empty":
         ext.mkdir(parents=True)
     bundle = _make_bundle(tmp_path)
-    res = _gen(tmp_path / "inst", "alpha", bundle_dir=bundle,
-               brave_binary=str(_stub_brave(tmp_path)), sync_extensions_from=ext)
+    res = _sync_instance(tmp_path, ext, bundle)
     assert _loaded_extensions(res.paths.launcher) == [str(bundle.resolve())]
+
+
+@pytest.mark.parametrize("broken", ["no-version-dirs", "unreadable"])
+@pytest.mark.parametrize("locale", _COLLATIONS)
+def test_launcher_skips_a_degenerate_id_dir_and_keeps_the_rest(tmp_path, broken, locale):
+    """A degenerate id dir costs THAT id — never the launch, never the other extensions.
+
+    Both states happen for real: an id dir with no `<version>_0` inside it is what an
+    uninstall leaves behind mid-collection, and an unreadable one is what a profile
+    generated under another user (or a `sudo`-built instance) looks like. In both the
+    glob inside the id dir cannot be expanded at all, `ls` fails, and under `set -eu`
+    that must degrade to "skip this id" rather than kill the shell before `exec`.
+
+    The broken id sorts LAST in every collation, so it is the loop's final iteration —
+    the one whose exit status the `for`, the `if` and then `set -e` actually see.
+
+    Redden: drop the `2>/dev/null`-guarded, status-0 shape of the candidate loop (e.g.
+    end the loop body on a bare `[ -n "$v" ] && …` false chain).
+    """
+    if broken == "unreadable" and os.geteuid() == 0:  # pragma: no cover - CI runs as root
+        pytest.skip("root ignores directory permissions, so nothing would be unreadable")
+    ext = tmp_path / "main" / "Extensions"
+    good = ext / "aaa" / "1.0.0_0"
+    good.mkdir(parents=True)
+    (good / "manifest.json").write_text('{"name": "x", "key": "k"}')
+    bad = ext / "zzz-broken"
+    bad.mkdir()
+    if broken == "unreadable":
+        (bad / "1.0.0_0").mkdir()
+        (bad / "1.0.0_0" / "manifest.json").write_text('{"name": "x", "key": "k"}')
+        os.chmod(bad, 0o000)
+    try:
+        bundle = _make_bundle(tmp_path)
+        res = _sync_instance(tmp_path, ext, bundle)
+        assert _loaded_extensions(res.paths.launcher, locale=locale) == [
+            str(bundle.resolve()), str(good)
+        ]
+    finally:
+        os.chmod(bad, 0o755)  # else tmp_path cleanup cannot descend into it
 
 
 def test_launcher_survives_spaces_in_the_synced_profile_path(tmp_path):
     # The real path is "~/Library/Application Support/BraveSoftware/…" — unquoted it
-    # would split. Redden: drop the _sh_quote around MAIN.
+    # would split. Redden: drop the _sh_quote around MAIN, or split the `ls -dt` output on
+    # $IFS (`for v in $(ls …)`) instead of reading it a line at a time.
     ext = tmp_path / "Application Support" / "Extensions"
     (ext / "aaa" / "1.0.0_0").mkdir(parents=True)
     (ext / "aaa" / "1.0.0_0" / "manifest.json").write_text("{}")
     bundle = _make_bundle(tmp_path)
-    res = _gen(tmp_path / "inst", "alpha", bundle_dir=bundle,
-               brave_binary=str(_stub_brave(tmp_path)), sync_extensions_from=ext)
+    res = _sync_instance(tmp_path, ext, bundle)
     assert _loaded_extensions(res.paths.launcher) == [
         str(bundle.resolve()), str(ext / "aaa" / "1.0.0_0")
     ]
@@ -886,12 +1021,105 @@ def test_cli_generate_bakes_an_absolute_expanded_sync_path(tmp_path):
     assert "~" not in script
 
 
-def test_build_launch_command_shape():
-    cmd = core.build_launch_command("/bin/brave", "/p", "/e", ["--foo"])
-    assert cmd[0] == "/bin/brave"
-    assert "--user-data-dir=/p" in cmd
-    assert "--load-extension=/e" in cmd
-    assert cmd[-1] == "--foo"
+def test_cli_generate_refuses_an_empty_sync_path(tmp_path):
+    """`--sync-extensions ""` is MISSING configuration, not the current directory.
+
+    `Path("").expanduser().resolve()` is the CWD, so an unset `--sync-extensions
+    "$BRAVE_PROFILE"` would bake the generator's working directory (the repo root) into
+    the launcher and quietly load whatever `*/*/manifest.json` happens to live there.
+    Redden: go back to `if sync_extensions is not None` alone — the empty string sails
+    through it and the launcher gets `MAIN='<cwd>'`.
+    """
+    bundle = _make_bundle(tmp_path)
+    out = tmp_path / "inst"
+    with pytest.raises(SystemExit, match="EMPTY path"):
+        cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
+                  "--out", str(out), "--sync-extensions", ""])
+    assert not out.exists()  # nothing generated at all
+
+
+def test_cli_generate_notes_a_sync_path_that_does_not_exist(tmp_path, capsys):
+    """A missing main profile degrades — loudly on stderr, exactly like `build_stamp`.
+
+    Sync is ON by default and the default path comes from the GENERATING user's `~`, so a
+    `.app` copied to another Mac or generated under `sudo` points at a directory that is
+    not there. The launcher's `[ -d "$MAIN" ]` guard then skips all ~26 extensions and
+    says nothing, the browser says nothing either — this note is the only signal. It must
+    NOT be fatal: a missing main profile is a legitimate state, and the launcher re-checks
+    the path at every launch. Redden: drop the note (generation goes silent) or raise
+    instead of noting (a legitimate state becomes a failed build).
+    """
+    bundle = _make_bundle(tmp_path)
+    out = tmp_path / "inst"
+    missing = tmp_path / "no-such-profile" / "Extensions"
+    rc = cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
+                   "--out", str(out), "--sync-extensions", str(missing)])
+    assert rc == 0  # generation SUCCEEDS
+    err = capsys.readouterr().err
+    assert "does not exist" in err and str(missing) in err
+    # …and the same path is still baked in, because it may exist by the next launch.
+    script = (out / "main" / "main.app" / "Contents" / "MacOS" / "run").read_text()
+    assert f"MAIN='{missing}'" in script
+
+
+def test_cli_generate_says_nothing_when_the_sync_path_is_there(tmp_path, capsys):
+    # The note must mark a real degrade, not fire on every healthy run. Redden: print it
+    # unconditionally.
+    ext = _fake_main_profile(tmp_path)
+    bundle = _make_bundle(tmp_path)
+    rc = cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
+                   "--out", str(tmp_path / "inst"), "--sync-extensions", str(ext)])
+    assert rc == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("which", ["bundle", "sync"])
+def test_generate_refuses_a_comma_in_either_baked_path(tmp_path, which):
+    """Chromium splits `--load-extension` on commas, so a comma in either path is fatal.
+
+    Extension ids and `<version>_0` dirs cannot contain a comma, but these two paths are
+    operator-chosen — and one comma in the MAIN path cuts every one of the ~27 entries
+    built under it into halves that name nothing, with the browser reporting nothing.
+    Redden: drop the check and the launcher is generated with the comma in it.
+    """
+    ext = _fake_main_profile(tmp_path)
+    bundle = _make_bundle(tmp_path, name="di,st" if which == "bundle" else "dist")
+    if which == "sync":
+        comma_dir = tmp_path / "ma,in"
+        comma_dir.mkdir()
+        shutil.copytree(ext, comma_dir / "Extensions")
+        ext = comma_dir / "Extensions"
+    with pytest.raises(ValueError, match="comma"):
+        _gen(tmp_path / "inst", "alpha", bundle_dir=bundle, sync_extensions_from=ext)
+
+
+def test_generate_result_carries_no_reconstructed_launch_command(tmp_path, capsys):
+    """The printed `launch:` line names the LAUNCHER, not an argv that would be a lie.
+
+    With sync on, the launcher resolves `--load-extension` at launch into the bundle plus
+    one dir per main-profile extension. A reconstructed argv (the old
+    `GenerateResult.launch_command`) still said `--load-extension=<bundle>` — a single
+    path — so an operator debugging "why is Bitwarden missing in this instance" copied
+    that line, got a browser without Bitwarden and concluded the sync was at fault. This
+    repo does not accept silent divergence (cf. the build stamp's `-dirty` marker), so the
+    field is gone and the script is the one source of truth for the argv.
+
+    Redden: put `launch_command` back on the dataclass and print `shlex.join` of it.
+    """
+    ext = _fake_main_profile(tmp_path)
+    bundle = _make_bundle(tmp_path)
+    res = _sync_instance(tmp_path, ext, bundle)
+    assert not hasattr(res, "launch_command")
+
+    out = tmp_path / "cli-out"
+    rc = cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
+                   "--out", str(out), "--sync-extensions", str(ext)])
+    assert rc == 0
+    launcher = out / "main" / "main.app" / "Contents" / "MacOS" / "run"
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "launch:" in ln)
+    assert str(launcher) in line
+    # The one thing it must never print is a `--load-extension=` the instance does not use.
+    assert "--load-extension=" not in line
 
 
 def test_two_instances_have_distinct_profile_flags(tmp_path):

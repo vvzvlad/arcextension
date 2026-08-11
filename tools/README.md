@@ -10,6 +10,15 @@
    `--user-data-dir`, an icon, and a launcher whose `--load-extension` points at the
    **shared** bundle). It writes **no** extension copy and **no** `instance.json`.
 
+By default the launcher **also** loads the **main Brave profile's** store-installed
+extensions (Bitwarden, DeepL, …) unpacked, alongside the shared bundle — `--load-extension`
+takes a comma-separated list, and the launcher builds that list **at every launch** by
+globbing the main profile's `Extensions/<id>/<version>_0/` dirs. It is still one shared
+bundle and still no per-instance copy of anything: those dirs are **read** from the main
+profile, never copied and never written to. Turn it off with `--no-sync-extensions`, point
+it elsewhere with `--sync-extensions PATH`. Extension **state** does not come along (see
+the caveats below).
+
 The service address, the instance NAME and the per-install secret are **not** in the build
 at all — each profile enters the first two through the extension's **enrollment settings
 UI** and generates the third itself, while the operator's part is opening a short window on
@@ -114,6 +123,32 @@ The launcher execs the **system Brave**. `--load-extension` is gated behind
 not allowed in Google Chrome"). It also does **not** work with **Enhanced Safe Browsing**
 enabled or under the `ExtensionInstallTypeBlocklist` policy (§13).
 
+With extension sync on, the flag carries ~27 unpacked extensions instead of one, and that
+has visible costs:
+
+- **A bigger developer-mode nag bubble on every launch.** Brave/Chromium warns about
+  extensions running in developer mode, and the bubble lists them — with the whole synced
+  set it is a long list, on every single start of every instance.
+- **Extension STATE is not carried, deliberately.** The vault session, per-extension
+  settings and local storage live in the profile's `Local Extension Settings`, which is
+  empty in a fresh instance: the extensions arrive installed but **logged-out and
+  unconfigured**. Copying that state would share ONE Bitwarden vault session across every
+  space, which is the opposite of what separate instances are for.
+- **The version loaded is the newest on DISK, not necessarily the one the main browser has
+  ACTIVE.** Chromium unpacks an update ahead of time and activates it later
+  (`idle_install_info` in `Secure Preferences`); measured on the owner's real profile, 2 of
+  26 diverged on the day this was written. Usually that only means "slightly newer" — but
+  `idle_install_info` is also where an update requesting **new permissions** waits for the
+  user's approval, and a `--load-extension` extension is granted its manifest's permissions
+  **with no prompt**. Being authoritative would mean parsing that JSON in POSIX sh, i.e. a
+  Python dependency at launch time or freezing versions at generation time; freezing is
+  exactly what re-resolving at every launch exists to avoid.
+- **A directory in `Extensions/` does not mean the extension is ENABLED.** Disabling one in
+  `brave://extensions` writes `state`/`disable_reasons` into prefs and leaves the directory;
+  an uninstalled one lingers until garbage collection. The glob loads both and
+  `--load-extension` activates unconditionally, so an extension disabled in the main browser
+  is **alive in every instance**. Filtering needs the same `Secure Preferences` JSON.
+
 ## Manual acceptance (needs a real browser + service — NOT covered by pytest)
 
 The pure core is unit-tested (`tests/test_instancegen.py`,
@@ -128,8 +163,17 @@ live browser and service and must be run by hand:
    LIVE one: the settings page must show «имя уже занято», the live instance must keep
    working, and `curator_auth_rejections_total{reason="enroll_id_taken"}` must tick.
 2. **Two instances share one bundle.** Generate a second instance against the same
-   `--bundle-dir`; confirm both launchers `--load-extension` the **same** directory
-   (`readlink`/`grep` the launchers) and share one `chrome-extension://<id>` origin.
+   `--bundle-dir` and confirm they share one `chrome-extension://<id>` origin for the
+   curator extension. ⚠️ **Grepping for `--load-extension` no longer shows the answer**:
+   with sync on (the default) the launchers read `--load-extension="$EXTS"`, and `$EXTS`
+   is built a few lines above from `EXTS=<bundle>` plus the main profile's dirs. Compare
+   the `EXTS=` line (the shared bundle) — or run both launchers and read the flag off
+   `brave://version`, which is what the browser actually got.
+2a. **The synced extensions arrive, and the main profile is untouched.** Launch an
+   instance and confirm on `brave://extensions` that the main profile's extensions are
+   there with their real ids, logged-out. Then confirm the main browser is unharmed: it
+   keeps running normally and nothing under its `Extensions/` changed (the launcher only
+   reads it — pinned by `test_launcher_never_writes_into_the_main_profile`).
 3. **Clone is rejected, the original is unharmed.** Copy an enrolled instance's `.app`
    (or its dir) to a second machine/profile, launch both; the second mints a new
    `install_uuid` and is **not** already enrolled — it must re-enroll rather than take

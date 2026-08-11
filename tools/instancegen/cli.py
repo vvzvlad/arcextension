@@ -161,6 +161,28 @@ def build_stamp(extension_dir: str | Path) -> tuple[str, str, str] | None:
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
+    # Argument checks run BEFORE a single directory is created, same reasoning as
+    # `copy_bundle`'s: a refusal after `out_root.mkdir` leaves a half-made output tree
+    # behind for the operator to clean up.
+    #
+    # `~` is expanded and the path made absolute HERE: the launcher is a script run from
+    # an arbitrary CWD by launchd, and `~` inside the sh-quoted literal would never expand.
+    sync_extensions = args.sync_extensions
+    if sync_extensions is not None:
+        # An EMPTY value is MISSING configuration, not "the current directory".
+        # `Path("").resolve()` is the CWD, so `--sync-extensions "$BRAVE_PROFILE"` with the
+        # variable unset would quietly bake the generator's working directory (the repo
+        # root, typically) into the launcher. Fail on missing configuration rather than
+        # substitute something (AGENTS.md); --no-sync-extensions is how you turn it OFF.
+        if not str(sync_extensions):
+            raise SystemExit(
+                "--sync-extensions got an EMPTY path (an unset shell variable?) — an "
+                "empty path resolves to the current directory, which is never the Brave "
+                "profile. Pass a real Extensions dir, or --no-sync-extensions to load "
+                "only the curator bundle."
+            )
+        sync_extensions = Path(sync_extensions).expanduser().resolve()
+
     out_root = Path(args.out).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     bundle_dir = Path(args.bundle_dir).resolve()
@@ -169,12 +191,6 @@ def cmd_generate(args: argparse.Namespace) -> int:
     icon_png = None
     if args.icon:
         icon_png = Path(args.icon).read_bytes()
-
-    # `~` is expanded and the path made absolute HERE: the launcher is a script run from
-    # an arbitrary CWD by launchd, and `~` inside the sh-quoted literal would never expand.
-    sync_extensions = args.sync_extensions
-    if sync_extensions is not None:
-        sync_extensions = Path(sync_extensions).expanduser().resolve()
 
     result = core.generate_instance(
         out_root=out_root,
@@ -202,6 +218,22 @@ def cmd_generate(args: argparse.Namespace) -> int:
               "keep updating with the main browser)")
         print("                   state is NOT copied — they start logged-out "
               "(--no-sync-extensions to skip)")
+        if not sync_extensions.is_dir():
+            # NOT an error: a machine with no such profile is a legitimate state, and the
+            # launcher re-checks the path at every launch, so it starts working the moment
+            # that directory appears. But the degrade is otherwise TOTALLY silent — the
+            # launcher's `[ -d "$MAIN" ]` guard skips the whole sync and neither it nor the
+            # browser says a word, so every synced extension is simply absent. Sync is on
+            # by DEFAULT and the default path comes from the generating user's `~`, so a
+            # .app generated under `sudo`, or copied to another Mac, lands here. Same
+            # degrade-with-a-note pattern as `build_stamp` above.
+            print(
+                f"note: --sync-extensions {sync_extensions} does not exist or is not a "
+                "directory — this instance will launch with the curator bundle ALONE, "
+                "with none of the main profile's extensions. Not fatal: the launcher "
+                "re-checks that path at every launch.",
+                file=sys.stderr,
+            )
     # No extension id is printed: it is Chromium's hash of the shared bundle's load path
     # and nothing consumes it anymore (no origin allow-list, no CORS list to update).
     print(f"  icon (.icns)   : {icns.reason}")
@@ -211,7 +243,14 @@ def cmd_generate(args: argparse.Namespace) -> int:
         # the operator does not expect it to be baked in.
         print(f"  note           : --service-url {args.service_url!r} is informational "
               "only; enter the address in the extension settings during enrollment")
-    print("  launch: " + shlex.join(result.launch_command))
+    # The LAUNCHER is printed, never a reconstructed argv. With extension sync on, the
+    # `--load-extension` value is resolved AT LAUNCH into the bundle plus one dir per
+    # main-profile extension, so a reconstructed argv would print a single path that the
+    # instance does not actually run with — and an operator debugging "why is Bitwarden
+    # missing here" would copy that line, get a browser without Bitwarden and conclude the
+    # opposite of the truth. One source of truth for the argv: the script itself.
+    print(f"  launch: {shlex.quote(str(p.launcher))}   (this script IS the argv; "
+          "with sync on, --load-extension is resolved inside it at launch)")
     return 0
 
 
