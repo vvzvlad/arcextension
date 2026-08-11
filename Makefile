@@ -150,6 +150,33 @@ instance: install ## Generate an instance .app (vars: INSTANCE_ID BUNDLE_DIR OUT
 		$(if $(SYNC_EXTENSIONS),--sync-extensions "$(SYNC_EXTENSIONS)",) \
 		$(if $(NO_SYNC_EXTENSIONS),--no-sync-extensions,)
 
+# 3) Copy the store extensions' STATE from the main profile into ONE instance, so they
+#    arrive logged-in instead of logged-out. QUIT BRAVE FIRST — the main browser and every
+#    instance .app: these are live LevelDB databases and the target refuses to run while
+#    any Brave process is alive (there is no --force).
+#      make instance-state INSTANCE_DIR=~/Applications/infra
+#      make instance-state INSTANCE_DIR=~/Applications/infra ONLY=<bitwarden id>
+#      FROM=<dir>   another profile's `Default` dir (default: the main Brave profile)
+#
+#    It is a ONE-TIME COPY and cannot be a live sync: a LevelDB has a single writer, so two
+#    browsers cannot share one directory (a symlink just makes the instance see broken
+#    storage). The profiles diverge afterwards — a logout or a vault change in one does not
+#    reach the others; re-run to re-align (it overwrites, it does not merge). It copies the
+#    account and the ENCRYPTED VAULT, so the full login is gone; whether the vault comes up
+#    UNLOCKED depends on the Bitwarden vault-timeout setting. And the encrypted vault then
+#    exists in one more profile on this disk.
+#
+#    Only ids with an `Extensions/<id>` dir in the SOURCE profile are copied. That excludes
+#    the curator extension by construction (it is loaded unpacked from a shared dir, so it
+#    has no such dir yet the SAME id everywhere) — copying its storage would overwrite the
+#    instance's install_uuid and enrollment secret with the main browser's.
+.PHONY: instance-state
+instance-state: install ## Copy extension state into an instance, Brave quit (vars: INSTANCE_DIR [FROM] [ONLY])
+	$(PY) -m tools.generate_instance copy-state \
+		--instance-dir "$(INSTANCE_DIR)" \
+		$(if $(FROM),--from "$(FROM)",) \
+		$(if $(ONLY),--only "$(ONLY)",)
+
 # --- Housekeeping ------------------------------------------------------------
 .PHONY: clean
 clean: ## Remove the venv and Python caches

@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.instancegen import cli, core, macos
+from tools.instancegen import cli, core, macos, state
 
 REPO_EXTENSION = Path(__file__).resolve().parents[1] / "extension"
 
@@ -1279,3 +1279,303 @@ def test_title_with_traversal_stays_under_out_root(tmp_path):
     # The human-readable title still survives verbatim in Info.plist.
     plist = res.paths.info_plist.read_text()
     assert "../../escape" in plist  # CFBundleName keeps the raw (xml-escaped) title
+
+
+# --------------------------------------------------------------------------- #
+# copy-state: the ONE-TIME copy of per-extension state into an instance
+# --------------------------------------------------------------------------- #
+# The id shapes below stand for the two kinds this feature must tell apart:
+# a STORE-installed extension (unpacked by the browser into `Extensions/<id>/`) and the
+# CURATOR-style one (loaded unpacked from a shared dir, so it has the SAME id in every
+# profile and NO `Extensions/<id>` dir anywhere).
+_STORE_ID = "nngceckbapebfimnlniiiahkandclblb"  # shaped like Bitwarden's
+_STORE_ID_2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_CURATOR_ID = "cccccccccccccccccccccccccccccccc"
+
+
+def _fake_source_profile(tmp_path) -> Path:
+    """A main profile's `Default` dir with both kinds of extension in it.
+
+    `_STORE_ID` has an `Extensions/` dir and BOTH state dirs; `_STORE_ID_2` has an
+    `Extensions/` dir and only `Local Extension Settings` (nothing ever used
+    chrome.storage.sync — the common case); `_CURATOR_ID` has state but NO `Extensions/`
+    dir, exactly like the curator extension in the owner's real profile.
+    """
+    source = tmp_path / "main" / "Default"
+    for ext_id in (_STORE_ID, _STORE_ID_2):
+        (source / "Extensions" / ext_id / "1.0.0_0").mkdir(parents=True)
+    for ext_id in (_STORE_ID, _STORE_ID_2, _CURATOR_ID):
+        d = source / state.LOCAL_SETTINGS_DIRNAME / ext_id
+        d.mkdir(parents=True)
+        (d / "000003.ldb").write_text(f"local-{ext_id}")
+        (d / "LOCK").write_text("")
+    sync = source / state.SYNC_SETTINGS_DIRNAME / _STORE_ID
+    sync.mkdir(parents=True)
+    (sync / "000003.ldb").write_text("sync-store")
+    return source
+
+
+def _instance_with_state(tmp_path, name="infra") -> Path:
+    """An instance root (as `generate` writes it) whose profile ALREADY holds state.
+
+    Both a store extension's dir and the curator's are pre-populated, because both are
+    real: the instance has been running, its store extensions minted empty databases and
+    the curator minted THIS install's identity.
+    """
+    inst = tmp_path / name
+    default = inst / "profile" / "Default"
+    for ext_id, marker in ((_STORE_ID, "instance-own-state"),
+                           (_CURATOR_ID, "instance-install-uuid")):
+        d = default / state.LOCAL_SETTINGS_DIRNAME / ext_id
+        d.mkdir(parents=True)
+        (d / "000001.log").write_text(marker)
+    return inst
+
+
+def _copy(tmp_path, source, inst, monkeypatch, *, running=(), only=None):
+    """Run the copy with the process check faked — never a real `pgrep` in a test.
+
+    `running_brave_processes` is THE seam (its own docstring says so): patching it keeps
+    the test off the machine's actual process table, which would otherwise decide whether
+    the suite passes depending on whether the developer has Brave open.
+    """
+    monkeypatch.setattr(state, "running_brave_processes", lambda *a, **kw: list(running))
+    return state.copy_extension_state(
+        source_default_dir=source, instance_dir=inst, only=only
+    )
+
+
+def _local(inst: Path, ext_id: str) -> Path:
+    return inst / "profile" / "Default" / state.LOCAL_SETTINGS_DIRNAME / ext_id
+
+
+def _sync(inst: Path, ext_id: str) -> Path:
+    return inst / "profile" / "Default" / state.SYNC_SETTINGS_DIRNAME / ext_id
+
+
+def test_copy_state_never_copies_an_id_without_an_extensions_dir(tmp_path, monkeypatch):
+    """THE identity guard: an id with state but no `Extensions/<id>` is left alone.
+
+    The curator extension is loaded unpacked from a shared directory, so it carries the
+    SAME chrome-extension:// id in every profile while having no `Extensions/` dir in any
+    of them — and its chrome.storage.local holds THIS instance's install_uuid and
+    per-install secret. Copying it would hand the instance the main browser's identity and
+    the service would see a different install.
+
+    Redden: drop the `Extensions/<id>` filter in `eligible_extension_ids` — the curator's
+    marker below is overwritten by the main profile's state.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    copied = _copy(tmp_path, source, inst, monkeypatch)
+
+    assert [c.extension_id for c in copied] == sorted([_STORE_ID, _STORE_ID_2])
+    assert _CURATOR_ID not in [c.extension_id for c in copied]
+    # The instance's OWN identity is still there, untouched.
+    assert (_local(inst, _CURATOR_ID) / "000001.log").read_text() == "instance-install-uuid"
+    assert not (_local(inst, _CURATOR_ID) / "000003.ldb").exists()
+
+
+def test_copy_state_replaces_the_destination_instead_of_merging(tmp_path, monkeypatch):
+    """An eligible id IS copied, and what the instance had is REPLACED, not merged.
+
+    A LevelDB is a set of files that only make sense together — fresh `.ldb` files next to
+    a stale `MANIFEST`/log is a database that is neither. Redden: copy with
+    `dirs_exist_ok=True` instead of replacing, and the instance's own `000001.log` survives
+    alongside the copied files.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    _copy(tmp_path, source, inst, monkeypatch)
+
+    dest = _local(inst, _STORE_ID)
+    assert (dest / "000003.ldb").read_text() == f"local-{_STORE_ID}"
+    assert not (dest / "000001.log").exists()  # the instance's previous content is gone
+    assert sorted(p.name for p in dest.iterdir()) == ["000003.ldb", "LOCK"]
+
+
+def test_copy_state_takes_sync_settings_when_present_and_skips_them_silently(
+    tmp_path, monkeypatch
+):
+    """`Sync Extension Settings` comes along when the source has it, and is not invented.
+
+    Most extensions never touch chrome.storage.sync, so its absence is normal and must not
+    raise or leave an empty dir behind. Redden: copy the Sync dir unconditionally.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    copied = {c.extension_id: c for c in _copy(tmp_path, source, inst, monkeypatch)}
+
+    assert (_sync(inst, _STORE_ID) / "000003.ldb").read_text() == "sync-store"
+    assert copied[_STORE_ID].parts == (
+        state.LOCAL_SETTINGS_DIRNAME, state.SYNC_SETTINGS_DIRNAME
+    )
+    # The source has no Sync dir for the second extension: nothing is created for it.
+    assert not _sync(inst, _STORE_ID_2).exists()
+    assert copied[_STORE_ID_2].parts == (state.LOCAL_SETTINGS_DIRNAME,)
+
+
+def test_copy_state_only_restricts_the_set(tmp_path, monkeypatch):
+    """`ONLY=` moves just the named ids — the point being "just Bitwarden, nothing else".
+
+    Redden: ignore `only` and every eligible id is copied, so the second extension's dir
+    appears in the instance.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    copied = _copy(tmp_path, source, inst, monkeypatch, only=[_STORE_ID])
+
+    assert [c.extension_id for c in copied] == [_STORE_ID]
+    assert (_local(inst, _STORE_ID) / "000003.ldb").is_file()
+    assert not _local(inst, _STORE_ID_2).exists()
+
+
+def test_copy_state_only_refuses_an_id_that_has_no_extensions_dir(tmp_path, monkeypatch):
+    """`ONLY=<curator id>` is refused rather than quietly obeyed — the filter has no bypass.
+
+    Redden: apply `only` to the raw state dirs instead of intersecting it with the eligible
+    set, and an explicit id becomes a way around the identity guard.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    with pytest.raises(state.StateCopyRefused, match=_CURATOR_ID):
+        _copy(tmp_path, source, inst, monkeypatch, only=[_CURATOR_ID])
+    assert (_local(inst, _CURATOR_ID) / "000001.log").read_text() == "instance-install-uuid"
+
+
+def test_copy_state_refuses_while_brave_is_running_and_copies_nothing(
+    tmp_path, monkeypatch
+):
+    """THE safety requirement: a live browser blocks the copy, and nothing is written.
+
+    These are live LevelDB databases; snapshotting one under its own writer can copy a
+    half-flushed log and leave the instance with a corrupt vault. There is no --force, so
+    this is the only outcome while Brave runs.
+
+    Redden: skip the check (or add a --force that bypasses it) — the destination below
+    changes.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    before = _snapshot(inst)
+    running = [
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser "
+        f"--user-data-dir={inst}/profile --load-extension=/x",
+        "/Applications/Brave Browser.app/…/Brave Browser Helper --type=renderer",
+    ]
+    with pytest.raises(state.StateCopyRefused) as excinfo:
+        _copy(tmp_path, source, inst, monkeypatch, running=running)
+
+    assert _snapshot(inst) == before  # not one byte written
+    # The message NAMES what to quit: the main browser and that instance's profile, and
+    # not the renderer helper, which quitting the browser takes with it anyway.
+    message = str(excinfo.value)
+    assert "the MAIN Brave profile" in message
+    assert f"{inst}/profile" in message
+    assert "renderer" not in message
+
+
+def test_copy_state_refuses_when_the_process_check_itself_fails(tmp_path, monkeypatch):
+    """No `pgrep`, no copy: an unverified guard must not authorise the copy.
+
+    Redden: return `[]` from `running_brave_processes` when pgrep cannot be run — the guard
+    then fails OPEN, i.e. it is exactly as good as no guard on the machine where it breaks.
+    """
+    def no_pgrep(*_args, **_kwargs):
+        raise FileNotFoundError("pgrep")
+
+    monkeypatch.setattr(state.subprocess, "run", no_pgrep)
+    with pytest.raises(state.StateCopyRefused, match="cannot check"):
+        state.running_brave_processes()
+
+
+def test_copy_state_interrupted_leaves_the_instances_previous_state_intact(
+    tmp_path, monkeypatch
+):
+    """A copy that dies half-way leaves the destination exactly as it was (stage-and-swap).
+
+    The fresh tree is built beside the target and swapped in whole (core.replace_tree), so
+    the failure window is two renames rather than the length of a 7 MB copy. Redden:
+    rmtree the destination and copytree straight into it — the assertion below then finds
+    the half-written tree instead of the instance's own state.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+
+    def die_half_way(_src, dst, *_args, **_kwargs):
+        # A HALF-written tree, then death — the state a power cut leaves behind.
+        Path(dst).mkdir(parents=True)
+        (Path(dst) / "000003.ldb").write_text("half a database")
+        raise KeyboardInterrupt("power cut")
+
+    monkeypatch.setattr(state.shutil, "copytree", die_half_way)
+    # Restricted to the one id whose destination ALREADY holds state: that is the content
+    # the swap has to protect, and copying it must be what gets interrupted.
+    with pytest.raises(KeyboardInterrupt):
+        _copy(tmp_path, source, inst, monkeypatch, only=[_STORE_ID])
+
+    dest = _local(inst, _STORE_ID)
+    assert (dest / "000001.log").read_text() == "instance-own-state"
+    assert not (dest / "000003.ldb").exists()
+    # And no staging leftovers next to it either.
+    assert sorted(p.name for p in dest.parent.iterdir()) == sorted([_STORE_ID, _CURATOR_ID])
+
+
+def test_copy_state_never_writes_into_the_source_profile(tmp_path, monkeypatch):
+    """The SOURCE profile is READ-ONLY here — the same invariant the launcher holds.
+
+    That profile is the owner's real browser. Asserted as a full before/after snapshot of
+    (relpath, mtime, size), every entry, files and directories both.
+
+    Redden: stage inside the source, write a marker there, or `mkdir` a missing state dir
+    in it.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    before = _snapshot(source)
+    _copy(tmp_path, source, inst, monkeypatch)
+    assert _snapshot(source) == before
+
+
+def test_cli_copy_state_runs_end_to_end_and_states_the_terms(tmp_path, monkeypatch, capsys):
+    """The CLI wiring, plus the three things the operator must be told on every run.
+
+    Redden: drop the copy/sync/vault-location paragraph — an operator would then take this
+    for a live sync and assume a logout propagates.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    monkeypatch.setattr(state, "running_brave_processes", lambda *a, **kw: [])
+
+    assert cli.main([
+        "copy-state", "--instance-dir", str(inst), "--from", str(source),
+        "--only", f"{_STORE_ID}, {_STORE_ID_2}",
+    ]) == 0
+
+    printed = capsys.readouterr().out
+    assert _STORE_ID in printed and _STORE_ID_2 in printed
+    assert "ONE-TIME COPY, not a sync" in printed
+    assert "master password" in printed          # what it does NOT promise
+    assert "one more copy on this disk" in printed  # where the vault now lives
+    assert (_local(inst, _STORE_ID) / "000003.ldb").is_file()
+
+
+def test_cli_copy_state_exits_non_zero_while_brave_runs(tmp_path, monkeypatch):
+    # A refusal is an expected outcome, not a crash: it must be a non-zero exit with the
+    # message, never a traceback. Redden: let StateCopyRefused propagate out of the CLI.
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    monkeypatch.setattr(
+        state, "running_brave_processes",
+        lambda *a, **kw: ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["copy-state", "--instance-dir", str(inst), "--from", str(source)])
+    assert "Brave is running" in str(excinfo.value)
+
+
+def test_cli_copy_state_has_no_force_option(tmp_path):
+    # The guard protects live databases and must have no bypass. Redden: add --force.
+    with pytest.raises(SystemExit):
+        cli.main(["copy-state", "--instance-dir", str(tmp_path), "--force"])

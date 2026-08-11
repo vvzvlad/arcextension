@@ -14,6 +14,7 @@ import shutil
 import struct
 import tempfile
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -538,9 +539,59 @@ def copy_bundle(
     )
 
 
-# Prefix of the staging dir `replace_bundle` builds into. Dotted so it is inconspicuous
-# next to the bundle, and distinctive so a leftover from a crashed rebuild is obvious.
+# Prefix of the staging dir `replace_tree` builds into. Dotted so it is inconspicuous
+# next to the target, and distinctive so a leftover from a crashed rebuild is obvious.
 _REBUILD_STAGING_PREFIX = ".rebuild-"
+
+
+def replace_tree(dst: str | Path, build: Callable[[Path], None]) -> None:
+    """Put a freshly built tree at *dst* without ever leaving a half-written one there.
+
+    *build* is handed a path that does not exist yet and must materialise the complete new
+    tree at it. Only a COMPLETE tree is ever swapped in:
+
+        1. build -> <parent>/.rebuild-XXXX/new     (the slow part; dst still intact)
+        2. rename dst -> <staging>/old             (dst is free for an instant)
+        3. rename <staging>/new -> dst             (dst is now the NEW tree, same path)
+        4. rmtree the staging dir                  (drops the previous tree)
+
+    The staging dir is a sibling of *dst* on purpose: ``os.replace`` cannot rename across
+    filesystems, and a system temp dir very often is one. The only lossy window is between
+    (2) and (3) — two renames in one directory — and even there the previous tree still
+    exists under the staging dir until step (4). Anything that fails earlier leaves *dst*
+    exactly as it was.
+
+    Shared by the two callers that must not corrupt what they replace: an unpacked bundle a
+    browser already loads (:func:`replace_bundle`) and an extension's LevelDB state
+    directory (:mod:`.state`).
+    """
+    dst = Path(dst).resolve()
+    parent = dst.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=_REBUILD_STAGING_PREFIX, dir=parent))
+    new_tree = staging / "new"
+    old_tree = staging / "old"
+
+    try:
+        build(new_tree)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    moved_away = False
+    if dst.exists() or dst.is_symlink():
+        os.replace(dst, old_tree)
+        moved_away = True
+    try:
+        os.replace(new_tree, dst)
+    except BaseException:
+        # Put the previous tree back at its path rather than leaving nothing there.
+        if moved_away:
+            os.replace(old_tree, dst)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def replace_bundle(
@@ -560,25 +611,17 @@ def replace_bundle(
 
     A naive ``rmtree(dst)`` + ``copytree`` would keep the path but is still wrong: an
     interrupted copy leaves the operator with a directory that is no longer a loadable
-    extension. So the fresh tree is built into a staging dir NEXT TO the target — same
-    parent, hence the same filesystem, hence ``os.replace`` is a rename and not a copy —
-    and only a COMPLETE tree is ever swapped in:
-
-        1. copy src -> <parent>/.rebuild-XXXX/new   (the slow part; dst still intact)
-        2. rename dst -> <staging>/old              (dst is free for an instant)
-        3. rename <staging>/new -> dst              (dst is now the NEW tree, same path)
-        4. rmtree the staging dir                   (drops the previous tree)
-
-    The only lossy window is between (2) and (3) — two renames in one directory — and
-    even there the previous tree still exists under the staging dir until step (4).
-    Anything that fails earlier leaves the existing bundle exactly as it was.
+    extension. So the fresh tree is staged next to the target and swapped in whole — see
+    :func:`replace_tree`, which owns that dance.
 
     *version* is forwarded to :func:`copy_bundle`, so the staged tree is already stamped
-    before the swap — the live bundle is never a stamped-in-place tree.
+    before the swap — the live bundle is never a stamped-in-place tree. ``copy_bundle``
+    also validates the source, and it runs inside the staged build, i.e. while dst is
+    still untouched.
     """
     src = Path(src_extension_dir).resolve()
     dst = Path(dst_extension_dir).resolve()
-    # Step (4) DELETES the previous tree at dst, so a source that is dst — or lives inside
+    # The swap DELETES the previous tree at dst, so a source that is dst — or lives inside
     # it — would destroy itself. `--out extension` is a plausible typo; refuse it here
     # rather than eat the repo's own bundle.
     if src == dst or src.is_relative_to(dst):
@@ -586,35 +629,7 @@ def replace_bundle(
             f"refusing to rebuild {dst} from a source inside it ({src}) — the rebuild "
             "replaces that whole directory"
         )
-    parent = dst.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    # Staging goes in the TARGET's parent on purpose: os.replace cannot rename across
-    # filesystems, and a system temp dir is very often a different one.
-    staging = Path(tempfile.mkdtemp(prefix=_REBUILD_STAGING_PREFIX, dir=parent))
-    new_tree = staging / "new"
-    old_tree = staging / "old"
-
-    try:
-        # Validates the source and does all the copying while dst is still untouched.
-        copy_bundle(src_extension_dir, new_tree, version=version)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-
-    moved_away = False
-    if dst.exists() or dst.is_symlink():
-        os.replace(dst, old_tree)
-        moved_away = True
-    try:
-        os.replace(new_tree, dst)
-    except BaseException:
-        # Put the previous bundle back at its path rather than leaving nothing loadable.
-        if moved_away:
-            os.replace(old_tree, dst)
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-
-    shutil.rmtree(staging, ignore_errors=True)
+    replace_tree(dst, lambda staged: copy_bundle(src, staged, version=version))
 
 
 def _clear_instance_dir_keeping_profile(root: Path) -> None:

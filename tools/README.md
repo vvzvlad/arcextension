@@ -129,11 +129,11 @@ has visible costs:
 - **A bigger developer-mode nag bubble on every launch.** Brave/Chromium warns about
   extensions running in developer mode, and the bubble lists them — with the whole synced
   set it is a long list, on every single start of every instance.
-- **Extension STATE is not carried, deliberately.** The vault session, per-extension
+- **Extension STATE is not carried by the launcher.** The vault session, per-extension
   settings and local storage live in the profile's `Local Extension Settings`, which is
   empty in a fresh instance: the extensions arrive installed but **logged-out and
-  unconfigured**. Copying that state would share ONE Bitwarden vault session across every
-  space, which is the opposite of what separate instances are for.
+  unconfigured**. That is the default because it is per instance, not fleet-wide — see
+  `make instance-state` below to copy it into a chosen instance once.
 - **The version loaded is the newest on DISK, not necessarily the one the main browser has
   ACTIVE.** Chromium unpacks an update ahead of time and activates it later
   (`idle_install_info` in `Secure Preferences`); measured on the owner's real profile, 2 of
@@ -174,6 +174,43 @@ stderr. The mtime glob stays anyway, on three reasons:
 3. **It binds to undocumented Chromium internals.** `extensions.settings.<id>.path` and
    `disable_reasons` are private schema, not an API; a rename would fall back to the
    heuristic **silently** — a new silent divergence replacing the one it removed.
+
+## Copying extension state into an instance (`make instance-state`)
+
+`make instance-state INSTANCE_DIR=~/Applications/infra [FROM=<Default dir>] [ONLY=id,id]`
+copies the store extensions' state — `Local Extension Settings/<id>` and, when it exists,
+`Sync Extension Settings/<id>` — from the main profile into one instance, so Bitwarden and
+friends come up logged in. The destination path is identical to the source's because the
+ids are (each store manifest carries a `key`, so Chromium hashes that, not the load path).
+**Quit Brave first** — the main browser *and* every instance `.app`: these are live
+LevelDB databases, a snapshot taken under their own writer can be corrupt, and the command
+refuses to run while any Brave process is alive. There is deliberately **no `--force`**.
+
+Four things it is important not to misread:
+
+- **It is a ONE-TIME COPY and cannot be a live sync.** A LevelDB has a single writer and is
+  lock-protected, so two browsers cannot share one directory — a symlink would only make
+  the instance see broken storage. The profiles **diverge** afterwards: a logout or a vault
+  change in one does not reach the others. Re-run to re-align (it overwrites, never merges).
+- **Only ids with an `Extensions/<id>` dir in the SOURCE profile are copied**, and that is
+  the safety filter, not tidiness. The curator extension is loaded unpacked from a shared
+  directory, so it has **no** `Extensions/` dir in any profile while carrying the **same**
+  id in all of them, and its `chrome.storage.local` holds *that instance's* `install_uuid`
+  and per-install secret. A blanket copy would overwrite the instance's identity with the
+  main browser's and the service would see a different install. No id is hard-coded; Brave's
+  component extensions are excluded by the same rule (on the owner's profile: 21 of 28 state
+  dirs are eligible).
+- **It removes the login, not necessarily the unlock.** The account and the encrypted vault
+  come along, so email + master password + 2FA are not needed again. Whether the vault comes
+  up **unlocked** is the Bitwarden vault-timeout setting's business: with «Never» + «Lock»
+  the derived key is persisted and it should; otherwise the master password is asked once.
+- **The encrypted vault then exists in one more profile on this disk** — the main profile
+  plus every instance this is run for.
+
+Each `<id>` directory is **replaced**, not merged (mixing fresh `.ldb` files with a stale
+`MANIFEST` yields a database that is neither), through the same stage-and-swap as
+`bundle --force`, so an interrupted copy leaves the instance's previous state intact. The
+source profile is **only ever read**.
 
 ## Manual acceptance (needs a real browser + service — NOT covered by pytest)
 

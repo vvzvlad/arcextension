@@ -22,7 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import core, macos
+from . import core, macos, state
 
 # The repo's extension bundle, resolved relative to this file (…/tools/instancegen).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -352,6 +352,83 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     return 0
 
 
+def _human_bytes(count: int) -> str:
+    """*count* as a short human size — the operator is comparing 7 MB against 16 KB."""
+    if count < 1024:
+        return f"{count} B"
+    for unit in ("KB", "MB", "GB"):
+        count /= 1024
+        if count < 1024 or unit == "GB":
+            return f"{count:.1f} {unit}"
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def cmd_copy_state(args: argparse.Namespace) -> int:
+    """Copy the store-installed extensions' STATE from the main profile into an instance.
+
+    This is the answer to "can the state come across too" — and the answer is "once, by
+    copy". :mod:`.state` carries the full argument; the three things the operator must be
+    told are printed below every run, because they are not reversible by an undo:
+
+    * it is a ONE-TIME COPY and cannot be a live sync (a LevelDB has a single writer, so
+      two browsers cannot share one directory and a symlink only breaks the second one) —
+      from here on the profiles diverge;
+    * it removes the full login but not necessarily the unlock: whether the vault comes up
+      unlocked is the vault-timeout setting's business, not this tool's;
+    * the encrypted vault now sits in one more profile on this disk.
+    """
+    only = None
+    if args.only is not None:
+        only = [part.strip() for part in args.only.split(",") if part.strip()]
+        if not only:
+            # An EMPTY value is missing configuration, not "all of them" — same reasoning
+            # as `generate`'s empty --sync-extensions check (AGENTS.md).
+            raise SystemExit(
+                "--only got an empty id list (an unset shell variable?) — pass real "
+                "extension ids, or drop --only to copy every eligible extension."
+            )
+
+    try:
+        copied = state.copy_extension_state(
+            source_default_dir=args.source,
+            instance_dir=args.instance_dir,
+            only=only,
+        )
+    except state.StateCopyRefused as exc:
+        # A refusal is an expected outcome, not a crash: exit non-zero with the message
+        # (SystemExit prints it on stderr and exits 1) instead of a traceback.
+        raise SystemExit(str(exc)) from exc
+
+    source = Path(args.source).expanduser().resolve()
+    profile = Path(args.instance_dir).expanduser().resolve() / "profile"
+    print(f"Copied extension state: {source}")
+    print(f"                     -> {profile}")
+    for item in copied:
+        # Which of the two dirs came along, spelled short: `Local` is chrome.storage.local,
+        # `Sync` is chrome.storage.sync (often absent, and then simply not listed).
+        parts = "+".join(part.split()[0] for part in item.parts)
+        print(f"  {item.extension_id}  {_human_bytes(item.bytes_copied):>9}  {parts}")
+    if not copied:
+        print("  (nothing eligible — no extension has both stored state and an "
+              f"{state.EXTENSIONS_DIRNAME}/<id> dir in that profile)")
+    print(f"  total: {_human_bytes(sum(i.bytes_copied for i in copied))} across "
+          f"{len(copied)} extension(s)")
+    print(
+        "\nThis is a ONE-TIME COPY, not a sync. Two browsers cannot share one LevelDB "
+        "(single writer,\nlock-protected — a symlink would only make the instance see "
+        "broken storage), so the profiles\nDIVERGE from now on: logging out here does not "
+        "log the others out, and a vault change in one\ndoes not propagate. Re-run this to "
+        "re-align them (it overwrites, it does not merge).\n"
+        "The account and the ENCRYPTED VAULT came along, so the full login (email + master "
+        "password +\n2FA) is not needed again. Whether the vault comes up UNLOCKED is your "
+        "Bitwarden vault-timeout\nsetting's business: with «Never» + «Lock» the derived key "
+        "is persisted and it should; otherwise\nyou are asked for the master password once."
+        "\nThe encrypted vault now exists in this instance's profile TOO — one more copy on "
+        "this disk,\nalongside the main profile and every other instance you run this for."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="generate_instance",
@@ -443,6 +520,36 @@ def build_parser() -> argparse.ArgumentParser:
         "chrome-extension:// id); the swap is staged, never a half-written dir",
     )
     b.set_defaults(func=cmd_bundle)
+
+    s = sub.add_parser(
+        "copy-state",
+        help="copy the main profile's extension STATE into an instance (one-time copy)",
+        allow_abbrev=False,
+    )
+    s.add_argument(
+        "--instance-dir",
+        required=True,
+        help="an instance root generated by `generate` (its --user-data-dir is the "
+        "`profile` dir inside it)",
+    )
+    s.add_argument(
+        "--from",
+        dest="source",
+        default=state.DEFAULT_MAIN_PROFILE_DIR,
+        metavar="PATH",
+        help="the MAIN Brave profile's `Default` dir, read-only (default: "
+        f"{state.DEFAULT_MAIN_PROFILE_DIR})",
+    )
+    s.add_argument(
+        "--only",
+        default=None,
+        metavar="ID,ID",
+        help="restrict the copy to these extension ids (default: every eligible one)",
+    )
+    # Deliberately NO --force: the running-browser check guards live LevelDB databases,
+    # and a snapshot taken under their own writer can be corrupt. Quitting Brave is the
+    # only way past it.
+    s.set_defaults(func=cmd_copy_state)
 
     return parser
 
