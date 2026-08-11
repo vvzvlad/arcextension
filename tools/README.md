@@ -178,8 +178,9 @@ stderr. The mtime glob stays anyway, on three reasons:
 ## Copying extension state into an instance (`make instance-state`)
 
 ```bash
-# Look before you leap: lists the ids, their sizes, the total and every exclusion
-# with its reason, and writes nothing. Safe to run with Brave up.
+# Look before you leap: lists the ids, what ARRIVES, what it DELETES at the
+# destination, the totals and every exclusion with its reason — and writes nothing.
+# Safe to run with Brave up.
 make instance-state INSTANCE_DIR=~/Applications/infra DRY_RUN=1
 
 # The real thing (quit Brave first).
@@ -195,10 +196,26 @@ hashes that, not the load path). **Quit Brave first** — the main browser *and*
 instance `.app`: these are live LevelDB databases, a snapshot taken under their own writer
 can be corrupt, and the command refuses to run while any Brave process is alive. There is
 deliberately **no `--force`**. The refusal names each process by **pid**, and says which of
-them are browsers to quit and which are helpers/PWA shims to kill.
+them are browsers to quit and which are helpers/PWA shims to kill. The check **fails
+closed** on every outcome it cannot positively read as "nothing matched" — a `pgrep` that
+errors (exit 2/3), one that claims a match and prints nothing, a line it cannot parse, and
+an empty set of binary names to search for (which would mean `pgrep` never ran at all).
 
-Five things it is important not to misread:
+Seven things it is important not to misread:
 
+- **The destination is not empty, and the run DELETES what is there.** Each `<id>` directory
+  is replaced whole, so whatever the instance had stored for that extension — its own
+  wallet, its own logged-in vault — is gone, with no backup and no undo. The plan therefore
+  sizes **both** sides: every row ends in `DELETES <n>` or `replaced nothing`, a row that
+  destroys a known wallet/vault (MetaMask, Bitwarden) gets a line of its own naming what it
+  is, and a `DELETES:` total sits next to the `total:` of what arrives. Read it before
+  running: on the owner's `infra` instance the plan deletes **95.9 MB** across all 21 ids,
+  including that instance's own **19.4 MB MetaMask seed vault** and **7.3 MB Bitwarden
+  vault**. (The *arriving* figure moves between dry runs — ~91–100 MB — because the source
+  is a set of live LevelDBs compacting under the running browser. One more reason the real
+  run refuses while Brave is up.)
+  (The id list that decides this is the safety filter's; the wallet/vault emphasis comes
+  from a small id → label map that **only** affects wording and never what is copied.)
 - **It is a ONE-TIME COPY and cannot be a live sync.** A LevelDB has a single writer and is
   lock-protected, so two browsers cannot share one directory — a symlink would only make
   the instance see broken storage. The two profiles hold **independent** copies afterwards:
@@ -224,6 +241,18 @@ Five things it is important not to misread:
   blanket copy would overwrite the instance's identity with the main browser's and the
   service would see a different install. No id is hard-coded by either layer (on the owner's
   profile: 21 of 28 state dirs are eligible, and the curator is excluded by both).
+  Layer (b) reads the instance's launcher, so a **missing, unreadable or
+  `--load-extension`-less launcher makes it yield nothing** — the run then proceeds on layer
+  (a) alone. That is a deliberate degradation and it is now a **printed** one: the output
+  carries a `identity guard layer (b) UNAVAILABLE` note with the cause, instead of leaving a
+  weaker guard to be inferred.
+- **An excluded id is not automatically an identity.** Only the id this instance loads
+  unpacked gets the "this install's identity (install_uuid + enrollment secret)" wording.
+  The other six exclusions on the owner's profile are Chrome **component** extensions (Web
+  Store `mnojpmjdmbbfmejpflffifhffcmidifd`, Docs Offline `ghbmnnjooekpmoecnnnilnnbdlolhkhi`,
+  …) — they have state and no `Extensions/<id>`, they are excluded for that reason, and they
+  are described as components. When layer (b) is unavailable the two cannot be told apart,
+  and the reason says exactly that rather than picking one and sounding certain.
 - **It removes the login, not necessarily the unlock.** The account and the encrypted vault
   come along, so email + master password + 2FA are not needed again. Whether the vault comes
   up **unlocked** is the Bitwarden vault-timeout setting's business: with «Never» + «Lock»

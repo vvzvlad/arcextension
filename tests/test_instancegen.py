@@ -1838,6 +1838,108 @@ def test_copy_state_excludes_the_bundle_this_instance_loads_unpacked(
         _copy(tmp_path, source, inst, monkeypatch, only=[curator_id])
 
 
+@pytest.mark.parametrize("binaries", [[], [""], ["", ""]])
+def test_running_brave_processes_refuses_an_empty_pattern_set(monkeypatch, binaries):
+    """"Fails closed" must not depend on the caller passing a binary.
+
+    With no pattern the loop never runs, `pgrep` is never called and EVERY refusal branch
+    in `_pgrep` is skipped — the function returned `[]`, which its callers read as "no
+    browser is running", having checked nothing. No CLI path reaches it today (the default
+    binary is always in the set), but the docstring promises this unconditionally.
+
+    Redden: drop the `if not patterns` guard — `pgrep` is never invoked and the call
+    answers "all clear".
+    """
+    def never(*_a, **_kw):
+        raise AssertionError("pgrep must not be reached — there is nothing to search for")
+
+    monkeypatch.setattr(state.subprocess, "run", never)
+    with pytest.raises(state.StateCopyRefused, match="no binary name to search for"):
+        state.running_brave_processes(binaries)
+
+
+def test_exclusion_reason_tells_a_component_extension_from_an_install_identity(tmp_path):
+    """Six of the seven excluded ids on the real profile are Chrome COMPONENT extensions
+    (Web Store, Docs Offline, …) — excluded correctly and described wrongly: every one was
+    told its storage "is per-install IDENTITY", which is true only of the id THIS instance
+    loads unpacked.
+
+    Layer (b) is what tells them apart, so this instance gets a real launcher: the derived
+    id keeps the identity wording, and the component-shaped id (state, no `Extensions/<id>`,
+    NOT the unpacked id) is described as what it is.
+
+    Redden: collapse the two branches of `_exclusion_reason` back into one — the component
+    id is accused of being this install's identity again.
+    """
+    bundle = tmp_path / "dist"
+    bundle.mkdir()
+    unpacked_id = state.chromium_unpacked_extension_id(str(bundle))
+
+    source = _fake_source_profile(tmp_path)  # `_CURATOR_ID` plays the COMPONENT here
+    d = source / state.LOCAL_SETTINGS_DIRNAME / unpacked_id
+    d.mkdir(parents=True)
+    (d / "000003.ldb").write_text("MAIN browser identity")
+
+    inst = _instance_with_state(tmp_path)
+    _write_launcher(inst, bundle)
+
+    plan = state.plan_extension_state_copy(source_default_dir=source, instance_dir=inst)
+    reasons = dict(plan.excluded)
+    assert plan.unpacked_layer_note is None  # layer (b) really did run
+
+    # The id this instance loads unpacked: the identity wording, kept verbatim.
+    assert "its storage is this install's identity" in reasons[unpacked_id]
+    # The component-shaped id: called a component, and explicitly NOT an identity.
+    assert "COMPONENT extension" in reasons[_CURATOR_ID]
+    assert "Not this instance's identity" in reasons[_CURATOR_ID]
+    assert "storage is per-install IDENTITY" not in reasons[_CURATOR_ID]
+    # Both are still EXCLUDED — the wording changed, the guard did not.
+    assert {unpacked_id, _CURATOR_ID}.isdisjoint(i.extension_id for i in plan.selected)
+
+
+@pytest.mark.parametrize("how", ["no launcher", "no --load-extension"])
+def test_copy_state_says_when_identity_layer_b_could_not_be_computed(
+    tmp_path, monkeypatch, capsys, how
+):
+    """A launcher that is missing or carries no `--load-extension` makes layer (b) yield no
+    ids — it excludes nothing and the run proceeds on layer (a) alone.
+
+    That is the right degradation and the wrong silence: the output was identical to a
+    healthy run, so a weaker guard had to be inferred from the phrasing of a reason.
+
+    Redden: drop `unpacked_layer_note` (or the CLI's note) — the degraded run prints
+    exactly what a fully guarded one prints.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    if how == "no --load-extension":
+        launcher = inst / "curator.app" / "Contents" / "MacOS" / "run"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\nexec '/Applications/Brave Browser.app/x' \\\n")
+
+    plan = state.plan_extension_state_copy(source_default_dir=source, instance_dir=inst)
+    assert plan.unpacked_layer_note is not None
+    monkeypatch.setattr(state, "running_brave_processes", lambda *a, **kw: [])
+
+    assert cli.main([
+        "copy-state", "--instance-dir", str(inst), "--from", str(source), "--dry-run",
+    ]) == 0
+    printed = capsys.readouterr().out
+    assert "layer (b) UNAVAILABLE" in printed
+    assert "Only layer (a) is in force" in printed
+    if how == "no launcher":
+        assert "no launcher script under" in printed
+    else:
+        assert "carries no --load-extension flag" in printed
+
+    # The real run says it too — a degraded guard is not a dry-run-only concern.
+    capsys.readouterr()
+    assert cli.main([
+        "copy-state", "--instance-dir", str(inst), "--from", str(source),
+    ]) == 0
+    assert "layer (b) UNAVAILABLE" in capsys.readouterr().out
+
+
 def test_copy_state_unpacked_id_is_read_through_the_sync_launcher_form(tmp_path):
     """With `--sync-extensions` on, the launcher reads `--load-extension="$EXTS"` and the
     path is in the `EXTS=` assignment above it. Both forms must be understood.
@@ -2071,13 +2173,98 @@ def test_cli_copy_state_dry_run_writes_nothing_and_explains_the_exclusions(
     printed = capsys.readouterr().out
     assert "DRY RUN" in printed
     assert _STORE_ID in printed and _STORE_ID_2 in printed
-    # …and the excluded id is listed WITH its reason.
+    # …and the excluded id is listed WITH its reason. This instance has no launcher, so
+    # layer (b) is unavailable and the reason says the id could not be classified rather
+    # than calling a component extension an install identity (see the two tests below).
     assert _CURATOR_ID in printed
-    assert "per-install IDENTITY" in printed
-    # Sizes and the disk headroom are shown before anything is committed to.
-    assert "total:" in printed and "disk :" in printed
+    assert "could NOT be determined" in printed
+    assert "layer (b) UNAVAILABLE" in printed
+    # Sizes, what is destroyed and the disk headroom, all before anything is committed to.
+    assert "total:" in printed and "disk :" in printed and "DELETES:" in printed
     # A running browser is REPORTED, not raised.
     assert "would REFUSE" in printed and "pid 93062" in printed
+
+
+def test_plan_sizes_what_is_destroyed_not_only_what_arrives(tmp_path):
+    """The plan sized the SOURCE only, so the run read as "21 ids arrive" when it is also
+    "42 MB of this instance's own state is deleted" — MetaMask's wallet among them.
+
+    `_instance_with_state` gives the destination a `_STORE_ID` directory and no
+    `_STORE_ID_2` one, which is the real shape: some ids have state to lose, some do not.
+    Both must be visible per row, and the totals must reflect both.
+
+    Redden: drop `bytes_replaced` from `PlannedCopy` (or size only `source`) — every row
+    reports "replaced nothing" while the destination still loses its state.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    # Make the loss measurable and asymmetric: the destination's own _STORE_ID state is
+    # bigger than what the source will put in its place.
+    (_local(inst, _STORE_ID) / "000002.ldb").write_text("x" * 4096)
+    doomed = state._tree_bytes(_local(inst, _STORE_ID))
+
+    plan = state.plan_extension_state_copy(source_default_dir=source, instance_dir=inst)
+    rows = {item.extension_id: item for item in plan.selected}
+
+    assert rows[_STORE_ID].bytes_replaced == doomed > 0
+    assert rows[_STORE_ID_2].bytes_replaced == 0  # nothing there to lose
+    assert plan.total_replaced_bytes == doomed
+    assert [i.extension_id for i in plan.selected if i.bytes_replaced] == [_STORE_ID]
+    # The source side is untouched by the new measurement.
+    assert plan.total_bytes == sum(i.bytes_to_copy for i in plan.selected) > 0
+
+
+def test_cli_copy_state_dry_run_names_the_state_it_destroys(tmp_path, monkeypatch, capsys):
+    """The operator must read the destruction off the plan, not infer it from the word
+    "overwrites" in a prose paragraph.
+
+    `_STORE_ID` is Bitwarden's real id, so its row is also the "a vault is being deleted"
+    case: that one gets a line of its own, because "the instance gets my main vault" and
+    "the instance's own vault is deleted" are the same command and different decisions.
+
+    Redden: print the rows without the last column, or drop the DELETES total.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    (_local(inst, _STORE_ID) / "000002.ldb").write_text("x" * 4096)
+    monkeypatch.setattr(state, "running_brave_processes", lambda *a, **kw: [])
+
+    assert cli.main([
+        "copy-state", "--instance-dir", str(inst), "--from", str(source), "--dry-run",
+    ]) == 0
+    printed = capsys.readouterr().out
+    rows = {line.split()[0]: line for line in printed.splitlines() if line.startswith("  ")}
+
+    assert "DELETES" in rows[_STORE_ID]  # a destination that has something to lose
+    assert "replaced nothing" in rows[_STORE_ID_2]  # and one that does not
+    # The vault case is impossible to miss, and it names what it is.
+    assert "THIS INSTANCE'S OWN Bitwarden" in printed
+    assert "ENCRYPTED PASSWORD VAULT" in printed and "no undo" in printed
+    # The total names the destruction as deletion, and counts the vault among it.
+    assert "DELETES:" in printed and "irrecoverably replaced" in printed
+    assert "1 of them a wallet/vault" in printed
+    # And the terms paragraph states the same thing rather than only "overwrites".
+    assert "REPLACED WHOLE" in printed and "is DELETED, not merged" in printed
+
+
+def test_cli_copy_state_real_run_reports_the_state_it_deleted(tmp_path, monkeypatch, capsys):
+    """The same accounting after the fact, in the past tense: what this instance no longer
+    has is as much a result of the run as what it gained.
+
+    Redden: report only `bytes_copied` in the real run's summary.
+    """
+    source = _fake_source_profile(tmp_path)
+    inst = _instance_with_state(tmp_path)
+    (_local(inst, _STORE_ID) / "000002.ldb").write_text("x" * 4096)
+    monkeypatch.setattr(state, "running_brave_processes", lambda *a, **kw: [])
+
+    assert cli.main([
+        "copy-state", "--instance-dir", str(inst), "--from", str(source),
+    ]) == 0
+    printed = capsys.readouterr().out
+    assert "DELETED" in printed and "DELETED:" in printed
+    assert "WAS DELETED" in printed  # the vault line, past tense now
+    assert "DELETES" not in printed  # a finished run does not speak in the future
 
 
 def test_cli_copy_state_states_the_appid_and_names_metamask(tmp_path, monkeypatch, capsys):

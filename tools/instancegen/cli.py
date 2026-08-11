@@ -378,6 +378,10 @@ def _human_bytes(count: int) -> str:
 # a live account), so the consequence is named as unverified rather than asserted either
 # way. Do not re-collapse these two into one sentence.
 _COPY_TERMS = (
+    "Every id listed above is REPLACED WHOLE. What this instance had stored for that "
+    "extension — its\nown wallet, its own logged-in vault, its own settings — is DELETED, "
+    "not merged with what arrives.\nThe last column above is how much, per id and in "
+    "total; there is no backup and no undo.\n"
     "This is a ONE-TIME COPY, not a sync. Two browsers cannot share one LevelDB (single "
     "writer,\nlock-protected — a symlink would only make the instance see broken "
     "storage), so the two profiles\nhold two independent copies from now on: a vault "
@@ -401,13 +405,75 @@ _COPY_TERMS = (
 )
 
 
-def _print_plan_rows(rows) -> None:
-    """The `<id>  <size>  Local+Sync` table shared by the dry run and the real run."""
-    for ext_id, size, parts in rows:
+def _print_plan_rows(rows, *, done: bool = False) -> None:
+    """The `<id>  <size>  Local+Sync  replaces …` table, shared by dry run and real run.
+
+    THE LAST COLUMN IS THE ONE THAT WAS MISSING. The table used to size only what ARRIVES,
+    while the destination is not empty: on the owner's real `infra` instance those same 21
+    ids already hold 95.9 MB of that instance's OWN state (measured), including a 19.4 MB
+    MetaMask seed vault and a 7.3 MB Bitwarden vault, and every byte of it is deleted by
+    the run. "Overwrites" in a prose paragraph is not that number. So each row says what it
+    destroys — the figure grows every time the instance is used — and a row
+    that destroys a wallet or a vault says it in a line of its own — the difference between
+    "the instance gets my main wallet" and "the instance's own wallet is deleted" is
+    exactly the decision being taken here.
+
+    Written in the present tense for a plan and the past tense for a finished run (*done*),
+    because "will be deleted" and "has been deleted" are not the same message to read.
+    """
+    for ext_id, size, parts, replaced in rows:
         # Which of the two dirs is involved, spelled short: `Local` is chrome.storage.local,
         # `Sync` is chrome.storage.sync (often absent, and then simply not listed).
         short = "+".join(part.split()[0] for part in parts)
-        print(f"  {ext_id}  {_human_bytes(size):>9}  {short}")
+        verb = "DELETED" if done else "DELETES"
+        verdict = f"{verb} {_human_bytes(replaced)}" if replaced else "replaced nothing"
+        print(f"  {ext_id}  {_human_bytes(size):>9}  {short:<10}  {verdict}")
+        secret = state.secret_store_label(ext_id)
+        if replaced and secret:
+            was = "WAS DELETED" if done else "IS DELETED"
+            hint = (
+                "" if done else
+                " Drop this id from --only if you meant to keep it."
+            )
+            print(f"      ^^^ THIS INSTANCE'S OWN {secret} ({_human_bytes(replaced)}) "
+                  f"{was} and replaced by the main profile's. Not merged, not backed up, "
+                  f"no undo.{hint}")
+
+
+def _print_destroy_total(replaced_total: int, rows, *, done: bool = False) -> None:
+    """The run's destruction total, named as deletion — the counterpart of `total:`."""
+    destroying = [(ext_id, replaced) for ext_id, _s, _p, replaced in rows if replaced]
+    label = "DELETED" if done else "DELETES"
+    if not destroying:
+        print(f"  {label}: nothing — every destination directory was empty or absent")
+        return
+    vaults = [ext_id for ext_id, _ in destroying if state.secret_store_label(ext_id)]
+    tail = f", {len(vaults)} of them a wallet/vault" if vaults else ""
+    held = "held" if done else "holds RIGHT NOW"
+    print(f"  {label}: {_human_bytes(replaced_total)} of state this instance {held} "
+          f"across {len(destroying)} of those id(s){tail} — irrecoverably replaced, "
+          "not merged")
+
+
+def _print_layer_b_note(note: str | None) -> None:
+    """Say it out loud when the positive identity layer went no-op, and why.
+
+    The guard has two layers: (a) the source must really have the extension installed
+    unpacked, (b) the id THIS instance loads unpacked is excluded by derivation from its
+    launcher. Layer (b) needs the launcher; without one it yields no ids, excludes nothing
+    and the run proceeds on layer (a) alone. That degradation was previously invisible —
+    the output looked identical to a healthy run. Printed now, so a weaker guard is READ
+    rather than inferred from the phrasing of an exclusion reason.
+    """
+    if note is None:
+        return
+    print("\nNOTE: identity guard layer (b) UNAVAILABLE — the unpacked-id exclusion could "
+          f"not be computed.\n  cause: {note}\n"
+          "  Only layer (a) is in force (the source's Extensions/<id>/<version>/"
+          "manifest.json filter).\n"
+          "  An extension this instance loads unpacked would NOT be excluded by name. If "
+          "this instance\n  is a real generated one, its launcher is missing or damaged — "
+          "regenerate it before copying.")
 
 
 def _cmd_copy_state_dry_run(args: argparse.Namespace, only: list[str] | None) -> int:
@@ -431,16 +497,20 @@ def _cmd_copy_state_dry_run(args: argparse.Namespace, only: list[str] | None) ->
     print("DRY RUN — nothing was read into, written to or deleted from any profile.")
     print(f"Would copy extension state: {plan.source}")
     print(f"                         -> {plan.destination}")
-    _print_plan_rows(
-        [(item.extension_id, item.bytes_to_copy, item.parts) for item in plan.selected]
-    )
+    rows = [
+        (item.extension_id, item.bytes_to_copy, item.parts, item.bytes_replaced)
+        for item in plan.selected
+    ]
+    _print_plan_rows(rows)
     if not plan.selected:
         print("  (nothing eligible — see the exclusions below)")
     print(f"  total: {_human_bytes(plan.total_bytes)} across "
           f"{len(plan.selected)} extension(s)")
+    _print_destroy_total(plan.total_replaced_bytes, rows)
     print(f"  disk : {_human_bytes(plan.peak_bytes)} needed at peak (the copy plus the "
           f"one tree being staged), {_human_bytes(plan.free_bytes)} free"
           f"{'' if plan.fits else '  <-- DOES NOT FIT; the real run would refuse'}")
+    _print_layer_b_note(plan.unpacked_layer_note)
     if plan.excluded:
         print(f"\nExcluded ({len(plan.excluded)} id(s) that have stored state):")
         for ext_id, reason in plan.excluded:
@@ -502,15 +572,26 @@ def cmd_copy_state(args: argparse.Namespace) -> int:
     profile = Path(args.instance_dir).expanduser().resolve() / "profile"
     print(f"Copied extension state: {source}")
     print(f"                     -> {profile}")
-    _print_plan_rows(
-        [(item.extension_id, item.bytes_copied, item.parts) for item in copied]
-    )
+    rows = [
+        (item.extension_id, item.bytes_copied, item.parts, item.bytes_replaced)
+        for item in copied
+    ]
+    _print_plan_rows(rows, done=True)
     if not copied:
         print("  (nothing eligible — no extension has both stored state and an installed "
               f"{state.EXTENSIONS_DIRNAME}/<id>/<version>/manifest.json in that profile; "
               "run again with --dry-run to see why each id was skipped)")
     print(f"  total: {_human_bytes(sum(i.bytes_copied for i in copied))} across "
           f"{len(copied)} extension(s)")
+    # Past tense here: these directories are already gone. Reported all the same — the
+    # operator has to know what this instance no longer has, not only what it gained.
+    _print_destroy_total(sum(i.bytes_replaced for i in copied), rows, done=True)
+    # Re-read rather than threaded through `copy_extension_state`: the function is pure and
+    # cheap (it parses the same launcher the plan did), and the copy's return type stays
+    # the list of what was copied.
+    _print_layer_b_note(state.unpacked_layer_unavailable(
+        Path(args.instance_dir).expanduser()
+    ))
     print("\n" + _COPY_TERMS)
     return 0
 

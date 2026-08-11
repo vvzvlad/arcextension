@@ -92,6 +92,24 @@ _PGREP_TIMEOUT = 10
 # (`<instance>/<Title>.app/Contents/MacOS/run`, see `core.instance_paths`).
 _LAUNCHER_GLOB = "*.app/Contents/MacOS/run"
 
+# Extensions whose per-extension storage IS a secret store, id -> what it holds.
+#
+# THIS LIST NEVER DECIDES WHAT IS COPIED. Eligibility is `eligible_extension_ids` alone and
+# no id is hard-coded by either of its layers; this map only decides how LOUD the plan is
+# about what the run DESTROYS at the destination. "19.4 MB replaced" and "this instance's
+# own MetaMask seed vault deleted" are the same number and not the same event, and the
+# second one is the decision the operator is actually taking. An id missing from this map
+# is reported plainly, never silently — the map can only add emphasis, never remove a row.
+KNOWN_SECRET_STORES = {
+    "nkbihfbeogaeaoehlefnkodbefgpgknn": "MetaMask — the wallet's ENCRYPTED SEED VAULT",
+    "nngceckbapebfimnlniiiahkandclblb": "Bitwarden — the ENCRYPTED PASSWORD VAULT",
+}
+
+
+def secret_store_label(extension_id: str) -> str | None:
+    """What *extension_id*'s storage holds, if it is a known vault/wallet; else ``None``."""
+    return KNOWN_SECRET_STORES.get(extension_id)
+
 
 class StateCopyRefused(RuntimeError):
     """The copy was refused, or died part-way through, with a message a human can act on.
@@ -108,20 +126,34 @@ class StateCopyRefused(RuntimeError):
 
 @dataclass(frozen=True)
 class CopiedState:
-    """One extension's copied state: its id, the bytes copied and which dirs came along."""
+    """One extension's copied state: its id, the bytes copied and which dirs came along.
+
+    *bytes_replaced* is what the instance held for this id BEFORE the copy and no longer
+    holds: the copy replaces each ``<id>`` directory whole, so that state is gone.
+    """
 
     extension_id: str
     bytes_copied: int
     parts: tuple[str, ...]
+    bytes_replaced: int = 0
 
 
 @dataclass(frozen=True)
 class PlannedCopy:
-    """One extension the plan WOULD copy: its id, total bytes and the dirs involved."""
+    """One extension the plan WOULD copy: its id, total bytes and the dirs involved.
+
+    *bytes_replaced* is the other half of the transaction and the half the plan used to
+    hide: the size of what the DESTINATION already holds for this id, across exactly the
+    dirs this run replaces. It is not a merge — ``core.replace_tree`` swaps the whole
+    directory — so every one of those bytes is deleted, irrecoverably and with no backup.
+    The plan sizes the source and the destination with the same
+    :func:`_tree_bytes`, so the two numbers are comparable.
+    """
 
     extension_id: str
     bytes_to_copy: int
     parts: tuple[str, ...]
+    bytes_replaced: int = 0
 
 
 @dataclass(frozen=True)
@@ -145,11 +177,19 @@ class StateCopyPlan:
     # instance's own launcher, which `generate --brave-binary` may have pointed elsewhere).
     brave_binaries: tuple[str, ...]
     total_bytes: int
+    # What the run DESTROYS: the state the instance holds RIGHT NOW for the selected ids,
+    # summed over exactly the directories that get replaced. Carried next to `total_bytes`
+    # because a plan that shows only what arrives shows half the transaction.
+    total_replaced_bytes: int
     # Peak disk the run needs at the destination: everything landed, PLUS the single
     # largest tree existing twice while it is staged next to its target (core.replace_tree
     # builds the new tree before it drops the old one).
     peak_bytes: int
     free_bytes: int
+    # Set when identity layer (b) — the unpacked-id exclusion read out of THIS instance's
+    # launcher — could not be computed, with the reason. `None` means it was computed.
+    # A silently degraded guard is the thing this field exists to make un-silent.
+    unpacked_layer_note: str | None = None
 
     @property
     def fits(self) -> bool:
@@ -221,9 +261,20 @@ def running_brave_processes(
     :func:`instance_brave_binaries`). Matches are deduplicated by pid, so a process caught
     by two patterns is listed once.
 
-    Fails CLOSED — see :func:`_pgrep` for every branch that refuses.
+    Fails CLOSED — see :func:`_pgrep` for every branch that refuses, and note that an EMPTY
+    pattern set refuses HERE. With no patterns the loop below never runs, so ``pgrep`` is
+    never called and every refusal in :func:`_pgrep` is skipped: the function would return
+    ``[]``, i.e. "no browser is running", having checked nothing. No caller reaches that
+    today (``plan.brave_binaries`` always contains :data:`core.DEFAULT_BRAVE_BINARY`), but
+    "fails closed" is this function's own promise and must not rest on a caller keeping it.
     """
     patterns = sorted({Path(binary).name for binary in brave_binaries if str(binary)})
+    if not patterns:
+        raise StateCopyRefused(
+            "cannot check whether Brave is running: no binary name to search for "
+            f"(brave_binaries={list(brave_binaries)!r}) — `pgrep` was never run, so this "
+            "is not an answer. Refusing to copy live LevelDB databases unverified."
+        )
     matches: dict[str, str] = {}
     for pattern in patterns:
         for line in _pgrep(pattern):
@@ -381,6 +432,43 @@ def instance_unpacked_load_paths(instance_dir: str | Path) -> list[str]:
         # Chromium splits --load-extension on commas; every entry is a load path.
         paths.extend(part for part in value.split(",") if part)
     return sorted(set(paths))
+
+
+def unpacked_layer_unavailable(instance_dir: str | Path) -> str | None:
+    """Why identity layer (b) could NOT be computed for *instance_dir*; ``None`` when it was.
+
+    Layer (b) is the POSITIVE half of the identity guard: it states what this instance's
+    own unpacked extension IS, by deriving its id from the ``--load-extension`` path baked
+    into the instance's launcher. Every input to that comes from the launcher, so a missing
+    launcher, an unreadable one, or one carrying no ``--load-extension`` makes the layer
+    yield an EMPTY id set — and an empty exclusion set excludes nothing. The run then goes
+    ahead on layer (a) alone (the source's ``Extensions/<id>/<version>/manifest.json``
+    filter), which is a real guard but a weaker one, and nothing in the output said so:
+    the operator had to infer the degradation from the phrasing of an exclusion reason.
+
+    Degrading is deliberate — refusing the whole copy because a launcher is missing would
+    be worse — but degrading SILENTLY is not. This returns the sentence the caller prints.
+    """
+    if instance_unpacked_load_paths(instance_dir):
+        return None
+    launchers = instance_launchers(instance_dir)
+    if not launchers:
+        return (
+            f"no launcher script under {Path(instance_dir)} ({_LAUNCHER_GLOB}) — there is "
+            "nothing to read a --load-extension path out of"
+        )
+    problems = []
+    for launcher in launchers:
+        try:
+            text = launcher.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            problems.append(f"{launcher} is unreadable ({type(exc).__name__}: {exc})")
+            continue
+        if _LOAD_EXTENSION_RE.search(text) is None:
+            problems.append(f"{launcher} carries no --load-extension flag")
+        else:
+            problems.append(f"{launcher}'s --load-extension value did not parse")
+    return "; ".join(problems)
 
 
 def chromium_unpacked_extension_id(load_path: str | Path) -> str:
@@ -583,12 +671,32 @@ def plan_extension_state_copy(
         peak_single = max([peak_single, *sizes])
         selected.append(
             PlannedCopy(
-                extension_id=ext_id, bytes_to_copy=sum(sizes), parts=tuple(parts)
+                extension_id=ext_id,
+                bytes_to_copy=sum(sizes),
+                parts=tuple(parts),
+                # The other half of the transaction: what the destination holds for this id
+                # TODAY, over exactly the dirs this run replaces. Same `_tree_bytes` as the
+                # source side, so the two are one comparison and not two measurements.
+                bytes_replaced=sum(
+                    _tree_bytes(destination / part / ext_id)
+                    for part in parts
+                    if (destination / part / ext_id).is_dir()
+                ),
             )
         )
 
+    layer_note = unpacked_layer_unavailable(instance)
     excluded = tuple(
-        (ext_id, _exclusion_reason(ext_id, extensions, unpacked_here, unpacked_paths))
+        (
+            ext_id,
+            _exclusion_reason(
+                ext_id,
+                extensions,
+                unpacked_here,
+                unpacked_paths,
+                layer_b_available=layer_note is None,
+            ),
+        )
         for ext_id in stored
         if ext_id not in selected_ids
     )
@@ -603,8 +711,10 @@ def plan_extension_state_copy(
             sorted({core.DEFAULT_BRAVE_BINARY, *instance_brave_binaries(instance)})
         ),
         total_bytes=total,
+        total_replaced_bytes=sum(item.bytes_replaced for item in selected),
         peak_bytes=total + peak_single,
         free_bytes=_free_bytes(destination),
+        unpacked_layer_note=layer_note,
     )
 
 
@@ -613,8 +723,24 @@ def _exclusion_reason(
     extensions: Path,
     unpacked_here: Sequence[str],
     unpacked_paths: Sequence[str],
+    *,
+    layer_b_available: bool = True,
 ) -> str:
-    """Why an id with stored state is not being copied — one sentence, no jargon."""
+    """Why an id with stored state is not being copied — one sentence, no jargon.
+
+    THE IDENTITY WORDING IS RESERVED FOR THE ID THAT IS AN IDENTITY. Every id that lacks
+    an ``Extensions/<id>/<version>/manifest.json`` used to be told it was "loaded from
+    outside the profile, and its storage is per-install IDENTITY" — true of the curator,
+    false of the six Chrome COMPONENT extensions (Web Store, Docs Offline, …) that share
+    the shape on the real profile. They were excluded correctly and described wrongly, the
+    same conflation :func:`_refuse_ineligible_only` was already split to avoid.
+
+    The two are told apart by layer (b): the ids THIS instance loads unpacked are known by
+    derivation, so anything else is a component/foreign extension, not this install's
+    identity. When layer (b) is unavailable (*layer_b_available* false — see
+    :func:`unpacked_layer_unavailable`) that distinction genuinely cannot be drawn, and the
+    reason says so instead of picking one of the two and sounding certain.
+    """
     if ext_id in unpacked_here:
         where = ", ".join(unpacked_paths) or "this instance's --load-extension path"
         return (
@@ -623,10 +749,22 @@ def _exclusion_reason(
             "enrollment secret), never something to clone"
         )
     if not is_installed_unpacked(extensions, ext_id):
+        missing = (
+            f"no {EXTENSIONS_DIRNAME}/{ext_id}/<version>/manifest.json in the source "
+            "profile, so the browser never installed it there: it is loaded from outside "
+            "the profile — a Chrome COMPONENT extension (Web Store, Docs Offline and the "
+            "like), a policy-installed one, or an unpacked build"
+        )
+        if layer_b_available:
+            return (
+                f"{missing}. Not this instance's identity (layer (b) checked: this "
+                "instance does not load it unpacked) — just not something this copy can "
+                "verify, so its state stays where it is"
+            )
         return (
-            f"no installed copy in the source profile (no {EXTENSIONS_DIRNAME}/{ext_id}"
-            "/<version>/manifest.json) — an extension with state but no unpacked dir is "
-            "loaded from outside the profile, and its storage is per-install IDENTITY"
+            f"{missing}. Whether it is a component extension or an unpacked build that IS "
+            "an install identity could NOT be determined here — identity layer (b) is "
+            "unavailable (see the note above). Excluded either way"
         )
     return "not selected by --only"
 
@@ -723,7 +861,11 @@ def copy_extension_state(
 
     Each ``<id>`` directory is REPLACED, not merged: a LevelDB is a set of files that only
     make sense together, and dropping fresh ``.ldb`` files next to a stale ``MANIFEST``
-    yields a database that is neither. The replacement goes through
+    yields a database that is neither. Replacing means DELETING: whatever this instance had
+    stored for that id — its own MetaMask wallet, its own logged-in Bitwarden — is gone,
+    with no backup and no undo. :attr:`PlannedCopy.bytes_replaced` sizes that loss per id
+    and :attr:`StateCopyPlan.total_replaced_bytes` for the run, so ``--dry-run`` shows both
+    halves of the trade instead of only what arrives. The replacement goes through
     :func:`core.replace_tree`, so the copy is staged beside the destination and swapped in
     whole — an interrupted run leaves that id's previous state exactly as it was. Any
     ``.rebuild-*`` staging dir a KILLED earlier run left behind (holding a partial copy of
@@ -796,6 +938,9 @@ def copy_extension_state(
                     extension_id=current,
                     bytes_copied=item.bytes_to_copy,
                     parts=item.parts,
+                    # Measured BEFORE the swap, by the plan — after it there is nothing
+                    # left to measure, which is the point of reporting it.
+                    bytes_replaced=item.bytes_replaced,
                 )
             )
     except BaseException as exc:
