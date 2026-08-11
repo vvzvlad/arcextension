@@ -183,9 +183,15 @@ def cmd_generate(args: argparse.Namespace) -> int:
             )
         sync_extensions = Path(sync_extensions).expanduser().resolve()
 
+    bundle_dir = Path(args.bundle_dir).resolve()
+    # Hoisted above the mkdir for the same reason as the empty-path check: `core` keeps
+    # this guard too (it is the library-level one), but there it runs AFTER
+    # `out_root.mkdir`, so a comma in either path left an empty output tree behind for the
+    # operator to clean up. Refuse before creating anything.
+    core.reject_comma_in_load_extension_paths(bundle_dir, sync_extensions)
+
     out_root = Path(args.out).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-    bundle_dir = Path(args.bundle_dir).resolve()
     title = args.title or args.instance_id
 
     icon_png = None
@@ -214,8 +220,16 @@ def cmd_generate(args: argparse.Namespace) -> int:
     print(f"  app bundle     : {p.app_dir}")
     print(f"  launcher       : {p.launcher}")
     if sync_extensions is not None:
-        print(f"  sync extensions: {sync_extensions}  (re-read at EVERY launch, so they "
-              "keep updating with the main browser)")
+        # STDOUT must not claim a working sync for a path that is not there: the note
+        # below goes to stderr, and under `make instance > build.log` this line is the
+        # only one kept — it would advertise ~26 extensions an instance will not have.
+        # Same shape as cmd_bundle's "NOT stamped (see the note above)".
+        if sync_extensions.is_dir():
+            print(f"  sync extensions: {sync_extensions}  (re-read at EVERY launch, so "
+                  "they keep updating with the main browser)")
+        else:
+            print(f"  sync extensions: {sync_extensions}  (NOT FOUND — see the note "
+                  "below; the curator bundle ALONE until that path appears)")
         print("                   state is NOT copied — they start logged-out "
               "(--no-sync-extensions to skip)")
         if not sync_extensions.is_dir():

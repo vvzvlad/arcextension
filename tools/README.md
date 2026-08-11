@@ -140,14 +140,40 @@ has visible costs:
   26 diverged on the day this was written. Usually that only means "slightly newer" — but
   `idle_install_info` is also where an update requesting **new permissions** waits for the
   user's approval, and a `--load-extension` extension is granted its manifest's permissions
-  **with no prompt**. Being authoritative would mean parsing that JSON in POSIX sh, i.e. a
-  Python dependency at launch time or freezing versions at generation time; freezing is
-  exactly what re-resolving at every launch exists to avoid.
+  **with no prompt**.
 - **A directory in `Extensions/` does not mean the extension is ENABLED.** Disabling one in
   `brave://extensions` writes `state`/`disable_reasons` into prefs and leaves the directory;
   an uninstalled one lingers until garbage collection. The glob loads both and
   `--load-extension` activates unconditionally, so an extension disabled in the main browser
-  is **alive in every instance**. Filtering needs the same `Secure Preferences` JSON.
+  is **alive in every instance**. The owner is not the only writer of `disable_reasons` —
+  the browser sets it too (a Web Store blocklisting, e.g. an extension pulled for
+  **malware**, the greylist, enterprise policy) and the directory is deliberately kept so
+  the extension can be restored, so **a killswitch that disabled an extension in the main
+  browser is bypassed in the instances**. On a profile that carries a password manager and a
+  crypto wallet that is a different class of consequence from "I turned it off and it still
+  runs".
+
+Reading `Secure Preferences` was **considered and rejected — not impossible**.
+`/usr/bin/plutil` ships in the **base** macOS install (a real Mach-O, unlike the
+`/usr/bin/python3` shim), reads Chromium's JSON and answers both questions directly:
+`plutil -extract "extensions.settings.<id>.path" raw -o - "Secure Preferences"` gives the
+**active** version dir and `…disable_reasons` the enablement state, 26 sequential calls in
+0.22 s wall, with a missing/corrupt file answering empty on stdout and complaining on
+stderr. The mtime glob stays anyway, on three reasons:
+
+1. **The shipped branch would leave CI.** The tests run the generated launcher end-to-end on
+   any machine. `plutil` is macOS-only, so the launcher would become
+   `plutil … || <mtime fallback>` and a Linux runner would only ever exercise the fallback —
+   green CI on a branch that never runs on the target platform. That is the disease
+   `_tiny_repo_extension`'s docstring was written against, with the **platform** deciding
+   whether the assertion runs, and the untested branch would be the shipped one.
+2. **The fallback survives regardless.** `Secure Preferences` is written lazily and can be
+   caught mid-flush (verified: `plutil` answers empty on a truncated file), so the glob stays
+   as the fallback either way — both costs above merely become rarer, at double the
+   complexity in the one script that must never fail.
+3. **It binds to undocumented Chromium internals.** `extensions.settings.<id>.path` and
+   `disable_reasons` are private schema, not an API; a rename would fall back to the
+   heuristic **silently** — a new silent divergence replacing the one it removed.
 
 ## Manual acceptance (needs a real browser + service — NOT covered by pytest)
 

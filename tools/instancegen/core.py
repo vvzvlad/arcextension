@@ -151,11 +151,7 @@ def render_launcher_script(
     edge that must be named: ``idle_install_info`` is ALSO where Chromium parks an update
     requesting NEW PERMISSIONS the user has not approved yet, and a ``--load-extension``
     extension is granted its manifest's permissions with no prompt at all — so an instance
-    can run a permission set the main browser is deliberately holding back. Being
-    authoritative would mean reading ``Secure Preferences``, i.e. parsing JSON in POSIX sh:
-    either a Python dependency at LAUNCH time, or resolving the versions once at generation
-    time — and freezing is exactly the behaviour re-resolving at every launch exists to
-    avoid. The trade-off is accepted knowingly, not overlooked.
+    can run a permission set the main browser is deliberately holding back.
 
     **(b) A directory under ``Extensions/`` does not mean the extension is ENABLED.**
     Disabling an extension in ``brave://extensions`` writes ``state``/``disable_reasons``
@@ -163,7 +159,36 @@ def render_launcher_script(
     until garbage collection. The glob loads both, and ``--load-extension`` activates what
     it is given unconditionally — so an extension the owner disabled in the main browser
     stays alive in every instance, and one they removed can come back until Chromium
-    collects the dir. Filtering would need the same ``Secure Preferences`` JSON as (a).
+    collects the dir. The owner is NOT the only writer of ``disable_reasons``: the browser
+    sets it too — a Web Store blocklisting (an extension pulled for MALWARE), the greylist,
+    enterprise policy — and the directory is deliberately kept so the extension can be
+    restored, so a killswitch that disabled an extension in the main browser is BYPASSED in
+    every instance, which for a profile carrying a password manager and a crypto wallet is a
+    different class of consequence from "I turned it off and it still runs".
+
+    **Reading ``Secure Preferences`` was CONSIDERED AND REJECTED — it is not impossible.**
+    ``/usr/bin/plutil`` ships in the BASE macOS install (a real Mach-O, unlike the
+    ``/usr/bin/python3`` shim, which is only a Command Line Tools trampoline), reads
+    Chromium's JSON and answers both questions directly — ``plutil -extract
+    "extensions.settings.<id>.path" raw -o - "Secure Preferences"`` names the ACTIVE version
+    dir, ``…disable_reasons`` the enablement state, 26 sequential calls in 0.22 s wall; a
+    missing or corrupt file answers empty and complains on stderr, so falling back is
+    trivial. The mtime glob stays anyway, on these three reasons:
+
+    1. **The shipped branch would leave CI.** The tests run the GENERATED launcher
+       end-to-end on whatever machine runs them. ``plutil`` is macOS-only, so the launcher
+       would become ``plutil … || <mtime fallback>`` and a Linux runner would only ever
+       exercise the fallback — green CI on a branch that never runs on the target platform.
+       That is precisely the disease ``_tiny_repo_extension``'s docstring was written
+       against ("the shape of the clone must not decide whether the assertion runs"): here
+       the PLATFORM would decide, and the untested branch would be the shipped one.
+    2. **The fallback survives regardless.** ``Secure Preferences`` is written lazily and
+       can be caught mid-flush (verified: ``plutil`` answers empty on a truncated file), so
+       the glob remains the fallback either way — both costs above merely become RARER, at
+       double the complexity in the one script that must never fail.
+    3. **It binds to undocumented Chromium internals.** ``extensions.settings.<id>.path``
+       and ``disable_reasons`` are private schema, not an API; a rename would fall back to
+       the heuristic SILENTLY, i.e. a new silent divergence replacing the one it removed.
     """
     flags = " ".join(_sh_quote(f) for f in (extra_flags or []))
     flags_line = f"  {flags} \\\n" if flags else ""
@@ -217,12 +242,19 @@ def _render_extension_sync(
         "# The curator bundle is FIRST and is loaded even with no main profile present.\n"
         "# Two things this cannot know: whether the newest dir on disk is the version the\n"
         "# main browser has ACTIVE (an update pending a permission prompt sits on disk\n"
-        "# already), and whether an extension is ENABLED there at all (a disabled or\n"
-        "# uninstalled one keeps its dir). Both would need Secure Preferences parsed.\n"
+        "# already), and whether an extension is ENABLED there at all — a dir survives both\n"
+        "# the owner disabling it and the Web Store blocklisting it. Both are answerable\n"
+        "# from Secure Preferences via plutil; considered and rejected, see\n"
+        "# render_launcher_script in tools/instancegen/core.py for why.\n"
         f"EXTS={_sh_quote(str(extension_dir))}\n"
         f"MAIN={_sh_quote(str(main_extensions_dir))}\n"
         'if [ -d "$MAIN" ]; then\n'
         '  for d in "$MAIN"/*/; do\n'
+        "    # An empty $MAIN leaves the glob unexpanded, as a literal, which the checks\n"
+        "    # below would discard anyway — this says so explicitly instead of relying on\n"
+        "    # it. It does NOT make the script zsh-proof: zsh's `nomatch` aborts at\n"
+        "    # expansion time, before this line runs.\n"
+        '    [ -e "$d" ] || continue\n'
         "    id=${d%/}; id=${id##*/}\n"
         "    # Not an extension: Chromium's staging dir. Dotted entries need no case of\n"
         "    # their own — POSIX `*` never expands to a leading dot.\n"
@@ -626,6 +658,33 @@ class GenerateResult:
     paths: InstancePaths
 
 
+def reject_comma_in_load_extension_paths(
+    bundle_dir: str | Path | None, sync_extensions_from: str | Path | None
+) -> None:
+    """Refuse either operator-chosen ``--load-extension`` path if it contains a COMMA.
+
+    Chromium splits ``--load-extension`` on commas. Extension ids and ``<version>_0`` dir
+    names cannot contain one, but these two paths ARE operator-chosen — and a single comma
+    anywhere in the main-profile path poisons EVERY entry the launcher builds under it (~27
+    at once), each half naming a directory that does not exist, with the browser reporting
+    nothing. Refuse the path instead of generating that launcher.
+
+    Lives on its own so both the library entry point (:func:`generate_instance`) and the
+    CLI can raise the SAME refusal from ONE text — the CLI runs it before it creates
+    ``--out``, so a refused invocation leaves no half-made output tree behind.
+    """
+    for option, path in (
+        ("--bundle-dir", bundle_dir),
+        ("--sync-extensions", sync_extensions_from),
+    ):
+        if path is not None and "," in str(path):
+            raise ValueError(
+                f"{option} path contains a comma ({path}) — Chromium splits "
+                "--load-extension on commas, so every path baked from it would be cut "
+                "into pieces that do not exist. Move or rename the directory."
+            )
+
+
 def generate_instance(
     *,
     out_root: str | Path,
@@ -680,21 +739,10 @@ def generate_instance(
             "shared universal bundle first with `instancegen bundle`"
         )
 
-    # Chromium splits `--load-extension` on COMMAS. Extension ids and `<version>_0` dir
-    # names cannot contain one, but these two paths are operator-chosen — and a single
-    # comma anywhere in the main-profile path poisons EVERY entry the launcher builds
-    # under it (~27 at once), each half naming a directory that does not exist, with the
-    # browser reporting nothing. Refuse the path instead of generating that launcher.
-    for option, path in (
-        ("--bundle-dir", bundle_dir),
-        ("--sync-extensions", sync_extensions_from),
-    ):
-        if path is not None and "," in str(path):
-            raise ValueError(
-                f"{option} path contains a comma ({path}) — Chromium splits "
-                "--load-extension on commas, so every path baked from it would be cut "
-                "into pieces that do not exist. Move or rename the directory."
-            )
+    # The library-level comma guard (see the function's own docstring). The CLI runs the
+    # same check BEFORE it creates `--out`; this one stays because `generate_instance` is
+    # the public entry point and has other callers.
+    reject_comma_in_load_extension_paths(bundle_dir, sync_extensions_from)
 
     if paths.root.exists():
         if not overwrite:

@@ -1073,6 +1073,37 @@ def test_cli_generate_says_nothing_when_the_sync_path_is_there(tmp_path, capsys)
     assert capsys.readouterr().err == ""
 
 
+def test_cli_generate_stdout_does_not_claim_a_sync_that_is_not_there(tmp_path, capsys):
+    """STDOUT must say NOT FOUND for a missing sync dir — the stderr note is not enough.
+
+    The two streams are routinely separated (`make instance > build.log`), and the kept one
+    is stdout: the cheerful `sync extensions: <path> (re-read at EVERY launch …)` line then
+    stands alone, advertising ~26 extensions the instance will not have. `cmd_bundle`
+    already handles its own degrade this way ("NOT stamped (see the note above)").
+
+    Redden: print the same stdout line in both states.
+    """
+    bundle = _make_bundle(tmp_path)
+    missing = tmp_path / "no-such-profile" / "Extensions"
+    rc = cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
+                   "--out", str(tmp_path / "gone"), "--sync-extensions", str(missing)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "sync extensions:" in ln)
+    assert "NOT FOUND" in line and str(missing) in line
+    assert "re-read at EVERY launch" not in out
+
+    # …and the healthy run keeps the plain line, with no scare word on it.
+    ext = _fake_main_profile(tmp_path)
+    rc = cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
+                   "--out", str(tmp_path / "here"), "--sync-extensions", str(ext)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "sync extensions:" in ln)
+    assert "NOT FOUND" not in out
+    assert "re-read at EVERY launch" in line and str(ext) in line
+
+
 @pytest.mark.parametrize("which", ["bundle", "sync"])
 def test_generate_refuses_a_comma_in_either_baked_path(tmp_path, which):
     """Chromium splits `--load-extension` on commas, so a comma in either path is fatal.
@@ -1081,6 +1112,11 @@ def test_generate_refuses_a_comma_in_either_baked_path(tmp_path, which):
     operator-chosen — and one comma in the MAIN path cuts every one of the ~27 entries
     built under it into halves that name nothing, with the browser reporting nothing.
     Redden: drop the check and the launcher is generated with the comma in it.
+
+    The CLI leg pins WHERE the refusal happens: like the empty-path check, it must run
+    BEFORE `out_root.mkdir`, so a refused invocation leaves no half-made output tree for
+    the operator to clean up. Redden: leave the check only in `generate_instance`, which
+    runs after the mkdir — `--out` is then created and left behind.
     """
     ext = _fake_main_profile(tmp_path)
     bundle = _make_bundle(tmp_path, name="di,st" if which == "bundle" else "dist")
@@ -1091,6 +1127,12 @@ def test_generate_refuses_a_comma_in_either_baked_path(tmp_path, which):
         ext = comma_dir / "Extensions"
     with pytest.raises(ValueError, match="comma"):
         _gen(tmp_path / "inst", "alpha", bundle_dir=bundle, sync_extensions_from=ext)
+
+    out = tmp_path / "cli-out"
+    with pytest.raises(ValueError, match="comma"):
+        cli.main(["generate", "--instance-id", "main", "--bundle-dir", str(bundle),
+                  "--out", str(out), "--sync-extensions", str(ext)])
+    assert not out.exists()  # nothing created at all
 
 
 def test_generate_result_carries_no_reconstructed_launch_command(tmp_path, capsys):
