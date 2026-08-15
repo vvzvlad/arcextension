@@ -17,8 +17,8 @@ import sqlite3
 
 _INSERT_JS_AUDIT = """
 INSERT INTO js_audit (ts, instance_id, tab_id, url_at_exec, world, code,
-                      outcome, initiator, auth_ctx, detail)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      await_promise, outcome, initiator, auth_ctx, detail)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -32,6 +32,7 @@ def insert_js_audit(
     tab_id: int | None = None,
     url_at_exec: str | None = None,
     world: str | None = None,
+    await_promise: bool = False,
     auth_ctx: str | None = None,
     outcome: str | None = None,
     detail: str | None = None,
@@ -40,6 +41,12 @@ def insert_js_audit(
 
     ``outcome`` starts NULL (unknown) and is filled by
     :func:`update_js_audit_outcome` once the response — or a timeout — is known.
+
+    ``await_promise`` records HOW the code ran, which the ``code`` text alone cannot say:
+    the same source is scoped and terminated differently as an async-function body than
+    under indirect eval (there, a top-level ``return`` is a SyntaxError). A row that cannot
+    tell the reader which one produced its effect is unreconstructable in exactly the sense
+    §12 refuses for truncated code.
     """
     cur = conn.execute(
         _INSERT_JS_AUDIT,
@@ -50,6 +57,7 @@ def insert_js_audit(
             url_at_exec,
             world,
             code,  # full, never truncated (§12)
+            1 if await_promise else 0,
             outcome,
             initiator,
             auth_ctx,

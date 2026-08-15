@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createChromeMock } from "./chrome-mock.js";
-import { dispatchCommand } from "../src/commands.js";
+import {
+  dispatchCommand,
+  evalInWorld,
+  readTextInWorld,
+  matchInWorld,
+} from "../src/commands.js";
 import * as activityMap from "../src/activity-map.js";
 import {
   CMD_OPEN_TAB,
@@ -12,6 +17,9 @@ import {
   CMD_MERGE_WINDOWS,
   CMD_EXECUTE_JS,
   CMD_MOVE_TAB,
+  CMD_GET_TEXT,
+  CMD_WAIT_FOR,
+  WAIT_POLL_MS,
 } from "../src/constants.js";
 
 const NOW = 1_000_000_000;
@@ -54,6 +62,11 @@ describe("stale_session rejects every verb without executing", () => {
     [CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }],
     [CMD_MOVE_TAB, { tabId: 1, windowId: 2 }],
     [CMD_EXECUTE_JS, { code: "1", tabId: 1 }],
+    // The FIXED-function verbs skip the execute_js checkbox, NOT the session check: a
+    // frame from a dead session names tab ids this extension no longer owns, so reading
+    // one is reading a stranger's tab.
+    [CMD_GET_TEXT, { tabId: 1 }],
+    [CMD_WAIT_FOR, { tabId: 1, urlMatches: "x", timeoutMs: 1000 }],
   ];
 
   it.each(verbs)("%s from a foreign session => stale_session, no side effects", async (cmd, params) => {
@@ -1350,7 +1363,8 @@ describe("execute_js checkbox gate (§12)", () => {
     const injection = exec.mock.calls[0][0];
     expect(injection.target).toEqual({ tabId: 5 });
     expect(injection.world).toBe("MAIN");
-    expect(injection.args).toEqual(["2+2"]); // the curator code is passed as an arg
+    // The code plus the awaitPromise flag; false is the default eval path (unchanged).
+    expect(injection.args).toEqual(["2+2", false]);
   });
 
   it("checkbox ON but target is a non-http tab => precondition_failed, NOT executed (§12)", async () => {
@@ -1628,5 +1642,605 @@ describe("#49 bulk open_tab {items} + hoisted-out-of-loop work", () => {
     expect(map.markCuratorCause).toHaveBeenCalledTimes(1);
     expect(map.readMap).not.toHaveBeenCalled(); // no minIdleMs => no map read at all
     expect(elapsed).toBeLessThan(1000); // trivially inside any cmd_timeout_ms budget
+  });
+});
+
+// --- the injected function BODIES -------------------------------------------
+//
+// These are tested DIRECTLY, not through dispatchCommand: the chrome mock's
+// scripting.executeScript returns a canned value and never RUNS the function, so nothing
+// else in this file can prove what the code injected into a real page actually does.
+
+describe("evalInWorld — execute_js's injected body", () => {
+  it("proves the bug AND the fix: indirect eval cannot return; the async path can", async () => {
+    // THE bug this wave fixes. Indirect eval supports neither a top-level `return`
+    // (SyntaxError) nor top-level `await`, so async code could never hand a value back —
+    // it arrived as null. `chrome.scripting` DOES await a promise the injected function
+    // returns; the eval wrapper was the whole problem.
+    expect(() => evalInWorld("return 7;", false)).toThrow(SyntaxError);
+    await expect(evalInWorld("return await Promise.resolve(7);", true)).resolves.toBe(7);
+    await expect(
+      evalInWorld("const v = await Promise.resolve(2); return v * 3;", true),
+    ).resolves.toBe(6);
+  });
+
+  it("a source whose LAST LINE is a // comment still runs on BOTH compile paths", async () => {
+    // Why AsyncFunction and not `new Function("(async()=>{" + source + "})()")`: with
+    // string splicing the appended `})()` lands INSIDE that trailing comment and the whole
+    // thing is a SyntaxError. Go back to splicing and this reddens.
+    //
+    // The same hazard reappears one layer down in the EXPRESSION compile
+    // (`return (<source>\n);`), which is why the newline before `)` is there. Both paths
+    // must survive it, so exercise both: the first falls back to the statement body, the
+    // second is compiled as an expression.
+    await expect(evalInWorld("return 42; // the answer", true)).resolves.toBe(42);
+    await expect(evalInWorld("40 + 2 // the answer", true)).resolves.toBe(42);
+  });
+
+  it("a PROMISE is chained, not cloned — the default path keeps working", async () => {
+    // chrome.scripting awaits a promise the injected function returns, so this has ALWAYS
+    // worked with no flag. Running the clone probe first breaks it: structuredClone throws
+    // DataCloneError on a promise, and the agent gets {__unserializable:"Promise"} instead
+    // of its data. Omitting a new parameter must reproduce pre-wave behaviour exactly.
+    await expect(evalInWorld("Promise.resolve(7)", false)).resolves.toBe(7);
+    await expect(
+      evalInWorld("Promise.resolve({ ok: true }).then((v) => v)", false),
+    ).resolves.toEqual({ ok: true });
+  });
+
+  it("the probe still applies to what the promise RESOLVES TO", async () => {
+    // Chaining must not disable the diagnostic — it must MOVE it onto the value that
+    // actually crosses the structured-clone boundary.
+    const got = await evalInWorld("Promise.resolve(() => 1)", false);
+    expect(got.__unserializable).toBe("Function");
+  });
+
+  it("with await_promise ON, a plain EXPRESSION still returns its value", async () => {
+    // `new AsyncFunction(source)` makes the source the function BODY, which discards an
+    // expression's completion value — so this answered null: the very silent-null failure
+    // the flag exists to remove, and one an agent that turns it on by default would hit
+    // everywhere. Hence the expression-first compile.
+    await expect(evalInWorld("2 + 2", true)).resolves.toBe(4);
+    await expect(evalInWorld("({ a: 1 })", true)).resolves.toEqual({ a: 1 });
+    await expect(evalInWorld("await Promise.resolve(9)", true)).resolves.toBe(9);
+    // …and multi-statement code still reaches the statement fallback, where `return` works.
+    await expect(
+      evalInWorld("const v = await Promise.resolve(2);\nreturn v * 3;", true),
+    ).resolves.toBe(6);
+  });
+
+  it("the sync path is unchanged for an ordinary value", () => {
+    expect(evalInWorld("2 + 2", false)).toBe(4);
+    expect(evalInWorld("({a: 1})", false)).toEqual({ a: 1 });
+  });
+
+  it("an UNSERIALIZABLE value names itself instead of arriving as null", () => {
+    // chrome.scripting structured-clones the result out of the page, so a function / DOM
+    // node / Symbol silently becomes null — which reads exactly like "the code returned
+    // null" and is this verb's most confusing failure.
+    const fn = evalInWorld("(function widget() {})", false);
+    expect(fn.__unserializable).toBe("Function");
+    expect(fn.preview).toContain("widget");
+
+    const obj = evalInWorld("({ handler: function () {} })", false);
+    expect(obj.__unserializable).toBe("Object");
+
+    const sym = evalInWorld("Symbol('x')", false);
+    expect(sym.__unserializable).toBe("Symbol");
+  });
+
+  it("the diagnostic applies to the async path too", async () => {
+    const got = await evalInWorld("return () => 1;", true);
+    expect(got.__unserializable).toBe("Function");
+  });
+
+  it("a page that deleted structuredClone gets today's behaviour, not a fabrication", () => {
+    // MAIN world shares the page's globals. Without the guard the probe would throw for
+    // EVERY value and mark each one unserializable — a diagnostic that invents its finding
+    // is worse than none.
+    const saved = globalThis.structuredClone;
+    globalThis.structuredClone = undefined;
+    try {
+      expect(evalInWorld("({a: 1})", false)).toEqual({ a: 1 });
+    } finally {
+      globalThis.structuredClone = saved;
+    }
+  });
+});
+
+// A minimal document double for the two DOM-reading injected bodies.
+function withDocument(doc, fn) {
+  const saved = globalThis.document;
+  globalThis.document = doc;
+  try {
+    return fn();
+  } finally {
+    globalThis.document = saved;
+  }
+}
+
+// `badSelectors` lists selectors the double should reject the way a real engine does — by
+// throwing a SyntaxError — so the "a typo must not burn the whole budget" tests exercise
+// the real code path rather than a stubbed return value.
+function fakeDoc(bodyText, matches = {}, badSelectors = []) {
+  return {
+    body: bodyText === null ? null : { innerText: bodyText },
+    querySelector: (sel) => {
+      if (badSelectors.includes(sel)) {
+        const e = new Error(`'${sel}' is not a valid selector`);
+        e.name = "SyntaxError";
+        throw e;
+      }
+      return sel in matches ? matches[sel] : null;
+    },
+  };
+}
+
+describe("readTextInWorld — get_text's injected body", () => {
+  it("reads the body with no selector, and the element with one", () => {
+    withDocument(fakeDoc("whole page", { "#main": { innerText: "just main" } }), () => {
+      expect(readTextInWorld(null, null)).toEqual({
+        found: true, text: "whole page", totalBytes: 10,
+      });
+      expect(readTextInWorld("#main", null)).toEqual({
+        found: true, text: "just main", totalBytes: 9,
+      });
+    });
+  });
+
+  it("a selector that matches NOTHING is found:false, never an empty string", () => {
+    // "your selector is wrong" and "the page is blank" are different facts; conflating
+    // them sends the agent to debug the wrong one.
+    withDocument(fakeDoc("whole page"), () => {
+      expect(readTextInWorld("#nope", null)).toEqual({ found: false, text: "", totalBytes: 0 });
+    });
+    // A matched-but-genuinely-empty element still reports found:true.
+    withDocument(fakeDoc("x", { "#empty": { innerText: "" } }), () => {
+      expect(readTextInWorld("#empty", null)).toEqual({ found: true, text: "", totalBytes: 0 });
+    });
+  });
+
+  it("cuts at maxBytes on a CHARACTER boundary and reports the TRUE total", () => {
+    // Ten 2-byte characters = 20 bytes. A 5-byte cut lands mid-character: the half
+    // sequence is dropped rather than decoded into U+FFFD.
+    withDocument(fakeDoc("Ω".repeat(10)), () => {
+      const got = readTextInWorld(null, 5);
+      expect(got.text).toBe("ΩΩ"); // 4 bytes kept, the severed 5th dropped
+      expect(got.text).not.toContain("�");
+      expect(got.truncated).toBe(true);
+      expect(got.totalBytes).toBe(20); // the size of the WHOLE document, not of the cut
+    });
+  });
+
+  it("does not cut when the text fits, and ignores a zero/absent maxBytes", () => {
+    withDocument(fakeDoc("short"), () => {
+      expect(readTextInWorld(null, 1000).truncated).toBeUndefined();
+      expect(readTextInWorld(null, 0)).toEqual({ found: true, text: "short", totalBytes: 5 });
+    });
+  });
+});
+
+describe("matchInWorld — the wait_for predicate", () => {
+  it("answers the selector question", () => {
+    withDocument(fakeDoc("", { ".done": {} }), () => {
+      expect(matchInWorld(".done", null)).toEqual({ matched: true });
+      expect(matchInWorld(".missing", null)).toEqual({ matched: false });
+    });
+  });
+
+  it("answers the textContains question", () => {
+    withDocument(fakeDoc("Order complete, thank you"), () => {
+      expect(matchInWorld(null, "complete")).toEqual({ matched: true });
+      expect(matchInWorld(null, "failed")).toEqual({ matched: false });
+    });
+  });
+
+  it("reports a MALFORMED selector as a value, never a throw", () => {
+    // A throw is read by pollUntil as "the frame is being recreated" and polled through to
+    // the deadline — so a typo would cost the whole budget and then answer "not matched".
+    // The distinction has to travel as data.
+    withDocument(fakeDoc("", {}, ["#a:has(>"]), () => {
+      const got = matchInWorld("#a:has(>", null);
+      expect(got.badSelector).toBe(true);
+      expect(got.matched).toBeUndefined();
+      expect(got.message).toMatch(/not a valid selector/);
+    });
+  });
+});
+
+// --- get_text: the FIXED-function read (§12) ---------------------------------
+function chromeWithOneTab(url = "https://x/", extra = {}) {
+  globalThis.chrome = createChromeMock({ tabs: [{ id: 5, windowId: 1, url, ...extra }] });
+}
+
+describe("get_text", () => {
+  it("runs with the execute_js checkbox OFF — a fixed function is not eval (§12)", async () => {
+    // THE load-bearing assertion of this verb. The execute_js gate exists because
+    // ARBITRARY code arrives there and truncated code cannot be reconstructed; a function
+    // committed into this bundle has nothing to reconstruct. Gate this on the checkbox and
+    // the whole point of the verb (a cheap read that does not need the dangerous switch)
+    // is gone.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { found: true, text: "hello", totalBytes: 5 } }];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { text: "hello" } });
+  });
+
+  it("passes selector + maxBytes to the FIXED function, never a code string", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { found: true, text: "t", totalBytes: 1 } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5, selector: "#a", maxBytes: 9 }), ctx());
+    const injection = exec.mock.calls[0][0];
+    expect(injection.args).toEqual(["#a", 9]);
+    expect(typeof injection.func).toBe("function");
+  });
+
+  it("surfaces the extension-side truncation with the TRUE total", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [
+      { result: { found: true, text: "cut", totalBytes: 4096, truncated: true } },
+    ];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5, maxBytes: 3 }), ctx());
+    // camelCase on the WIRE, like every other §6 key (`tabId`, `elapsedMs`); the MCP layer
+    // is what renames it to `total_bytes` for the agent.
+    expect(res.result).toEqual({ text: "cut", truncated: true, totalBytes: 4096 });
+  });
+
+  it("a MALFORMED selector is precondition_failed, not `internal`", async () => {
+    // Without readTextInWorld catching it, the SyntaxError escapes the injection and the
+    // dispatcher's outer try turns it into `internal` — a code that says "our bug" and
+    // sends the agent to read our logs instead of its own selector.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [
+      { result: { found: false, badSelector: true, message: "'#a:has(>' is not a valid selector" } },
+    ];
+    const res = await dispatchCommand(
+      frame(CMD_GET_TEXT, { tabId: 5, selector: "#a:has(>" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#a:has(>");
+  });
+
+  it("a selector that matched nothing => precondition_failed", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { found: false, text: "", totalBytes: 0 } }];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5, selector: "#nope" }), ctx());
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#nope");
+  });
+
+  it("keeps execute_js's http/https target guard (§12)", async () => {
+    // With <all_urls> granted an unguarded read would return a file:// page's text.
+    chromeWithOneTab("file:///etc/passwd");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a vanished tab is no_such_tab, not internal", async () => {
+    chromeWithOneTab();
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 999 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
+// --- wait_for ----------------------------------------------------------------
+// A fake clock whose SLEEP is what advances time: the poll loop then runs to its deadline
+// instantly and deterministically, instead of spending real seconds.
+function fakeClock(start = NOW) {
+  const state = { t: start, sleeps: 0, hooks: [] };
+  return {
+    now: () => state.t,
+    sleep: async (ms) => {
+      state.t += ms;
+      state.sleeps += 1;
+      for (const h of state.hooks) h(state.sleeps);
+    },
+    onSleep: (fn) => state.hooks.push(fn),
+    get sleeps() {
+      return state.sleeps;
+    },
+  };
+}
+
+describe("wait_for", () => {
+  it("requires EXACTLY ONE predicate and polls NOTHING otherwise", async () => {
+    chromeWithOneTab();
+    const get = vi.spyOn(chrome.tabs, "get");
+    for (const params of [
+      { tabId: 5, timeoutMs: 1000 }, // none
+      { tabId: 5, timeoutMs: 1000, urlMatches: "a", selector: "#b" }, // two
+      { tabId: 5, timeoutMs: 1000, urlMatches: "a", selector: "#b", textContains: "c" },
+    ]) {
+      const res = await dispatchCommand(frame(CMD_WAIT_FOR, params), ctx());
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("precondition_failed");
+      expect(res.error.message).toMatch(/EXACTLY ONE/);
+    }
+    expect(get).not.toHaveBeenCalled(); // refused before touching the browser
+  });
+
+  it("urlMatches needs NO injection at all and matches a substring", async () => {
+    chromeWithOneTab("https://shop/checkout/done?x=1");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/checkout/done", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { matched: true, elapsedMs: 0 } });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("keeps polling until the condition becomes true, then reports elapsedMs", async () => {
+    chromeWithOneTab("https://shop/cart");
+    const c = fakeClock();
+    // The page "navigates" on the second poll interval.
+    c.onSleep((n) => {
+      if (n === 2) chrome.__state.tabs[0].url = "https://shop/done";
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/done", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.matched).toBe(true);
+    expect(res.result.elapsedMs).toBe(2 * WAIT_POLL_MS);
+  });
+
+  it("a condition that never holds is a SUCCESS with matched:false, NOT `timeout`", async () => {
+    // §11 reserves `timeout` for "no frame arrived" — state UNKNOWN, do not blindly retry.
+    // A wait that ran its full course is the opposite fact: the browser answered, and the
+    // answer is "no". Spelling both as one error code destroys the distinction the agent
+    // needs; spelling this one as a verdict puts it in the response SHAPE, which survives
+    // the wire (an `elapsedMs` on an error frame would not — the service discards `result`
+    // on any ok:false).
+    chromeWithOneTab("https://shop/cart");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/never", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ matched: false, elapsedMs: 1000 });
+    // It really polled to the deadline rather than giving up at once (1000/250 = 4).
+    expect(c.sleeps).toBe(4);
+  });
+
+  it("a MALFORMED selector is refused at once, not polled to the deadline", async () => {
+    // `document.querySelector("#a:has(>")` throws SyntaxError, and pollUntil reads a throw
+    // from an injection as "the frame is being recreated". Untreated, a typo costs the
+    // whole 30-60 s budget and THEN reads as "condition not met" — the agent debugs the
+    // page instead of its selector.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [
+      { result: { badSelector: true, message: "'#a:has(>' is not a valid selector" } },
+    ];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: "#a:has(>", timeoutMs: 60000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#a:has(>");
+    expect(c.sleeps).toBe(0); // refused on the FIRST probe
+  });
+
+  it("re-checks the scheme on EVERY poll, not once up front", async () => {
+    // The guard is checked before the first probe, but a wait keeps injecting for up to a
+    // minute and the page can move under us. With <all_urls> granted, an injection into a
+    // file:// page reads it same-origin — so a guard that expires mid-wait is not a guard.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.tabs[0].url = "file:///etc/passwd";
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".ready", timeoutMs: 60000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(c.sleeps).toBe(1); // caught on the second probe, not at the deadline
+  });
+
+  it("selector polls the FIXED predicate in the page", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.scriptResults = [{ result: { matched: true } }];
+    });
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".ready", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result).toEqual({ matched: true, elapsedMs: WAIT_POLL_MS });
+    expect(exec.mock.calls[0][0].args).toEqual([".ready", null]);
+    expect(exec.mock.calls[0][0].func).toBe(matchInWorld);
+  });
+
+  it("textContains rides the same predicate with the other argument", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = fakeClock();
+    await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, textContains: "Paid", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(exec.mock.calls[0][0].args).toEqual([null, "Paid"]);
+  });
+
+  it("runs with the execute_js checkbox OFF (fixed function, §12)", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".x", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("guards the scheme for the INJECTING predicates but not for urlMatches", async () => {
+    // A tab mid-navigation legitimately sits on about:blank, and waiting for it to REACH
+    // an http url is the main use of urlMatches — guarding it would make the verb useless.
+    chromeWithOneTab("about:blank");
+    const c = fakeClock();
+    const injected = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".x", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(injected.error.code).toBe("precondition_failed");
+
+    const byUrl = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "about:", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(byUrl.ok).toBe(true);
+  });
+
+  it("a tab that vanishes mid-wait ends the wait with no_such_tab", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.tabs.length = 0; // the human closed it
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".x", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("refuses a missing or non-positive timeoutMs loudly", async () => {
+    chromeWithOneTab();
+    for (const timeoutMs of [undefined, 0, -1, "5000", 1.5]) {
+      const res = await dispatchCommand(
+        frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "x", timeoutMs }),
+        ctx(),
+      );
+      expect(res.error.code).toBe("precondition_failed");
+    }
+  });
+});
+
+// --- navigate_tab waitUntil ---------------------------------------------------
+describe("navigate_tab waitUntil", () => {
+  it("DEFAULT (absent) is byte-for-byte today's behaviour: update, {ok:true}, no wait", async () => {
+    // The reset path (src/api/rules.py) calls this verb; it must not change at all.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/" }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(c.sleeps).toBe(0); // nothing was waited for
+    expect(chrome.__state.tabs[0].url).toBe("https://new/");
+  });
+
+  it("waitUntil:'none' is explicitly the same as absent", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "none" }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(c.sleeps).toBe(0);
+  });
+
+  it("'load' waits for status:'complete' and never accepts the OLD page's complete", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    // The tab is 'complete' from the PREVIOUS page at update time. Accepting that would
+    // return before the new document even started loading — the exact bug the option
+    // exists to prevent — so the first check happens only after one poll interval.
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.tabs[0].status = "loading";
+      if (n === 2) chrome.__state.tabs[0].status = "complete";
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "load", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.elapsedMs).toBe(2 * WAIT_POLL_MS);
+  });
+
+  it("'selector' waits for the fixed predicate", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 2) chrome.__state.scriptResults = [{ result: { matched: true } }];
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.elapsedMs).toBe(2 * WAIT_POLL_MS);
+  });
+
+  it("a wait that expires is ok+matched:false — the navigation DID happen", async () => {
+    // Same rule as wait_for: the deadline passing is a VERDICT, not an error. `timeout`
+    // means "no frame arrived, state unknown", and here the state is perfectly known — the
+    // tab really moved, the condition just never came true.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    c.onSleep(() => {
+      chrome.__state.tabs[0].status = "loading"; // never finishes
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "load", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ ok: true, matched: false, elapsedMs: 1000 });
+    expect(chrome.__state.tabs[0].url).toBe("https://new/"); // it really navigated
+  });
+
+  it("a bad waitUntil / missing selector is refused BEFORE the tab is navigated", async () => {
+    // A refusal AFTER the update would read as "nothing happened" about a tab that has
+    // already moved.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const bad = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "settled" }),
+      ctx(),
+    );
+    expect(bad.error.code).toBe("precondition_failed");
+    const noSelector = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", timeoutMs: 100,
+      }),
+      ctx(),
+    );
+    expect(noSelector.error.code).toBe("precondition_failed");
+    expect(chrome.__state.tabs[0].url).toBe("https://old/"); // untouched
+  });
+
+  it("still refuses a non-http url before anything else (§12)", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "javascript:alert(1)", waitUntil: "load", timeoutMs: 100,
+      }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(chrome.__state.tabs[0].url).toBe("https://old/");
   });
 });

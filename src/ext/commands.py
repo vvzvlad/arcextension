@@ -187,6 +187,11 @@ async def send_command(
                 url_at_exec=params.get("urlAtExec"),
                 world=params.get("world"),
                 code=params.get("code") or "",
+                # HOW it ran, not just what: the same text means different things as an
+                # async-function body and under indirect eval (different scope, and
+                # `return` is a SyntaxError in one of them). Without this the full code is
+                # still not enough to reconstruct the execution (§12).
+                await_promise=bool(params.get("awaitPromise")),
                 initiator=initiator,
                 auth_ctx=auth_ctx,
                 now=_now_ms(),

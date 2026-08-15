@@ -266,6 +266,38 @@ async def test_execute_js_audit_written_before_send_then_outcome_ok(tmp_path):
         await db.close()
 
 
+async def test_execute_js_audit_records_HOW_the_code_ran(tmp_path):
+    """``await_promise`` is audited, because ``code`` alone does not say what it meant.
+
+    The same text is a different program on the two paths: as an async-function body it
+    has its own scope and ``return`` is how it answers, while under indirect eval it runs
+    in the page's globals and a top-level ``return`` is a SyntaxError. §12 keeps the code
+    in FULL because "усечённый код нереконструируем" — a row that cannot say which of the
+    two produced its effect is unreconstructable for exactly the same reason.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        reg, cs, ws = _registry_with()
+        for params, expected in (
+            ({"code": "1+1", "tabId": 5}, 0),                          # omitted => eval path
+            ({"code": "return 1", "tabId": 5, "awaitPromise": True}, 1),
+        ):
+            before = len(ws.sent)  # ws.sent accumulates: wait for a NEW frame, not any frame
+            task = asyncio.create_task(send_command(
+                reg, db, "i1", protocol.CMD_EXECUTE_JS, params,
+                cmd_timeout_ms=5000, initiator="mcp", auth_ctx="mcp:s",
+            ))
+            assert await _until(lambda: len(ws.sent) > before)
+            resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                                  "result": {}})
+            await task
+        modes = await db.read(lambda c: c.execute(
+            "SELECT await_promise FROM js_audit ORDER BY id").fetchall())
+        assert modes == [(0,), (1,)]
+    finally:
+        await db.close()
+
+
 async def test_execute_js_audit_records_timeout(tmp_path):
     # A timed-out execute_js (no response ever) STILL leaves an audit row — the
     # before-send write is what guarantees the only trace of code execution.

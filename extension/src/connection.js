@@ -53,6 +53,9 @@ export function chromeEnv() {
       crypto.getRandomValues(a);
       return a;
     },
+    // Which bundle is running, for the hello capability report. A seam like every other
+    // chrome touch here so the connection tests can pin a version without a real manifest.
+    manifestVersion: () => chrome.runtime.getManifest().version,
     WebSocketImpl: WebSocket,
     now: () => Date.now(),
     log: (...args) => console.log("[ext]", ...args),
@@ -63,6 +66,7 @@ import {
   INSTALL_UUID_KEY,
   SESSION_ID_KEY,
   ALLOW_EXECUTE_JS_KEY,
+  ALLOW_DEBUGGER_KEY,
   CONNECTION_STATE_KEY,
   INSTANCE_SECRET_KEY,
   INSTANCE_SECRET_PENDING_KEY,
@@ -613,7 +617,44 @@ export class Connection {
       // The AUTHORITATIVE execute_js state is the options checkbox in
       // storage.local (§12) — a copied bundle sets its own checkbox. Report it.
       allowExecuteJs: await this._readAllowExecuteJs(),
+      // The CAPABILITY REPORT (§11/§12). An agent must be able to see what this copy
+      // allows BEFORE it calls and fails mid-task; these two ride the same path as
+      // allowExecuteJs and surface in list_instances.
+      //   allowDebugger — the second per-copy checkbox, default OFF. NO verb reads it
+      //     yet; it is the switch a later screenshot/CDP path will read. Reported now so
+      //     an agent never has to discover the answer by failing.
+      //   extVersion — which bundle is actually running. The service and the extension
+      //     update by DIFFERENT paths (the Dockerfile does not ship extension/), so
+      //     "new service + old extension" is a guaranteed state, and until now nothing
+      //     could tell an agent that the copy it is talking to predates a verb.
+      allowDebugger: await this._readAllowDebugger(),
+      extVersion: this._manifestVersion(),
     });
+  }
+
+  // Same contract as _readAllowExecuteJs one function down: storage.local is the
+  // authoritative state, an unset key or a read error is OFF.
+  async _readAllowDebugger() {
+    try {
+      const got = await this.env.storageLocalGet(ALLOW_DEBUGGER_KEY);
+      return !!(got && got[ALLOW_DEBUGGER_KEY]);
+    } catch (e) {
+      this.env.log("reading debugger checkbox failed:", e);
+      return false;
+    }
+  }
+
+  // The running bundle's manifest version. Best-effort and never fatal: a hello that
+  // failed because the version could not be read would be a capability REPORT taking
+  // the connection down, which is exactly backwards. `null` = "this copy did not say".
+  _manifestVersion() {
+    try {
+      const v = this.env.manifestVersion();
+      return typeof v === "string" && v ? v : null;
+    } catch (e) {
+      this.env.log("reading manifest version failed:", e);
+      return null;
+    }
   }
 
   // Report EXACTLY what the execute_js gate enforces (§12: "инстанс сообщает

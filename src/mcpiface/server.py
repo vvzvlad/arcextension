@@ -173,7 +173,7 @@ def build_mcp(app_ref) -> MCPServer:
     # unprotected, exactly as before (fail-open by design).
     @mcp.tool()
     async def open_tab(instance: str, url: str, pinned: bool = False, active: bool = False,
-                       window_id: int | None = None,
+                       window_id: int | None = None, lease_ttl_s: int | None = None,
                        expected_session: str | None = None) -> dict:
         """Open a tab in an instance (§6).
 
@@ -183,10 +183,35 @@ def build_mcp(app_ref) -> MCPServer:
         non-fullscreen window or has vanished. A server-side cross-check turns an OLD
         extension that ignores the key (dropping the tab in its own window) into the same
         loud ``no_window``.
+
+        ``lease_ttl_s`` protects the opened url from the curator pass for that many seconds
+        (an ``exemptions`` row — the "owned by the agent" lease). Clamped to the shared
+        30-day ceiling; there is no "forever". A lease that could not be written is
+        reported as ``lease: {ok:false, error}`` — the tab is open either way, so do NOT
+        retry the open on that.
         """
         return await _guarded(tools.open_tab(
             _host(), instance=instance, url=url, pinned=pinned, active=active,
-            window_id=window_id, auth_ctx=current_mcp_session(),
+            window_id=window_id, lease_ttl_s=lease_ttl_s, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def navigate_tab(instance: str, tab_id: int, url: str,
+                           wait_until: str | None = None, selector: str | None = None,
+                           timeout_ms: int | None = None,
+                           expected_session: str | None = None) -> dict:
+        """Point a tab at an http/https url (§6), optionally waiting for the page.
+
+        ``wait_until`` defaults to ``'none'`` (return as soon as the navigation is issued —
+        today's behaviour). ``'load'`` waits for the tab to report ``complete``;
+        ``'selector'`` waits for ``selector`` to match. ``timeout_ms`` bounds the wait and
+        is clamped to EXECUTE_JS_MAX_TIMEOUT_MS. A wait that expires still answers ``ok``,
+        with ``result.matched == false``: the navigation WAS issued and the condition
+        simply never became true — a verdict, not a failure."""
+        return await _guarded(tools.navigate_tab(
+            _host(), instance=instance, tab_id=tab_id, url=url, wait_until=wait_until,
+            selector=selector, timeout_ms=timeout_ms, auth_ctx=current_mcp_session(),
             expected_session=expected_session,
         ))
 
@@ -255,14 +280,103 @@ def build_mcp(app_ref) -> MCPServer:
     async def execute_js(
         instance: str, tab_id: int, code: str,
         world: str | None = None, url_at_exec: str | None = None,
+        await_promise: bool = False, timeout_ms: int | None = None,
+        max_bytes: int | None = None,
         expected_session: str | None = None,
     ) -> dict:
-        """Run JS in a tab (§12: audited before send, gated by the checkbox+kill-switch)."""
+        """Run JS in a tab (§12: audited before send, gated by the checkbox+kill-switch).
+
+        A promise is awaited on EITHER path, with or without the flag: ``fetch(u).then(r =>
+        r.json())`` resolves to the parsed body, not to a promise.
+
+        ``await_promise=true`` buys the two KEYWORDS indirect eval cannot parse — a
+        top-level ``await`` and a top-level ``return``. A single EXPRESSION still returns
+        its value (``document.title`` answers the title); MULTI-STATEMENT code must
+        ``return`` explicitly, or the value is null. Reach for the flag when the snippet
+        wants to write ``await``/``return``, not as a default.
+
+        ``timeout_ms`` raises this one command's budget (clamped to
+        EXECUTE_JS_MAX_TIMEOUT_MS) for code that legitimately takes longer than
+        CMD_TIMEOUT_MS.
+
+        The result is FLAT: ``value`` is the main frame's result. ``frames`` appears only
+        when the injection genuinely produced more than one — its absence means one frame,
+        and ``value`` is it. A value chrome could not structured-clone (a DOM node, a
+        function, a circular object) arrives as ``{__unserializable, preview}`` instead of a
+        silent null. Payloads are capped at ``max_bytes`` (default 40000) with ``truncated``
+        + ``total_bytes`` — no need to ``.slice()`` in the snippet."""
         return await _guarded(tools.execute_js(
             _host(), instance=instance, tab_id=tab_id, code=code, world=world,
-            url_at_exec=url_at_exec, auth_ctx=current_mcp_session(),
+            url_at_exec=url_at_exec, await_promise=await_promise, timeout_ms=timeout_ms,
+            max_bytes=max_bytes, auth_ctx=current_mcp_session(),
             expected_session=expected_session,
         ))
+
+    @mcp.tool()
+    async def get_text(instance: str, tab_id: int, selector: str | None = None,
+                       max_bytes: int | None = None,
+                       expected_session: str | None = None) -> dict:
+        """Read a tab's visible text — ``innerText`` of ``selector`` (or of the whole body).
+
+        A FIXED injected function, so — unlike execute_js — it needs NO execute_js checkbox
+        and writes no js_audit row; the http/https target guard still applies. A
+        ``selector`` matching nothing is ``precondition_failed``, not an empty string.
+        Capped at ``max_bytes`` (default 40000), reporting ``truncated`` + ``total_bytes``."""
+        return await _guarded(tools.get_text(
+            _host(), instance=instance, tab_id=tab_id, selector=selector,
+            max_bytes=max_bytes, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def wait_for(instance: str, tab_id: int, url_matches: str | None = None,
+                       selector: str | None = None, text_contains: str | None = None,
+                       timeout_ms: int | None = None,
+                       expected_session: str | None = None) -> dict:
+        """Wait until a page condition holds; answers ``{ok, matched, elapsed_ms}``.
+
+        A deadline that passes is ``matched: false`` — a SUCCESS carrying a negative
+        verdict, not an error: the browser answered, the condition simply never became
+        true. A ``timeout`` error here means the opposite and keeps its §11 meaning: no
+        response arrived at all, so the state is UNKNOWN and must not be blindly retried.
+
+        EXACTLY ONE of ``url_matches`` (substring of the live tab url — no injection at
+        all), ``selector`` (matches in the page) or ``text_contains`` (substring of the
+        body text). Zero or several is ``invalid_args`` and nothing is polled.
+
+        ``timeout_ms`` defaults to EXECUTE_JS_MAX_TIMEOUT_MS and is clamped to it. Like
+        get_text this injects a FIXED function, so no execute_js checkbox is needed."""
+        return await _guarded(tools.wait_for(
+            _host(), instance=instance, tab_id=tab_id, url_matches=url_matches,
+            selector=selector, text_contains=text_contains, timeout_ms=timeout_ms,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    # --- exemptions: the agent's «не трогать» lease (§10/§11) ----------------
+    @mcp.tool()
+    async def list_exemptions(instance: str | None = None,
+                              include_expired: bool = False) -> dict:
+        """List active «do not touch» exemptions the curator pass honours, optionally for
+        one instance. ``include_expired`` also returns lapsed rows."""
+        return await _guarded(tools.list_exemptions(
+            _host(), instance=instance, include_expired=include_expired,
+        ))
+
+    @mcp.tool()
+    async def set_exemption(instance: str, url: str, ttl_s: int,
+                            reason: str | None = None) -> dict:
+        """Protect ``instance`` + ``url`` from the curator pass for ``ttl_s`` seconds.
+
+        Keyed by (instance, url), so a repeat call REFRESHES the deadline. Clamped to the
+        30-day ceiling — an exemption is never infinite."""
+        return await _guarded(tools.set_exemption(
+            _host(), instance=instance, url=url, ttl_s=ttl_s, reason=reason,
+        ))
+
+    @mcp.tool()
+    async def clear_exemption(instance: str, url: str) -> dict:
+        """Lift an exemption. Idempotent: ``deleted: 0`` when it was already gone."""
+        return await _guarded(tools.clear_exemption(_host(), instance=instance, url=url))
 
     @mcp.tool()
     async def relocate_tab(instance_from: str, instance_to: str,

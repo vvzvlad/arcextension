@@ -135,6 +135,8 @@ UPDATE instances SET
     connected = 1,
     session_id = ?,
     allow_execute_js = ?,
+    allow_debugger = ?,
+    ext_version = ?,
     last_seen_at = ?,
     reject_reason = NULL,
     reject_at = NULL
@@ -148,6 +150,8 @@ def hello_upsert(
     session_id: str | None,
     allow_execute_js: bool,
     now: int,
+    allow_debugger: bool = False,
+    ext_version: str | None = None,
 ) -> int | None:
     """Register a successful hello on an already-active row; return its new
     ``conn_epoch``, or ``None`` if no active row exists.
@@ -157,10 +161,23 @@ def hello_upsert(
     which is returned as a sentinel so the caller rejects cleanly instead of doing
     ``int(None)`` — the row may have been revoked/deleted between the channel's
     ``resolve_secret`` and this write.
+
+    ``allow_debugger`` / ``ext_version`` are the rest of the capability report (§11) and
+    are keyword-optional so every existing caller and test keeps compiling; they default
+    to the same "this copy said nothing" values the columns default to. Like
+    ``allow_execute_js`` they are OVERWRITTEN on every hello rather than merged — the
+    extension reports its live state each time, so the row is a mirror, never a history.
     """
     conn.execute(
         _HELLO_UPSERT,
-        (session_id, 1 if allow_execute_js else 0, now, instance_id),
+        (
+            session_id,
+            1 if allow_execute_js else 0,
+            1 if allow_debugger else 0,
+            ext_version,
+            now,
+            instance_id,
+        ),
     )
     row = conn.execute(
         "SELECT conn_epoch FROM instances WHERE id = ? AND status = 'active'",

@@ -26,6 +26,7 @@ at the plan is exactly why the stop is pressed).
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import Counter
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ from uuid import uuid4
 from starlette.exceptions import HTTPException
 
 from src.api import actions as actions_api
+from src.api import exemptions as exemptions_api
 from src.api import instances as instances_api
 from src.api import pause as pause_api
 from src.api import rules as rules_api
@@ -52,6 +54,123 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# --- result size cap (shared by execute_js and get_text) ---------------------
+# A page's innerText or a `document.querySelectorAll(...)` dump is routinely megabytes.
+# Before this, the agent's only defence was writing `.slice(0, 1500)` into every snippet
+# by hand — which it forgets exactly once, and then a single tool call floods its context.
+# The server does the cutting instead, so the cap is a property of the TOOL rather than of
+# whatever the agent remembered to type.
+DEFAULT_MAX_BYTES = 40000
+
+
+def _cut_utf8(raw: bytes, limit: int) -> str:
+    """Decode ``raw[:limit]``, dropping an incomplete trailing UTF-8 sequence.
+
+    ``errors="ignore"`` would silently drop bad bytes ANYWHERE; here the bad bytes possible
+    are the 1-3 that a byte-boundary cut severed plus any surrogate escape
+    :func:`_measure_utf8` had to encode, so ignoring them is exactly the intent — the
+    alternative is ending every truncated payload in U+FFFD.
+    """
+    return raw[:limit].decode("utf-8", errors="ignore")
+
+
+def _measure_utf8(text: str) -> bytes:
+    """UTF-8 bytes of ``text``, tolerating a LONE SURROGATE.
+
+    A page can genuinely hand one back — ``execute_js`` with ``"'\\ud800'"``, or such a
+    char sitting in some element's ``textContent`` — and a plain ``.encode("utf-8")``
+    raises ``UnicodeEncodeError`` on it. That escapes :func:`_guarded` (which catches only
+    ToolError/HTTPException) and dies in the transport, so ONE malformed character on a
+    page would take down a tool call that used to work: before the cap existed the value
+    passed straight through and the MCP layer encoded it with ``ensure_ascii=True``, where
+    a surrogate is harmless.
+
+    ``surrogatepass`` keeps the measurement honest (the char is counted, at its 3-byte
+    WTF-8 width) and never raises; the decode on the way out drops what it cannot represent.
+    """
+    return text.encode("utf-8", errors="surrogatepass")
+
+
+def _validate_max_bytes(max_bytes: int | None) -> int:
+    """Resolve ``max_bytes`` to a positive limit, refusing a bad one.
+
+    Hoisted out of :func:`truncate_payload` so the capped verbs can call it BEFORE issuing
+    their command: the cap is applied to the RESPONSE, so validating it there means an
+    invalid argument costs a full round trip — during which the extension, reading
+    ``maxBytes <= 0`` as "no limit", ships the entire innerText over the socket — and only
+    then hears ``invalid_args``. Refusing an argument never required the browser.
+    """
+    limit = DEFAULT_MAX_BYTES if max_bytes is None else int(max_bytes)
+    if limit <= 0:
+        raise ToolError("invalid_args", "max_bytes must be a positive integer")
+    return limit
+
+
+def truncate_payload(value, max_bytes: int | None = None) -> tuple:
+    """Cap ``value`` at ``max_bytes`` of its UTF-8 size; return ``(value, meta)``.
+
+    ``meta`` is ``{}`` when nothing was cut, else ``{"truncated": True, "total_bytes": N}``
+    where ``N`` is the FULL size — the number the agent needs to decide whether to narrow
+    its selector or page through the rest.
+
+    Two shapes, because the two callers carry two shapes:
+
+    * a ``str`` (``get_text``'s text, or a string ``execute_js`` result) is cut IN THE
+      STRING, so what comes back is still readable text;
+    * anything else is measured as JSON and, when it trips, handed back as
+      ``{"__truncated_json": "<prefix>"}``. A cut JSON document is not valid JSON, so
+      returning it as a STRING under an explicit marker is the honest option — the
+      alternative is a structure that looks parseable and is not.
+
+    Applied to the VALUE, never to the whole response envelope: cutting the envelope would
+    take ``value`` / ``frames`` with it and leave the agent unable to address what it got.
+    """
+    limit = _validate_max_bytes(max_bytes)
+    if isinstance(value, str):
+        raw = _measure_utf8(value)
+        if len(raw) <= limit:
+            return value, {}
+        return _cut_utf8(raw, limit), {"truncated": True, "total_bytes": len(raw)}
+    # `default=str` so an exotic value the extension somehow sent (it should be
+    # JSON-serializable already, chrome structured-clones it) can still be measured
+    # instead of raising inside a size check.
+    raw = _measure_utf8(json.dumps(value, ensure_ascii=False, default=str))
+    if len(raw) <= limit:
+        return value, {}
+    return (
+        {"__truncated_json": _cut_utf8(raw, limit)},
+        {"truncated": True, "total_bytes": len(raw)},
+    )
+
+
+# --- caller-named command budgets (§6 + EXECUTE_JS_MAX_TIMEOUT_MS) -----------
+def _clamp_timeout_ms(app, timeout_ms: int | None) -> int | None:
+    """Clamp a caller's ``timeout_ms`` to ``EXECUTE_JS_MAX_TIMEOUT_MS``; ``None`` stays None.
+
+    ``None`` means "the caller named nothing" and MUST keep meaning ``CMD_TIMEOUT_MS``
+    downstream — that is what makes every new timeout parameter backwards compatible.
+    """
+    if timeout_ms is None:
+        return None
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms < 1:
+        raise ToolError("invalid_args", "timeout_ms must be a positive integer")
+    return min(timeout_ms, app.state.settings.execute_js_max_timeout_ms)
+
+
+# How much longer the SOCKET budget is than the page-condition deadline of a waiting verb.
+# THIS ORDERING IS THE WHOLE POINT OF wait_for: the extension polls until its own deadline
+# and only then answers `timeout`, so if the service gave up at the same instant the
+# command would die on the wire before the page condition could ever resolve — every wait
+# would report `timeout` (the service's) instead of the truth. The margin covers the last
+# poll interval plus the round trip.
+_WAIT_SLACK_MS = 3000
+
+
+def _wait_budget_ms(app, wait_ms: int) -> int:
+    """The socket budget for a command that polls for ``wait_ms`` inside the extension."""
+    return max(app.state.settings.cmd_timeout_ms, wait_ms + _WAIT_SLACK_MS)
+
+
 class ToolError(Exception):
     """A tool refused or failed in a way the agent must see (returned, not raised
     out of the transport). ``code`` is a short machine string; ``payload`` carries
@@ -66,14 +185,23 @@ class ToolError(Exception):
 
 # --- stop gate (§12) ---------------------------------------------------------
 async def _ensure_not_paused(app) -> None:
-    """Raise :class:`ToolError` while the emergency stop is armed — a stopped system
-    refuses every mutating MCP verb (§12). Reused by all command/rule-write/relocate/
-    reset verbs."""
+    """Raise :class:`ToolError` while the emergency stop is armed (§12).
+
+    THE LINE THE GATE ACTUALLY DRAWS — and the message must say the same thing, because a
+    refusal that misdescribes itself sends the reader looking for a bug: everything that
+    REACHES THE BROWSER or writes persistent state is refused. That is every command verb
+    (including the observing ones, ``get_text`` / ``wait_for``: they inject into pages and
+    park the MV3 worker in a poll loop for up to a minute, which is exactly the "stop
+    touching my browser" the stop means) plus the rule and exemption writers. What is NOT
+    gated is a read that never leaves the DB — ``list_exemptions`` and friends — because
+    looking at the state is precisely why one presses stop.
+    """
     since = await app.state.db.read(pause_ops.read_stopped_at)
     if since is not None:
         raise ToolError(
             "stopped",
-            "the curator is stopped; mutating verbs are refused until resume",
+            "the curator is stopped; verbs that touch the browser or write state are "
+            "refused until resume",
             {"stopped_at": since},
         )
 
@@ -138,6 +266,10 @@ async def _freshen_fleet(app) -> dict:
     # session_id per active instance (#47): the epoch stamped alongside freshness so the
     # agent can pin it as expected_session on a later mutating verb.
     sessions = await db.read(state_read._read_active_sessions)
+    # The §11 capability report: what each copy ALLOWS, as it declared in its last hello.
+    # Carried here so an agent can read it BEFORE calling — the alternative is finding out
+    # from a `js_disabled` halfway through a task.
+    caps = await db.read(state_read._read_capabilities)
     envelope: dict = {}
     for iid, res in zip(known, results):
         # Only a reader FAULT (a sqlite Exception from the unwrapped db.read inside
@@ -150,8 +282,17 @@ async def _freshen_fleet(app) -> dict:
         else:
             fresh, reason, _conn_state = res
         row = rows.get(iid) or {}
+        cap = caps.get(iid) or {}
         envelope[iid] = {
             "snapshot_at": row.get("snapshot_at"),
+            # Capability report (§11/§12). ``allow_execute_js`` gates execute_js at the
+            # extension edge; ``allow_debugger`` gates nothing yet (it is the switch a
+            # later screenshot/CDP path reads) and is reported now so an agent never has
+            # to learn a copy's answer by failing; ``ext_version`` is which bundle is
+            # running — null when that copy has not said hello since the column landed.
+            "allow_execute_js": cap.get("allow_execute_js"),
+            "allow_debugger": cap.get("allow_debugger"),
+            "ext_version": cap.get("ext_version"),
             "fresh": fresh,
             "reason": reason,
             "session_id": sessions.get(iid),
@@ -424,7 +565,8 @@ def _tool_error_from_http(exc: HTTPException) -> tuple[str, str]:
 
 
 # --- commands (initiator='mcp' + auth_ctx, §12) ------------------------------
-async def _command(app, instance, command, params, *, auth_ctx, expected_session=None):
+async def _command(app, instance, command, params, *, auth_ctx, expected_session=None,
+                   cmd_timeout_ms=None):
     """Issue one extension command as an MCP verb. Every command carries
     ``initiator='mcp'`` and ``auth_ctx`` = the MCP session (§12: js_audit records the
     session, never a token id). Command failures are surfaced as a ``ToolError`` so
@@ -432,12 +574,17 @@ async def _command(app, instance, command, params, *, auth_ctx, expected_session
     ``stale_session`` (#47), which rides the SAME generic mapping: when the agent pinned
     ``expected_session`` and the browser has since restarted, ``send_command`` stamps the
     old session, the extension refuses with ``stale_session``, and it reaches the agent as
-    a ToolError like any other §6 code."""
+    a ToolError like any other §6 code.
+
+    ``cmd_timeout_ms`` overrides the global ``CMD_TIMEOUT_MS`` for THIS command only.
+    ``None`` (every caller that does not pass it) keeps the global budget byte for byte;
+    the waiting verbs pass a longer one, already clamped to ``EXECUTE_JS_MAX_TIMEOUT_MS``."""
     settings = app.state.settings
     try:
         return await send_command(
             app.state.ext_registry, app.state.db, instance, command, params,
-            cmd_timeout_ms=settings.cmd_timeout_ms, initiator="mcp", auth_ctx=auth_ctx,
+            cmd_timeout_ms=(settings.cmd_timeout_ms if cmd_timeout_ms is None else cmd_timeout_ms),
+            initiator="mcp", auth_ctx=auth_ctx,
             expected_session=expected_session,
         )
     except CommandError as exc:
@@ -491,6 +638,7 @@ def _reconcile_bulk_results(raw_results, items: list) -> list:
 
 async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
                    active: bool = False, window_id: int | None = None,
+                   lease_ttl_s: int | None = None,
                    auth_ctx: str | None = None,
                    expected_session: str | None = None) -> dict:
     """Open a tab in an instance (§6), optionally in a NAMED window (#45).
@@ -507,8 +655,26 @@ async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
     guaranteed state — so we compare the ``windowId`` the extension actually reports to
     the one we asked for and turn a mismatch into a loud ``no_window``. The extension
     cannot do this itself: to it the request never said "here", it was an unknown key.
+
+    ``lease_ttl_s`` writes an ``exemptions`` row for this url on a successful open — the
+    "owned by the agent" lease. Without it, a tab the agent opens for a task is fair game
+    for the very next pass, which may relocate or collapse it mid-task.
+
+    THE SPLIT INSIDE THAT LEASE, which is not the same for both halves:
+
+    * its ARGUMENTS (``url``, ``ttl_s``) are validated FIRST, before the tab is opened, and
+      a bad one is a hard ``invalid_args`` with no frame sent. Judging an argument never
+      required a tab to exist, and ``lease_ttl_s=0`` answering ``ok: true`` with
+      ``lease: {ok: false}`` — while ``set_exemption`` refuses the very same value — would
+      make the contract depend on which door the agent knocked at;
+    * the WRITE afterwards is best-effort and reported as ``lease: {ok:false, ...}`` without
+      failing the call. Here soft degradation is the honest answer: the tab IS open, and
+      saying otherwise would invite the agent to open a second one.
     """
     await _ensure_not_paused(app)
+    # Validated up front, its result reused below: re-deriving it after the open would run
+    # the ceiling and the url rule twice and let the two answers drift.
+    lease_plan = _plan_open_lease(url, lease_ttl_s) if lease_ttl_s is not None else None
     params: dict = {"url": url, "pinned": bool(pinned), "active": bool(active)}
     if window_id is not None:
         params["windowId"] = window_id
@@ -524,7 +690,10 @@ async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
                 f"open_tab landed in window {actual!r}, not the requested {window_id!r} "
                 "(the window vanished, or this extension predates window addressing)",
             )
-    return {"ok": True, "result": result}
+    out = {"ok": True, "result": result}
+    if lease_plan is not None:
+        out["lease"] = await _write_open_lease(app, instance, *lease_plan)
+    return out
 
 
 async def close_tab(app, *, instance: str, tab_id: int | None = None,
@@ -657,23 +826,242 @@ async def merge_windows(app, *, instance: str, params: dict | None = None,
     return {"ok": True, "result": result, "merged": result["merged"]}
 
 
+def _flatten_injection_results(raw_results, max_bytes: int | None) -> dict:
+    """Turn chrome's ``[InjectionResult]`` into ``{value, frames}`` (+ truncation meta).
+
+    ``chrome.scripting.executeScript`` answers one ``{frameId, documentId, result}`` per
+    frame, and the old verb handed that array straight through inside ``{"result": {...}}``.
+    Through MCP that arrived as JSON inside JSON inside JSON — three layers of escaping for
+    what is, in the overwhelming majority of calls, ONE value from ONE frame.
+
+    So: ``value`` is the MAIN frame's result (``frameId == 0``, or the first entry when no
+    frame 0 is reported — a same-shape answer beats an empty one).
+
+    ``frames`` is present ONLY when there is genuinely more than one, and each entry is
+    capped separately so a giant result in one sub-frame cannot swallow the main frame's
+    answer. Today the extension targets ``{tabId}`` and never sets ``allFrames``, so one
+    entry is what every call produces — emitting it anyway would repeat ``value`` verbatim
+    and, since the cap is per entry, let a truncated response weigh 2x ``max_bytes``:
+    a byte cap that doubles the payload it was added to bound. The key stays in the shape
+    for the day an all-frames injection exists; until then its absence means "one frame".
+    """
+    entries = [r for r in (raw_results or []) if isinstance(r, dict)]
+    main = next((r for r in entries if r.get("frameId") == 0), None)
+    if main is None and entries:
+        main = entries[0]
+
+    value, meta = truncate_payload(main.get("result") if main else None, max_bytes)
+    out = {"value": value, **meta}
+    if len(entries) > 1:
+        # Reuse the already-cut main value rather than truncating it a second time.
+        out["frames"] = [
+            {"frame_id": main.get("frameId"), "value": value, **meta}
+            if r is main
+            else _one_frame(r, max_bytes)
+            for r in entries
+        ]
+    return out
+
+
+def _one_frame(entry: dict, max_bytes: int | None) -> dict:
+    fvalue, fmeta = truncate_payload(entry.get("result"), max_bytes)
+    return {"frame_id": entry.get("frameId"), "value": fvalue, **fmeta}
+
+
 async def execute_js(app, *, instance: str, tab_id: int, code: str,
                      world: str | None = None, url_at_exec: str | None = None,
+                     await_promise: bool = False, timeout_ms: int | None = None,
+                     max_bytes: int | None = None,
                      auth_ctx: str | None = None,
                      expected_session: str | None = None) -> dict:
     """Run JS in a tab as an MCP verb. ``send_command`` writes the js_audit row
     BEFORE the send and enforces the runtime kill-switch (§12): a disabled/rejected
     call is still audited (with ``initiator='mcp'`` + the MCP ``auth_ctx``), and the
     extension's own execute_js checkbox still gates it at the edge. Refused while
-    paused."""
+    paused.
+
+    ``await_promise`` (default False) makes the code the body of an async function in the
+    page, so top-level ``await`` and ``return`` both work and the promise is awaited before
+    the value comes back. Without it the code goes through indirect eval exactly as before
+    — which supports neither, and is why async snippets used to answer ``null``.
+
+    ``timeout_ms`` raises THIS command's socket budget (clamped to
+    ``EXECUTE_JS_MAX_TIMEOUT_MS``) because async page code legitimately outlives
+    ``CMD_TIMEOUT_MS``; omitted, the global budget applies unchanged.
+
+    The result is FLAT: ``value`` (plus ``frames`` only when there is more than one)
+    instead of the raw ``{results:[...]}``, capped at ``max_bytes`` (default 40 kB) — see
+    :func:`_flatten_injection_results`."""
     await _ensure_not_paused(app)
+    budget = _clamp_timeout_ms(app, timeout_ms)
+    # VALIDATE BEFORE THE ROUND TRIP. `max_bytes` is only enforced after the response comes
+    # back, so a bad value used to cost a full command — and for THIS verb also a durable
+    # js_audit row recording code that was never going to be delivered.
+    _validate_max_bytes(max_bytes)
     params: dict = {"tabId": tab_id, "code": code}
     if world is not None:
         params["world"] = world
     if url_at_exec is not None:
         params["urlAtExec"] = url_at_exec
+    # Sent ONLY when true, so an unchanged call puts an unchanged frame on the wire and an
+    # older extension sees exactly the params it always saw.
+    if await_promise:
+        params["awaitPromise"] = True
     result = await _command(app, instance, protocol.CMD_EXECUTE_JS, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session, cmd_timeout_ms=budget)
+    return {"ok": True, **_flatten_injection_results(result.get("results"), max_bytes)}
+
+
+async def get_text(app, *, instance: str, tab_id: int, selector: str | None = None,
+                   max_bytes: int | None = None, auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
+    """Read a tab's text — the cheap read that used to require ``execute_js`` (§11).
+
+    NOT behind the execute_js checkbox and writing NO ``js_audit`` row, and that is a
+    deliberate line rather than an oversight: the gate exists because ARBITRARY code
+    arrives at ``execute_js`` and §12's argument is that truncated code cannot be
+    reconstructed after the fact. This verb injects a FIXED function that is committed into
+    the extension and known at build time — there is nothing to reconstruct. Every other
+    gate still applies: the stop gate here, the revoke check and ``stale_session`` in
+    ``send_command``, and the extension's http/https edge guard on the target tab.
+
+    A ``selector`` that matches nothing is ``precondition_failed``, never an empty string:
+    "your selector is wrong" and "the page is blank" are different facts, and conflating
+    them sends the agent to debug the wrong one.
+
+    ``max_bytes`` (default 40 kB) rides down to the extension — which cuts at the source,
+    so a 10 MB innerText never crosses the socket and ``total_bytes`` is the TRUE size —
+    and is then re-applied here by the shared cap, which is what enforces it for an older
+    extension that ignores the parameter."""
+    await _ensure_not_paused(app)
+    # Before the round trip: an extension reading `maxBytes <= 0` as "no limit" would ship
+    # the whole innerText across the socket, and only then would the cap refuse it here.
+    limit = _validate_max_bytes(max_bytes)
+    params: dict = {"tabId": tab_id, "maxBytes": limit}
+    if selector is not None:
+        params["selector"] = selector
+    result = await _command(app, instance, protocol.CMD_GET_TEXT, params, auth_ctx=auth_ctx,
                             expected_session=expected_session)
+    text, meta = truncate_payload(result.get("text") or "", limit)
+    # The EXTENSION's number wins when it already cut: it measured the whole document, so
+    # its totalBytes is the real size, where a server-side re-measure could only report the
+    # size of what already arrived. `totalBytes` is camelCase on the WIRE like every other
+    # §6 key; the MCP-facing name is snake_case.
+    #
+    # Falling back to the local measurement when the number is missing: "truncated: true,
+    # total_bytes: null" is the tool saying "I cut it and I won't say by how much". An
+    # under-count from an extension that reported the flag without the size is still a
+    # floor the agent can act on.
+    if result.get("truncated"):
+        reported = result.get("totalBytes")
+        if not isinstance(reported, int) or isinstance(reported, bool):
+            reported = meta.get("total_bytes", len(_measure_utf8(text)))
+        meta = {"truncated": True, "total_bytes": reported}
+    return {"ok": True, "text": text, **meta}
+
+
+async def wait_for(app, *, instance: str, tab_id: int, url_matches: str | None = None,
+                   selector: str | None = None, text_contains: str | None = None,
+                   timeout_ms: int | None = None, auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
+    """Wait until a page condition holds; answer ``{ok, matched, elapsed_ms}`` (§11).
+
+    A DEADLINE THAT PASSES IS ``matched: False``, NOT an error. §11 fixes ``timeout`` to
+    mean UNKNOWN — no frame arrived, the browser may be wedged, do not blindly retry — and
+    a wait that ran its full course is the opposite: the browser answered, and "no, it
+    never became true" is a definite negative the agent can act on. Two different facts get
+    two different response SHAPES, because a shape is what survives the wire; a shared error
+    string would ask the agent to tell them apart by reading prose. A transport ``timeout``
+    can still happen here and still means unknown.
+
+    EXACTLY ONE of ``url_matches`` / ``selector`` / ``text_contains``. Zero or several is
+    ``invalid_args`` and NOTHING is sent: "wait for A and B" and "wait for A or B" are
+    different verbs, and guessing which was meant would spend the whole budget answering a
+    question nobody asked.
+
+    Like :func:`get_text` this injects a FIXED function (for ``selector`` /
+    ``text_contains``; ``url_matches`` needs no injection at all), so it is NOT behind the
+    execute_js checkbox and writes no ``js_audit`` row — see that docstring for why.
+
+    THE ORDERING THAT MAKES THE VERB WORK: the extension polls until ITS deadline and only
+    then reports the negative verdict, so the SOCKET budget must outlast that deadline
+    (:func:`_wait_budget_ms`). Give both the same number and every wait dies on the wire
+    first, reporting the service's ``timeout`` — "unknown" — instead of the page's actual
+    answer, which is strictly worse than not having the verb."""
+    await _ensure_not_paused(app)
+    given = [
+        name for name, value in (
+            ("url_matches", url_matches),
+            ("selector", selector),
+            ("text_contains", text_contains),
+        ) if value is not None
+    ]
+    if len(given) != 1:
+        raise ToolError(
+            "invalid_args",
+            "exactly one of url_matches / selector / text_contains is required "
+            f"(got {len(given)}: {given or 'none'})",
+        )
+    # An omitted timeout means "the ceiling", not "CMD_TIMEOUT_MS": a wait with no stated
+    # length wants the longest one the operator permits, where every other verb wants the
+    # ordinary command budget.
+    wait_ms = _clamp_timeout_ms(app, timeout_ms)
+    if wait_ms is None:
+        wait_ms = app.state.settings.execute_js_max_timeout_ms
+
+    params: dict = {"tabId": tab_id, "timeoutMs": wait_ms}
+    if url_matches is not None:
+        params["urlMatches"] = url_matches
+    if selector is not None:
+        params["selector"] = selector
+    if text_contains is not None:
+        params["textContains"] = text_contains
+    result = await _command(
+        app, instance, protocol.CMD_WAIT_FOR, params, auth_ctx=auth_ctx,
+        expected_session=expected_session, cmd_timeout_ms=_wait_budget_ms(app, wait_ms),
+    )
+    # Renamed, not splatted: `elapsedMs` is the WIRE spelling (§6 is camelCase throughout),
+    # and everything the agent reads is snake_case.
+    return {
+        "ok": True,
+        "matched": bool(result.get("matched")),
+        "elapsed_ms": int(result.get("elapsedMs") or 0),
+    }
+
+
+async def navigate_tab(app, *, instance: str, tab_id: int, url: str,
+                       wait_until: str | None = None, selector: str | None = None,
+                       timeout_ms: int | None = None, auth_ctx: str | None = None,
+                       expected_session: str | None = None) -> dict:
+    """Point a tab at a url (§6), optionally waiting for the page to be there.
+
+    ``wait_until`` defaults to ``'none'`` — the frame then carries no wait key at all and
+    the extension behaves exactly as it always has (issue the update, answer ``{ok:true}``).
+    ``'load'`` waits for the tab to report ``complete``; ``'selector'`` waits for
+    ``selector`` to match. A wait that expires is a SUCCESS whose ``result`` carries
+    ``matched: false`` — never an error: the tab was pointed at the url either way, so the
+    negative is a verdict, not the "state unknown" that ``timeout`` reserves (see
+    :func:`wait_for`).
+
+    The http/https edge guard is the extension's and is unchanged (§12: a caller must not
+    be able to steer a tab to ``data:``/``javascript:``). §7/§5 note, also unchanged: the
+    navigation's document change stamps the tab's activity clock, so a navigated tab reads
+    as freshly touched — it errs SAFE (a too-fresh tab is never wrongly closed) and
+    self-heals within IDLE_MINUTES."""
+    await _ensure_not_paused(app)
+    params: dict = {"tabId": tab_id, "url": url}
+    budget = None
+    if wait_until is not None and wait_until != "none":
+        wait_ms = _clamp_timeout_ms(app, timeout_ms)
+        if wait_ms is None:
+            wait_ms = app.state.settings.execute_js_max_timeout_ms
+        params["waitUntil"] = wait_until
+        params["timeoutMs"] = wait_ms
+        if selector is not None:
+            params["selector"] = selector
+        budget = _wait_budget_ms(app, wait_ms)  # same ordering rule as wait_for
+    result = await _command(app, instance, protocol.CMD_NAVIGATE_TAB, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session, cmd_timeout_ms=budget)
     return {"ok": True, "result": result}
 
 
@@ -1272,6 +1660,116 @@ def _delete_source_tab(conn, instance_id: str, tab_id: int) -> None:
     conn.execute(
         "DELETE FROM tabs WHERE instance_id = ? AND tab_id = ?", (instance_id, tab_id)
     )
+
+
+# --- exemptions: the agent's «не трогать» lease (§10/§11) --------------------
+#
+# The ``exemptions`` table and the pass's respect for it are OLD (``step4_passes`` skips a
+# tab whose instance+url carries a row with ``until`` in the future). What was missing is a
+# WRITER the agent can reach: only ``restore`` and ``/api/exemptions`` wrote rows, so a tab
+# an agent opened for a task could be collapsed by the very next pass, mid-task.
+#
+# Every rule below is IMPORTED from :mod:`src.api.exemptions`, never restated: the same
+# normalization, the same http(s)-with-a-host url check (a scheme-less url would produce a
+# row that can never match a live tab — a permanently invisible no-op), the same known-
+# instance check, and the same «never infinite» 30-day ceiling. A second door that
+# re-derived those rules is exactly how a ceiling gets quietly weakened on one side.
+async def list_exemptions(app, *, instance: str | None = None,
+                          include_expired: bool = False) -> dict:
+    """Active exemptions, optionally for ONE instance; ``include_expired`` also lists lapsed
+    rows (they are not deleted eagerly — the pass just ignores them — which is what makes
+    "it WAS protected until 14:20" answerable afterwards).
+
+    The ``instance`` filter is applied over the rows rather than in SQL: the reader is
+    shared with the HTTP endpoint and the table is small (one row per protected url), so
+    narrowing it here costs nothing and keeps ONE query shape."""
+    now = _now_ms()
+    items = await app.state.db.read(
+        lambda c: exemptions_api._list(c, now, include_expired)
+    )
+    if instance is not None:
+        items = [i for i in items if i["instance_id"] == instance]
+    return {"ok": True, "server_now": now, "exemptions": items}
+
+
+async def set_exemption(app, *, instance: str, url: str, ttl_s: int,
+                        reason: str | None = None) -> dict:
+    """Protect ``instance`` + ``url`` from the pass for ``ttl_s`` seconds (refreshes an
+    existing row — the table's PK is the pair, so a repeat call moves the deadline instead
+    of growing duplicates).
+
+    Gated by the stop like every other mutating verb (§12), and by the shared ceiling: a
+    ttl above 30 days is clamped, never honoured. There is deliberately no "forever"."""
+    await _ensure_not_paused(app)
+    try:
+        req = _req(app)
+        instance_id = await exemptions_api._validate_instance(req, instance)
+        target = exemptions_api._validate_url(url)
+        now = _now_ms()
+        until = exemptions_api.until_from_ttl_s(now, ttl_s)
+    except HTTPException as exc:
+        raise ToolError(*_tool_error_from_http(exc))
+    label = reason if isinstance(reason, str) and reason else "mcp"
+    await app.state.db.write(
+        lambda c: exemptions_api._upsert(c, instance_id, target, until, label)
+    )
+    return {
+        "ok": True,
+        "exemption": {
+            "instance_id": instance_id, "url": target,
+            "url_norm": normalize_url(target), "until": until,
+            "reason": label, "expired": False,
+        },
+    }
+
+
+async def clear_exemption(app, *, instance: str, url: str) -> dict:
+    """Lift an exemption. Idempotent: ``deleted: 0`` when it was already gone."""
+    await _ensure_not_paused(app)
+    try:
+        req = _req(app)
+        instance_id = await exemptions_api._validate_instance(req, instance)
+        target = exemptions_api._validate_url(url)
+    except HTTPException as exc:
+        raise ToolError(*_tool_error_from_http(exc))
+    deleted = await app.state.db.write(
+        lambda c: exemptions_api._delete(c, instance_id, target)
+    )
+    return {"ok": True, "deleted": deleted}
+
+
+def _plan_open_lease(url: str, ttl_s: int) -> tuple[str, int]:
+    """Validate ``open_tab``'s lease ARGUMENTS and return ``(url, until)``. Raises.
+
+    Called BEFORE the tab is opened. The rules are the shared ones — the same url check
+    and the same 30-day ceiling ``set_exemption`` applies — so the identical ``ttl_s``
+    cannot be a refusal through one verb and a shrug through another."""
+    try:
+        return (
+            exemptions_api._validate_url(url),
+            exemptions_api.until_from_ttl_s(_now_ms(), ttl_s),
+        )
+    except HTTPException as exc:
+        raise ToolError(*_tool_error_from_http(exc))
+
+
+async def _write_open_lease(app, instance: str, url: str, until: int) -> dict:
+    """Best-effort exemption WRITE for a tab ``open_tab`` just opened — the "owned by the
+    agent" lease. Arguments were already validated by :func:`_plan_open_lease`.
+
+    NEVER raises: the tab IS open by the time this runs, so turning a failed write into a
+    failed ``open_tab`` would report "nothing happened" about a tab that exists and invite
+    the agent to open a second one. The outcome is REPORTED instead, and an agent that
+    needs the protection can see it did not get it. What remains here is genuinely a
+    RUNTIME fault (a degraded DB, a disk full) — never a bad argument, which is refused
+    before the browser is touched at all."""
+    try:
+        await app.state.db.write(
+            lambda c: exemptions_api._upsert(c, instance, url, until, "mcp_lease")
+        )
+        return {"ok": True, "until": until, "reason": "mcp_lease"}
+    except Exception as exc:  # noqa: BLE001 - a lease fault must not mask an open tab
+        return {"ok": False, "error": "lease_write_failed", "message": str(exc)}
 
 
 # --- pass + stop/start -------------------------------------------------------

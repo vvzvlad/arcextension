@@ -24,6 +24,16 @@ from src.curator.enroll import ENROLL_WINDOW_MAX_MIN
 # whoever printed it.
 UNKNOWN_REVISION = "unknown"
 
+# MIRROR of ``WAIT_MAX_TIMEOUT_MS`` in extension/src/constants.js — the extension's own
+# ceiling on a polling verb, past which it clamps whatever the service sent. It is
+# DUPLICATED because the other side is JavaScript loaded into a browser and there is no
+# shared artifact to import (the same predicament as the CMD_*/ERR_* wire strings); the
+# mirror is turned into a fact by ``tests/test_settings.py``, which parses constants.js.
+#
+# It bounds EXECUTE_JS_MAX_TIMEOUT_MS below, so an operator can never configure a budget
+# the browser will not honour.
+EXT_WAIT_MAX_TIMEOUT_MS = 60000
+
 
 class Settings(BaseSettings):
     # --- Required tokens: no default; missing OR empty/blank fails at startup ---
@@ -47,6 +57,21 @@ class Settings(BaseSettings):
     tick_ms: int = 60000
     heartbeat_ms: int = 15000
     cmd_timeout_ms: int = 20000
+    # The CEILING on a caller-supplied per-command budget, for the verbs that legitimately
+    # need longer than CMD_TIMEOUT_MS: an async execute_js awaiting a fetch, and the
+    # polling verbs (wait_for, navigate_tab's waitUntil) which are ALL wait by definition.
+    # A single global CMD_TIMEOUT_MS cannot serve both — raising it would give every
+    # ordinary command a 30-second wedge budget, which is how one hung tab stalls a pass.
+    # So the caller names its own timeout and this clamps it; a caller that names nothing
+    # keeps CMD_TIMEOUT_MS exactly as before. ge=1 because 0/negative would make every such
+    # call fail instantly, i.e. config that silently disables the feature.
+    #
+    # le=EXT_WAIT_MAX_TIMEOUT_MS because the EXTENSION clamps at 60 s of its own accord
+    # (constants.js WAIT_MAX_TIMEOUT_MS — a worker parked in a poll loop is not running its
+    # tick). Without this bound an operator writing 120000 would be told 120000 by every
+    # message and silently handed 60 s: config that means something other than it says.
+    # Failing at STARTUP, per AGENTS.md, is the loud version of the same refusal.
+    execute_js_max_timeout_ms: int = Field(default=30000, ge=1, le=EXT_WAIT_MAX_TIMEOUT_MS)
     snapshot_timeout_ms: int = 10000
     lease_ttl_ms: int = 600000
     restore_exemption_min: int = 120

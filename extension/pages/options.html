@@ -109,6 +109,24 @@
         <span>Allow <code>execute_js</code> on this copy</span>
       </label>
 
+      <!--
+        The debugger opt-in (§12). Unlike execute_js — whose danger is entirely in what
+        the code does — this one has a cost the owner PAYS EVEN WHEN NOTHING GOES WRONG,
+        and that cost is stated here rather than left to be discovered: attaching the
+        debugger puts the browser's "идёт отладка" bar across the top of the window for as
+        long as it stays attached, and the attached state is trivially detectable by
+        anti-bot systems, which is how a logged-in session gets challenged or blocked.
+        Nothing reads this switch yet; it is reported in `hello` so an agent can see what
+        this copy allows before it asks.
+      -->
+      <label class="ui-checkbox" for="allow-debugger">
+        <input type="checkbox" id="allow-debugger" />
+        <span>
+          Allow the <code>debugger</code> on this copy — shows the browser's
+          «идёт отладка» bar while attached, and is detectable by anti-bot systems
+        </span>
+      </label>
+
       <p class="ui-status" id="status" role="status" aria-live="polite"></p>
     </main>
     <script src="options.js" type="module"></script>

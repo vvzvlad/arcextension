@@ -274,8 +274,18 @@ export function createChromeMock(opts = {}) {
       onFocusChanged: new FakeEvent(),
     },
     scripting: {
-      executeScript: async (_injection) => {
+      // The injected `func` is NOT run — the canned `scriptResults` stands in for whatever
+      // it would have returned (the injected bodies are unit-tested directly against a
+      // document double instead). What IS modelled is the REJECTION for a target that no
+      // longer exists: Chromium answers "No tab with id: N", and the polling verbs rely on
+      // that rejection to end a wait on a tab the human closed rather than burning the
+      // whole budget in silence.
+      executeScript: async (injection) => {
         await tick();
+        const tabId = injection && injection.target && injection.target.tabId;
+        if (!state.tabs.some((t) => t.id === tabId)) {
+          throw new Error(`No tab with id: ${tabId}.`);
+        }
         return state.scriptResults;
       },
     },
@@ -306,6 +316,9 @@ export function createChromeMock(opts = {}) {
     },
     runtime: {
       getURL: (path) => `chrome-extension://mock-id/${path}`,
+      // The running bundle's manifest — hello reports its `version` as `extVersion` so an
+      // agent can tell a copy that predates a verb from one that has it.
+      getManifest: () => ({ version: opts.extVersion || "9.9.9" }),
       onInstalled: new FakeEvent(),
       onStartup: new FakeEvent(),
       onMessage: new FakeEvent(),

@@ -120,6 +120,13 @@ export const VERDICT_UNKNOWN = "unknown_instance";
 // the AUTHORITATIVE runtime state — read fresh on every execute_js and reported
 // in `hello` — so a copied instance.json cannot smuggle the gate open.
 export const ALLOW_EXECUTE_JS_KEY = "allowExecuteJs";
+// The debugger opt-in checkbox (§12): per-copy, default OFF, chrome.storage.local,
+// reported in `hello` exactly like the execute_js one. NOTHING reads it as a gate yet —
+// no verb in this wave attaches the debugger. It exists now because the CAPABILITY
+// REPORT is the point: an agent must be able to see what a copy will allow BEFORE it
+// calls and fails, and a switch that appears only together with its first consumer means
+// every agent written before that day has to discover the answer by failing.
+export const ALLOW_DEBUGGER_KEY = "allowDebugger";
 // The last known /ext connection facts (§6 `get_connection_state`), kept in
 // chrome.storage.session: an MV3 worker dies between events, so an in-memory-only
 // `lastSeenAt` would read as "never" on every cold start — the startpage would show
@@ -148,6 +155,34 @@ export const CMD_EXECUTE_JS = "execute_js";
 // separate processes; between the windows of one instance there was nothing at
 // all, though `chrome.tabs.move` has been in use here since merge_windows.
 export const CMD_MOVE_TAB = "move_tab";
+// Read a page's text, and wait for a page condition. Both inject a FIXED function that
+// is committed into this bundle and known at build time — NOT arbitrary code — so
+// neither is gated by the execute_js checkbox and neither writes a js_audit row (§12's
+// argument is "усечённый код нереконструируем", and there is nothing to reconstruct
+// here). Every OTHER gate still applies: session check, the service-side pause/stop and
+// revoke checks, and the http/https edge guard on the target tab.
+export const CMD_GET_TEXT = "get_text";
+export const CMD_WAIT_FOR = "wait_for";
+
+// How often `wait_for` (and navigate_tab's waitUntil) re-tests its condition. 250 ms is
+// the usual "fast enough to feel instant, cheap enough to run for 30 s" compromise: at
+// the 30 s ceiling that is ~120 polls, each one `chrome.tabs.get` or one injected
+// one-liner. The SERVICE budget for such a command must exceed the poll deadline, or the
+// command times out on the wire before the page condition can resolve — see
+// src/mcpiface/tools.py `_wait_budget_ms`.
+export const WAIT_POLL_MS = 250;
+
+// The extension's OWN ceiling on how long a wait may occupy this worker, independent of
+// whatever `timeoutMs` the service sends. A worker parked in a poll loop is a worker not
+// running its tick, and a wait longer than a minute would straddle a TICK_MS period.
+//
+// This is the HARD ceiling of the pair: the operator's EXECUTE_JS_MAX_TIMEOUT_MS (30 s by
+// default) is the knob, and `Settings` refuses a value above this number rather than
+// accepting it and quietly delivering 60 s — a config that silently means something else
+// than it says is worse than one that fails at startup. `tests/test_settings.py` pins the
+// two together the way `tests/test_ext_protocol.py` pins the CMD_/ERR_ strings, since
+// again there is no shared artifact the two languages could import.
+export const WAIT_MAX_TIMEOUT_MS = 60000;
 
 // --- Command error codes (§6) -----------------------------------------------
 // The `error.code` a failing `response` carries. Mirrors the ERR_* strings in
@@ -164,4 +199,9 @@ export const ERR_BUSY_DRAGGING = "busy_dragging";
 // inside its own window" apart from every other precondition, and act on it
 // without parsing a message string.
 export const ERR_PINNED_CROSS_WINDOW = "pinned_cross_window";
+// There is deliberately NO extension-side `timeout` code. A waiting verb that reaches its
+// deadline answers `ok:true` with `{matched:false, elapsedMs}` — a definite negative from a
+// browser that is plainly alive. `timeout` (src/ext/protocol.py) stays what §11 defines it
+// as: the SERVICE saying no frame arrived at all, i.e. the state is UNKNOWN and must not be
+// blindly retried. One string, one meaning, one producer.
 export const ERR_INTERNAL = "internal";
