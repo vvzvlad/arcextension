@@ -173,7 +173,7 @@ def build_mcp(app_ref) -> MCPServer:
     # unprotected, exactly as before (fail-open by design).
     @mcp.tool()
     async def open_tab(instance: str, url: str, pinned: bool = False, active: bool = False,
-                       window_id: int | None = None,
+                       window_id: int | None = None, lease_ttl_s: int | None = None,
                        expected_session: str | None = None) -> dict:
         """Open a tab in an instance (§6).
 
@@ -183,10 +183,87 @@ def build_mcp(app_ref) -> MCPServer:
         non-fullscreen window or has vanished. A server-side cross-check turns an OLD
         extension that ignores the key (dropping the tab in its own window) into the same
         loud ``no_window``.
+
+        ``lease_ttl_s`` protects the opened url from the curator pass for that many seconds
+        (an ``exemptions`` row — the "owned by the agent" lease). Clamped to the shared
+        30-day ceiling; there is no "forever". A lease that could not be written is
+        reported as ``lease: {ok:false, error}`` — the tab is open either way, so do NOT
+        retry the open on that.
+
+        The lease protects an ADDRESS, not a tab: it is written for the url you asked for
+        and matched against the tab's live url. A REDIRECT therefore drops it —
+        ``https://shop/checkout`` landing on ``/checkout/step-1`` leaves a row that matches
+        nothing, even though ``lease: {ok:true}`` says the write succeeded. After any
+        navigation you did not ask for, read the live url and re-arm with
+        ``set_exemption``.
+
+        ASKING FOR A LEASE ALSO CHANGES HOW AN UNKNOWN ``instance`` FAILS. With
+        ``lease_ttl_s`` the instance is a lease ARGUMENT, judged exactly as ``set_exemption``
+        judges it: an unknown one is a hard ``invalid_request`` BEFORE the tab is opened,
+        nothing sent. WITHOUT it the same call reaches the socket and comes back
+        ``no_connection`` instead. One door, two codes, decided by whether a lease was asked
+        for — expected, and worth knowing before you read the code as a different fault.
         """
         return await _guarded(tools.open_tab(
             _host(), instance=instance, url=url, pinned=pinned, active=active,
-            window_id=window_id, auth_ctx=current_mcp_session(),
+            window_id=window_id, lease_ttl_s=lease_ttl_s, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def navigate_tab(instance: str, tab_id: int, url: str,
+                           wait_until: str | None = None, selector: str | None = None,
+                           timeout_ms: int | None = None,
+                           expected_session: str | None = None) -> dict:
+        """Point a tab at an http/https url (§6), optionally waiting for the page.
+
+        ``wait_until`` defaults to ``'none'`` (return as soon as the navigation is issued —
+        today's behaviour, answering the unchanged ``{ok, result}``). ``'load'`` waits for
+        the tab to report ``complete``; ``'selector'`` waits for ``selector`` to match.
+        BOTH wait for the navigation to COMMIT first, so neither ordinarily reports about
+        the page the tab is leaving. THREE CASES ESCAPE THAT and can answer about the OLD
+        document: navigating to the address the tab is ALREADY on (the reload is
+        indistinguishable from the document it replaces); a navigation that never changes
+        the document at all (a 204, a ``Content-Disposition: attachment`` download, a
+        cancelled load); and a navigation that has produced NO observable trace by the third
+        poll (~750 ms), where a bounded grace opens the gate rather than burn your whole
+        deadline on a page that may already be loaded. The third one does NOT require the
+        addresses to match: it can answer about the old document even when you asked for a
+        different address. That is the deliberate trade — a rare wrong document instead of a
+        certain wrong answer at the deadline — and the reason ``matched: true`` is worth
+        confirming with ``list_tabs`` when it comes back suspiciously fast. A tab that was
+        ALREADY loading when you called is deliberately NOT a fourth: for it a
+        loading→complete round is the OLD document finishing, so neither that signal nor the
+        grace is granted, and a navigation it cannot recognise any other way answers
+        ``matched: false`` at the deadline instead of confidently about the page it was
+        leaving.
+
+        ``timeout_ms`` bounds the wait and is clamped to EXECUTE_JS_MAX_TIMEOUT_MS. It also
+        removes that grace, and the boundary is 500 ms: the grace opens the gate on the THIRD
+        poll and the first sits behind a 250 ms pre-pause, so a budget of 500 ms or less
+        never reaches it — measured, ``timeout_ms=500`` answers ``matched: false`` where 501
+        answers ``matched: true``. Above that but below about a second the gate can open and
+        the CONDITION then gets one or two polls before the deadline (at 999 ms it is tested
+        at 750 ms and again at 999 ms). A short budget is the pre-grace behaviour, not a
+        faster version of the same one.
+
+        WITH a wait the answer is ``wait_for``'s: ``{ok, matched, elapsed_ms}``. A wait that
+        expires still answers ``ok`` with ``matched: false`` — the navigation WAS issued and
+        the condition simply never became true, which is a verdict, not a failure.
+
+        ``matched: false`` HAS TWO MEANINGS and your next move differs: either the condition
+        never became true (the page is there, the selector is wrong or slower than
+        ``timeout_ms``), or the COMMIT was never recognised, in which case the condition was
+        never tested at all. The answer cannot tell them apart — read the tab's live url
+        (``list_tabs``) before concluding the page is wrong. An extension too old to
+        understand ``wait_until`` is NOT one of the two: it is refused with its OWN code,
+        ``extension_too_old`` (never ``precondition_failed``, which on this verb always means
+        "fix your argument", and never dressed up as ``matched: false``). Retrying or
+        rewording the call cannot help — stop asking THIS copy to wait, or update its
+        extension; the tab WAS navigated either way."""
+        return await _guarded(tools.navigate_tab(
+            _host(), instance=instance, tab_id=tab_id, url=url, wait_until=wait_until,
+            selector=selector, timeout_ms=timeout_ms, auth_ctx=current_mcp_session(),
             expected_session=expected_session,
         ))
 
@@ -255,14 +332,110 @@ def build_mcp(app_ref) -> MCPServer:
     async def execute_js(
         instance: str, tab_id: int, code: str,
         world: str | None = None, url_at_exec: str | None = None,
+        await_promise: bool = False, timeout_ms: int | None = None,
+        max_bytes: int | None = None,
         expected_session: str | None = None,
     ) -> dict:
-        """Run JS in a tab (§12: audited before send, gated by the checkbox+kill-switch)."""
+        """Run JS in a tab (§12: audited before send, gated by the checkbox+kill-switch).
+
+        A promise is awaited on EITHER path, with or without the flag: ``fetch(u).then(r =>
+        r.json())`` resolves to the parsed body, not to a promise.
+
+        ``await_promise=true`` is what you reach for to write the two KEYWORDS indirect eval
+        cannot parse — a top-level ``await`` and a top-level ``return``. It is not ONLY
+        that: the flag also re-parses the snippet as an EXPRESSION, so a source that is
+        ambiguous between a block and an object literal changes meaning — ``{a:1};`` answers
+        ``1`` without the flag (eval reads a labelled block) and ``{"a": 1}`` with it.
+        Exotic, and in your favour, but do not read the flag as "the same result plus two
+        keywords". A single EXPRESSION still returns its value on either path, with or
+        without a trailing ``;`` (``document.title`` and ``document.title;`` both answer the
+        title); MULTI-STATEMENT code must ``return`` explicitly, or the value is null. Reach
+        for the flag when the snippet wants to write ``await``/``return``, not as a default.
+
+        ``timeout_ms`` raises this one command's budget (clamped to
+        EXECUTE_JS_MAX_TIMEOUT_MS) for code that legitimately takes longer than
+        CMD_TIMEOUT_MS.
+
+        The result is FLAT: ``value`` is the main frame's result. ``frames`` appears only
+        when the injection genuinely produced more than one — its absence means one frame,
+        and ``value`` is it. A value chrome could not structured-clone (a DOM node, a
+        function, a circular object) arrives as ``{__unserializable, preview}`` instead of a
+        silent null. Payloads are capped at ``max_bytes`` (default 40000) with ``truncated``
+        + ``total_bytes`` — but that cut happens on the SERVICE, after the whole value has
+        crossed the socket: it protects your context, not the wire. Unlike get_text, this
+        cap does not reach the page, so a snippet that can return less should return less."""
         return await _guarded(tools.execute_js(
             _host(), instance=instance, tab_id=tab_id, code=code, world=world,
-            url_at_exec=url_at_exec, auth_ctx=current_mcp_session(),
+            url_at_exec=url_at_exec, await_promise=await_promise, timeout_ms=timeout_ms,
+            max_bytes=max_bytes, auth_ctx=current_mcp_session(),
             expected_session=expected_session,
         ))
+
+    @mcp.tool()
+    async def get_text(instance: str, tab_id: int, selector: str | None = None,
+                       max_bytes: int | None = None,
+                       expected_session: str | None = None) -> dict:
+        """Read a tab's visible text — ``innerText`` of ``selector`` (or of the whole body).
+
+        A FIXED injected function, so — unlike execute_js — it needs NO execute_js checkbox
+        and writes no js_audit row; the http/https target guard still applies. A
+        ``selector`` matching nothing is ``precondition_failed``, not an empty string.
+        Capped at ``max_bytes`` (default 40000), reporting ``truncated`` + ``total_bytes``."""
+        return await _guarded(tools.get_text(
+            _host(), instance=instance, tab_id=tab_id, selector=selector,
+            max_bytes=max_bytes, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def wait_for(instance: str, tab_id: int, url_matches: str | None = None,
+                       selector: str | None = None, text_contains: str | None = None,
+                       timeout_ms: int | None = None,
+                       expected_session: str | None = None) -> dict:
+        """Wait until a page condition holds; answers ``{ok, matched, elapsed_ms}``.
+
+        A deadline that passes is ``matched: false`` — a SUCCESS carrying a negative
+        verdict, not an error: the browser answered, the condition simply never became
+        true. A ``timeout`` error here means the opposite and keeps its §11 meaning: no
+        response arrived at all, so the state is UNKNOWN and must not be blindly retried.
+
+        EXACTLY ONE of ``url_matches`` (substring of the live tab url — no injection at
+        all), ``selector`` (matches in the page) or ``text_contains`` (substring of the
+        body text). Zero or several is ``invalid_args`` and nothing is polled.
+
+        ``timeout_ms`` defaults to EXECUTE_JS_MAX_TIMEOUT_MS and is clamped to it. Like
+        get_text this injects a FIXED function, so no execute_js checkbox is needed."""
+        return await _guarded(tools.wait_for(
+            _host(), instance=instance, tab_id=tab_id, url_matches=url_matches,
+            selector=selector, text_contains=text_contains, timeout_ms=timeout_ms,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    # --- exemptions: the agent's «не трогать» lease (§10/§11) ----------------
+    @mcp.tool()
+    async def list_exemptions(instance: str | None = None,
+                              include_expired: bool = False) -> dict:
+        """List active «do not touch» exemptions the curator pass honours, optionally for
+        one instance. ``include_expired`` also returns lapsed rows."""
+        return await _guarded(tools.list_exemptions(
+            _host(), instance=instance, include_expired=include_expired,
+        ))
+
+    @mcp.tool()
+    async def set_exemption(instance: str, url: str, ttl_s: int,
+                            reason: str | None = None) -> dict:
+        """Protect ``instance`` + ``url`` from the curator pass for ``ttl_s`` seconds.
+
+        Keyed by (instance, url), so a repeat call REFRESHES the deadline. Clamped to the
+        30-day ceiling — an exemption is never infinite."""
+        return await _guarded(tools.set_exemption(
+            _host(), instance=instance, url=url, ttl_s=ttl_s, reason=reason,
+        ))
+
+    @mcp.tool()
+    async def clear_exemption(instance: str, url: str) -> dict:
+        """Lift an exemption. Idempotent: ``deleted: 0`` when it was already gone."""
+        return await _guarded(tools.clear_exemption(_host(), instance=instance, url=url))
 
     @mcp.tool()
     async def relocate_tab(instance_from: str, instance_to: str,

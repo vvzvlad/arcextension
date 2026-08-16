@@ -514,9 +514,18 @@ async def _handle_hello(
 
         now = _now_ms()
         allow_execute_js = bool(msg.get("allowExecuteJs"))
+        # The rest of the capability report (§11). Both are self-reported by the copy, as
+        # allowExecuteJs already is: they describe what THAT browser will do, and it is the
+        # only thing that can know. ``extVersion`` is normalized to None for anything that
+        # is not a non-empty string — an old bundle sends nothing, and a junk value must
+        # read as "did not say" rather than be echoed to the agent as a version.
+        allow_debugger = bool(msg.get("allowDebugger"))
+        ext_version_raw = msg.get("extVersion")
+        ext_version = ext_version_raw if isinstance(ext_version_raw, str) and ext_version_raw else None
         new_epoch = await db.write(
             lambda c: queries.hello_upsert(
-                c, instance_id, session_id, allow_execute_js, now
+                c, instance_id, session_id, allow_execute_js, now,
+                allow_debugger=allow_debugger, ext_version=ext_version,
             )
         )
         if new_epoch is None:

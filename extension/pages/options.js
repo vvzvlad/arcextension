@@ -20,6 +20,10 @@
 // Storage keys — mirror src/constants.js (options.js is loaded raw in the page, not
 // bundled, so it does not import to avoid module-resolution surprises under the CSP).
 const ALLOW_EXECUTE_JS_KEY = "allowExecuteJs";
+// The debugger opt-in (§12), default OFF like execute_js. Nothing reads it as a gate yet
+// — it is reported in `hello` so an agent can see this copy's capabilities up front — but
+// the switch ships with the report so the owner decides BEFORE the first consumer exists.
+const ALLOW_DEBUGGER_KEY = "allowDebugger";
 const SERVICE_ADDRESS_KEY = "serviceAddress";
 const INSTANCE_NAME_KEY = "browserName";
 const ENROLL_CODE_KEY = "enrollCode";
@@ -210,6 +214,7 @@ export async function init(doc, chromeApi) {
   };
 
   const checkbox = el("allow-execute-js");
+  const debuggerBox = el("allow-debugger");
   const addressInput = el("service-address");
   const nameInput = el("browser-name");
   const codeInput = el("enroll-code");
@@ -223,11 +228,13 @@ export async function init(doc, chromeApi) {
   // Load current values.
   const got = await chromeApi.storage.local.get([
     ALLOW_EXECUTE_JS_KEY,
+    ALLOW_DEBUGGER_KEY,
     SERVICE_ADDRESS_KEY,
     INSTANCE_NAME_KEY,
     ENROLL_CODE_KEY,
   ]);
   if (checkbox) checkbox.checked = !!got[ALLOW_EXECUTE_JS_KEY];
+  if (debuggerBox) debuggerBox.checked = !!got[ALLOW_DEBUGGER_KEY];
   if (addressInput) addressInput.value = got[SERVICE_ADDRESS_KEY] || "";
   if (nameInput) nameInput.value = got[INSTANCE_NAME_KEY] || "";
   if (codeInput) codeInput.value = got[ENROLL_CODE_KEY] || "";
@@ -275,6 +282,16 @@ export async function init(doc, chromeApi) {
     checkbox.addEventListener("change", async () => {
       await chromeApi.storage.local.set({ [ALLOW_EXECUTE_JS_KEY]: checkbox.checked });
       setStatus(checkbox.checked ? "execute_js enabled on this copy" : "execute_js disabled on this copy");
+    });
+  }
+  if (debuggerBox) {
+    debuggerBox.addEventListener("change", async () => {
+      await chromeApi.storage.local.set({ [ALLOW_DEBUGGER_KEY]: debuggerBox.checked });
+      setStatus(
+        debuggerBox.checked
+          ? "debugger enabled on this copy — the «идёт отладка» bar will show while attached"
+          : "debugger disabled on this copy",
+      );
     });
   }
   if (addressInput) {

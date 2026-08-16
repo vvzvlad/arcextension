@@ -41,10 +41,39 @@ from src.rules.matcher import normalize_target
 # retire a URL from curation forever, which is the same failure the finite pause exists
 # to prevent (§7). 30 days is a generous ceiling that still guarantees self-expiry.
 MAX_MINUTES = 30 * 24 * 60
+MAX_MS = MAX_MINUTES * 60_000
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# --- the shared rules (ONE definition, HTTP and MCP both call them) ----------
+# The MCP verbs (§11 list_exemptions / set_exemption / clear_exemption) are a second door
+# onto the same table, and a second door that re-derives the rules is how a ceiling gets
+# quietly weakened on one side. So the ceiling, the url check and the instance check live
+# here once; :mod:`src.mcpiface.tools` imports them rather than restating them.
+def clamp_until(now: int, until: int) -> int:
+    """Apply the «never infinite» ceiling to an absolute deadline (ms).
+
+    An unbounded "do not touch" row would quietly retire a URL from curation forever —
+    the same failure the finite pause exists to prevent (§7).
+    """
+    return min(until, now + MAX_MS)
+
+
+def until_from_ttl_s(now: int, ttl_s) -> int:
+    """Absolute deadline (ms) from a TTL in SECONDS, under :func:`clamp_until`.
+
+    Seconds because that is the unit an AGENT thinks in — it leases a tab for the length
+    of a task, not for a round number of minutes. The ceiling is the same one the HTTP
+    ``minutes`` form gets; the unit differs, the policy does not.
+    """
+    if isinstance(ttl_s, bool) or not isinstance(ttl_s, int):
+        raise HTTPException(status_code=422, detail="ttl_s must be an integer (seconds)")
+    if ttl_s < 1:
+        raise HTTPException(status_code=422, detail="ttl_s must be >= 1")
+    return clamp_until(now, now + ttl_s * 1000)
 
 
 # --- readers / writers (sync ``fn(conn)``, one transaction each) -------------
@@ -163,14 +192,13 @@ def _resolve_until(body: dict, now: int) -> int:
             raise HTTPException(status_code=422, detail="until must be an integer (ms)")
         if until <= now:
             raise HTTPException(status_code=422, detail="until must be in the future")
-        cap = now + MAX_MINUTES * 60_000
-        return min(until, cap)
+        return clamp_until(now, until)
     if minutes is not None:
         if isinstance(minutes, bool) or not isinstance(minutes, int):
             raise HTTPException(status_code=422, detail="minutes must be an integer")
         if minutes < 1:
             raise HTTPException(status_code=422, detail="minutes must be >= 1")
-        return now + min(minutes, MAX_MINUTES) * 60_000
+        return clamp_until(now, now + minutes * 60_000)
     raise HTTPException(
         status_code=422, detail="one of `until` (ms) or `minutes` is required"
     )

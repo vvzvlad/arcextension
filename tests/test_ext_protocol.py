@@ -172,9 +172,15 @@ _JS_WIRE_CONST_RE = re.compile(
     r'^export const ((?:CMD|ERR)_[A-Z0-9_]+)\s*=\s*"([^"]*)";', re.MULTILINE
 )
 
-# The two codes that exist ONLY on the service side: no live socket for the instance,
-# and the local wait timed out before any `response` arrived. Neither can be produced by
-# the extension (it is the peer that is missing), so neither belongs in constants.js.
+# The codes that exist only on the service side: no live socket for the instance, and no
+# `response` frame inside the command budget. Both describe a MISSING peer, so the
+# extension cannot possibly produce either and neither belongs in constants.js.
+#
+# ``ERR_TIMEOUT`` stays here even though this wave added waiting verbs (§11): a `wait_for`
+# whose condition never came true answers `ok:true, matched:false` — the browser answered,
+# the verdict is simply "no". Letting the extension ALSO say `timeout` would collapse that
+# definite negative into "state unknown, do not retry", which is the one thing `timeout`
+# must keep meaning.
 _SERVICE_ONLY_ERRORS = {"ERR_NO_CONNECTION", "ERR_TIMEOUT"}
 
 
@@ -204,12 +210,12 @@ def test_command_verbs_mirror_the_extension_exactly():
     """
     js = {k: v for k, v in _js_wire_constants().items() if k.startswith("CMD_")}
     assert js == _py_wire_constants("CMD_")
-    # The seven original verbs plus move_tab and focus_window — spelled out so a silent
-    # RENAME of a live wire string (which would keep both sides equal, and break every
-    # deployed copy of the other half) still reddens here.
+    # The seven original verbs plus move_tab, focus_window and the two FIXED-function
+    # observation verbs — spelled out so a silent RENAME of a live wire string (which would
+    # keep both sides equal, and break every deployed copy of the other half) still reddens.
     assert set(js.values()) == {
         "open_tab", "close_tab", "get_tab", "focus_tab", "focus_window", "navigate_tab",
-        "merge_windows", "execute_js", "move_tab",
+        "merge_windows", "execute_js", "move_tab", "get_text", "wait_for",
     }
 
 

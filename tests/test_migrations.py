@@ -334,6 +334,75 @@ def test_v1_to_latest_is_idempotent_on_rerun(tmp_path):
         conn.close()
 
 
+def test_step4_adds_the_capability_columns_with_honest_defaults(tmp_path):
+    """The §11 capability report's storage, on a database that already has live rows.
+
+    Both defaults are load-bearing. ``allow_debugger`` DEFAULT 0: a column defaulting to 1
+    would report every pre-migration instance as debugger-capable — the opposite of the
+    truth, and exactly the kind of false capability an agent would then act on.
+    ``ext_version`` NULL: an instance that has not said hello since the upgrade genuinely
+    has not told us which bundle it runs, and "unknown" must not be spelled as a made-up
+    version string.
+    """
+    db = str(tmp_path / "curator.db")
+    backups = str(tmp_path / "backups")
+    conn = _open(db)
+    try:
+        # A live-looking v3 database (one enrolled instance that opted INTO execute_js).
+        migrate(conn, db, backups, steps=STEPS[:3], max_version=3)
+        assert _version(conn) == 3
+        assert "allow_debugger" not in _columns(conn, "instances")
+        conn.execute(
+            "INSERT INTO instances (id, status, secret_hash, conn_epoch, allow_execute_js) "
+            "VALUES ('main', 'active', 'hash-main', 7, 1)"
+        )
+        conn.commit()
+
+        result = migrate(conn, db, backups)  # applies step 4
+        assert result.ok and not result.degraded
+        assert _version(conn) == MAX_VERSION
+        assert {"allow_debugger", "ext_version"} <= _columns(conn, "instances")
+
+        row = conn.execute(
+            "SELECT allow_execute_js, allow_debugger, ext_version FROM instances "
+            "WHERE id = 'main'"
+        ).fetchone()
+        # The pre-existing opt-in survived; the two new facts read as "not told us".
+        assert row == (1, 0, None)
+    finally:
+        conn.close()
+
+
+def test_step5_records_how_audited_code_ran_and_backfills_the_only_honest_answer(tmp_path):
+    """``js_audit.await_promise``, DEFAULT 0 on rows written before the column existed.
+
+    0 is not a convenience default: every pre-migration row came from the eval path,
+    because that was the only path there was. A default of 1 would retroactively claim
+    async-function semantics for code that never had them.
+    """
+    db = str(tmp_path / "curator.db")
+    backups = str(tmp_path / "backups")
+    conn = _open(db)
+    try:
+        migrate(conn, db, backups, steps=STEPS[:4], max_version=4)
+        assert "await_promise" not in _columns(conn, "js_audit")
+        conn.execute(
+            "INSERT INTO js_audit (ts, instance_id, code, initiator) "
+            "VALUES (1, 'main', 'document.title', 'mcp')"
+        )
+        conn.commit()
+
+        result = migrate(conn, db, backups)  # applies step 5
+        assert result.ok and not result.degraded
+        assert _version(conn) == MAX_VERSION
+        assert "await_promise" in _columns(conn, "js_audit")
+        assert conn.execute(
+            "SELECT code, await_promise FROM js_audit"
+        ).fetchone() == ("document.title", 0)
+    finally:
+        conn.close()
+
+
 def test_failing_step_is_degraded_and_rolls_back(tmp_path):
     db = str(tmp_path / "curator.db")
     backups = str(tmp_path / "backups")

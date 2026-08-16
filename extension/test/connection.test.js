@@ -248,6 +248,48 @@ describe("hello reports the STORED execute_js checkbox (§12)", () => {
   });
 });
 
+// --- the capability report (§11/§12) ----------------------------------------
+// An agent must be able to see what a copy allows BEFORE it calls and fails mid-task.
+// These two ride the SAME hello path allowExecuteJs already rode.
+describe("hello carries the capability report", () => {
+  it("reports allowDebugger (default OFF) and the running extVersion", async () => {
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    expect(conn.ws.sent[0]).toMatchObject({
+      type: "hello",
+      // Never ticked => OFF, exactly like the execute_js gate: a capability that
+      // defaulted ON would tell the agent this copy permits something it does not.
+      allowDebugger: false,
+      extVersion: "9.9.9", // from the mock's chrome.runtime.getManifest()
+    });
+  });
+
+  it("reports allowDebugger:true once the options checkbox is ticked", async () => {
+    await chrome.storage.local.set({ allowDebugger: true });
+    const conn = makeConnection();
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    expect(conn.ws.sent[0]).toMatchObject({ type: "hello", allowDebugger: true });
+  });
+
+  it("a manifest read that throws costs the version, NEVER the hello", async () => {
+    // The capability REPORT must not be able to take the connection down — that would be
+    // exactly backwards. `null` = "this copy did not say".
+    const conn = makeConnection();
+    conn.env.manifestVersion = () => {
+      throw new Error("no manifest here");
+    };
+    await conn.ensureSocket();
+    conn.ws._open();
+    await flush();
+    expect(conn.ws.sent[0]).toMatchObject({ type: "hello", extVersion: null });
+    expect(conn.ws.sent[0].secret).toBe(SECRET_HEX); // the frame still went out intact
+  });
+});
+
 describe("ensureSocket idempotence (§6)", () => {
   it("does not open a second socket when one is already live", async () => {
     const conn = makeConnection();

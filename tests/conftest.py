@@ -41,6 +41,9 @@ _DEFAULTS: dict = {
     # test is waiting for, so the heartbeat is parked far away.
     "heartbeat_ms": 600_000,
     "cmd_timeout_ms": 2_000,
+    # The ceiling a caller-named timeout is clamped to (async execute_js / wait_for).
+    # Test-shaped: well above cmd_timeout_ms so a test can exercise the clamp both ways.
+    "execute_js_max_timeout_ms": 30_000,
     "snapshot_timeout_ms": 2_000,
     "lease_ttl_ms": 600_000,
     "state_fresh_ms": 3_000_000,

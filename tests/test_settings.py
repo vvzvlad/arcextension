@@ -1,7 +1,10 @@
+import re
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from src.settings import Settings
+from src.settings import EXT_WAIT_MAX_TIMEOUT_MS, Settings
 
 
 def _base_env(monkeypatch):
@@ -22,6 +25,7 @@ def test_loads_defaults_from_section4(monkeypatch):
     assert s.tick_ms == 60000
     assert s.heartbeat_ms == 15000
     assert s.cmd_timeout_ms == 20000
+    assert s.execute_js_max_timeout_ms == 30000
     assert s.snapshot_timeout_ms == 10000
     assert s.lease_ttl_ms == 600000
     assert s.restore_exemption_min == 120
@@ -263,3 +267,60 @@ def test_the_retired_enrollment_knobs_are_gone_and_a_leftover_value_is_harmless(
     # A nonsense leftover is equally harmless — it is no longer a knob at all.
     monkeypatch.setenv("ENROLL_REQUEST_TTL_MIN", "0")
     assert Settings(_env_file=None).enroll_window_min == 10
+
+
+def test_execute_js_max_timeout_is_configurable_and_refuses_a_useless_value(monkeypatch):
+    """The ceiling a caller-named per-command budget is clamped to.
+
+    It exists because ONE global CMD_TIMEOUT_MS cannot serve both an ordinary command and
+    a verb that waits by definition: raising the global would hand every command a
+    30-second wedge budget, which is how one hung tab stalls a whole pass.
+
+    0 / negative is a startup failure rather than a silent floor: it would make every
+    async execute_js and every wait_for fail instantly, i.e. config that quietly disables
+    the feature it names.
+    """
+    _base_env(monkeypatch)
+    monkeypatch.setenv("EXECUTE_JS_MAX_TIMEOUT_MS", "45000")
+    assert Settings(_env_file=None).execute_js_max_timeout_ms == 45000
+    for bad in ("0", "-1"):
+        monkeypatch.setenv("EXECUTE_JS_MAX_TIMEOUT_MS", bad)
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+    monkeypatch.setenv("EXECUTE_JS_MAX_TIMEOUT_MS", "not-a-number")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_execute_js_max_timeout_cannot_exceed_what_the_extension_will_honour(monkeypatch):
+    """A budget the browser will not honour is refused at STARTUP, never silently reduced.
+
+    The extension clamps every polling verb at its own WAIT_MAX_TIMEOUT_MS (60 s: a worker
+    parked in a poll loop is a worker not running its tick). Without the upper bound, an
+    operator writing 120000 would be told 120000 by every message and handed 60 s — config
+    that means something other than it says, which is the failure mode AGENTS.md answers
+    with "missing/😖 ENV -> fail at startup".
+    """
+    _base_env(monkeypatch)
+    monkeypatch.setenv("EXECUTE_JS_MAX_TIMEOUT_MS", str(EXT_WAIT_MAX_TIMEOUT_MS))
+    assert Settings(_env_file=None).execute_js_max_timeout_ms == EXT_WAIT_MAX_TIMEOUT_MS
+    monkeypatch.setenv("EXECUTE_JS_MAX_TIMEOUT_MS", str(EXT_WAIT_MAX_TIMEOUT_MS + 1))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_the_extension_wait_ceiling_mirror_is_real():
+    """``EXT_WAIT_MAX_TIMEOUT_MS`` equals ``WAIT_MAX_TIMEOUT_MS`` in constants.js.
+
+    Duplicated by construction — the other side is JavaScript in a browser and there is no
+    shared artifact to import — so the promise is only worth what a test makes of it. Same
+    predicament, and same remedy, as the CMD_*/ERR_* wire strings in test_ext_protocol.py:
+    parse the JS. Lower the extension's ceiling alone and the service would keep accepting
+    budgets it silently cannot deliver.
+    """
+    constants_js = (
+        Path(__file__).resolve().parent.parent / "extension" / "src" / "constants.js"
+    ).read_text(encoding="utf-8")
+    m = re.search(r"^export const WAIT_MAX_TIMEOUT_MS\s*=\s*(\d+);", constants_js, re.MULTILINE)
+    assert m, "WAIT_MAX_TIMEOUT_MS not found in constants.js (moved or reformatted?)"
+    assert int(m.group(1)) == EXT_WAIT_MAX_TIMEOUT_MS

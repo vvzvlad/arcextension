@@ -33,6 +33,8 @@ import {
   CMD_MERGE_WINDOWS,
   CMD_EXECUTE_JS,
   CMD_MOVE_TAB,
+  CMD_GET_TEXT,
+  CMD_WAIT_FOR,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
@@ -41,6 +43,9 @@ import {
   ERR_BUSY_DRAGGING,
   ERR_PINNED_CROSS_WINDOW,
   ERR_INTERNAL,
+  WAIT_POLL_MS,
+  WAIT_COMMIT_GRACE_POLLS,
+  WAIT_MAX_TIMEOUT_MS,
 } from "./constants.js";
 
 // --- small helpers ----------------------------------------------------------
@@ -67,13 +72,205 @@ export function isHttpUrl(url) {
   return u.protocol === "http:" || u.protocol === "https:";
 }
 
-// The function body injected into the target world by execute_js. It MUST be a
-// top-level, closure-free function: chrome.scripting serializes it to source and
-// runs it in the page, so it cannot capture anything from this module.
-function evalInWorld(source) {
-  // Indirect eval: run the curator-supplied source in the injected world.
-  // eslint-disable-next-line no-eval
-  return (0, eval)(source);
+// --- injected function bodies ------------------------------------------------
+//
+// EVERY function below is injected into a page by chrome.scripting, which serializes it
+// TO SOURCE. So each MUST be top-level and closure-free: it cannot capture a module
+// import, a module constant, or anything else from this file. Inner helpers declared
+// INSIDE the function are fine — they travel with the source.
+//
+// They are exported ONLY so the tests can call them directly against a DOM double: the
+// chrome mock's `scripting.executeScript` returns a canned value without ever running the
+// function, so an un-exported injected body is untestable.
+//
+// THE SPLIT THAT MATTERS (§12): `evalInWorld` carries ARBITRARY code and is therefore
+// behind the execute_js checkbox + the kill-switch + a js_audit row. `readTextInWorld` and
+// `matchInWorld` are FIXED — committed here, known at build time, taking only a selector
+// or a substring — so there is nothing to reconstruct after the fact and they are NOT
+// behind that gate and write NO audit row. They are still subject to every other gate: the
+// session check above, the service-side pause/stop and revoke checks, and the http/https
+// edge guard on the target tab.
+
+// The body injected into the target world by execute_js.
+//
+// `awaitPromise` (default false) buys the two KEYWORDS indirect eval cannot parse: a
+// top-level `await`, and a top-level `return` (a SyntaxError in eval). It is NOT what
+// makes async code work in general — chrome.scripting awaits a promise the injected
+// function returns, so `fetch(u).then(r => r.json())` resolves on the default path and
+// always has. Reach for the flag when the snippet wants to WRITE `await`/`return`.
+//
+// AsyncFunction, not `new Function("(async()=>{" + source + "})()")`: string-splicing the
+// source into a wrapper breaks on a source whose last line is a `//` comment — the
+// appended `})()` lands inside that comment and the whole thing is a SyntaxError. The
+// constructor takes the body verbatim and supplies the braces itself.
+//
+// It is compiled in TWO STEPS, the strategy a REPL uses, because the constructor makes the
+// source the function BODY — which throws an expression's completion value away. Compiled
+// only that way, `awaitPromise:true` would answer null for `document.title`: exactly the
+// silent null this flag exists to remove, and worse, since an agent that turns the flag on
+// for every call would get nulls everywhere. So: EXPRESSION first, statements as fallback.
+export function evalInWorld(source, awaitPromise) {
+  // chrome.scripting structured-clones the result on its way out of the page, and a value
+  // that cannot be cloned — a DOM node, a function, a circular object, a Window — becomes
+  // a silent `null`. That reads exactly like "the code returned null", which is the single
+  // most confusing failure this verb has. Name it instead.
+  const describe = (v) => {
+    // A PROMISE is CHAINED, never cloned — and this test must come BEFORE the probe.
+    // chrome.scripting awaits a promise the injected function returns, so
+    // `Promise.resolve(42)` and `fetch(u).then(r => r.json())` have always worked with no
+    // flag at all; but structuredClone throws DataCloneError on a promise, so probing one
+    // would report `{__unserializable:"Promise"}` and swallow the data the agent asked
+    // for. Chaining puts the probe on the RESOLVED value — the one that actually crosses
+    // the boundary — which is where it belonged all along.
+    //
+    // The `.then` read is guarded for the same reason the `.constructor` read below is: an
+    // exotic proxy can throw on property access. A throw here just falls through to the
+    // probe, which is already wrapped.
+    let thenable = false;
+    try {
+      thenable =
+        !!v && (typeof v === "object" || typeof v === "function") && typeof v.then === "function";
+    } catch {
+      thenable = false;
+    }
+    if (thenable) return v.then(describe);
+    // MAIN world shares the page's globals, and a page can delete structuredClone. Without
+    // this guard the probe would throw for EVERY value and report each one unserializable —
+    // turning a diagnostic into a fabrication. No probe available => say nothing, which is
+    // exactly today's behaviour.
+    if (typeof structuredClone !== "function") return v;
+    try {
+      structuredClone(v);
+      return v;
+    } catch {
+      let kind = typeof v;
+      try {
+        if (v && v.constructor && v.constructor.name) kind = v.constructor.name;
+      } catch {
+        // An exotic proxy can throw on `.constructor`; `typeof` is still an answer.
+      }
+      let preview = "";
+      try {
+        preview = String(v).slice(0, 200);
+      } catch {
+        preview = "<unstringifiable>";
+      }
+      return { __unserializable: kind, preview };
+    }
+  };
+  if (!awaitPromise) {
+    // Indirect eval — today's path, unchanged. The ONLY observable difference is that a
+    // result which used to arrive as `null` because it could not be cloned now names
+    // itself; a value that clones fine is returned byte for byte as before.
+    // eslint-disable-next-line no-eval
+    return describe((0, eval)(source));
+  }
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  // Step 1 — compile the source as an EXPRESSION, so its completion value survives
+  // (`document.title` answers the title, not null). The trailing NEWLINE before `)` is
+  // load-bearing: a source ending in a `//` comment would otherwise swallow the closing
+  // paren — the same hazard that rules out splicing an IIFE, one wrapper layer down.
+  //
+  // Step 2 — retry the expression with trailing whitespace and semicolons stripped.
+  // `document.title;` is the ORDINARY way to write a one-liner, and that semicolon inside
+  // the parens is a SyntaxError: without this step the most common shape of all fell
+  // through to the statement body, which has no `return`, and the value was lost — the
+  // silent null this flag exists to remove, back again. The trim is safe because it removes
+  // ONLY trailing `;` and whitespace, and neither can change an EXPRESSION's value; code
+  // that is genuinely more than one statement (`const a = 1; a;`) still fails to parse
+  // inside the parens and still reaches step 3. The trailing NEWLINE is load-bearing here
+  // for the same reason as in step 1 — the trim stops at the first non-`;`/non-space
+  // character, so a source ending in a `//` comment is left exactly as it was.
+  //
+  // Step 3 — a SyntaxError from BOTH expression attempts means it was never an expression
+  // (`const r = await f(); return r.status`), so compile the ORIGINAL, untouched source as
+  // the BODY, where writing `return` is the agent's job. Only a SyntaxError falls back: any
+  // other constructor failure is real and must surface. Compiling up to three times is free
+  // of side effects — no step RUNS the code.
+  let fn;
+  try {
+    fn = new AsyncFunction(`return (${source}\n);`);
+  } catch (e) {
+    if (!(e instanceof SyntaxError)) throw e;
+    try {
+      fn = new AsyncFunction(`return (${source.replace(/[\s;]+$/, "")}\n);`);
+    } catch (e2) {
+      if (!(e2 instanceof SyntaxError)) throw e2;
+      fn = new AsyncFunction(source);
+    }
+  }
+  // Returning the promise is what makes chrome.scripting await it.
+  return fn().then(describe);
+}
+
+// The body injected by get_text. Returns `{found, text, totalBytes, truncated?}`.
+//
+// `found:false` (a selector that matched nothing) is NOT an empty string: an empty string
+// reads as "the page is blank", which is a different fact and would send the agent
+// debugging the page instead of its selector.
+//
+// The cut happens HERE, not only on the service, for two reasons: this side is the only
+// one that knows the TRUE size (so `totalBytes` is honest rather than "the size of what
+// we already truncated"), and a 10 MB innerText never has to cross the socket at all.
+export function readTextInWorld(selector, maxBytes) {
+  let el;
+  if (selector) {
+    try {
+      el = document.querySelector(selector);
+    } catch (e) {
+      // A malformed selector (`#a:has(>`) is the CALLER's typo. Unreported it escapes the
+      // injection as a rejected promise and reaches the agent as `internal` — a code that
+      // says "our bug", sending them to read our logs instead of their selector. Carried
+      // back as a VALUE because a throw is indistinguishable from a torn-down frame.
+      if (e && e.name === "SyntaxError") {
+        return { found: false, badSelector: true, message: String((e && e.message) || e) };
+      }
+      throw e;
+    }
+  } else {
+    el = document.body;
+  }
+  if (!el) return { found: false, text: "", totalBytes: 0 };
+  const text = el.innerText ?? "";
+  const bytes = new TextEncoder().encode(text);
+  const limit = typeof maxBytes === "number" && maxBytes > 0 ? maxBytes : 0;
+  if (!limit || bytes.length <= limit) {
+    return { found: true, text, totalBytes: bytes.length };
+  }
+  // Cut on a CHARACTER boundary. Slicing the byte array can land mid-sequence, and a
+  // plain decode of that would end the text in U+FFFD; `{stream:true}` holds back the
+  // incomplete trailing sequence instead (the decoder is discarded, so it is never
+  // flushed). Costs at most 3 dropped bytes, never a mojibake tail.
+  const cut = new TextDecoder("utf-8").decode(bytes.slice(0, limit), { stream: true });
+  return { found: true, text: cut, totalBytes: bytes.length, truncated: true };
+}
+
+// The body injected by wait_for's `selector` / `textContains` predicates, and by
+// navigate_tab's `waitUntil:'selector'`. Returns `{matched}` — or `{badSelector, message}`
+// for a selector that does not parse, which the caller must NOT mistake for "not yet".
+export function matchInWorld(selector, textContains) {
+  if (selector) {
+    try {
+      return { matched: !!document.querySelector(selector) };
+    } catch (e) {
+      // Same reasoning as readTextInWorld, and here it costs more: an injection that
+      // THROWS is read by pollUntil as a frame being torn down mid-navigation, so a typo'd
+      // selector would poll to the deadline and then report "condition not met" — a whole
+      // minute spent to answer the wrong question.
+      if (e && e.name === "SyntaxError") {
+        return { badSelector: true, message: String((e && e.message) || e) };
+      }
+      throw e;
+    }
+  }
+  // innerText, not textContent, and the reflow it forces (up to ~240 layouts across a 60 s
+  // wait) is the price: textContent also returns text inside `display:none` templates and
+  // `<script>`/`<style>` bodies, so an SPA that ships its success banner hidden in the
+  // markup would match on the FIRST poll. A wait that returns before the thing is on
+  // screen is worse than a slow one — and it also keeps this predicate agreeing with
+  // get_text, which is where the agent read the text it is now waiting for.
+  const text = (document.body && document.body.innerText) || "";
+  return { matched: text.includes(textContains) };
 }
 
 // --- the dispatcher ---------------------------------------------------------
@@ -83,11 +280,14 @@ function evalInWorld(source) {
 //     sessionId differs was minted by a dead session and addresses foreign tabs.
 //   - now:  () => ms  (injectable clock; defaults to Date.now)
 //   - map:  the activity-map module (injectable for tests)
+//   - sleep: (ms) => Promise (injectable timer, for the polling verbs — a test that
+//     drives wait_for must be able to advance its clock without spending real seconds)
 // Returns `{ok, result}` or `{ok, error:{code, message}}`. Never throws — an
 // unexpected failure becomes `{ok:false, error:{code:'internal'}}`.
 export async function dispatchCommand(frame, ctx = {}) {
   const nowFn = ctx.now || (() => Date.now());
   const map = ctx.map || activityMap;
+  const sleep = ctx.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const sessionId = ctx.sessionId;
   if (!frame || typeof frame !== "object") {
     return fail(ERR_INTERNAL, "empty command frame");
@@ -114,13 +314,19 @@ export async function dispatchCommand(frame, ctx = {}) {
       case CMD_FOCUS_WINDOW:
         return await focusWindow(params);
       case CMD_NAVIGATE_TAB:
-        return await navigateTab(params);
+        return await navigateTab(params, nowFn, sleep);
       case CMD_MERGE_WINDOWS:
         return await mergeWindows(params, nowFn, map);
       case CMD_MOVE_TAB:
         return await moveTab(params, nowFn, map);
       case CMD_EXECUTE_JS:
         return await executeJs(params);
+      // The two FIXED-function verbs (§12): no execute_js checkbox, no js_audit row —
+      // see the comment above the injected bodies for why that separation is sound.
+      case CMD_GET_TEXT:
+        return await getText(params);
+      case CMD_WAIT_FOR:
+        return await waitFor(params, nowFn, sleep);
       default:
         return fail(ERR_INTERNAL, `unknown command: ${command}`);
     }
@@ -432,16 +638,460 @@ async function focusWindow(params) {
 // per-tab curator-nav suppression is a new mechanism best added with its first
 // real caller. curatorCause is per-WINDOW (for a close/move neighbour activation),
 // which cannot express "suppress this one tab's navigation".
-async function navigateTab(params) {
+//
+// `waitUntil` (§6, optional) turns the fire-and-forget navigation into one that reports
+// when the page is actually there. DEFAULT `'none'` is today's behaviour byte for byte —
+// same single `tabs.update`, same bare `{ok:true}` — because the reset path
+// (src/api/rules.py) calls this verb and must not change at all.
+//
+//   'none'     — return as soon as the update is issued (today).
+//   'load'     — poll until the tab reports `status === 'complete'`.
+//   'selector' — poll until `selector` matches in the page (needs `selector`).
+//
+// A wait that reaches its deadline is a SUCCESS carrying `matched:false` — never an error.
+// The tab was pointed at the url either way, so "the condition never came true" is a
+// definite answer; `timeout` is reserved for the service's "no frame arrived at all"
+// (see wait_for's header comment for the full argument).
+async function navigateTab(params, nowFn, sleep) {
   if (!isHttpUrl(params.url)) {
     return fail(ERR_PRECONDITION_FAILED, "navigate_tab accepts only http/https urls");
+  }
+  const waitUntil =
+    params.waitUntil === undefined || params.waitUntil === null ? "none" : params.waitUntil;
+  if (waitUntil !== "none" && waitUntil !== "load" && waitUntil !== "selector") {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `navigate_tab waitUntil must be one of none/load/selector (got ${JSON.stringify(waitUntil)})`,
+    );
+  }
+  if (waitUntil === "selector" && (typeof params.selector !== "string" || params.selector === "")) {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      "navigate_tab waitUntil:'selector' requires a non-empty selector",
+    );
+  }
+  // VALIDATE BEFORE NAVIGATING: a bad waitUntil/selector must not leave the tab pointed
+  // somewhere new and then refuse — the refusal would read as "nothing happened".
+  const deadlineMs = waitUntil === "none" ? 0 : clampWaitMs(params.timeoutMs);
+  if (waitUntil !== "none" && deadlineMs === null) {
+    return fail(ERR_PRECONDITION_FAILED, "navigate_tab timeoutMs must be a positive integer");
+  }
+  // The url AND the status the tab is leaving, read BEFORE the update — the only markers
+  // that tell the OLD document from the new one (see `navigationCommitted`; the status is
+  // what makes its grace bound safe). Read for both waiting modes, never for 'none', so the
+  // default path puts exactly the calls on the browser it always did.
+  let startUrl = null;
+  let startStatus = null;
+  if (waitUntil !== "none") {
+    try {
+      const before = await chrome.tabs.get(params.tabId);
+      startUrl = (before && before.url) || null;
+      startStatus = (before && before.status) || null;
+    } catch {
+      return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+    }
   }
   try {
     await chrome.tabs.update(params.tabId, { url: params.url });
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
-  return ok({ ok: true });
+  if (waitUntil === "none") return ok({ ok: true });
+
+  const started = nowFn();
+  const deadline = started + deadlineMs;
+  // ONE poll interval before the first check, deliberately. Right after `tabs.update` the
+  // tab can still report the OLD page's `status:'complete'` for a tick — accepting that
+  // would make `waitUntil:'load'` return before the new document has even started
+  // loading, i.e. exactly the bug the option exists to prevent. Costs one interval.
+  await sleep(Math.min(WAIT_POLL_MS, deadlineMs));
+  // GATE BOTH WAITING MODES ON THE COMMIT, inside the same deadline. Until the new document
+  // commits, 'selector' would inject into the OLD one and 'load' would read the OLD one's
+  // `status:'complete'` — the same defect answered twice, so it gets one answer. See
+  // `navigationCommitted` for the signals and for what the gate costs. A commit that never
+  // arrives ends the same way a condition that never becomes true does: `matched:false`,
+  // because the update WAS issued and that is a verdict.
+  const commit = await pollUntil(
+    navigationCommitted(params.tabId, params.url, startUrl, startStatus),
+    deadline,
+    nowFn,
+    sleep,
+    params.tabId,
+  );
+  if (commit.error) return fail(commit.error, commit.message);
+  if (!commit.matched) {
+    return ok({ ok: true, matched: false, elapsedMs: nowFn() - started });
+  }
+  const probe =
+    waitUntil === "load"
+      ? async () => {
+          const tab = await chrome.tabs.get(params.tabId);
+          return tab && tab.status === "complete";
+        }
+      : injectingProbe(params.tabId, params.selector, undefined, "navigate_tab");
+  const outcome = await pollUntil(probe, deadline, nowFn, sleep, params.tabId);
+  if (outcome.error) return fail(outcome.error, outcome.message);
+  // `matched:false` is a SUCCESS carrying a negative verdict, exactly as in wait_for: the
+  // navigation WAS issued, and "the condition never became true" is a definite answer, not
+  // the "no frame arrived / state unknown" that `timeout` reserves for the service.
+  return ok({ ok: true, matched: !!outcome.matched, elapsedMs: nowFn() - started });
+}
+
+// --- get_text / wait_for: FIXED-function observation (§12) -------------------
+
+// Clamp a caller's timeout to the extension's own ceiling. Returns null for a value that
+// is not a positive integer, so the caller can refuse it loudly rather than invent one.
+function clampWaitMs(value) {
+  if (!Number.isInteger(value) || value <= 0) return null;
+  return Math.min(value, WAIT_MAX_TIMEOUT_MS);
+}
+
+// Run the FIXED predicate in the page. Returns `true`/`false`, or a `{fatal}` sentinel for
+// a selector that does not parse — see `pollUntil` for why that cannot be a throw.
+async function injectMatch(tabId, selector, textContains) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: matchInWorld,
+    args: [selector ?? null, textContains ?? null],
+  });
+  const got = ((results || [])[0] || {}).result || {};
+  if (got.badSelector) {
+    return {
+      fatal: {
+        code: ERR_PRECONDITION_FAILED,
+        message: `invalid CSS selector ${JSON.stringify(selector)}: ${got.message}`,
+      },
+    };
+  }
+  return !!got.matched;
+}
+
+// Wrap an injecting predicate so the target's SCHEME is re-checked on EVERY poll.
+//
+// Checking it once up front is not enough for a call that keeps injecting for up to a
+// minute: the page can move under us (a redirect, a user click) onto a `file://` url, and
+// with <all_urls> granted the next injection would read that local page same-origin. A
+// guard that expires mid-wait is not a guard.
+function injectingProbe(tabId, selector, textContains, verb) {
+  return async () => {
+    const live = await chrome.tabs.get(tabId);
+    if (!isHttpUrl(live && live.url)) {
+      return {
+        fatal: {
+          code: ERR_PRECONDITION_FAILED,
+          message: `${verb} target is not an http/https tab`,
+        },
+      };
+    }
+    return await injectMatch(tabId, selector, textContains);
+  };
+}
+
+// A probe that answers "the navigation this command issued has COMMITTED" — the gate BOTH
+// of navigate_tab's waiting modes run before they start testing their own condition.
+//
+// `chrome.tabs.update(tabId, {url})` does NOT move `tab.url`: until the new document
+// commits, `tabs.get` keeps answering the PREVIOUS url and the target sits in
+// `tab.pendingUrl`. Injecting inside that window reads the OLD DOM, and that produced two
+// distinct wrong answers: a selector that exists on both pages (`#app`, `body`, an SPA
+// header) matched at once — so `waitUntil` waited for nothing — and a tab leaving a
+// non-http page (`about:blank`, a `chrome://` newtab, `file://`) tripped the per-poll
+// scheme guard and answered "navigate_tab target is not an http/https tab": an error about
+// something that did not happen, AFTER the navigation was already issued. The single
+// pre-probe pause cannot cover either: the commit lands after the server answers, so
+// 250 ms is a heuristic, not a guarantee.
+//
+// `waitUntil:'load'` is gated for the SAME reason and not by symmetry. `status` is meant to
+// flip to `loading` when the navigation STARTS, but a `beforeunload` dialog, a throttled
+// background tab or a busy MV3 worker delays that flip past our first poll — and until it
+// happens, `complete` describes the page being LEFT. One gate, both modes.
+//
+// Three signals, in the order they are trustworthy:
+//   1. `pendingUrl` is set => still in flight, never commit. (It needs the `tabs`
+//      permission, which the manifest grants, so this is the normal case, not a fallback.)
+//   2. the tab's url IS the target, or it simply LEFT `startUrl` — a redirect landing
+//      elsewhere is still the new document, which is what "commit" has to mean here.
+//      ⚠️ Leaving `startUrl` is not PROOF of a new document: a `#fragment` target, or a
+//      `pushState` from the page being left, moves the url same-document and opens the
+//      gate on the OLD DOM. Same escape as the 204/attachment case, different signal.
+//   3. the tab went `loading` and came back `complete` — for a navigation whose url can
+//      never satisfy (2), e.g. a redirect chain that lands back on the address we started
+//      from. Least precise of the three, hence last, and reachable only after (1) cleared.
+//      It ALSO requires the tab not to have been `loading` before the update: see the
+//      paragraph on that at the bottom, which is where this signal's own wrong answer lived.
+//
+// ⚠️ Navigating a tab to the address it is ALREADY on rests on (1) alone: the moment
+// `pendingUrl` clears, (2) holds by definition, and (3) is never reached. Where the field
+// is unavailable the gate would open on the pre-reload document — accepted deliberately,
+// because there the old document IS the same page, and the alternative (demand (3)'s
+// loading→complete round) answers `matched:false` about a reload short enough to fit
+// between two polls.
+//
+// AND A BOUNDED GRACE, because those three leave a hole that none of them can close. A
+// navigation whose FINAL address is `startUrl` — a redirect that bounces back, `/admin`
+// refused throwing the tab to `/login` — can never satisfy (2); and if it also commits and
+// finishes inside the pre-pause (cache, a local redirect, a 304), no poll ever observes
+// `loading`, so (3) is dead too. The gate would then stay shut for the WHOLE deadline and
+// answer `matched:false` about a page that is loaded and does contain the selector — where
+// the same call answered `matched:true` in 250 ms before the gate existed. So after
+// WAIT_COMMIT_GRACE_POLLS CONSECUTIVE polls in which nothing suggested a navigation at all
+// — no `pendingUrl`, no `loading`, the url still `startUrl`, and the tab already `complete`
+// BEFORE the update, so this `complete` cannot be the old page still finishing — the gate
+// opens anyway.
+//
+// WHAT THE GRACE ASSUMES — written down so a later reader can attack the assumption instead
+// of guessing it: that a navigation which has really STARTED exposes `pendingUrl` within one
+// `tabs.get`. That is deliberately NOT the claim that `status` flips promptly; the paragraph
+// gating 'load' above says the opposite about `status`, and the two only look opposed.
+// `pendingUrl` is set by the navigation controller when the request is issued, while the
+// `loading` flip is what `beforeunload`, a throttled tab or a busy worker delay. So the
+// grace leans on the OTHER signal, the one that argument does NOT call unreliable — which is
+// why the two can both be true. Falsify it — a browser that leaves `pendingUrl` empty while
+// a load is in flight — and the grace starts firing on live navigations; then the bound has
+// to grow, or this signal has to change.
+//
+// IT IS NOT CONFINED TO THE ⚠️ CORNER ABOVE, and pretending otherwise would be the comment
+// lying about its own cost. "Three polls with no evidence" requires NEITHER that the
+// addresses match NOR that the document be unchanged: start `https://old/`, target
+// `https://new/`, a navigation simply not visible yet, and the answer is `matched:true`
+// about `https://old/` with the tab still on the old address. That is a THIRD way to be
+// answered about the document being left, next to the two the MCP description names (a
+// same-address reload; a navigation that changes no document at all). It is the deliberate
+// trade, not an oversight: a rare wrong document instead of a CERTAIN wrong answer after the
+// full deadline. Narrowing it — demanding `targetUrl === startUrl` — would close this third
+// escape and reopen the very stall the grace exists for, since a redirect that lands back on
+// `startUrl` has a TARGET that differs. The BOUND is what keeps it rare rather than normal:
+// a navigation that really started needs one `tabs.get` to show `pendingUrl` or `loading`,
+// not three, so anything still silent on the third poll is a navigation we have no evidence
+// of at all.
+//
+// IT DOES NOT APPLY TO A NON-HTTP(S) START, and that narrowing is exactly the shape of the
+// hole. Every case the grace exists for — a redirect bouncing back to `startUrl`, a cache
+// hit, a 304 — presupposes an http(s) document to bounce back TO: a tab sitting on
+// `about:blank` cannot "redirect back to about:blank". So on a non-http start the grace
+// bought nothing and re-opened precisely the two wrong answers this gate was written to
+// prevent — `precondition_failed: not an http/https tab` for 'selector' (an error about a
+// navigation that DID happen) and `matched:true` about `about:blank` for 'load'. No
+// injection ever reached the non-http document (the per-poll scheme guard held), so what it
+// cost was wrong ANSWERS, not access.
+//
+// A TAB ALREADY `loading` GETS NEITHER (3) NOR THE GRACE, and the (3) half is the one that
+// was actually wrong rather than merely missing. Such a tab produces a `loading` →
+// `complete` round ALL BY ITSELF, out of the document it is LEAVING — so (3) used to read
+// that as the commit, and it did so TWO POLLS EARLIER than the grace it is denied would
+// have. Reproduced: a mid-load tab whose flip to `loading` and whose `pendingUrl` are both
+// delayed past our polls (a `beforeunload` dialog, a throttled tab, a busy MV3 worker — the
+// same three reasons the 'load' gate exists at all), the old page landing on poll 2, and the
+// answer `matched:true` at 500 ms about `https://old/`, with the selector probe injected
+// into the OLD DOM. That is the precise defect this whole gate exists to remove, so the
+// `startStatus !== "loading"` term closes it. Pinned by "...and gets no SIGNAL (3) either"
+// in commands.test.js — the older "gets NO grace" test cannot see it, because there the
+// commit lands on the first poll and `sawLoading` never turns true.
+//
+// WHAT REFUSING IT COSTS, written down rather than discovered later: for a tab that was
+// mid-load, a navigation whose FINAL address is the one it started from — the redirect that
+// bounces back, `/admin` refused throwing the tab to `/login` and back — now has NO signal
+// left at all. (2) is unsatisfiable by definition, (3) is refused here, the grace was
+// refused above; the navigation really happened, and the answer is `matched:false` at the
+// deadline. That is the trade this codebase keeps making: an agent that knows it does not
+// know beats one told confidently about the page it has just left. Two things are NOT part
+// of that cost — navigating a mid-load tab to the address it is ALREADY on (there (2) holds
+// the moment `pendingUrl` clears, the ⚠️ corner above), and a `startStatus` of `null` or
+// `unloaded` (the term claims "not `loading`", and an unknown or discarded status is not a
+// known `loading`; only a `complete` start earns the GRACE, which is the stricter test).
+function navigationCommitted(tabId, targetUrl, startUrl, startStatus) {
+  let sawLoading = false;
+  let quietPolls = 0;
+  return async () => {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab) return false;
+    if (tab.status === "loading") sawLoading = true;
+    if (tab.pendingUrl) {
+      quietPolls = 0; // a navigation IS in flight — the opposite of "no evidence"
+      return false;
+    }
+    if (tab.url === targetUrl || (startUrl !== null && tab.url !== startUrl)) return true;
+    // (3), and the `startStatus` term is load-bearing: for a tab that was ALREADY `loading`
+    // when the update was issued, a `complete` seen now is the OLD document finishing. See
+    // "A TAB ALREADY `loading` GETS NEITHER (3) NOR THE GRACE" above for the reproduction
+    // and for what refusing it costs.
+    if (sawLoading && tab.status === "complete" && startStatus !== "loading") return true;
+    const quiet =
+      // REDUNDANT BY CONSTRUCTION, and kept anyway: the only way to reach this line with
+      // `sawLoading` true and the tab `complete` is a `startStatus` of `loading` — which the
+      // very next term rejects. (Before that term existed the return just above did the same
+      // job on its own.) So no mutation of this one can redden a test; it is insurance
+      // against these lines being reordered, not a load-bearing check.
+      !sawLoading &&
+      startStatus === "complete" &&
+      tab.status === "complete" &&
+      tab.url === startUrl &&
+      // See "IT DOES NOT APPLY TO A NON-HTTP(S) START" above: no non-http page can be the
+      // page a redirect bounces back to, so the grace would buy nothing and cost two wrong
+      // answers. Pinned by "a non-http START gets NO grace" in commands.test.js.
+      isHttpUrl(startUrl);
+    quietPolls = quiet ? quietPolls + 1 : 0;
+    return quietPolls >= WAIT_COMMIT_GRACE_POLLS;
+  };
+}
+
+// Poll `probe` every WAIT_POLL_MS until it answers true or `deadline` passes.
+//
+// An injection that THROWS is not a failure here: mid-navigation Chromium tears the frame
+// down and answers "Frame with ID 0 was removed" — which is precisely the moment we are
+// waiting through. So a throw is swallowed and we re-test whether the TAB still exists;
+// only a vanished tab ends the wait (waiting for a condition in a closed tab can never
+// succeed, and silently burning the whole budget would hide the real cause).
+//
+// That leniency is also why a probe reports a CALLER error as a `{fatal}` VALUE instead of
+// throwing: a throw would be read as "the frame is being recreated" and polled through to
+// the deadline, turning a typo into a minute of waiting and then the wrong verdict.
+//
+// Returns `{matched:true}` / `{matched:false}` (deadline) / `{error, message}`.
+async function pollUntil(probe, deadline, nowFn, sleep, tabId) {
+  for (;;) {
+    try {
+      const got = await probe();
+      // Order matters: `{fatal}` is truthy, so it must be tested before the plain "true".
+      if (got && got.fatal) return { error: got.fatal.code, message: got.fatal.message };
+      if (got) return { matched: true };
+    } catch (e) {
+      try {
+        await chrome.tabs.get(tabId);
+      } catch {
+        return { error: ERR_NO_SUCH_TAB, message: `no such tab: ${tabId}` };
+      }
+      void e; // transient: the frame was being replaced. Keep polling.
+    }
+    const remaining = deadline - nowFn();
+    if (remaining <= 0) return { matched: false };
+    await sleep(Math.min(WAIT_POLL_MS, remaining));
+  }
+}
+
+// get_text {tabId, selector?, maxBytes?} -> {text, truncated?, totalBytes?}.
+//
+// NOT gated by the execute_js checkbox and writing NO js_audit row: the injected function
+// is fixed and committed (see the injected-bodies comment). The http/https edge guard IS
+// applied, exactly as execute_js applies it — with <all_urls> granted, an unguarded target
+// would read a `file://` page's text same-origin.
+async function getText(params) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "get_text target is not an http/https tab");
+  }
+  const selector = typeof params.selector === "string" && params.selector !== "" ? params.selector : null;
+  const maxBytes = Number.isInteger(params.maxBytes) && params.maxBytes > 0 ? params.maxBytes : null;
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: params.tabId },
+    func: readTextInWorld,
+    args: [selector, maxBytes],
+  });
+  const got = ((results || [])[0] || {}).result || {};
+  if (got.badSelector) {
+    // "Your selector does not parse" — distinct from "it parsed and matched nothing", and
+    // from `internal`, which is what this used to become by escaping the injection.
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `invalid CSS selector ${JSON.stringify(selector)}: ${got.message}`,
+    );
+  }
+  if (!got.found) {
+    // A selector that matched nothing is a REFUSAL, not an empty page (see
+    // readTextInWorld). With no selector this means the document has no body at all.
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      selector
+        ? `selector ${selector} matched no element in tab ${params.tabId}`
+        : `tab ${params.tabId} has no document body to read`,
+    );
+  }
+  const result = { text: got.text ?? "" };
+  if (got.truncated) {
+    result.truncated = true;
+    // camelCase on the WIRE like every other §6 key (`tabId`, `elapsedMs`); the MCP layer
+    // is the one that renames it to snake_case for the agent.
+    result.totalBytes = got.totalBytes;
+  }
+  return ok(result);
+}
+
+// wait_for {tabId, urlMatches?|selector?|textContains?, timeoutMs} ->
+// {matched:boolean, elapsedMs}.
+//
+// A DEADLINE THAT PASSES IS A SUCCESS, not an error, and this is the whole shape of the
+// verb. §11 fixes `timeout` to mean UNKNOWN — no frame arrived, the browser may be wedged,
+// do not blindly retry. A wait that ran to its deadline is the opposite: the browser is
+// alive, the frame DID arrive, and the answer "no, it never became true" is a definite
+// negative the agent can act on. Spelling both as `timeout` would ask the agent to tell
+// them apart from a string; spelling this one as `{ok:true, matched:false}` puts the
+// distinction in the response SHAPE, which survives the wire. `timeout` therefore has
+// exactly ONE producer again: the service, when nothing came back.
+//
+// EXACTLY ONE predicate. Zero or several is `precondition_failed` and NOTHING is polled:
+// "wait for A and B" and "wait for A or B" are different verbs, and guessing which one
+// the caller meant would make a 30-second wait answer a question nobody asked.
+//
+// `urlMatches` is a substring test against the live `chrome.tabs.get(...).url` and needs
+// NO injection at all — which is also why it carries no http/https guard: the usual wait
+// is precisely for a tab to REACH an http url, and a tab mid-navigation legitimately sits
+// on `about:blank` for a moment. The two injecting predicates DO carry the guard, up front
+// AND on every poll (see `injectingProbe`): an agent waiting for a selector in a `file://`
+// tab has made a mistake it should hear about immediately, not 30 seconds later.
+async function waitFor(params, nowFn, sleep) {
+  const keys = ["urlMatches", "selector", "textContains"].filter(
+    (k) => params[k] !== undefined && params[k] !== null,
+  );
+  if (keys.length !== 1) {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `wait_for requires EXACTLY ONE of urlMatches / selector / textContains (got ${keys.length})`,
+    );
+  }
+  const key = keys[0];
+  const needle = params[key];
+  if (typeof needle !== "string" || needle === "") {
+    return fail(ERR_PRECONDITION_FAILED, `wait_for ${key} must be a non-empty string`);
+  }
+  const budget = clampWaitMs(params.timeoutMs);
+  if (budget === null) {
+    return fail(ERR_PRECONDITION_FAILED, "wait_for timeoutMs must be a positive integer");
+  }
+
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  if (key !== "urlMatches" && !isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "wait_for target is not an http/https tab");
+  }
+
+  const started = nowFn();
+  const deadline = started + budget;
+  const probe =
+    key === "urlMatches"
+      ? async () => {
+          const live = await chrome.tabs.get(params.tabId);
+          return !!(live && typeof live.url === "string" && live.url.includes(needle));
+        }
+      : injectingProbe(
+          params.tabId,
+          key === "selector" ? needle : null,
+          key === "textContains" ? needle : null,
+          "wait_for",
+        );
+  const outcome = await pollUntil(probe, deadline, nowFn, sleep, params.tabId);
+  if (outcome.error) return fail(outcome.error, outcome.message);
+  // Both verdicts are `ok` — see the header comment. `matched:false` says the deadline
+  // passed with the condition still false; it does NOT say the browser failed to answer.
+  return ok({ matched: !!outcome.matched, elapsedMs: nowFn() - started });
 }
 
 // merge_windows {windowIds?, targetWindowId?}. Move the source windows' tabs into
@@ -1006,9 +1656,13 @@ async function openTabBulk(params, nowFn, map) {
   return ok({ results });
 }
 
-// execute_js {code, tabId?, world?}. Gated on the options checkbox in
+// execute_js {code, tabId?, world?, awaitPromise?}. Gated on the options checkbox in
 // chrome.storage.local, read FRESH here (default OFF). Off => js_disabled and NOT
 // executed. On => run the code in the requested world via chrome.scripting.
+//
+// `awaitPromise` (default false) makes the source the body of an async function so
+// top-level `await`/`return` work and chrome awaits the returned promise — see
+// evalInWorld. Omitted, the eval path is unchanged.
 async function executeJs(params) {
   const stored = await chrome.storage.local.get(ALLOW_EXECUTE_JS_KEY);
   const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
@@ -1032,7 +1686,7 @@ async function executeJs(params) {
     target: { tabId: params.tabId },
     world: params.world || "MAIN",
     func: evalInWorld,
-    args: [String(params.code == null ? "" : params.code)],
+    args: [String(params.code == null ? "" : params.code), !!params.awaitPromise],
   });
   return ok({ results });
 }

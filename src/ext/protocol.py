@@ -55,6 +55,15 @@ CMD_EXECUTE_JS = "execute_js"
 # instances is the open+close pair of §7, which works only because the browsers are
 # separate processes; between the windows of one browser there was no verb at all.
 CMD_MOVE_TAB = "move_tab"
+# Read a page's text, and wait for a page condition. Both inject a FIXED function that is
+# committed into the extension bundle and known at build time — NOT arbitrary code — so
+# neither is behind the execute_js checkbox and neither writes a ``js_audit`` row. §12's
+# argument for that gate is "усечённый код нереконструируем"; with a fixed function there
+# is nothing to reconstruct. Every OTHER gate still applies to them, exactly as to every
+# command: the pause/stop gate, the revoke check, ``stale_session``, and the extension's
+# own http/https edge guard on the target tab.
+CMD_GET_TEXT = "get_text"
+CMD_WAIT_FOR = "wait_for"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side
@@ -74,6 +83,13 @@ ERR_INTERNAL = "internal"
 # Service-side only: no live socket for the instance, and the local send/wait
 # timed out before any `response` arrived.
 ERR_NO_CONNECTION = "no_connection"
+# Service-side only, and it keeps EXACTLY ONE producer even now that §11 has waiting
+# verbs: no ``response`` frame arrived inside the command budget, so the browser's state is
+# UNKNOWN — the command may have run, may not have, and the agent must NOT blindly retry.
+# A ``wait_for`` whose page condition never came true is the opposite fact (the browser
+# answered; the verdict is simply "no") and is therefore returned as ``ok:true`` with
+# ``matched:false``. Two different facts, two different response SHAPES — which is what
+# survives the wire, where a shared error string would not.
 ERR_TIMEOUT = "timeout"
 
 # --- Reject reasons / hello_ack error codes ---------------------------------

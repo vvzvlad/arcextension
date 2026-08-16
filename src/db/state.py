@@ -196,6 +196,35 @@ def _read_active_sessions(conn: sqlite3.Connection) -> dict[str, str | None]:
     return {r["id"]: r["session_id"] for r in rows}
 
 
+def _read_capabilities(conn: sqlite3.Connection) -> dict[str, dict]:
+    """``{instance_id: {allow_execute_js, allow_debugger, ext_version}}`` per ACTIVE instance.
+
+    The §11 capability report: what a copy will ALLOW, as that copy itself declared it in
+    its last ``hello``. An agent reads this BEFORE it calls, instead of discovering
+    ``js_disabled`` — or a verb an older bundle has never heard of — halfway through a task.
+
+    A separate reader for the same reason as :func:`_read_active_sessions`: the §10
+    ``StateResponse`` shape (:func:`_read_instances`) must stay byte-identical, so a field
+    that only the MCP envelope wants does not go into that projection.
+
+    ``ext_version`` may be NULL for an instance that has not said hello since the column
+    landed — genuinely "it has not told us", which is not the same as a version.
+    """
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, allow_execute_js, allow_debugger, ext_version FROM instances "
+        f"{_ACTIVE_ONLY}"
+    ).fetchall()
+    return {
+        r["id"]: {
+            "allow_execute_js": bool(r["allow_execute_js"]),
+            "allow_debugger": bool(r["allow_debugger"]),
+            "ext_version": r["ext_version"],
+        }
+        for r in rows
+    }
+
+
 def _read_quick_links(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(

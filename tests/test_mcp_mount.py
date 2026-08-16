@@ -102,6 +102,12 @@ def test_mcp_tools_list_exposes_every_phase11_tool(tmp_path):
         "upsert_rule", "delete_rule", "open_tab", "close_tab", "focus_tab",
         "relocate_tab", "reset_singleton", "merge_windows", "execute_js",
         "pause", "resume", "run_pass",
+        # The agent-facing observation verbs and the «не трогать» lease. Pinned HERE and
+        # not only in test_mcp_tools.py because that file calls the handlers directly: a
+        # tool whose signature the MCP SDK cannot serialize would still pass there and be
+        # invisible to every agent.
+        "get_text", "wait_for", "navigate_tab",
+        "list_exemptions", "set_exemption", "clear_exemption",
     }
     with TestClient(app) as client:
         r = client.post("/mcp", json=_init_body(), headers=_headers())

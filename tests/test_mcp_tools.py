@@ -8,12 +8,15 @@ Covers each tool's handler plus the guards the reviewer mutation-checks:
 """
 
 import asyncio
+import re
 import sqlite3
 from conftest import make_settings
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from src.api import exemptions as exemptions_api
 from src.curator import lease
 from src.curator import pause as pause_ops
 from src.db import state as state_read
@@ -24,6 +27,7 @@ from src.ext import protocol
 from src.ext.commands import resolve_response
 from src.ext.registry import ConnState, Registry
 from src.mcpiface import tools
+from src.settings import EXT_WAIT_MAX_TIMEOUT_MS
 
 
 # --- fakes / fixtures --------------------------------------------------------
@@ -166,9 +170,14 @@ async def test_list_instances_returns_freshness_envelope_and_stopped_at(tmp_path
     # session_id rides the envelope (#47); "main" was inserted with no session_id.
     # The mirror-row fields the envelope replaced ride along too: dropping them would
     # leave `last_seen_at` / `reject_reason` / `reject_at` with no MCP surface at all.
+    # The §11 capability report rides the same envelope: what this copy ALLOWS, as it
+    # declared in its last hello. An instance that has never said hello reports the column
+    # defaults — both switches OFF, version unknown — which is the honest answer.
     assert main == {"snapshot_at": 1234, "fresh": False, "reason": "disconnected",
                     "session_id": None, "connected": False, "last_seen_at": None,
-                    "reject_reason": None, "reject_at": None}
+                    "reject_reason": None, "reject_at": None,
+                    "allow_execute_js": False, "allow_debugger": False,
+                    "ext_version": None}
 
     # A stopped curator surfaces stopped_at so an agent does not read the stop as a break.
     now = tools._now_ms()
@@ -191,7 +200,8 @@ async def test_list_tabs_returns_tabs_and_per_instance_freshness(tmp_path):
     assert out["instances"] == {
         "main": {"snapshot_at": now, "fresh": True, "reason": "fresh",
                  "session_id": "sess-1", "connected": True, "last_seen_at": None,
-                 "reject_reason": None, "reject_at": None}
+                 "reject_reason": None, "reject_at": None,
+                 "allow_execute_js": False, "allow_debugger": False, "ext_version": None}
     }
 
 
@@ -211,10 +221,14 @@ async def test_list_tabs_freshens_and_flags_a_disconnected_sibling(tmp_path):
     assert set(inst) == {"main", "media"}
     assert inst["main"] == {"snapshot_at": now, "fresh": True, "reason": "fresh",
                             "session_id": "sess-1", "connected": True,
-                            "last_seen_at": None, "reject_reason": None, "reject_at": None}
+                            "last_seen_at": None, "reject_reason": None, "reject_at": None,
+                            "allow_execute_js": False, "allow_debugger": False,
+                            "ext_version": None}
     assert inst["media"] == {"snapshot_at": None, "fresh": False, "reason": "disconnected",
                              "session_id": "sess-2", "connected": False,
-                             "last_seen_at": None, "reject_reason": None, "reject_at": None}
+                             "last_seen_at": None, "reject_reason": None, "reject_at": None,
+                             "allow_execute_js": False, "allow_debugger": False,
+                             "ext_version": None}
     # The disconnected sibling did not drop the fresh instance's tab.
     assert [t["tab_id"] for t in out["tabs"]] == [1]
 
@@ -332,7 +346,9 @@ async def test_list_tabs_reader_error_maps_to_error_and_isolates_siblings(tmp_pa
     # (separate, working) mirror read.
     assert inst["bad"] == {"snapshot_at": 42, "fresh": False, "reason": "error",
                            "session_id": "sess-2", "connected": True,
-                           "last_seen_at": None, "reject_reason": None, "reject_at": None}
+                           "last_seen_at": None, "reject_reason": None, "reject_at": None,
+                           "allow_execute_js": False, "allow_debugger": False,
+                           "ext_version": None}
     # The sibling with a working reader is returned normally.
     assert inst["main"]["reason"] == "fresh" and inst["main"]["fresh"] is True
 
@@ -1884,3 +1900,722 @@ async def test_relocate_bulk_one_undo_pass_id_reverses_the_whole_batch(tmp_path)
     cls = _classify(rows)
     assert cls["relocations"] == 2
     assert cls["reopens"] == 2 and cls["copy_closes"] == 2 and cls["impact"] > 0
+
+
+# --- the shared result cap ---------------------------------------------------
+def test_truncate_payload_cuts_a_string_and_reports_the_TRUE_total():
+    """The cap exists so the agent never has to write ``.slice(0, 1500)`` by hand — it
+    forgets exactly once, and one call then floods its context."""
+    assert tools.truncate_payload("short", 100) == ("short", {})
+    value, meta = tools.truncate_payload("x" * 50, 10)
+    assert value == "x" * 10
+    # total_bytes is the FULL size, which is what tells the agent to narrow its selector.
+    assert meta == {"truncated": True, "total_bytes": 50}
+
+
+def test_truncate_payload_never_ends_a_cut_string_in_a_broken_character():
+    # Ten 2-byte characters; an 5-byte cut lands mid-sequence. The severed bytes are
+    # dropped rather than decoded into U+FFFD.
+    value, meta = tools.truncate_payload("Ω" * 10, 5)
+    assert value == "ΩΩ"
+    assert "�" not in value
+    assert meta["total_bytes"] == 20
+
+
+def test_truncate_payload_hands_back_a_non_str_as_a_marked_string_not_broken_json():
+    """A cut JSON document is not valid JSON, so it comes back as a STRING under an
+    explicit marker — the alternative is a structure that LOOKS parseable and is not."""
+    big = {"rows": ["y" * 100 for _ in range(50)]}
+    value, meta = tools.truncate_payload(big, 60)
+    assert set(value) == {"__truncated_json"}
+    assert len(value["__truncated_json"].encode()) <= 60
+    assert meta["truncated"] is True and meta["total_bytes"] > 60
+    # Under the limit the value is returned UNTOUCHED, still a real structure.
+    assert tools.truncate_payload({"a": 1}, 1000) == ({"a": 1}, {})
+
+
+def test_truncate_payload_refuses_a_useless_limit():
+    with pytest.raises(tools.ToolError) as ei:
+        tools.truncate_payload("x", 0)
+    assert ei.value.code == "invalid_args"
+
+
+def test_flatten_injection_results_picks_the_main_frame_and_keeps_the_rest():
+    raw = [
+        {"frameId": 7, "documentId": "d7", "result": "sub"},
+        {"frameId": 0, "documentId": "d0", "result": "main"},
+    ]
+    out = tools._flatten_injection_results(raw, None)
+    # frameId 0 is the main frame regardless of the order chrome reports them in.
+    assert out["value"] == "main"
+    assert out["frames"] == [
+        {"frame_id": 7, "value": "sub"}, {"frame_id": 0, "value": "main"},
+    ]
+    # No frame 0 reported => the first entry, so the shape is never empty.
+    assert tools._flatten_injection_results([{"frameId": 3, "result": "only"}], None)["value"] == "only"
+    # Nothing at all is a null value, not a crash.
+    assert tools._flatten_injection_results(None, None) == {"value": None}
+
+
+def test_flatten_omits_frames_when_there_is_only_one():
+    """One frame => no ``frames`` key, because it would just repeat ``value``.
+
+    The extension targets ``{tabId}`` and never sets ``allFrames``, so ONE entry is what
+    every call today produces. Emitting it anyway sends the same payload twice — and since
+    the cap is applied per entry, a truncated answer would weigh 2x ``max_bytes``: a byte
+    cap that doubles the payload it exists to bound.
+    """
+    out = tools._flatten_injection_results([{"frameId": 0, "result": "z" * 100}], 10)
+    assert "frames" not in out
+    assert out == {"value": "z" * 10, "truncated": True, "total_bytes": 100}
+
+
+def test_flatten_caps_each_frame_separately(tmp_path):
+    # A giant result in ONE sub-frame must not swallow the main frame's answer.
+    raw = [{"frameId": 0, "result": "ok"}, {"frameId": 1, "result": "z" * 100}]
+    out = tools._flatten_injection_results(raw, 10)
+    assert out["value"] == "ok" and "truncated" not in out
+    assert out["frames"][1]["truncated"] is True
+    assert out["frames"][1]["total_bytes"] == 100
+    # The main frame's already-cut value is REUSED, not truncated a second time.
+    assert out["frames"][0] == {"frame_id": 0, "value": "ok"}
+
+
+# --- execute_js: awaitPromise, the flat result, the caller-named budget -------
+async def test_execute_js_returns_a_flat_value_instead_of_nested_injection_results(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.execute_js(_app(db, reg), instance="main", tab_id=2, code="1"),
+        cs, ws,
+        {"results": [{"frameId": 0, "documentId": "d", "result": {"title": "T"}}]},
+    )
+    # Was `{"result": {"results": [ ... ]}}` — JSON inside JSON inside JSON for ONE value.
+    # And `frames` is ABSENT for a single frame rather than repeating `value` verbatim.
+    assert out == {"ok": True, "value": {"title": "T"}}
+    # awaitPromise is NOT on the wire unless asked for: an unchanged call must put an
+    # unchanged frame on the socket for an older extension.
+    assert "awaitPromise" not in frame["params"]
+
+
+async def test_execute_js_await_promise_rides_the_frame_only_when_true(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    _out, frame = await _run_with_response(
+        lambda: tools.execute_js(_app(db, reg), instance="main", tab_id=2,
+                                 code="return await f()", await_promise=True),
+        cs, ws, {"results": [{"frameId": 0, "result": 1}]},
+    )
+    assert frame["params"]["awaitPromise"] is True
+
+
+async def test_execute_js_caps_the_value_at_max_bytes(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.execute_js(_app(db, reg), instance="main", tab_id=2, code="1",
+                                 max_bytes=8),
+        cs, ws, {"results": [{"frameId": 0, "result": "a" * 40}]},
+    )
+    assert out["value"] == "a" * 8
+    assert out["truncated"] is True and out["total_bytes"] == 40
+
+
+async def test_a_bad_max_bytes_is_refused_BEFORE_the_round_trip(tmp_path):
+    """No frame on the socket, and for execute_js no js_audit row either.
+
+    The cap is applied to the RESPONSE, so validating it there meant an invalid argument
+    cost a full command — during which the extension, reading ``maxBytes <= 0`` as "no
+    limit", ships the entire innerText over the socket — and only then heard ``invalid_args``.
+    For ``execute_js`` it also left a durable audit row for code that was never delivered.
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    for bad in (0, -1):
+        with pytest.raises(tools.ToolError) as exc:
+            await tools.get_text(_app(db, reg), instance="main", tab_id=2, max_bytes=bad)
+        assert exc.value.code == "invalid_args"
+        with pytest.raises(tools.ToolError) as exc:
+            await tools.execute_js(_app(db, reg), instance="main", tab_id=2, code="1",
+                                   max_bytes=bad)
+        assert exc.value.code == "invalid_args"
+    assert ws.sent == []
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+def test_truncation_survives_a_LONE_SURROGATE(tmp_path):
+    """A page can genuinely return one, and encoding it must not kill the tool call.
+
+    ``"\\ud800".encode("utf-8")`` raises ``UnicodeEncodeError``, and ``_guarded`` catches
+    only ToolError/HTTPException — so one malformed character on a page would escape into
+    the transport. This path is NEW: before the cap the value passed straight through and
+    the MCP layer encoded it with ``ensure_ascii=True``, where a surrogate is harmless.
+    """
+    lone = "before\ud800after"
+    # Under the cap: returned untouched, exactly as any other string.
+    assert tools.truncate_payload(lone, 1000) == (lone, {})
+    # Over the cap: measured (the surrogate counts at its 3-byte width) and cut, never raised.
+    value, meta = tools.truncate_payload(lone, 8)
+    assert meta == {"truncated": True, "total_bytes": 14}
+    assert isinstance(value, str)
+    # Same for the JSON branch, which has its own encode.
+    value, meta = tools.truncate_payload({"k": lone}, 8)
+    assert meta["truncated"] is True and meta["total_bytes"] > 8
+
+
+async def _capture_budget(monkeypatch, factory, result=None):
+    """Run ``factory()`` capturing the ``cmd_timeout_ms`` the verb hands send_command.
+
+    The budget is the ONE thing a response-driven test cannot observe (the frame carries
+    no timeout), and for the waiting verbs it is the whole correctness argument.
+
+    ``result`` is what the fake extension answers; the empty default is fine for every verb
+    that only reads keys, but a verb that JUDGES the frame (``navigate_tab`` refuses one
+    without ``matched``) needs a realistic one.
+    """
+    seen = {}
+
+    async def _fake_send(registry, db, instance_id, command, params, *, cmd_timeout_ms, **kw):
+        seen["cmd_timeout_ms"] = cmd_timeout_ms
+        seen["params"] = params
+        seen["command"] = command
+        return {} if result is None else result
+
+    monkeypatch.setattr(tools, "send_command", _fake_send)
+    await factory()
+    return seen
+
+
+async def test_execute_js_timeout_is_clamped_to_the_ceiling(tmp_path, monkeypatch):
+    db = await _make_db(tmp_path)
+    app = _app(db, Registry(), _settings(cmd_timeout_ms=1000, execute_js_max_timeout_ms=5000))
+    # Under the ceiling: honoured verbatim.
+    seen = await _capture_budget(monkeypatch, lambda: tools.execute_js(
+        app, instance="main", tab_id=1, code="1", timeout_ms=4000))
+    assert seen["cmd_timeout_ms"] == 4000
+    # Over it: clamped, never honoured — the operator's ENV is the ceiling, not a hint.
+    seen = await _capture_budget(monkeypatch, lambda: tools.execute_js(
+        app, instance="main", tab_id=1, code="1", timeout_ms=999_000))
+    assert seen["cmd_timeout_ms"] == 5000
+    # Absent: the GLOBAL budget, byte for byte as before.
+    seen = await _capture_budget(monkeypatch, lambda: tools.execute_js(
+        app, instance="main", tab_id=1, code="1"))
+    assert seen["cmd_timeout_ms"] == 1000
+    for bad in (0, -1, "5000", True):
+        with pytest.raises(tools.ToolError):
+            await tools.execute_js(app, instance="main", tab_id=1, code="1", timeout_ms=bad)
+
+
+# --- get_text: the FIXED-function read (§12) ---------------------------------
+async def test_get_text_returns_the_text_and_writes_NO_js_audit_row(tmp_path):
+    """THE §12 line this wave draws. The execute_js gate (checkbox + kill-switch + an
+    audit row before the send) exists because ARBITRARY code arrives there and truncated
+    code cannot be reconstructed. get_text injects a function committed into the extension
+    and known at build time — there is nothing to reconstruct, so it is NOT behind that
+    gate and writes NO audit row. Every other gate still applies (stop, revoke,
+    stale_session, the http/https edge guard).
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.get_text(_app(db, reg), instance="main", tab_id=2, selector="#a"),
+        cs, ws, {"text": "hello world"},
+    )
+    assert out == {"ok": True, "text": "hello world"}
+    assert frame["command"] == protocol.CMD_GET_TEXT
+    assert frame["params"] == {"tabId": 2, "maxBytes": tools.DEFAULT_MAX_BYTES, "selector": "#a"}
+    # No arbitrary code ran, so there is nothing to audit — and an audit row here would be
+    # a row with an empty `code` column, i.e. evidence of nothing.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_get_text_keeps_the_extensions_truncation_numbers(tmp_path):
+    # The extension measured the WHOLE document, so its total_bytes is the real size; a
+    # server-side re-measure could only report the size of what already arrived.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.get_text(_app(db, reg), instance="main", tab_id=2, max_bytes=4),
+        cs, ws, {"text": "abcd", "truncated": True, "totalBytes": 99999},
+    )
+    # camelCase on the wire (§6), snake_case for the agent.
+    assert out == {"ok": True, "text": "abcd", "truncated": True, "total_bytes": 99999}
+
+
+async def test_get_text_never_reports_truncated_with_a_null_total(tmp_path):
+    """An extension that flags ``truncated`` without a number falls back to our measurement.
+
+    "truncated: true, total_bytes: null" is the tool saying "I cut it and I won't say by how
+    much". The local number is a floor rather than the true size, but a floor is actionable
+    and a null is not.
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.get_text(_app(db, reg), instance="main", tab_id=2, max_bytes=64),
+        cs, ws, {"text": "abcd", "truncated": True},  # no totalBytes at all
+    )
+    assert out == {"ok": True, "text": "abcd", "truncated": True, "total_bytes": 4}
+
+
+async def test_get_text_cap_is_enforced_even_by_an_extension_that_ignores_maxBytes(tmp_path):
+    # "New service + old extension" is a guaranteed state (they update by different
+    # paths), so the server-side cap is what actually protects the agent's context.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.get_text(_app(db, reg), instance="main", tab_id=2, max_bytes=5),
+        cs, ws, {"text": "x" * 500},  # no truncated flag: an old extension ignored maxBytes
+    )
+    assert out["text"] == "x" * 5
+    assert out["truncated"] is True and out["total_bytes"] == 500
+
+
+async def test_get_text_is_refused_while_stopped_and_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.get_text(app, instance="main", tab_id=2)
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
+# --- wait_for ----------------------------------------------------------------
+async def test_wait_for_requires_exactly_one_predicate_and_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    for kwargs in (
+        {},
+        {"url_matches": "a", "selector": "#b"},
+        {"url_matches": "a", "selector": "#b", "text_contains": "c"},
+    ):
+        with pytest.raises(tools.ToolError) as ei:
+            await tools.wait_for(app, instance="main", tab_id=1, **kwargs)
+        assert ei.value.code == "invalid_args"
+    assert ws.sent == []  # "and" vs "or" is not a guess to make — nothing is polled
+
+
+async def test_wait_for_socket_budget_OUTLASTS_the_page_deadline(tmp_path, monkeypatch):
+    """THE ordering that makes the verb work.
+
+    The extension polls until ITS deadline and only then answers ``timeout``. Give the
+    socket the same budget and the command dies on the wire first — every wait would
+    report the SERVICE's timeout instead of the page's answer, which is strictly worse
+    than not having the verb.
+    """
+    db = await _make_db(tmp_path)
+    app = _app(db, Registry(), _settings(cmd_timeout_ms=1000, execute_js_max_timeout_ms=30000))
+    seen = await _capture_budget(monkeypatch, lambda: tools.wait_for(
+        app, instance="main", tab_id=1, selector="#done", timeout_ms=8000))
+    assert seen["params"]["timeoutMs"] == 8000
+    assert seen["cmd_timeout_ms"] > 8000
+    # And it is never SHORTER than the ordinary command budget either.
+    seen = await _capture_budget(monkeypatch, lambda: tools.wait_for(
+        app, instance="main", tab_id=1, selector="#done", timeout_ms=1))
+    assert seen["cmd_timeout_ms"] >= 1000
+
+
+def test_the_socket_slack_outlasts_a_whole_poll_interval():
+    """``_WAIT_SLACK_MS`` must exceed the extension's poll period, not merely be positive.
+
+    The extension checks its deadline only BETWEEN polls, so the last check can land up to
+    one full WAIT_POLL_MS late — plus the round trip home. A slack smaller than that
+    interval would let the socket give up while the answer is already on its way, turning
+    a definite ``matched:false`` into "state unknown" for the calls that ran closest to
+    their deadline: the hardest failure to reproduce, since it depends on timing alone.
+    """
+    constants_js = (
+        Path(__file__).resolve().parent.parent / "extension" / "src" / "constants.js"
+    ).read_text(encoding="utf-8")
+    m = re.search(r"^export const WAIT_POLL_MS\s*=\s*(\d+);", constants_js, re.MULTILINE)
+    assert m, "WAIT_POLL_MS not found in constants.js (moved or reformatted?)"
+    assert tools._WAIT_SLACK_MS > int(m.group(1))
+
+
+def test_the_default_ceiling_fits_inside_what_the_extension_will_honour():
+    """``EXECUTE_JS_MAX_TIMEOUT_MS`` <= the extension's own WAIT_MAX_TIMEOUT_MS.
+
+    Pinned on the DEFAULT here; ``tests/test_settings.py`` pins the bound for every
+    configured value. Raise the default past the extension's ceiling and every wait longer
+    than a minute would be silently shortened while the service reported the longer number.
+    """
+    settings = make_settings()
+    assert settings.execute_js_max_timeout_ms <= EXT_WAIT_MAX_TIMEOUT_MS
+
+
+async def test_wait_for_defaults_to_the_ceiling_and_clamps_to_it(tmp_path, monkeypatch):
+    # A wait with no stated length wants the LONGEST the operator permits — where every
+    # other verb wants the ordinary command budget.
+    db = await _make_db(tmp_path)
+    app = _app(db, Registry(), _settings(cmd_timeout_ms=1000, execute_js_max_timeout_ms=7000))
+    seen = await _capture_budget(monkeypatch, lambda: tools.wait_for(
+        app, instance="main", tab_id=1, url_matches="/done"))
+    assert seen["params"]["timeoutMs"] == 7000
+    seen = await _capture_budget(monkeypatch, lambda: tools.wait_for(
+        app, instance="main", tab_id=1, url_matches="/done", timeout_ms=999_000))
+    assert seen["params"]["timeoutMs"] == 7000
+
+
+async def test_wait_for_passes_the_predicate_through_and_writes_no_audit(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.wait_for(_app(db, reg), instance="main", tab_id=2,
+                               text_contains="Paid", timeout_ms=3000),
+        cs, ws, {"matched": True, "elapsedMs": 500},
+    )
+    # `elapsedMs` is the wire spelling; everything the agent reads is snake_case.
+    assert out == {"ok": True, "matched": True, "elapsed_ms": 500}
+    assert frame["command"] == protocol.CMD_WAIT_FOR
+    assert frame["params"] == {"tabId": 2, "timeoutMs": 3000, "textContains": "Paid"}
+    # Fixed function, not eval => no js_audit row (see get_text's docstring).
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_wait_for_reports_a_missed_condition_as_ok_matched_false(tmp_path):
+    """The deadline passing is a VERDICT, not ``timeout``.
+
+    §11 fixes ``timeout`` to mean UNKNOWN — no frame arrived, the browser may be wedged, do
+    not blindly retry. A wait that ran its course is the opposite fact and must not wear the
+    same name: the browser answered, and the answer is "no". The two are told apart by the
+    response SHAPE, which is what survives the wire — an ``elapsedMs`` riding on an
+    ``ok:false`` frame would not, since ``send_command`` discards ``result`` on any failure.
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.wait_for(_app(db, reg), instance="main", tab_id=2,
+                               selector="#done", timeout_ms=3000),
+        cs, ws, {"matched": False, "elapsedMs": 3000},
+    )
+    assert out == {"ok": True, "matched": False, "elapsed_ms": 3000}
+
+
+# --- navigate_tab waitUntil --------------------------------------------------
+async def test_navigate_tab_without_wait_until_sends_the_frame_it_always_sent(tmp_path, monkeypatch):
+    # The reset path calls this command; a new key on the wire by default would change
+    # what every deployed extension receives.
+    db = await _make_db(tmp_path)
+    app = _app(db, Registry())
+    seen = await _capture_budget(monkeypatch, lambda: tools.navigate_tab(
+        app, instance="main", tab_id=2, url="https://a/"))
+    assert seen["params"] == {"tabId": 2, "url": "https://a/"}
+    # The GLOBAL budget, unchanged: naming no wait must not buy a longer socket.
+    assert seen["cmd_timeout_ms"] == app.state.settings.cmd_timeout_ms
+    seen = await _capture_budget(monkeypatch, lambda: tools.navigate_tab(
+        app, instance="main", tab_id=2, url="https://a/", wait_until="none"))
+    assert seen["params"] == {"tabId": 2, "url": "https://a/"}
+
+
+async def test_navigate_tab_with_wait_until_carries_the_wait_and_a_longer_budget(tmp_path, monkeypatch):
+    db = await _make_db(tmp_path)
+    app = _app(db, Registry(), _settings(cmd_timeout_ms=1000, execute_js_max_timeout_ms=30000))
+    seen = await _capture_budget(monkeypatch, lambda: tools.navigate_tab(
+        app, instance="main", tab_id=2, url="https://a/", wait_until="selector",
+        selector="#app", timeout_ms=6000), {"matched": True, "elapsedMs": 10})
+    assert seen["params"] == {"tabId": 2, "url": "https://a/", "waitUntil": "selector",
+                              "timeoutMs": 6000, "selector": "#app"}
+    assert seen["cmd_timeout_ms"] > 6000  # same ordering rule as wait_for
+
+
+async def test_navigate_tab_answers_in_wait_fors_shape_when_a_wait_was_asked_for(tmp_path):
+    """One question, one shape. ``wait_for`` renames on purpose — ``elapsedMs`` is the WIRE
+    spelling and everything the agent reads is snake_case — and passing the extension's
+    frame through raw made the neighbouring verb answer camelCase, with a SECOND ``ok:true``
+    nested inside an answer whose subject may be a condition that did not hold.
+
+    Both budget tests above go through a fake ``send_command`` that answers ``{}``, so the
+    response shape was pinned by nothing; this one hands over a realistic frame.
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.navigate_tab(_app(db, reg), instance="main", tab_id=2,
+                                   url="https://a/", wait_until="selector",
+                                   selector="#app", timeout_ms=5000),
+        cs, ws, {"ok": True, "matched": False, "elapsedMs": 5000},
+    )
+    assert out == {"ok": True, "matched": False, "elapsed_ms": 5000}
+    assert frame["params"]["waitUntil"] == "selector"
+
+
+async def test_navigate_tab_refuses_an_OLD_extension_with_its_OWN_code(tmp_path):
+    """A frame with no ``matched`` key means "this extension cannot wait" — never "it did
+    not match" — and it says so in a code of its OWN.
+
+    ``navigate_tab`` is an OLD command with a NEW parameter: a pre-wave bundle drops
+    ``waitUntil`` as an unknown key, does the ``tabs.update`` and answers ``{ok:true}``.
+    Reading ``matched`` off that with ``.get`` manufactured ``{matched: false,
+    elapsed_ms: 0}`` — a verdict nobody reached, and one the agent cannot tell from an
+    honest "the condition never became true". Same class as ``open_tab``'s ``windowId``
+    cross-check: new service + old extension is a guaranteed state.
+
+    THE CODE IS THE POINT OF THIS ASSERTION. It used to be ``precondition_failed``, which
+    this verb also answers for four ARGUMENT refusals — and the agent's move is opposite
+    there ("fix the argument and call again") to here ("this copy's extension is too old;
+    retrying cannot help"). §11's rule for ``pinned_cross_window`` is that a distinct
+    situation gets a distinct code so a caller can branch without parsing prose.
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    with pytest.raises(tools.ToolError) as ei:
+        await _run_with_response(
+            lambda: tools.navigate_tab(_app(db, reg), instance="main", tab_id=2,
+                                       url="https://a/", wait_until="load",
+                                       timeout_ms=5000),
+            cs, ws, {"ok": True},  # the pre-wave answer: it never learned to wait
+        )
+    assert ei.value.code == "extension_too_old"
+    assert ei.value.code != protocol.ERR_PRECONDITION_FAILED  # branchable, not prose
+    assert "matched" in ei.value.message
+
+
+async def test_navigate_tab_without_a_wait_keeps_its_pre_wave_answer(tmp_path):
+    # The reset path (§8) reads this shape; omitting the parameter must reproduce it.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.navigate_tab(_app(db, reg), instance="main", tab_id=2,
+                                   url="https://a/"),
+        cs, ws, {"ok": True},
+    )
+    assert out == {"ok": True, "result": {"ok": True}}
+
+
+# --- exemptions: the agent's «не трогать» lease (§10/§11) --------------------
+async def _known_instance(db, iid="main"):
+    await _insert_instance(db, iid)
+
+
+async def test_set_list_clear_exemption_round_trip(tmp_path):
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    app = _app(db)
+    out = await tools.set_exemption(app, instance="main", url="https://a/b?x=1", ttl_s=600)
+    assert out["ok"] is True
+    ex = out["exemption"]
+    assert ex["instance_id"] == "main" and ex["reason"] == "mcp"
+    assert ex["until"] > tools._now_ms()
+
+    listed = await tools.list_exemptions(app)
+    assert [e["url"] for e in listed["exemptions"]] == ["https://a/b?x=1"]
+    # The pass matches on the NORMALIZED url, so the row carries it for the agent to see.
+    assert listed["exemptions"][0]["url_norm"] == "https://a/b"
+
+    # A repeat REFRESHES the deadline instead of growing a second row (PK is the pair).
+    again = await tools.set_exemption(app, instance="main", url="https://a/b?x=1",
+                                      ttl_s=1200, reason="task-42")
+    assert again["exemption"]["until"] > ex["until"]
+    listed = await tools.list_exemptions(app)
+    assert len(listed["exemptions"]) == 1 and listed["exemptions"][0]["reason"] == "task-42"
+
+    assert await tools.clear_exemption(app, instance="main", url="https://a/b?x=1") == {
+        "ok": True, "deleted": 1}
+    # Idempotent: lifting an already-lifted exemption is not an error.
+    assert (await tools.clear_exemption(app, instance="main", url="https://a/b?x=1"))["deleted"] == 0
+
+
+async def test_set_exemption_honours_the_shared_never_infinite_ceiling(tmp_path):
+    # The MCP door must not be able to write a protection the HTTP door refuses: an
+    # unbounded row would quietly retire a URL from curation forever (§7).
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    app = _app(db)
+    now = tools._now_ms()
+    out = await tools.set_exemption(app, instance="main", url="https://a/", ttl_s=10**9)
+    assert out["exemption"]["until"] <= now + exemptions_api.MAX_MS + 5000
+    for bad in (0, -5, "600"):
+        with pytest.raises(tools.ToolError):
+            await tools.set_exemption(app, instance="main", url="https://a/", ttl_s=bad)
+
+
+async def test_set_exemption_reuses_the_url_and_instance_guards(tmp_path):
+    """Reused, not re-derived: a scheme-less url normalises to something no live tab can
+    equal, so the row would be a permanently invisible no-op that LOOKS active."""
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    app = _app(db)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.set_exemption(app, instance="main", url="grafana.lc/d/1", ttl_s=60)
+    assert "http" in ei.value.message
+    with pytest.raises(tools.ToolError):
+        await tools.set_exemption(app, instance="typo", url="https://a/", ttl_s=60)
+
+
+async def test_exemption_writes_are_refused_while_stopped(tmp_path):
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    app = _app(db)
+    await tools.pause(app)
+    for call in (
+        lambda: tools.set_exemption(app, instance="main", url="https://a/", ttl_s=60),
+        lambda: tools.clear_exemption(app, instance="main", url="https://a/"),
+    ):
+        with pytest.raises(tools.ToolError) as ei:
+            await call()
+        assert ei.value.code == "stopped"
+    # Reading is never gated — an agent must still be able to see what is protected.
+    assert (await tools.list_exemptions(app))["exemptions"] == []
+
+
+async def test_list_exemptions_can_be_scoped_to_one_instance(tmp_path):
+    db = await _make_db(tmp_path)
+    await _known_instance(db, "main")
+    await _known_instance(db, "media")
+    app = _app(db)
+    await tools.set_exemption(app, instance="main", url="https://a/", ttl_s=60)
+    await tools.set_exemption(app, instance="media", url="https://b/", ttl_s=60)
+    out = await tools.list_exemptions(app, instance="media")
+    assert [e["url"] for e in out["exemptions"]] == ["https://b/"]
+
+
+# --- open_tab lease ----------------------------------------------------------
+async def test_open_tab_lease_writes_an_exemption_the_pass_honours(tmp_path):
+    # Without it, a tab the agent opens for a task is fair game for the very next pass.
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, _frame = await _run_with_response(
+        lambda: tools.open_tab(app, instance="main", url="https://task/", lease_ttl_s=900),
+        cs, ws, {"tabId": 7, "windowId": 1},
+    )
+    assert out["ok"] is True and out["lease"]["ok"] is True
+    rows = await db.read(lambda c: c.execute(
+        "SELECT instance_id, url, reason FROM exemptions").fetchall())
+    assert rows == [("main", "https://task/", "mcp_lease")]
+
+
+async def test_open_tab_without_lease_ttl_writes_nothing_and_reports_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.open_tab(_app(db, reg), instance="main", url="https://task/"),
+        cs, ws, {"tabId": 7, "windowId": 1},
+    )
+    assert out == {"ok": True, "result": {"tabId": 7, "windowId": 1}}  # unchanged shape
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM exemptions").fetchone()) == (0,)
+
+
+async def test_a_failed_lease_WRITE_is_REPORTED_and_never_fails_the_open(tmp_path):
+    """A RUNTIME write fault degrades softly — that half of the contract is right.
+
+    The tab IS open by the time the write runs, so turning the fault into a failed open
+    would report "nothing happened" about a tab that exists and invite the agent to open a
+    second one. Simulated with a ``db.write`` that raises, which is the real shape of the
+    failure (a degraded DB, a full disk) — NOT a bad argument, which is refused earlier and
+    never reaches here.
+    """
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+
+    async def _boom(_fn):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    app.state.db = SimpleNamespace(read=db.read, write=_boom)
+    out, _frame = await _run_with_response(
+        lambda: tools.open_tab(app, instance="main", url="https://task/", lease_ttl_s=600),
+        cs, ws, {"tabId": 7, "windowId": 1},
+    )
+    assert out["ok"] is True and out["result"] == {"tabId": 7, "windowId": 1}
+    assert out["lease"] == {"ok": False, "error": "lease_write_failed",
+                            "message": "disk I/O error"}
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM exemptions").fetchone()) == (0,)
+
+
+async def test_an_INVALID_lease_argument_is_refused_before_the_tab_is_opened(tmp_path):
+    """A bad ``lease_ttl_s`` is a HARD refusal with NO frame sent — not a soft report.
+
+    ``ok: true`` with ``lease: {ok: false}`` for a value ``set_exemption`` refuses outright
+    makes the contract depend on which door the agent knocked at. And judging an argument
+    never required a tab to exist, so there is nothing to degrade around: refusing early
+    also leaves no orphan tab behind.
+
+    The code is asserted to be THE SAME one ``set_exemption`` produces for the identical
+    input, which is the actual property under test — a different-but-still-hard code would
+    leave the two doors disagreeing, just about a different thing.
+    """
+    db = await _make_db(tmp_path)
+    await _known_instance(db)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    for bad in (0, -1, "600"):
+        with pytest.raises(tools.ToolError) as door_a:
+            await tools.set_exemption(_app(db, reg), instance="main", url="https://task/",
+                                      ttl_s=bad)
+        with pytest.raises(tools.ToolError) as door_b:
+            await tools.open_tab(_app(db, reg), instance="main", url="https://task/",
+                                 lease_ttl_s=bad)
+        assert door_b.value.code == door_a.value.code == "invalid_request"
+    # A bad url is refused on the same path, and likewise before the browser is touched.
+    with pytest.raises(tools.ToolError) as exc:
+        await tools.open_tab(_app(db, reg), instance="main", url="grafana.lc/d/1",
+                             lease_ttl_s=600)
+    assert exc.value.code == "invalid_request"
+    assert ws.sent == []  # NOTHING went on the socket
+
+
+async def test_open_tab_lease_judges_the_INSTANCE_exactly_as_set_exemption_does(tmp_path):
+    """The instance is an ARGUMENT of the lease, and both doors onto ``exemptions`` must
+    judge it the same way.
+
+    ``_write_open_lease`` called ``_upsert`` directly, so ``open_tab`` could write a row for
+    an instance ``set_exemption`` refuses — a row the pass can never match, since it matches
+    on ``instance_id``. The practical risk is small (a live socket implies an active row),
+    which argues for the check being cheap, not for it being absent: two doors that disagree
+    about who may be written for is how a rule gets quietly weakened on one side.
+    """
+    db = await _make_db(tmp_path)
+    await _known_instance(db, "main")
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "ghost")  # a socket, yet no row in `instances`
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as door_a:
+        await tools.set_exemption(app, instance="ghost", url="https://task/", ttl_s=600)
+    with pytest.raises(tools.ToolError) as door_b:
+        await tools.open_tab(app, instance="ghost", url="https://task/", lease_ttl_s=600)
+    assert door_b.value.code == door_a.value.code
+    assert ws.sent == []  # refused BEFORE the tab was opened, like every other lease argument
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM exemptions").fetchone()) == (0,)
+
+
+# --- the capability report (§11/§12) -----------------------------------------
+async def test_list_instances_reports_what_a_copy_declared_in_its_hello(tmp_path):
+    """An agent must be able to see what a copy allows BEFORE it calls and fails."""
+    from src.db import queries
+
+    db = await _make_db(tmp_path)
+    await _insert_instance(db, "main")
+    await db.write(lambda c: queries.hello_upsert(
+        c, "main", "sess-1", True, tools._now_ms(),
+        allow_debugger=True, ext_version="0.4.2",
+    ))
+    out = await tools.list_instances(_app(db))
+    envelope = out["instances"]["main"]
+    assert envelope["allow_execute_js"] is True
+    assert envelope["allow_debugger"] is True
+    assert envelope["ext_version"] == "0.4.2"

@@ -260,12 +260,56 @@ _V3_STATEMENTS: list[str] = [
     "ALTER TABLE instances DROP COLUMN title",
 ]
 
+# --- Version 4: the capability report (§11/§12) ------------------------------
+# ``allow_execute_js`` has been reported in ``hello`` since v1, but it was the ONLY thing
+# an instance said about itself. An agent could not find out what a copy allows until a
+# verb failed mid-task, which is the expensive moment to learn it. Two more facts ride the
+# same hello -> instances -> list_instances path:
+#
+# * ``allow_debugger`` — the second per-copy options checkbox, default OFF like its
+#   sibling. NO verb reads it as a gate yet; it is the switch a later screenshot/CDP path
+#   will read. It lands NOW because the report is the point: a capability that appears
+#   only with its first consumer forces every agent written before that day to discover
+#   the answer by failing. DEFAULT 0 — a column that defaulted to 1 would report every
+#   pre-migration instance as debugger-capable, which is the opposite of the truth.
+# * ``ext_version`` — which extension bundle is actually running (from
+#   ``chrome.runtime.getManifest().version``). The service and the extension update by
+#   DIFFERENT paths (the Dockerfile does not ship ``extension/``), so "new service + old
+#   extension" is a guaranteed state; without this nothing could tell an agent that the
+#   copy it is talking to predates a verb. NULLable: an instance that has not said hello
+#   since the upgrade genuinely has not told us, and "unknown" must not be spelled as a
+#   made-up version string.
+#
+# Each ALTER TABLE is its own statement (the runner executes them in order inside one
+# BEGIN IMMEDIATE), matching the v2 style.
+_V4_STATEMENTS: list[str] = [
+    "ALTER TABLE instances ADD COLUMN allow_debugger INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE instances ADD COLUMN ext_version TEXT",
+]
+
+# --- Version 5: HOW the audited code was executed (§12) ----------------------
+# ``js_audit.code`` records WHAT ran; ``await_promise`` records the mode it ran IN, and
+# without it the stored text is ambiguous. The same source means two different things on
+# the two paths: through indirect eval it runs in the page's global scope and a top-level
+# `return` is a SyntaxError, while as an async-function body it has its own scope and
+# `return` is how it answers. §12 justifies keeping the code in full because "усечённый код
+# нереконструируем" — a row that cannot say which of the two produced its effect is
+# unreconstructable for the same reason, one field over.
+#
+# DEFAULT 0 is the honest backfill, not a convenience: every row written before this column
+# existed came from the eval path, because that was the only path.
+_V5_STATEMENTS: list[str] = [
+    "ALTER TABLE js_audit ADD COLUMN await_promise INTEGER NOT NULL DEFAULT 0",
+]
+
 # Ordered list of steps. Append new steps with the next target_version and bump
 # MAX_VERSION; never edit a shipped step (a migrated DB has already run it).
 STEPS: list[tuple[int, list[str]]] = [
     (1, _V1_STATEMENTS),
     (2, _V2_STATEMENTS),
     (3, _V3_STATEMENTS),
+    (4, _V4_STATEMENTS),
+    (5, _V5_STATEMENTS),
 ]
 
 MAX_VERSION: int = max(target for target, _ in STEPS)

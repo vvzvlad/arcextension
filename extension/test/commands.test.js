@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createChromeMock } from "./chrome-mock.js";
-import { dispatchCommand } from "../src/commands.js";
+import {
+  dispatchCommand,
+  evalInWorld,
+  readTextInWorld,
+  matchInWorld,
+} from "../src/commands.js";
 import * as activityMap from "../src/activity-map.js";
 import {
   CMD_OPEN_TAB,
@@ -12,6 +17,10 @@ import {
   CMD_MERGE_WINDOWS,
   CMD_EXECUTE_JS,
   CMD_MOVE_TAB,
+  CMD_GET_TEXT,
+  CMD_WAIT_FOR,
+  WAIT_POLL_MS,
+  WAIT_COMMIT_GRACE_POLLS,
 } from "../src/constants.js";
 
 const NOW = 1_000_000_000;
@@ -54,6 +63,11 @@ describe("stale_session rejects every verb without executing", () => {
     [CMD_MERGE_WINDOWS, { windowIds: [2], targetWindowId: 1 }],
     [CMD_MOVE_TAB, { tabId: 1, windowId: 2 }],
     [CMD_EXECUTE_JS, { code: "1", tabId: 1 }],
+    // The FIXED-function verbs skip the execute_js checkbox, NOT the session check: a
+    // frame from a dead session names tab ids this extension no longer owns, so reading
+    // one is reading a stranger's tab.
+    [CMD_GET_TEXT, { tabId: 1 }],
+    [CMD_WAIT_FOR, { tabId: 1, urlMatches: "x", timeoutMs: 1000 }],
   ];
 
   it.each(verbs)("%s from a foreign session => stale_session, no side effects", async (cmd, params) => {
@@ -1350,7 +1364,8 @@ describe("execute_js checkbox gate (§12)", () => {
     const injection = exec.mock.calls[0][0];
     expect(injection.target).toEqual({ tabId: 5 });
     expect(injection.world).toBe("MAIN");
-    expect(injection.args).toEqual(["2+2"]); // the curator code is passed as an arg
+    // The code plus the awaitPromise flag; false is the default eval path (unchanged).
+    expect(injection.args).toEqual(["2+2", false]);
   });
 
   it("checkbox ON but target is a non-http tab => precondition_failed, NOT executed (§12)", async () => {
@@ -1628,5 +1643,986 @@ describe("#49 bulk open_tab {items} + hoisted-out-of-loop work", () => {
     expect(map.markCuratorCause).toHaveBeenCalledTimes(1);
     expect(map.readMap).not.toHaveBeenCalled(); // no minIdleMs => no map read at all
     expect(elapsed).toBeLessThan(1000); // trivially inside any cmd_timeout_ms budget
+  });
+});
+
+// --- the injected function BODIES -------------------------------------------
+//
+// These are tested DIRECTLY, not through dispatchCommand: the chrome mock's
+// scripting.executeScript returns a canned value and never RUNS the function, so nothing
+// else in this file can prove what the code injected into a real page actually does.
+
+describe("evalInWorld — execute_js's injected body", () => {
+  it("proves the bug AND the fix: indirect eval cannot return; the async path can", async () => {
+    // THE bug this wave fixes. Indirect eval supports neither a top-level `return`
+    // (SyntaxError) nor top-level `await`, so async code could never hand a value back —
+    // it arrived as null. `chrome.scripting` DOES await a promise the injected function
+    // returns; the eval wrapper was the whole problem.
+    expect(() => evalInWorld("return 7;", false)).toThrow(SyntaxError);
+    await expect(evalInWorld("return await Promise.resolve(7);", true)).resolves.toBe(7);
+    await expect(
+      evalInWorld("const v = await Promise.resolve(2); return v * 3;", true),
+    ).resolves.toBe(6);
+  });
+
+  it("a source whose LAST LINE is a // comment still runs on BOTH compile paths", async () => {
+    // Why AsyncFunction and not `new Function("(async()=>{" + source + "})()")`: with
+    // string splicing the appended `})()` lands INSIDE that trailing comment and the whole
+    // thing is a SyntaxError. Go back to splicing and this reddens.
+    //
+    // The same hazard reappears one layer down in the EXPRESSION compile
+    // (`return (<source>\n);`), which is why the newline before `)` is there. Both paths
+    // must survive it, so exercise both: the first falls back to the statement body, the
+    // second is compiled as an expression.
+    await expect(evalInWorld("return 42; // the answer", true)).resolves.toBe(42);
+    await expect(evalInWorld("40 + 2 // the answer", true)).resolves.toBe(42);
+  });
+
+  it("a PROMISE is chained, not cloned — the default path keeps working", async () => {
+    // chrome.scripting awaits a promise the injected function returns, so this has ALWAYS
+    // worked with no flag. Running the clone probe first breaks it: structuredClone throws
+    // DataCloneError on a promise, and the agent gets {__unserializable:"Promise"} instead
+    // of its data. Omitting a new parameter must reproduce pre-wave behaviour exactly.
+    await expect(evalInWorld("Promise.resolve(7)", false)).resolves.toBe(7);
+    await expect(
+      evalInWorld("Promise.resolve({ ok: true }).then((v) => v)", false),
+    ).resolves.toEqual({ ok: true });
+  });
+
+  it("the probe still applies to what the promise RESOLVES TO", async () => {
+    // Chaining must not disable the diagnostic — it must MOVE it onto the value that
+    // actually crosses the structured-clone boundary.
+    const got = await evalInWorld("Promise.resolve(() => 1)", false);
+    expect(got.__unserializable).toBe("Function");
+  });
+
+  it("with await_promise ON, a plain EXPRESSION still returns its value", async () => {
+    // `new AsyncFunction(source)` makes the source the function BODY, which discards an
+    // expression's completion value — so this answered null: the very silent-null failure
+    // the flag exists to remove, and one an agent that turns it on by default would hit
+    // everywhere. Hence the expression-first compile.
+    await expect(evalInWorld("2 + 2", true)).resolves.toBe(4);
+    await expect(evalInWorld("({ a: 1 })", true)).resolves.toEqual({ a: 1 });
+    await expect(evalInWorld("await Promise.resolve(9)", true)).resolves.toBe(9);
+    // …and multi-statement code still reaches the statement fallback, where `return` works.
+    await expect(
+      evalInWorld("const v = await Promise.resolve(2);\nreturn v * 3;", true),
+    ).resolves.toBe(6);
+  });
+
+  it("a TRAILING SEMICOLON does not bring the silent null back", async () => {
+    // `document.title;` is how a one-liner is ordinarily written, and that semicolon is a
+    // SyntaxError inside `return ( … )` — so the expression compile failed, the statement
+    // body ran without a `return`, and the value vanished. An agent that turns the flag on
+    // got nulls everywhere: precisely the failure the flag exists to remove. Hence the
+    // second expression attempt on the trimmed source.
+    globalThis.document = { title: "TITLE" };
+    try {
+      await expect(evalInWorld("document.title;", true)).resolves.toBe("TITLE");
+    } finally {
+      delete globalThis.document;
+    }
+    await expect(evalInWorld("2 + 2;", true)).resolves.toBe(4);
+    await expect(evalInWorld("await Promise.resolve(9);", true)).resolves.toBe(9);
+    await expect(evalInWorld("({ a: 1 });  \n", true)).resolves.toEqual({ a: 1 });
+    // …and the trim must not turn MULTI-STATEMENT code into an expression: it still takes
+    // the statement path, where `return` is the caller's job (so this one is undefined).
+    await expect(evalInWorld("const a = 1; a;", true)).resolves.toBeUndefined();
+    await expect(evalInWorld("const a = 1; return a;", true)).resolves.toBe(1);
+  });
+
+  it("the sync path is unchanged for an ordinary value", () => {
+    expect(evalInWorld("2 + 2", false)).toBe(4);
+    expect(evalInWorld("({a: 1})", false)).toEqual({ a: 1 });
+  });
+
+  it("an UNSERIALIZABLE value names itself instead of arriving as null", () => {
+    // chrome.scripting structured-clones the result out of the page, so a function / DOM
+    // node / Symbol silently becomes null — which reads exactly like "the code returned
+    // null" and is this verb's most confusing failure.
+    const fn = evalInWorld("(function widget() {})", false);
+    expect(fn.__unserializable).toBe("Function");
+    expect(fn.preview).toContain("widget");
+
+    const obj = evalInWorld("({ handler: function () {} })", false);
+    expect(obj.__unserializable).toBe("Object");
+
+    const sym = evalInWorld("Symbol('x')", false);
+    expect(sym.__unserializable).toBe("Symbol");
+  });
+
+  it("the diagnostic applies to the async path too", async () => {
+    const got = await evalInWorld("return () => 1;", true);
+    expect(got.__unserializable).toBe("Function");
+  });
+
+  it("a page that deleted structuredClone gets today's behaviour, not a fabrication", () => {
+    // MAIN world shares the page's globals. Without the guard the probe would throw for
+    // EVERY value and mark each one unserializable — a diagnostic that invents its finding
+    // is worse than none.
+    const saved = globalThis.structuredClone;
+    globalThis.structuredClone = undefined;
+    try {
+      expect(evalInWorld("({a: 1})", false)).toEqual({ a: 1 });
+    } finally {
+      globalThis.structuredClone = saved;
+    }
+  });
+});
+
+// A minimal document double for the two DOM-reading injected bodies.
+function withDocument(doc, fn) {
+  const saved = globalThis.document;
+  globalThis.document = doc;
+  try {
+    return fn();
+  } finally {
+    globalThis.document = saved;
+  }
+}
+
+// `badSelectors` lists selectors the double should reject the way a real engine does — by
+// throwing a SyntaxError — so the "a typo must not burn the whole budget" tests exercise
+// the real code path rather than a stubbed return value.
+function fakeDoc(bodyText, matches = {}, badSelectors = []) {
+  return {
+    body: bodyText === null ? null : { innerText: bodyText },
+    querySelector: (sel) => {
+      if (badSelectors.includes(sel)) {
+        const e = new Error(`'${sel}' is not a valid selector`);
+        e.name = "SyntaxError";
+        throw e;
+      }
+      return sel in matches ? matches[sel] : null;
+    },
+  };
+}
+
+describe("readTextInWorld — get_text's injected body", () => {
+  it("reads the body with no selector, and the element with one", () => {
+    withDocument(fakeDoc("whole page", { "#main": { innerText: "just main" } }), () => {
+      expect(readTextInWorld(null, null)).toEqual({
+        found: true, text: "whole page", totalBytes: 10,
+      });
+      expect(readTextInWorld("#main", null)).toEqual({
+        found: true, text: "just main", totalBytes: 9,
+      });
+    });
+  });
+
+  it("a selector that matches NOTHING is found:false, never an empty string", () => {
+    // "your selector is wrong" and "the page is blank" are different facts; conflating
+    // them sends the agent to debug the wrong one.
+    withDocument(fakeDoc("whole page"), () => {
+      expect(readTextInWorld("#nope", null)).toEqual({ found: false, text: "", totalBytes: 0 });
+    });
+    // A matched-but-genuinely-empty element still reports found:true.
+    withDocument(fakeDoc("x", { "#empty": { innerText: "" } }), () => {
+      expect(readTextInWorld("#empty", null)).toEqual({ found: true, text: "", totalBytes: 0 });
+    });
+  });
+
+  it("cuts at maxBytes on a CHARACTER boundary and reports the TRUE total", () => {
+    // Ten 2-byte characters = 20 bytes. A 5-byte cut lands mid-character: the half
+    // sequence is dropped rather than decoded into U+FFFD.
+    withDocument(fakeDoc("Ω".repeat(10)), () => {
+      const got = readTextInWorld(null, 5);
+      expect(got.text).toBe("ΩΩ"); // 4 bytes kept, the severed 5th dropped
+      expect(got.text).not.toContain("�");
+      expect(got.truncated).toBe(true);
+      expect(got.totalBytes).toBe(20); // the size of the WHOLE document, not of the cut
+    });
+  });
+
+  it("does not cut when the text fits, and ignores a zero/absent maxBytes", () => {
+    withDocument(fakeDoc("short"), () => {
+      expect(readTextInWorld(null, 1000).truncated).toBeUndefined();
+      expect(readTextInWorld(null, 0)).toEqual({ found: true, text: "short", totalBytes: 5 });
+    });
+  });
+});
+
+describe("matchInWorld — the wait_for predicate", () => {
+  it("answers the selector question", () => {
+    withDocument(fakeDoc("", { ".done": {} }), () => {
+      expect(matchInWorld(".done", null)).toEqual({ matched: true });
+      expect(matchInWorld(".missing", null)).toEqual({ matched: false });
+    });
+  });
+
+  it("answers the textContains question", () => {
+    withDocument(fakeDoc("Order complete, thank you"), () => {
+      expect(matchInWorld(null, "complete")).toEqual({ matched: true });
+      expect(matchInWorld(null, "failed")).toEqual({ matched: false });
+    });
+  });
+
+  it("reports a MALFORMED selector as a value, never a throw", () => {
+    // A throw is read by pollUntil as "the frame is being recreated" and polled through to
+    // the deadline — so a typo would cost the whole budget and then answer "not matched".
+    // The distinction has to travel as data.
+    withDocument(fakeDoc("", {}, ["#a:has(>"]), () => {
+      const got = matchInWorld("#a:has(>", null);
+      expect(got.badSelector).toBe(true);
+      expect(got.matched).toBeUndefined();
+      expect(got.message).toMatch(/not a valid selector/);
+    });
+  });
+});
+
+// --- get_text: the FIXED-function read (§12) ---------------------------------
+function chromeWithOneTab(url = "https://x/", extra = {}) {
+  globalThis.chrome = createChromeMock({ tabs: [{ id: 5, windowId: 1, url, ...extra }] });
+}
+
+describe("get_text", () => {
+  it("runs with the execute_js checkbox OFF — a fixed function is not eval (§12)", async () => {
+    // THE load-bearing assertion of this verb. The execute_js gate exists because
+    // ARBITRARY code arrives there and truncated code cannot be reconstructed; a function
+    // committed into this bundle has nothing to reconstruct. Gate this on the checkbox and
+    // the whole point of the verb (a cheap read that does not need the dangerous switch)
+    // is gone.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { found: true, text: "hello", totalBytes: 5 } }];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { text: "hello" } });
+  });
+
+  it("passes selector + maxBytes to the FIXED function, never a code string", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { found: true, text: "t", totalBytes: 1 } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5, selector: "#a", maxBytes: 9 }), ctx());
+    const injection = exec.mock.calls[0][0];
+    expect(injection.args).toEqual(["#a", 9]);
+    expect(typeof injection.func).toBe("function");
+  });
+
+  it("surfaces the extension-side truncation with the TRUE total", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [
+      { result: { found: true, text: "cut", totalBytes: 4096, truncated: true } },
+    ];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5, maxBytes: 3 }), ctx());
+    // camelCase on the WIRE, like every other §6 key (`tabId`, `elapsedMs`); the MCP layer
+    // is what renames it to `total_bytes` for the agent.
+    expect(res.result).toEqual({ text: "cut", truncated: true, totalBytes: 4096 });
+  });
+
+  it("a MALFORMED selector is precondition_failed, not `internal`", async () => {
+    // Without readTextInWorld catching it, the SyntaxError escapes the injection and the
+    // dispatcher's outer try turns it into `internal` — a code that says "our bug" and
+    // sends the agent to read our logs instead of its own selector.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [
+      { result: { found: false, badSelector: true, message: "'#a:has(>' is not a valid selector" } },
+    ];
+    const res = await dispatchCommand(
+      frame(CMD_GET_TEXT, { tabId: 5, selector: "#a:has(>" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#a:has(>");
+  });
+
+  it("a selector that matched nothing => precondition_failed", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { found: false, text: "", totalBytes: 0 } }];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5, selector: "#nope" }), ctx());
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#nope");
+  });
+
+  it("keeps execute_js's http/https target guard (§12)", async () => {
+    // With <all_urls> granted an unguarded read would return a file:// page's text.
+    chromeWithOneTab("file:///etc/passwd");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a vanished tab is no_such_tab, not internal", async () => {
+    chromeWithOneTab();
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 999 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
+// --- wait_for ----------------------------------------------------------------
+// A fake clock whose SLEEP is what advances time: the poll loop then runs to its deadline
+// instantly and deterministically, instead of spending real seconds.
+function fakeClock(start = NOW) {
+  const state = { t: start, sleeps: 0, hooks: [] };
+  return {
+    now: () => state.t,
+    sleep: async (ms) => {
+      state.t += ms;
+      state.sleeps += 1;
+      for (const h of state.hooks) h(state.sleeps);
+    },
+    onSleep: (fn) => state.hooks.push(fn),
+    get sleeps() {
+      return state.sleeps;
+    },
+  };
+}
+
+describe("wait_for", () => {
+  it("requires EXACTLY ONE predicate and polls NOTHING otherwise", async () => {
+    chromeWithOneTab();
+    const get = vi.spyOn(chrome.tabs, "get");
+    for (const params of [
+      { tabId: 5, timeoutMs: 1000 }, // none
+      { tabId: 5, timeoutMs: 1000, urlMatches: "a", selector: "#b" }, // two
+      { tabId: 5, timeoutMs: 1000, urlMatches: "a", selector: "#b", textContains: "c" },
+    ]) {
+      const res = await dispatchCommand(frame(CMD_WAIT_FOR, params), ctx());
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("precondition_failed");
+      expect(res.error.message).toMatch(/EXACTLY ONE/);
+    }
+    expect(get).not.toHaveBeenCalled(); // refused before touching the browser
+  });
+
+  it("urlMatches needs NO injection at all and matches a substring", async () => {
+    chromeWithOneTab("https://shop/checkout/done?x=1");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/checkout/done", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { matched: true, elapsedMs: 0 } });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("keeps polling until the condition becomes true, then reports elapsedMs", async () => {
+    chromeWithOneTab("https://shop/cart");
+    const c = fakeClock();
+    // The page "navigates" on the second poll interval.
+    c.onSleep((n) => {
+      if (n === 2) chrome.__state.tabs[0].url = "https://shop/done";
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/done", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.matched).toBe(true);
+    expect(res.result.elapsedMs).toBe(2 * WAIT_POLL_MS);
+  });
+
+  it("a condition that never holds is a SUCCESS with matched:false, NOT `timeout`", async () => {
+    // §11 reserves `timeout` for "no frame arrived" — state UNKNOWN, do not blindly retry.
+    // A wait that ran its full course is the opposite fact: the browser answered, and the
+    // answer is "no". Spelling both as one error code destroys the distinction the agent
+    // needs; spelling this one as a verdict puts it in the response SHAPE, which survives
+    // the wire (an `elapsedMs` on an error frame would not — the service discards `result`
+    // on any ok:false).
+    chromeWithOneTab("https://shop/cart");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/never", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ matched: false, elapsedMs: 1000 });
+    // It really polled to the deadline rather than giving up at once (1000/250 = 4).
+    expect(c.sleeps).toBe(4);
+  });
+
+  it("a MALFORMED selector is refused at once, not polled to the deadline", async () => {
+    // `document.querySelector("#a:has(>")` throws SyntaxError, and pollUntil reads a throw
+    // from an injection as "the frame is being recreated". Untreated, a typo costs the
+    // whole 30-60 s budget and THEN reads as "condition not met" — the agent debugs the
+    // page instead of its selector.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [
+      { result: { badSelector: true, message: "'#a:has(>' is not a valid selector" } },
+    ];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: "#a:has(>", timeoutMs: 60000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#a:has(>");
+    expect(c.sleeps).toBe(0); // refused on the FIRST probe
+  });
+
+  it("re-checks the scheme on EVERY poll, not once up front", async () => {
+    // The guard is checked before the first probe, but a wait keeps injecting for up to a
+    // minute and the page can move under us. With <all_urls> granted, an injection into a
+    // file:// page reads it same-origin — so a guard that expires mid-wait is not a guard.
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.tabs[0].url = "file:///etc/passwd";
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".ready", timeoutMs: 60000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(c.sleeps).toBe(1); // caught on the second probe, not at the deadline
+  });
+
+  it("selector polls the FIXED predicate in the page", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.scriptResults = [{ result: { matched: true } }];
+    });
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".ready", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result).toEqual({ matched: true, elapsedMs: WAIT_POLL_MS });
+    expect(exec.mock.calls[0][0].args).toEqual([".ready", null]);
+    expect(exec.mock.calls[0][0].func).toBe(matchInWorld);
+  });
+
+  it("textContains rides the same predicate with the other argument", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = fakeClock();
+    await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, textContains: "Paid", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(exec.mock.calls[0][0].args).toEqual([null, "Paid"]);
+  });
+
+  it("runs with the execute_js checkbox OFF (fixed function, §12)", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".x", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("guards the scheme for the INJECTING predicates but not for urlMatches", async () => {
+    // A tab mid-navigation legitimately sits on about:blank, and waiting for it to REACH
+    // an http url is the main use of urlMatches — guarding it would make the verb useless.
+    chromeWithOneTab("about:blank");
+    const c = fakeClock();
+    const injected = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".x", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(injected.error.code).toBe("precondition_failed");
+
+    const byUrl = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "about:", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(byUrl.ok).toBe(true);
+  });
+
+  it("a tab that vanishes mid-wait ends the wait with no_such_tab", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.tabs.length = 0; // the human closed it
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, selector: ".x", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("refuses a missing or non-positive timeoutMs loudly", async () => {
+    chromeWithOneTab();
+    for (const timeoutMs of [undefined, 0, -1, "5000", 1.5]) {
+      const res = await dispatchCommand(
+        frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "x", timeoutMs }),
+        ctx(),
+      );
+      expect(res.error.code).toBe("precondition_failed");
+    }
+  });
+});
+
+// --- navigate_tab waitUntil ---------------------------------------------------
+describe("navigate_tab waitUntil", () => {
+  it("DEFAULT (absent) is byte-for-byte today's behaviour: update, {ok:true}, no wait", async () => {
+    // The reset path (src/api/rules.py) calls this verb; it must not change at all.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/" }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(c.sleeps).toBe(0); // nothing was waited for
+    expect(chrome.__state.tabs[0].url).toBe("https://new/");
+  });
+
+  it("waitUntil:'none' is explicitly the same as absent", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "none" }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(c.sleeps).toBe(0);
+  });
+
+  it("'load' waits for status:'complete' and never accepts the OLD page's complete", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    // The tab is 'complete' from the PREVIOUS page at update time. Accepting that would
+    // return before the new document even started loading — the exact bug the option
+    // exists to prevent — so the first check happens only after one poll interval.
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.tabs[0].status = "loading";
+      if (n === 2) chrome.__state.tabs[0].status = "complete";
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "load", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.elapsedMs).toBe(2 * WAIT_POLL_MS);
+  });
+
+  it("'selector' waits for the fixed predicate", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.scriptResults = [{ result: { matched: false } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 2) chrome.__state.scriptResults = [{ result: { matched: true } }];
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.elapsedMs).toBe(2 * WAIT_POLL_MS);
+  });
+
+  it("'selector' waits for the COMMIT before injecting — no error about the OLD page", async () => {
+    // `tabs.update` does not move `tab.url`: the old url stands until the navigation
+    // commits. Leaving `about:blank` (a fresh tab — the ordinary case) the injecting probe
+    // therefore used to see `about:blank`, trip the http/https guard and answer
+    // `precondition_failed: target is not an http/https tab` — an error about something
+    // that did not happen, AFTER the tab was already sent on its way.
+    chromeWithOneTab("about:blank", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 2; // commits on the 2nd tabs.get, not instantly
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.matched).toBe(true);
+    expect(chrome.__state.tabs[0].url).toBe("https://new/");
+  });
+
+  it("'selector' cannot be satisfied by the OLD document", async () => {
+    // The second half of the same defect, and the quieter one: with an http old page the
+    // injection lands in the OLD DOM, so a selector present on both pages (`#app`, `body`,
+    // an SPA header) answered `matched:true` immediately and the wait waited for nothing.
+    // The predicate below matches ONLY while the tab still shows the old address.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 2;
+    Object.defineProperty(chrome.__state, "scriptResults", {
+      configurable: true,
+      get: () => [{ result: { matched: chrome.__state.tabs[0].url === "https://old/" } }],
+    });
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#only-old",
+        timeoutMs: 1000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ ok: true, matched: false, elapsedMs: 1000 });
+  });
+
+  it("a redirect back to the ORIGINAL url opens the gate only at FULL LOAD — signal (3)'s cost", async () => {
+    // The url can then satisfy neither "is the target" nor "left the start" — only the
+    // loading→complete round says the document was replaced. Without that third signal the
+    // gate would never open and a page that really did navigate would answer matched:false.
+    //
+    // ⚠️ And that round ENDS at full load, which the mock now says out loud: the tab spends
+    // gets 2-3 committed-but-still-loading, exactly where a real one does. So for this one
+    // shape `waitUntil:'selector'` degrades into "wait for load, THEN look" — while a
+    // selector is usually awaited precisely to catch an element DURING loading. Named in §6
+    // as a cost, because the alternative is not available: the commit itself is invisible
+    // here, and the only other option is burning the whole deadline.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 2;
+    chrome.__state.navCompleteAfterGets = 4; // committed on get 2, `complete` only on get 4
+    chrome.__state.navCommitUrl = "https://old/"; // the redirect lands where we started
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result.matched).toBe(true);
+    expect(res.result.elapsedMs).toBe(4 * WAIT_POLL_MS); // the COMPLETION, not the commit
+  });
+
+  it("the gate opens ANYWAY when nothing ever showed a navigation — bounded, and honest", async () => {
+    // THE HOLE THE THREE SIGNALS LEAVE. A redirect that bounces back to the address we
+    // started from (`/admin` refused, tab thrown to `/login`) can never satisfy (2); and if
+    // it also commits and finishes inside the 250 ms pre-pause (cache, a local redirect, a
+    // 304), no poll ever sees `loading`, so (3) is dead too. An unbounded gate then burns
+    // the WHOLE deadline and answers matched:false about a page that is loaded and does
+    // contain the selector — where the same call answered matched:true in 250 ms before the
+    // gate existed. The grace turns a certain wrong answer into a rare wrong document.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 1; // commit + completion on the FIRST gate poll
+    chrome.__state.navCommitUrl = "https://old/"; // ...back where we started
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 3000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result).toEqual({
+      ok: true,
+      matched: true,
+      // BOUNDED: the grace, not the deadline (3000) and not the first poll either.
+      elapsedMs: WAIT_COMMIT_GRACE_POLLS * WAIT_POLL_MS,
+    });
+  });
+
+  it("a NON-HTTP start gets NO grace — the hole it patches cannot exist there", async () => {
+    // THE GRACE IS ONLY AS WIDE AS THE HOLE. Every case it exists for — a redirect bouncing
+    // back to `startUrl`, a cache hit, a 304 — presupposes an http(s) document to bounce
+    // back TO: a tab on `about:blank` cannot "redirect back to about:blank". So on a
+    // non-http start the grace bought nothing and re-opened precisely the two wrong answers
+    // the gate was written to prevent. The tab below reproduces both — `about:blank`
+    // "navigating" and landing on itself.
+    for (const [waitUntil, extra] of [["selector", { selector: "#app" }], ["load", {}]]) {
+      chromeWithOneTab("about:blank", { status: "complete" });
+      chrome.__state.navCommitAfterGets = 1;
+      chrome.__state.navCommitUrl = "about:blank"; // it never leaves the non-http page
+      chrome.__state.scriptResults = [{ result: { matched: true } }];
+      const c = fakeClock();
+      const res = await dispatchCommand(
+        frame(CMD_NAVIGATE_TAB, {
+          tabId: 5, url: "https://new/", waitUntil, timeoutMs: 3000, ...extra,
+        }),
+        ctx({ now: c.now, sleep: c.sleep }),
+      );
+      // Drop `isHttpUrl(startUrl)` from `quiet` and this is, at 3 * WAIT_POLL_MS,
+      // `precondition_failed: not an http/https tab` for 'selector' — an error about a
+      // navigation that DID happen — and `matched:true` about `about:blank` for 'load'.
+      expect(res).toEqual({
+        ok: true,
+        result: { ok: true, matched: false, elapsedMs: 3000 },
+      });
+    }
+  });
+
+  it("a tab ALREADY loading before the update gets NO grace", async () => {
+    // The bound is only safe because the tab was `complete` BEFORE `tabs.update`: only then
+    // can a `complete` seen afterwards not be the document we are LEAVING still finishing.
+    // Start from `loading` and that argument is gone — the `complete` arriving three quiet
+    // polls later is most probably the OLD page landing, i.e. the one false signal the
+    // pre-pause exists to reject — so this navigation pays the deadline instead.
+    chromeWithOneTab("https://old/", { status: "loading" });
+    chrome.__state.navCommitAfterGets = 1;
+    chrome.__state.navCommitUrl = "https://old/"; // ...and comes back where it started
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 3000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    // Relax `startStatus === "complete"` to `startStatus !== null` and this becomes
+    // matched:true at 3 * WAIT_POLL_MS — the grace handed to exactly the tab the comment
+    // says must never have it.
+    expect(res.result).toEqual({ ok: true, matched: false, elapsedMs: 3000 });
+  });
+
+  it("...and gets no SIGNAL (3) either — `complete` there is the OLD document landing", async () => {
+    // DENYING THE GRACE WAS NOT ENOUGH. Signal (3) — `sawLoading && complete` — accepts
+    // exactly the state the grace is denied for, and TWO POLLS EARLIER: a tab that was
+    // already `loading` at `tabs.update` produces `loading` → `complete` all by itself, out
+    // of the document it is LEAVING. The test above misses it because its commit lands on
+    // the first poll, so `sawLoading` never turns true; here the flip to `loading` and
+    // `pendingUrl` are both delayed past our polls (a `beforeunload` dialog, a throttled
+    // tab, a busy worker — the three reasons the 'load' gate exists at all) while the old
+    // page finishes on poll 2. That is the gate's own defect, answered confidently.
+    for (const [waitUntil, extra] of [["selector", { selector: "#app" }], ["load", {}]]) {
+      chromeWithOneTab("https://old/", { status: "loading" }); // mid-load BEFORE the update
+      chrome.__state.navCommitAfterGets = 99; // the new navigation never commits
+      chrome.__state.scriptResults = [{ result: { matched: true } }];
+      const c = fakeClock();
+      c.onSleep((n) => {
+        // Sleep n precedes poll n (sleep 1 is the pre-pause).
+        if (n === 1) delete chrome.__state.tabs[0].pendingUrl; // never observed
+        if (n === 2) chrome.__state.tabs[0].status = "complete"; // the OLD page landing
+      });
+      const res = await dispatchCommand(
+        frame(CMD_NAVIGATE_TAB, {
+          tabId: 5, url: "https://new/", waitUntil, timeoutMs: 3000, ...extra,
+        }),
+        ctx({ now: c.now, sleep: c.sleep }),
+      );
+      // Drop `startStatus !== "loading"` from signal (3) and this is
+      // `{matched:true, elapsedMs: 2 * WAIT_POLL_MS}` — 'selector' having injected into
+      // `https://old/`, 'load' having read that same page's `complete`.
+      expect(res).toEqual({ ok: true, result: { ok: true, matched: false, elapsedMs: 3000 } });
+      expect(chrome.__state.tabs[0].url).toBe("https://old/"); // it never left
+    }
+  });
+
+  it("WHAT THAT COSTS: a mid-load tab redirected BACK to its own address pays the deadline", async () => {
+    // The other half of the same condition, pinned so it is not discovered later. For a tab
+    // that was already `loading`, a navigation whose FINAL address is the one it started
+    // from (`/admin` refused, the tab thrown to `/login` and back) now has nothing left:
+    // (2) is unsatisfiable by definition, (3) is denied because the start was `loading`, and
+    // the grace was denied for the same reason. It really did navigate, and the answer is
+    // still matched:false — deliberately, because the alternative is a confident matched:true
+    // about the document being left, which is what this gate exists to remove.
+    chromeWithOneTab("https://old/", { status: "loading" });
+    chrome.__state.navCommitAfterGets = 2;
+    chrome.__state.navCommitUrl = "https://old/"; // the redirect lands where we started
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 3000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    // Drop `startStatus !== "loading"` and this is matched:true at 2 * WAIT_POLL_MS.
+    expect(res.result).toEqual({ ok: true, matched: false, elapsedMs: 3000 });
+  });
+
+  it("a DISCARDED start still gets signal (3): `not loading` is the claim, not `complete`", async () => {
+    // WHY THE TERM IS `startStatus !== "loading"` AND NOT `=== "complete"`, which would also
+    // close the escape above and reads stricter-therefore-safer. `unloaded` is a real Chrome
+    // status (a discarded tab, memory saver) and so is a status we simply could not read:
+    // in neither case is there an old load in flight whose `complete` we could mistake for
+    // the commit, so denying (3) there would buy nothing and cost the same deadline as the
+    // redirect-back case above — for a tab that has no document to be wrong about. The GRACE
+    // keeps the stricter `=== "complete"` test, because it opens the gate on NO evidence at
+    // all and its bound rests on the tab having been finished before the update.
+    chromeWithOneTab("https://old/", { status: "unloaded" });
+    chrome.__state.navCommitAfterGets = 2;
+    chrome.__state.navCommitUrl = "https://old/"; // only (3) can recognise this one
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 3000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    // Tighten the term to `startStatus === "complete"` and this becomes matched:false at 3000.
+    expect(res.result).toEqual({ ok: true, matched: true, elapsedMs: 2 * WAIT_POLL_MS });
+  });
+
+  it("a `pendingUrl` poll RESETS the quiet counter — the grace needs three in a ROW", async () => {
+    // CONSECUTIVE is the whole bound: evidence that arrives late must restart the count, or
+    // "three quiet polls" degrades into "three quiet polls whenever" and the gate opens on a
+    // navigation it has already watched go by. Polls 1-2 are quiet, poll 3 shows a
+    // `pendingUrl`, polls 4-6 are quiet again — so the gate opens on poll 6, NOT on poll 4,
+    // which is the fourth CUMULATIVE quiet poll.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 1;
+    chrome.__state.navCommitUrl = "https://old/";
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      // Sleep n precedes poll n (sleep 1 is the pre-pause). The status deliberately stays
+      // `complete`: flipping it to `loading` would satisfy signal (3) instead and prove
+      // nothing about the counter.
+      if (n === 3) chrome.__state.tabs[0].pendingUrl = "https://new/";
+      if (n === 4) delete chrome.__state.tabs[0].pendingUrl;
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    // Delete the `quietPolls = 0` in the pendingUrl branch and this is 4 * WAIT_POLL_MS.
+    expect(res.result).toEqual({ ok: true, matched: true, elapsedMs: 6 * WAIT_POLL_MS });
+  });
+
+  it("a timeoutMs shorter than the grace silently removes it — the documented boundary", async () => {
+    // The gate opens on the THIRD poll and the first sits behind the pre-pause, so a
+    // deadline of 2 * WAIT_POLL_MS can never reach it while 2 * WAIT_POLL_MS + 1 can (the
+    // last sleep is clamped to what remains). "750 ms is noise against 30 s" is true of the
+    // default and false of a caller who names 300 — the constant and navigate_tab's MCP
+    // description both say so, and this pins the number they quote.
+    for (const [timeoutMs, matched] of [[500, false], [501, true]]) {
+      chromeWithOneTab("https://old/", { status: "complete" });
+      chrome.__state.navCommitAfterGets = 1;
+      chrome.__state.navCommitUrl = "https://old/";
+      chrome.__state.scriptResults = [{ result: { matched: true } }];
+      const c = fakeClock();
+      const res = await dispatchCommand(
+        frame(CMD_NAVIGATE_TAB, {
+          tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs,
+        }),
+        ctx({ now: c.now, sleep: c.sleep }),
+      );
+      expect([timeoutMs, res.result.matched]).toEqual([timeoutMs, matched]);
+    }
+    expect(2 * WAIT_POLL_MS).toBe(500); // the numbers above are the documented ones
+  });
+
+  it("signal (1): a same-address navigation waits for `pendingUrl` to clear", async () => {
+    // Navigating a tab to the address it is ALREADY on is the case that rests on (1) alone:
+    // (2) holds from the first instant (the url IS the target), so `pendingUrl` is the only
+    // thing between the gate and the un-reloaded document. Drop that check and the probe
+    // reads the page we are leaving — one poll early, which is exactly how long this
+    // reload takes.
+    chromeWithOneTab("https://same/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 2;
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://same/", waitUntil: "selector", selector: "#app", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result.matched).toBe(true);
+    expect(res.result.elapsedMs).toBe(2 * WAIT_POLL_MS); // not 1: it waited for the commit
+  });
+
+  it("signal (2b) needs the PRE-UPDATE tabs.get: a redirect to a THIRD address", async () => {
+    // The commit lands on neither the start nor the target, so only "it simply LEFT
+    // startUrl" recognises it — and startUrl exists only because a snapshot was taken
+    // BEFORE `tabs.update`. Without either half the gate has nothing left: (3) never saw
+    // `loading` (the commit beat the first poll) and the grace cannot fire (the url DID
+    // change), so a completed navigation would burn the entire deadline.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 1;
+    chrome.__state.navCommitUrl = "https://other/"; // a redirect to a third address
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 3000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result).toEqual({ ok: true, matched: true, elapsedMs: WAIT_POLL_MS });
+  });
+
+  it("'load' runs the SAME commit gate — a pending navigation is not the old page's complete", async () => {
+    // `status` is meant to flip to `loading` when the navigation STARTS, but a
+    // `beforeunload` dialog, a throttled background tab or a busy worker delays that flip,
+    // and until it lands `complete` describes the page being LEFT — the very bug the option
+    // exists to prevent, one interval later than the pre-pause can cover (250 ms is a
+    // heuristic, not a guarantee). The tab below reports exactly that: `pendingUrl` set,
+    // status still `complete`. The gate reads (1) and refuses to believe it.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 3;
+    const c = fakeClock();
+    c.onSleep(() => {
+      const t = chrome.__state.tabs[0];
+      if (t.pendingUrl) t.status = "complete"; // the flip that has not happened yet
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "load", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result.matched).toBe(true);
+    expect(res.result.elapsedMs).toBe(3 * WAIT_POLL_MS); // the commit, not the stale complete
+  });
+
+  it("a navigation that never commits is matched:false, not an error", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    chrome.__state.navCommitAfterGets = 99; // still in flight when the deadline passes
+    chrome.__state.scriptResults = [{ result: { matched: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", selector: "#app", timeoutMs: 1000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result).toEqual({ ok: true, matched: false, elapsedMs: 1000 });
+  });
+
+  it("a wait that expires is ok+matched:false — the navigation DID happen", async () => {
+    // Same rule as wait_for: the deadline passing is a VERDICT, not an error. `timeout`
+    // means "no frame arrived, state unknown", and here the state is perfectly known — the
+    // tab really moved, the condition just never came true.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const c = fakeClock();
+    c.onSleep(() => {
+      chrome.__state.tabs[0].status = "loading"; // never finishes
+    });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "load", timeoutMs: 1000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ ok: true, matched: false, elapsedMs: 1000 });
+    expect(chrome.__state.tabs[0].url).toBe("https://new/"); // it really navigated
+  });
+
+  it("a bad waitUntil / missing selector is refused BEFORE the tab is navigated", async () => {
+    // A refusal AFTER the update would read as "nothing happened" about a tab that has
+    // already moved.
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const bad = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, { tabId: 5, url: "https://new/", waitUntil: "settled" }),
+      ctx(),
+    );
+    expect(bad.error.code).toBe("precondition_failed");
+    const noSelector = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "https://new/", waitUntil: "selector", timeoutMs: 100,
+      }),
+      ctx(),
+    );
+    expect(noSelector.error.code).toBe("precondition_failed");
+    expect(chrome.__state.tabs[0].url).toBe("https://old/"); // untouched
+  });
+
+  it("still refuses a non-http url before anything else (§12)", async () => {
+    chromeWithOneTab("https://old/", { status: "complete" });
+    const res = await dispatchCommand(
+      frame(CMD_NAVIGATE_TAB, {
+        tabId: 5, url: "javascript:alert(1)", waitUntil: "load", timeoutMs: 100,
+      }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(chrome.__state.tabs[0].url).toBe("https://old/");
   });
 });
