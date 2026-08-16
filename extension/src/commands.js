@@ -44,6 +44,7 @@ import {
   ERR_PINNED_CROSS_WINDOW,
   ERR_INTERNAL,
   WAIT_POLL_MS,
+  WAIT_COMMIT_GRACE_POLLS,
   WAIT_MAX_TIMEOUT_MS,
 } from "./constants.js";
 
@@ -170,16 +171,33 @@ export function evalInWorld(source, awaitPromise) {
   // load-bearing: a source ending in a `//` comment would otherwise swallow the closing
   // paren — the same hazard that rules out splicing an IIFE, one wrapper layer down.
   //
-  // Step 2 — a SyntaxError means it was never an expression (`const r = await f(); return
-  // r.status`), so compile it as the BODY, where writing `return` is the agent's job.
-  // Only a SyntaxError falls back: any other constructor failure is real and must surface.
-  // Compiling twice is free of side effects — neither step RUNS the code.
+  // Step 2 — retry the expression with trailing whitespace and semicolons stripped.
+  // `document.title;` is the ORDINARY way to write a one-liner, and that semicolon inside
+  // the parens is a SyntaxError: without this step the most common shape of all fell
+  // through to the statement body, which has no `return`, and the value was lost — the
+  // silent null this flag exists to remove, back again. The trim is safe because it removes
+  // ONLY trailing `;` and whitespace, and neither can change an EXPRESSION's value; code
+  // that is genuinely more than one statement (`const a = 1; a;`) still fails to parse
+  // inside the parens and still reaches step 3. The trailing NEWLINE is load-bearing here
+  // for the same reason as in step 1 — the trim stops at the first non-`;`/non-space
+  // character, so a source ending in a `//` comment is left exactly as it was.
+  //
+  // Step 3 — a SyntaxError from BOTH expression attempts means it was never an expression
+  // (`const r = await f(); return r.status`), so compile the ORIGINAL, untouched source as
+  // the BODY, where writing `return` is the agent's job. Only a SyntaxError falls back: any
+  // other constructor failure is real and must surface. Compiling up to three times is free
+  // of side effects — no step RUNS the code.
   let fn;
   try {
     fn = new AsyncFunction(`return (${source}\n);`);
   } catch (e) {
     if (!(e instanceof SyntaxError)) throw e;
-    fn = new AsyncFunction(source);
+    try {
+      fn = new AsyncFunction(`return (${source.replace(/[\s;]+$/, "")}\n);`);
+    } catch (e2) {
+      if (!(e2 instanceof SyntaxError)) throw e2;
+      fn = new AsyncFunction(source);
+    }
   }
   // Returning the promise is what makes chrome.scripting await it.
   return fn().then(describe);
@@ -658,6 +676,21 @@ async function navigateTab(params, nowFn, sleep) {
   if (waitUntil !== "none" && deadlineMs === null) {
     return fail(ERR_PRECONDITION_FAILED, "navigate_tab timeoutMs must be a positive integer");
   }
+  // The url AND the status the tab is leaving, read BEFORE the update — the only markers
+  // that tell the OLD document from the new one (see `navigationCommitted`; the status is
+  // what makes its grace bound safe). Read for both waiting modes, never for 'none', so the
+  // default path puts exactly the calls on the browser it always did.
+  let startUrl = null;
+  let startStatus = null;
+  if (waitUntil !== "none") {
+    try {
+      const before = await chrome.tabs.get(params.tabId);
+      startUrl = (before && before.url) || null;
+      startStatus = (before && before.status) || null;
+    } catch {
+      return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+    }
+  }
   try {
     await chrome.tabs.update(params.tabId, { url: params.url });
   } catch {
@@ -672,6 +705,23 @@ async function navigateTab(params, nowFn, sleep) {
   // would make `waitUntil:'load'` return before the new document has even started
   // loading, i.e. exactly the bug the option exists to prevent. Costs one interval.
   await sleep(Math.min(WAIT_POLL_MS, deadlineMs));
+  // GATE BOTH WAITING MODES ON THE COMMIT, inside the same deadline. Until the new document
+  // commits, 'selector' would inject into the OLD one and 'load' would read the OLD one's
+  // `status:'complete'` — the same defect answered twice, so it gets one answer. See
+  // `navigationCommitted` for the signals and for what the gate costs. A commit that never
+  // arrives ends the same way a condition that never becomes true does: `matched:false`,
+  // because the update WAS issued and that is a verdict.
+  const commit = await pollUntil(
+    navigationCommitted(params.tabId, params.url, startUrl, startStatus),
+    deadline,
+    nowFn,
+    sleep,
+    params.tabId,
+  );
+  if (commit.error) return fail(commit.error, commit.message);
+  if (!commit.matched) {
+    return ok({ ok: true, matched: false, elapsedMs: nowFn() - started });
+  }
   const probe =
     waitUntil === "load"
       ? async () => {
@@ -734,6 +784,154 @@ function injectingProbe(tabId, selector, textContains, verb) {
       };
     }
     return await injectMatch(tabId, selector, textContains);
+  };
+}
+
+// A probe that answers "the navigation this command issued has COMMITTED" — the gate BOTH
+// of navigate_tab's waiting modes run before they start testing their own condition.
+//
+// `chrome.tabs.update(tabId, {url})` does NOT move `tab.url`: until the new document
+// commits, `tabs.get` keeps answering the PREVIOUS url and the target sits in
+// `tab.pendingUrl`. Injecting inside that window reads the OLD DOM, and that produced two
+// distinct wrong answers: a selector that exists on both pages (`#app`, `body`, an SPA
+// header) matched at once — so `waitUntil` waited for nothing — and a tab leaving a
+// non-http page (`about:blank`, a `chrome://` newtab, `file://`) tripped the per-poll
+// scheme guard and answered "navigate_tab target is not an http/https tab": an error about
+// something that did not happen, AFTER the navigation was already issued. The single
+// pre-probe pause cannot cover either: the commit lands after the server answers, so
+// 250 ms is a heuristic, not a guarantee.
+//
+// `waitUntil:'load'` is gated for the SAME reason and not by symmetry. `status` is meant to
+// flip to `loading` when the navigation STARTS, but a `beforeunload` dialog, a throttled
+// background tab or a busy MV3 worker delays that flip past our first poll — and until it
+// happens, `complete` describes the page being LEFT. One gate, both modes.
+//
+// Three signals, in the order they are trustworthy:
+//   1. `pendingUrl` is set => still in flight, never commit. (It needs the `tabs`
+//      permission, which the manifest grants, so this is the normal case, not a fallback.)
+//   2. the tab's url IS the target, or it simply LEFT `startUrl` — a redirect landing
+//      elsewhere is still the new document, which is what "commit" has to mean here.
+//      ⚠️ Leaving `startUrl` is not PROOF of a new document: a `#fragment` target, or a
+//      `pushState` from the page being left, moves the url same-document and opens the
+//      gate on the OLD DOM. Same escape as the 204/attachment case, different signal.
+//   3. the tab went `loading` and came back `complete` — for a navigation whose url can
+//      never satisfy (2), e.g. a redirect chain that lands back on the address we started
+//      from. Least precise of the three, hence last, and reachable only after (1) cleared.
+//      It ALSO requires the tab not to have been `loading` before the update: see the
+//      paragraph on that at the bottom, which is where this signal's own wrong answer lived.
+//
+// ⚠️ Navigating a tab to the address it is ALREADY on rests on (1) alone: the moment
+// `pendingUrl` clears, (2) holds by definition, and (3) is never reached. Where the field
+// is unavailable the gate would open on the pre-reload document — accepted deliberately,
+// because there the old document IS the same page, and the alternative (demand (3)'s
+// loading→complete round) answers `matched:false` about a reload short enough to fit
+// between two polls.
+//
+// AND A BOUNDED GRACE, because those three leave a hole that none of them can close. A
+// navigation whose FINAL address is `startUrl` — a redirect that bounces back, `/admin`
+// refused throwing the tab to `/login` — can never satisfy (2); and if it also commits and
+// finishes inside the pre-pause (cache, a local redirect, a 304), no poll ever observes
+// `loading`, so (3) is dead too. The gate would then stay shut for the WHOLE deadline and
+// answer `matched:false` about a page that is loaded and does contain the selector — where
+// the same call answered `matched:true` in 250 ms before the gate existed. So after
+// WAIT_COMMIT_GRACE_POLLS CONSECUTIVE polls in which nothing suggested a navigation at all
+// — no `pendingUrl`, no `loading`, the url still `startUrl`, and the tab already `complete`
+// BEFORE the update, so this `complete` cannot be the old page still finishing — the gate
+// opens anyway.
+//
+// WHAT THE GRACE ASSUMES — written down so a later reader can attack the assumption instead
+// of guessing it: that a navigation which has really STARTED exposes `pendingUrl` within one
+// `tabs.get`. That is deliberately NOT the claim that `status` flips promptly; the paragraph
+// gating 'load' above says the opposite about `status`, and the two only look opposed.
+// `pendingUrl` is set by the navigation controller when the request is issued, while the
+// `loading` flip is what `beforeunload`, a throttled tab or a busy worker delay. So the
+// grace leans on the OTHER signal, the one that argument does NOT call unreliable — which is
+// why the two can both be true. Falsify it — a browser that leaves `pendingUrl` empty while
+// a load is in flight — and the grace starts firing on live navigations; then the bound has
+// to grow, or this signal has to change.
+//
+// IT IS NOT CONFINED TO THE ⚠️ CORNER ABOVE, and pretending otherwise would be the comment
+// lying about its own cost. "Three polls with no evidence" requires NEITHER that the
+// addresses match NOR that the document be unchanged: start `https://old/`, target
+// `https://new/`, a navigation simply not visible yet, and the answer is `matched:true`
+// about `https://old/` with the tab still on the old address. That is a THIRD way to be
+// answered about the document being left, next to the two the MCP description names (a
+// same-address reload; a navigation that changes no document at all). It is the deliberate
+// trade, not an oversight: a rare wrong document instead of a CERTAIN wrong answer after the
+// full deadline. Narrowing it — demanding `targetUrl === startUrl` — would close this third
+// escape and reopen the very stall the grace exists for, since a redirect that lands back on
+// `startUrl` has a TARGET that differs. The BOUND is what keeps it rare rather than normal:
+// a navigation that really started needs one `tabs.get` to show `pendingUrl` or `loading`,
+// not three, so anything still silent on the third poll is a navigation we have no evidence
+// of at all.
+//
+// IT DOES NOT APPLY TO A NON-HTTP(S) START, and that narrowing is exactly the shape of the
+// hole. Every case the grace exists for — a redirect bouncing back to `startUrl`, a cache
+// hit, a 304 — presupposes an http(s) document to bounce back TO: a tab sitting on
+// `about:blank` cannot "redirect back to about:blank". So on a non-http start the grace
+// bought nothing and re-opened precisely the two wrong answers this gate was written to
+// prevent — `precondition_failed: not an http/https tab` for 'selector' (an error about a
+// navigation that DID happen) and `matched:true` about `about:blank` for 'load'. No
+// injection ever reached the non-http document (the per-poll scheme guard held), so what it
+// cost was wrong ANSWERS, not access.
+//
+// A TAB ALREADY `loading` GETS NEITHER (3) NOR THE GRACE, and the (3) half is the one that
+// was actually wrong rather than merely missing. Such a tab produces a `loading` →
+// `complete` round ALL BY ITSELF, out of the document it is LEAVING — so (3) used to read
+// that as the commit, and it did so TWO POLLS EARLIER than the grace it is denied would
+// have. Reproduced: a mid-load tab whose flip to `loading` and whose `pendingUrl` are both
+// delayed past our polls (a `beforeunload` dialog, a throttled tab, a busy MV3 worker — the
+// same three reasons the 'load' gate exists at all), the old page landing on poll 2, and the
+// answer `matched:true` at 500 ms about `https://old/`, with the selector probe injected
+// into the OLD DOM. That is the precise defect this whole gate exists to remove, so the
+// `startStatus !== "loading"` term closes it. Pinned by "...and gets no SIGNAL (3) either"
+// in commands.test.js — the older "gets NO grace" test cannot see it, because there the
+// commit lands on the first poll and `sawLoading` never turns true.
+//
+// WHAT REFUSING IT COSTS, written down rather than discovered later: for a tab that was
+// mid-load, a navigation whose FINAL address is the one it started from — the redirect that
+// bounces back, `/admin` refused throwing the tab to `/login` and back — now has NO signal
+// left at all. (2) is unsatisfiable by definition, (3) is refused here, the grace was
+// refused above; the navigation really happened, and the answer is `matched:false` at the
+// deadline. That is the trade this codebase keeps making: an agent that knows it does not
+// know beats one told confidently about the page it has just left. Two things are NOT part
+// of that cost — navigating a mid-load tab to the address it is ALREADY on (there (2) holds
+// the moment `pendingUrl` clears, the ⚠️ corner above), and a `startStatus` of `null` or
+// `unloaded` (the term claims "not `loading`", and an unknown or discarded status is not a
+// known `loading`; only a `complete` start earns the GRACE, which is the stricter test).
+function navigationCommitted(tabId, targetUrl, startUrl, startStatus) {
+  let sawLoading = false;
+  let quietPolls = 0;
+  return async () => {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab) return false;
+    if (tab.status === "loading") sawLoading = true;
+    if (tab.pendingUrl) {
+      quietPolls = 0; // a navigation IS in flight — the opposite of "no evidence"
+      return false;
+    }
+    if (tab.url === targetUrl || (startUrl !== null && tab.url !== startUrl)) return true;
+    // (3), and the `startStatus` term is load-bearing: for a tab that was ALREADY `loading`
+    // when the update was issued, a `complete` seen now is the OLD document finishing. See
+    // "A TAB ALREADY `loading` GETS NEITHER (3) NOR THE GRACE" above for the reproduction
+    // and for what refusing it costs.
+    if (sawLoading && tab.status === "complete" && startStatus !== "loading") return true;
+    const quiet =
+      // REDUNDANT BY CONSTRUCTION, and kept anyway: the only way to reach this line with
+      // `sawLoading` true and the tab `complete` is a `startStatus` of `loading` — which the
+      // very next term rejects. (Before that term existed the return just above did the same
+      // job on its own.) So no mutation of this one can redden a test; it is insurance
+      // against these lines being reordered, not a load-bearing check.
+      !sawLoading &&
+      startStatus === "complete" &&
+      tab.status === "complete" &&
+      tab.url === startUrl &&
+      // See "IT DOES NOT APPLY TO A NON-HTTP(S) START" above: no non-http page can be the
+      // page a redirect bounces back to, so the grace would buy nothing and cost two wrong
+      // answers. Pinned by "a non-http START gets NO grace" in commands.test.js.
+      isHttpUrl(startUrl);
+    quietPolls = quiet ? quietPolls + 1 : 0;
+    return quietPolls >= WAIT_COMMIT_GRACE_POLLS;
   };
 }
 

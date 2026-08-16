@@ -138,7 +138,29 @@ export function createChromeMock(opts = {}) {
     moveError: opts.moveError || null, // when set, tabs.move throws this message
     removeError: opts.removeError || null, // when set, tabs.remove throws this message
     scriptResults: opts.scriptResults || [{ result: null }], // scripting.executeScript return
+    // ⚠️ DEFERRED COMMIT, opt-in. Real `tabs.update({url})` does NOT change `tab.url`:
+    // until the navigation commits, `tabs.get` answers the PREVIOUS url and the target
+    // waits in `tab.pendingUrl`. This mock changed `url` SYNCHRONOUSLY, which is exactly
+    // why no test could see a probe reading the OLD document. Set `navCommitAfterGets` to
+    // N and the commit lands on the Nth `tabs.get` — counted in GETS, not milliseconds, so
+    // it stays deterministic under the tests' fake clock. `navCommitUrl` is the address the
+    // commit actually lands on when it differs from the requested one (a redirect).
+    // Left at 0 the old synchronous shortcut applies, so every existing test is untouched.
+    navCommitAfterGets: opts.navCommitAfterGets || 0,
+    navCommitUrl: opts.navCommitUrl || null,
+    // ⚠️ COMMIT AND COMPLETION ARE TWO EVENTS, and collapsing them (as this mock did) makes
+    // the ordinary real state — document committed, page still loading — INEXPRESSIBLE. A
+    // test written against the collapsed model reads as though a gate opened at the commit
+    // while in a browser it would open only at full load. Set `navCompleteAfterGets` to a
+    // get count LATER than `navCommitAfterGets` and the tab spends the gap where a real one
+    // does: new url, no `pendingUrl`, `status:'loading'`. Left unset it equals the commit,
+    // i.e. exactly the old collapsed behaviour, so every existing test is untouched.
+    navCompleteAfterGets: opts.navCompleteAfterGets || 0,
   };
+
+  // Strip the deferred-commit bookkeeping from a tab before it leaves the mock: the real
+  // API has no such keys, and a test asserting on a whole tab object must not see them.
+  const tabView = ({ __navGets, __commitAt, __completeAt, __commitUrl, ...view }) => view;
 
   const chrome = {
     storage: {
@@ -154,13 +176,31 @@ export function createChromeMock(opts = {}) {
       // the filter here the moment a filtered call site appears.
       query: async (_query) => {
         await tick();
-        return state.tabs.map((t) => ({ ...t }));
+        return state.tabs.map(tabView);
       },
       get: async (tabId) => {
         await tick();
         const t = state.tabs.find((x) => x.id === tabId);
         if (!t) throw new Error("no such tab");
-        return { ...t };
+        // The deferred navigation advances here, counted in gets. On the COMMIT get the url
+        // becomes the committed address and `pendingUrl` clears — the status stays
+        // `loading`, because a committed document is not a finished one. On the COMPLETION
+        // get (the same one unless the test asked for a gap) the status becomes `complete`.
+        if (t.__navGets !== undefined) {
+          t.__navGets += 1;
+          if (t.__navGets === t.__commitAt) {
+            t.url = t.__commitUrl;
+            delete t.pendingUrl;
+          }
+          if (t.__navGets >= t.__completeAt) {
+            t.status = "complete";
+            delete t.__navGets;
+            delete t.__commitAt;
+            delete t.__completeAt;
+            delete t.__commitUrl;
+          }
+        }
+        return tabView(t);
       },
       // create/remove/update/move mutate the "live browser" state so the command
       // dispatcher can be exercised end to end; each resolves on a macrotask.
@@ -189,8 +229,21 @@ export function createChromeMock(opts = {}) {
         await tick();
         const t = state.tabs.find((x) => x.id === tabId);
         if (!t) throw new Error("no such tab");
+        if (props.url !== undefined && state.navCommitAfterGets > 0) {
+          const { url, ...rest } = props;
+          Object.assign(t, rest); // everything BUT the url applies at once, as it really does
+          t.pendingUrl = url;
+          t.status = "loading";
+          t.__commitUrl = state.navCommitUrl || url;
+          t.__navGets = 0;
+          t.__commitAt = state.navCommitAfterGets;
+          // A completion earlier than the commit is not a state a browser can be in, so an
+          // unset (or nonsensical) value means "the same get", the collapsed default.
+          t.__completeAt = Math.max(state.navCompleteAfterGets, state.navCommitAfterGets);
+          return tabView(t);
+        }
         Object.assign(t, props);
-        return { ...t };
+        return tabView(t);
       },
       move: async (tabIds, moveProps) => {
         await tick();

@@ -2067,11 +2067,15 @@ def test_truncation_survives_a_LONE_SURROGATE(tmp_path):
     assert meta["truncated"] is True and meta["total_bytes"] > 8
 
 
-async def _capture_budget(monkeypatch, factory):
+async def _capture_budget(monkeypatch, factory, result=None):
     """Run ``factory()`` capturing the ``cmd_timeout_ms`` the verb hands send_command.
 
     The budget is the ONE thing a response-driven test cannot observe (the frame carries
     no timeout), and for the waiting verbs it is the whole correctness argument.
+
+    ``result`` is what the fake extension answers; the empty default is fine for every verb
+    that only reads keys, but a verb that JUDGES the frame (``navigate_tab`` refuses one
+    without ``matched``) needs a realistic one.
     """
     seen = {}
 
@@ -2079,7 +2083,7 @@ async def _capture_budget(monkeypatch, factory):
         seen["cmd_timeout_ms"] = cmd_timeout_ms
         seen["params"] = params
         seen["command"] = command
-        return {}
+        return {} if result is None else result
 
     monkeypatch.setattr(tools, "send_command", _fake_send)
     await factory()
@@ -2323,10 +2327,77 @@ async def test_navigate_tab_with_wait_until_carries_the_wait_and_a_longer_budget
     app = _app(db, Registry(), _settings(cmd_timeout_ms=1000, execute_js_max_timeout_ms=30000))
     seen = await _capture_budget(monkeypatch, lambda: tools.navigate_tab(
         app, instance="main", tab_id=2, url="https://a/", wait_until="selector",
-        selector="#app", timeout_ms=6000))
+        selector="#app", timeout_ms=6000), {"matched": True, "elapsedMs": 10})
     assert seen["params"] == {"tabId": 2, "url": "https://a/", "waitUntil": "selector",
                               "timeoutMs": 6000, "selector": "#app"}
     assert seen["cmd_timeout_ms"] > 6000  # same ordering rule as wait_for
+
+
+async def test_navigate_tab_answers_in_wait_fors_shape_when_a_wait_was_asked_for(tmp_path):
+    """One question, one shape. ``wait_for`` renames on purpose — ``elapsedMs`` is the WIRE
+    spelling and everything the agent reads is snake_case — and passing the extension's
+    frame through raw made the neighbouring verb answer camelCase, with a SECOND ``ok:true``
+    nested inside an answer whose subject may be a condition that did not hold.
+
+    Both budget tests above go through a fake ``send_command`` that answers ``{}``, so the
+    response shape was pinned by nothing; this one hands over a realistic frame.
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.navigate_tab(_app(db, reg), instance="main", tab_id=2,
+                                   url="https://a/", wait_until="selector",
+                                   selector="#app", timeout_ms=5000),
+        cs, ws, {"ok": True, "matched": False, "elapsedMs": 5000},
+    )
+    assert out == {"ok": True, "matched": False, "elapsed_ms": 5000}
+    assert frame["params"]["waitUntil"] == "selector"
+
+
+async def test_navigate_tab_refuses_an_OLD_extension_with_its_OWN_code(tmp_path):
+    """A frame with no ``matched`` key means "this extension cannot wait" — never "it did
+    not match" — and it says so in a code of its OWN.
+
+    ``navigate_tab`` is an OLD command with a NEW parameter: a pre-wave bundle drops
+    ``waitUntil`` as an unknown key, does the ``tabs.update`` and answers ``{ok:true}``.
+    Reading ``matched`` off that with ``.get`` manufactured ``{matched: false,
+    elapsed_ms: 0}`` — a verdict nobody reached, and one the agent cannot tell from an
+    honest "the condition never became true". Same class as ``open_tab``'s ``windowId``
+    cross-check: new service + old extension is a guaranteed state.
+
+    THE CODE IS THE POINT OF THIS ASSERTION. It used to be ``precondition_failed``, which
+    this verb also answers for four ARGUMENT refusals — and the agent's move is opposite
+    there ("fix the argument and call again") to here ("this copy's extension is too old;
+    retrying cannot help"). §11's rule for ``pinned_cross_window`` is that a distinct
+    situation gets a distinct code so a caller can branch without parsing prose.
+    """
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    with pytest.raises(tools.ToolError) as ei:
+        await _run_with_response(
+            lambda: tools.navigate_tab(_app(db, reg), instance="main", tab_id=2,
+                                       url="https://a/", wait_until="load",
+                                       timeout_ms=5000),
+            cs, ws, {"ok": True},  # the pre-wave answer: it never learned to wait
+        )
+    assert ei.value.code == "extension_too_old"
+    assert ei.value.code != protocol.ERR_PRECONDITION_FAILED  # branchable, not prose
+    assert "matched" in ei.value.message
+
+
+async def test_navigate_tab_without_a_wait_keeps_its_pre_wave_answer(tmp_path):
+    # The reset path (§8) reads this shape; omitting the parameter must reproduce it.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.navigate_tab(_app(db, reg), instance="main", tab_id=2,
+                                   url="https://a/"),
+        cs, ws, {"ok": True},
+    )
+    assert out == {"ok": True, "result": {"ok": True}}
 
 
 # --- exemptions: the agent's «не трогать» lease (§10/§11) --------------------
@@ -2506,6 +2577,30 @@ async def test_an_INVALID_lease_argument_is_refused_before_the_tab_is_opened(tmp
                              lease_ttl_s=600)
     assert exc.value.code == "invalid_request"
     assert ws.sent == []  # NOTHING went on the socket
+
+
+async def test_open_tab_lease_judges_the_INSTANCE_exactly_as_set_exemption_does(tmp_path):
+    """The instance is an ARGUMENT of the lease, and both doors onto ``exemptions`` must
+    judge it the same way.
+
+    ``_write_open_lease`` called ``_upsert`` directly, so ``open_tab`` could write a row for
+    an instance ``set_exemption`` refuses — a row the pass can never match, since it matches
+    on ``instance_id``. The practical risk is small (a live socket implies an active row),
+    which argues for the check being cheap, not for it being absent: two doors that disagree
+    about who may be written for is how a rule gets quietly weakened on one side.
+    """
+    db = await _make_db(tmp_path)
+    await _known_instance(db, "main")
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "ghost")  # a socket, yet no row in `instances`
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as door_a:
+        await tools.set_exemption(app, instance="ghost", url="https://task/", ttl_s=600)
+    with pytest.raises(tools.ToolError) as door_b:
+        await tools.open_tab(app, instance="ghost", url="https://task/", lease_ttl_s=600)
+    assert door_b.value.code == door_a.value.code
+    assert ws.sent == []  # refused BEFORE the tab was opened, like every other lease argument
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM exemptions").fetchone()) == (0,)
 
 
 # --- the capability report (§11/§12) -----------------------------------------

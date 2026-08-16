@@ -670,11 +670,25 @@ async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
     * the WRITE afterwards is best-effort and reported as ``lease: {ok:false, ...}`` without
       failing the call. Here soft degradation is the honest answer: the tab IS open, and
       saying otherwise would invite the agent to open a second one.
+
+    THE LEASE PROTECTS AN ADDRESS, NOT A TAB, and a REDIRECT therefore drops it. The row is
+    written for the url that was ASKED for, while the pass compares it against the tab's
+    LIVE url (``normalize_url(exemption.url) == normalize_url(tab.url)``), so an
+    ``open_tab("https://shop/checkout", lease_ttl_s=900)`` that lands on
+    ``/checkout/step-1`` leaves a row that can never match — while the answer says
+    ``lease: {ok: true}``, which is true about the WRITE and not about the protection. The
+    cure is the agent's, not the server's: read the live url (``list_tabs``) and re-arm with
+    ``set_exemption`` on it. Re-reading the url here instead would only narrow the window —
+    a redirect can land after the write too — trading a knowable limitation for a racy one.
     """
     await _ensure_not_paused(app)
     # Validated up front, its result reused below: re-deriving it after the open would run
     # the ceiling and the url rule twice and let the two answers drift.
-    lease_plan = _plan_open_lease(url, lease_ttl_s) if lease_ttl_s is not None else None
+    lease_plan = (
+        await _plan_open_lease(app, instance, url, lease_ttl_s)
+        if lease_ttl_s is not None
+        else None
+    )
     params: dict = {"url": url, "pinned": bool(pinned), "active": bool(active)}
     if window_id is not None:
         params["windowId"] = window_id
@@ -692,7 +706,10 @@ async def open_tab(app, *, instance: str, url: str, pinned: bool = False,
             )
     out = {"ok": True, "result": result}
     if lease_plan is not None:
-        out["lease"] = await _write_open_lease(app, instance, *lease_plan)
+        # `*lease_plan` carries an instance id that has PASSED `_validate_instance` — the
+        # value is the same string the caller sent (that function checks, it does not
+        # normalise), so what the tuple adds is the check having happened, not a transform.
+        out["lease"] = await _write_open_lease(app, *lease_plan)
     return out
 
 
@@ -891,7 +908,13 @@ async def execute_js(app, *, instance: str, tab_id: int, code: str,
 
     The result is FLAT: ``value`` (plus ``frames`` only when there is more than one)
     instead of the raw ``{results:[...]}``, capped at ``max_bytes`` (default 40 kB) — see
-    :func:`_flatten_injection_results`."""
+    :func:`_flatten_injection_results`.
+
+    THAT CAP IS APPLIED HERE, on the way out, and protects the AGENT'S CONTEXT ONLY —
+    unlike ``get_text``'s, which rides down to the extension and cuts in the page. Nothing
+    stops a megabyte-sized DOM dump from crossing the socket and living in this process's
+    memory first; only what reaches the agent is trimmed. So a snippet that can narrow what
+    it returns should still do so."""
     await _ensure_not_paused(app)
     budget = _clamp_timeout_ms(app, timeout_ms)
     # VALIDATE BEFORE THE ROUND TRIP. `max_bytes` is only enforced after the response comes
@@ -1035,13 +1058,30 @@ async def navigate_tab(app, *, instance: str, tab_id: int, url: str,
                        expected_session: str | None = None) -> dict:
     """Point a tab at a url (§6), optionally waiting for the page to be there.
 
-    ``wait_until`` defaults to ``'none'`` — the frame then carries no wait key at all and
-    the extension behaves exactly as it always has (issue the update, answer ``{ok:true}``).
-    ``'load'`` waits for the tab to report ``complete``; ``'selector'`` waits for
-    ``selector`` to match. A wait that expires is a SUCCESS whose ``result`` carries
-    ``matched: false`` — never an error: the tab was pointed at the url either way, so the
-    negative is a verdict, not the "state unknown" that ``timeout`` reserves (see
-    :func:`wait_for`).
+    ``wait_until`` defaults to ``'none'`` — the frame then carries no wait key at all, the
+    extension behaves exactly as it always has (issue the update, answer ``{ok:true}``), and
+    the ANSWER is the unchanged ``{ok, result}``. ``'load'`` waits for the tab to report
+    ``complete``; ``'selector'`` waits for ``selector`` to match. A wait that expires is a
+    SUCCESS carrying ``matched: false`` — never an error: the tab was pointed at the url
+    either way, so the negative is a verdict, not the "state unknown" that ``timeout``
+    reserves (see :func:`wait_for`).
+
+    WITH a wait the answer takes ``wait_for``'s shape — ``{ok, matched, elapsed_ms}`` — and
+    for its reasons: ``elapsedMs`` is the WIRE spelling (§6 is camelCase throughout) while
+    everything the agent reads is snake_case, and passing ``result`` through raw also nested
+    a second ``ok: true`` INSIDE an answer whose whole subject may be a condition that did
+    NOT hold. Two verbs answering the same question in two shapes is a difference the agent
+    would have to learn from prose.
+
+    AN OLD EXTENSION IS REFUSED, NEVER GUESSED AT. This is an OLD command with a NEW
+    parameter, so a pre-wave bundle ignores ``waitUntil``, navigates and answers a bare
+    ``{ok:true}`` — a frame with no ``matched`` key, which would otherwise be read as
+    ``matched: false`` and hand the agent a verdict nobody reached. It raises
+    ``extension_too_old`` instead, for the same reason ``open_tab`` cross-checks
+    ``windowId``: "new service + old extension" is a guaranteed state, not a corner. The
+    code is its OWN and service-side only — see the raise site for why it is neither
+    ``precondition_failed`` (which on this verb means "fix your argument") nor a §6 wire
+    constant.
 
     The http/https edge guard is the extension's and is unchanged (§12: a caller must not
     be able to steer a tab to ``data:``/``javascript:``). §7/§5 note, also unchanged: the
@@ -1051,7 +1091,8 @@ async def navigate_tab(app, *, instance: str, tab_id: int, url: str,
     await _ensure_not_paused(app)
     params: dict = {"tabId": tab_id, "url": url}
     budget = None
-    if wait_until is not None and wait_until != "none":
+    waiting = wait_until is not None and wait_until != "none"
+    if waiting:
         wait_ms = _clamp_timeout_ms(app, timeout_ms)
         if wait_ms is None:
             wait_ms = app.state.settings.execute_js_max_timeout_ms
@@ -1062,7 +1103,51 @@ async def navigate_tab(app, *, instance: str, tab_id: int, url: str,
         budget = _wait_budget_ms(app, wait_ms)  # same ordering rule as wait_for
     result = await _command(app, instance, protocol.CMD_NAVIGATE_TAB, params, auth_ctx=auth_ctx,
                             expected_session=expected_session, cmd_timeout_ms=budget)
-    return {"ok": True, "result": result}
+    if not waiting:
+        # No wait asked for: the pre-wave answer, byte for byte. The extension's frame is a
+        # bare {ok:true} here, and the reset path (§8) — `rules_api.perform_reset`, which
+        # sends CMD_NAVIGATE_TAB itself rather than calling this verb — depends on the same
+        # shape at the layer below.
+        return {"ok": True, "result": result}
+    if "matched" not in result:
+        # AN OLD EXTENSION CANNOT SAY "NO", so we must not say it for it. `navigate_tab` is
+        # an OLD command carrying a NEW parameter: a pre-wave bundle ignores `waitUntil` as
+        # an unknown key, issues the bare `tabs.update` and answers `{ok:true}` — and
+        # `result.get("matched")` would turn that into `{matched: false, elapsed_ms: 0}`, a
+        # fabricated verdict indistinguishable from an honest "the condition never became
+        # true". The evidence is in the frame: no `matched` key at all. Service and
+        # extension update by different paths (the Dockerfile does not ship `extension/`),
+        # so "new service + old extension" is a guaranteed state, which is exactly why
+        # `open_tab` cross-checks `windowId` — same class, same answer: refuse loudly.
+        # `wait_for` needs no such check; it is a NEW command, so an old bundle refuses it
+        # by itself.
+        #
+        # ITS OWN CODE, and not `precondition_failed`. This verb already answers that for
+        # four ARGUMENT refusals (a non-http url, a bad `wait_until`, a missing `selector`,
+        # a non-positive `timeout_ms`), where the agent's move is "fix the argument and call
+        # again". Here the arguments are fine and the CALL cannot be fixed at all: this
+        # copy's extension is too old, so the only moves are stop asking it to wait or
+        # update it. §11's own rule (`ERR_PINNED_CROSS_WINDOW`, src/ext/protocol.py) is that
+        # a distinct situation gets a distinct code so a caller can branch without parsing
+        # prose — same rule, applied one layer up.
+        #
+        # SERVICE-SIDE ONLY, deliberately: nothing about this string ever crosses the
+        # socket. The extension cannot produce it (an extension that could would not be the
+        # one being described), so it is NOT a §6 `ERR_` constant and is not mirrored in
+        # `extension/src/constants.js` — the same standing as `"stopped"` and the codes
+        # `_tool_error_from_http` mints. A wire constant would have bought a second copy to
+        # keep in sync for a value the far side can never send.
+        raise ToolError(
+            "extension_too_old",
+            "navigate_tab answered without `matched`: this extension predates `waitUntil` "
+            "and did NOT wait — the tab was navigated, but nothing was observed",
+        )
+    # Renamed, not splatted — see the docstring: wait_for's shape, one verb over.
+    return {
+        "ok": True,
+        "matched": bool(result.get("matched")),
+        "elapsed_ms": int(result.get("elapsedMs") or 0),
+    }
 
 
 # --- relocate: synchronous open + guarded source close in one call (#48, §11) ---
@@ -1738,14 +1823,22 @@ async def clear_exemption(app, *, instance: str, url: str) -> dict:
     return {"ok": True, "deleted": deleted}
 
 
-def _plan_open_lease(url: str, ttl_s: int) -> tuple[str, int]:
-    """Validate ``open_tab``'s lease ARGUMENTS and return ``(url, until)``. Raises.
+async def _plan_open_lease(app, instance: str, url: str, ttl_s: int) -> tuple[str, str, int]:
+    """Validate ``open_tab``'s lease ARGUMENTS and return ``(instance_id, url, until)``.
+    Raises.
 
-    Called BEFORE the tab is opened. The rules are the shared ones — the same url check
-    and the same 30-day ceiling ``set_exemption`` applies — so the identical ``ttl_s``
-    cannot be a refusal through one verb and a shrug through another."""
+    Called BEFORE the tab is opened. The rules are the shared ones — the same instance
+    check, the same url check and the same 30-day ceiling ``set_exemption`` applies — so
+    the identical arguments cannot be a refusal through one verb and a shrug through
+    another. The INSTANCE belongs in this list for the same reason the url does: an
+    exemption on an instance that does not exist is a permanently invisible no-op (the pass
+    matches on ``instance_id``), and this door writing a row the other door refuses is
+    exactly how two doors onto one table drift apart. The practical risk is small — a live
+    socket implies an active row — which is an argument for the check being cheap, not for
+    it being absent."""
     try:
         return (
+            await exemptions_api._validate_instance(_req(app), instance),
             exemptions_api._validate_url(url),
             exemptions_api.until_from_ttl_s(_now_ms(), ttl_s),
         )
@@ -1753,9 +1846,11 @@ def _plan_open_lease(url: str, ttl_s: int) -> tuple[str, int]:
         raise ToolError(*_tool_error_from_http(exc))
 
 
-async def _write_open_lease(app, instance: str, url: str, until: int) -> dict:
+async def _write_open_lease(app, instance_id: str, url: str, until: int) -> dict:
     """Best-effort exemption WRITE for a tab ``open_tab`` just opened — the "owned by the
-    agent" lease. Arguments were already validated by :func:`_plan_open_lease`.
+    agent" lease. Every argument, ``instance_id`` included, was already validated by
+    :func:`_plan_open_lease` — which is what keeps this ``_upsert`` and the one inside
+    ``set_exemption`` two paths to ONE door, rather than two doors with different rules.
 
     NEVER raises: the tab IS open by the time this runs, so turning a failed write into a
     failed ``open_tab`` would report "nothing happened" about a tab that exists and invite
@@ -1765,7 +1860,7 @@ async def _write_open_lease(app, instance: str, url: str, until: int) -> dict:
     before the browser is touched at all."""
     try:
         await app.state.db.write(
-            lambda c: exemptions_api._upsert(c, instance, url, until, "mcp_lease")
+            lambda c: exemptions_api._upsert(c, instance_id, url, until, "mcp_lease")
         )
         return {"ok": True, "until": until, "reason": "mcp_lease"}
     except Exception as exc:  # noqa: BLE001 - a lease fault must not mask an open tab

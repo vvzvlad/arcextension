@@ -189,6 +189,20 @@ def build_mcp(app_ref) -> MCPServer:
         30-day ceiling; there is no "forever". A lease that could not be written is
         reported as ``lease: {ok:false, error}`` — the tab is open either way, so do NOT
         retry the open on that.
+
+        The lease protects an ADDRESS, not a tab: it is written for the url you asked for
+        and matched against the tab's live url. A REDIRECT therefore drops it —
+        ``https://shop/checkout`` landing on ``/checkout/step-1`` leaves a row that matches
+        nothing, even though ``lease: {ok:true}`` says the write succeeded. After any
+        navigation you did not ask for, read the live url and re-arm with
+        ``set_exemption``.
+
+        ASKING FOR A LEASE ALSO CHANGES HOW AN UNKNOWN ``instance`` FAILS. With
+        ``lease_ttl_s`` the instance is a lease ARGUMENT, judged exactly as ``set_exemption``
+        judges it: an unknown one is a hard ``invalid_request`` BEFORE the tab is opened,
+        nothing sent. WITHOUT it the same call reaches the socket and comes back
+        ``no_connection`` instead. One door, two codes, decided by whether a lease was asked
+        for — expected, and worth knowing before you read the code as a different fault.
         """
         return await _guarded(tools.open_tab(
             _host(), instance=instance, url=url, pinned=pinned, active=active,
@@ -204,11 +218,49 @@ def build_mcp(app_ref) -> MCPServer:
         """Point a tab at an http/https url (§6), optionally waiting for the page.
 
         ``wait_until`` defaults to ``'none'`` (return as soon as the navigation is issued —
-        today's behaviour). ``'load'`` waits for the tab to report ``complete``;
-        ``'selector'`` waits for ``selector`` to match. ``timeout_ms`` bounds the wait and
-        is clamped to EXECUTE_JS_MAX_TIMEOUT_MS. A wait that expires still answers ``ok``,
-        with ``result.matched == false``: the navigation WAS issued and the condition
-        simply never became true — a verdict, not a failure."""
+        today's behaviour, answering the unchanged ``{ok, result}``). ``'load'`` waits for
+        the tab to report ``complete``; ``'selector'`` waits for ``selector`` to match.
+        BOTH wait for the navigation to COMMIT first, so neither ordinarily reports about
+        the page the tab is leaving. THREE CASES ESCAPE THAT and can answer about the OLD
+        document: navigating to the address the tab is ALREADY on (the reload is
+        indistinguishable from the document it replaces); a navigation that never changes
+        the document at all (a 204, a ``Content-Disposition: attachment`` download, a
+        cancelled load); and a navigation that has produced NO observable trace by the third
+        poll (~750 ms), where a bounded grace opens the gate rather than burn your whole
+        deadline on a page that may already be loaded. The third one does NOT require the
+        addresses to match: it can answer about the old document even when you asked for a
+        different address. That is the deliberate trade — a rare wrong document instead of a
+        certain wrong answer at the deadline — and the reason ``matched: true`` is worth
+        confirming with ``list_tabs`` when it comes back suspiciously fast. A tab that was
+        ALREADY loading when you called is deliberately NOT a fourth: for it a
+        loading→complete round is the OLD document finishing, so neither that signal nor the
+        grace is granted, and a navigation it cannot recognise any other way answers
+        ``matched: false`` at the deadline instead of confidently about the page it was
+        leaving.
+
+        ``timeout_ms`` bounds the wait and is clamped to EXECUTE_JS_MAX_TIMEOUT_MS. It also
+        removes that grace, and the boundary is 500 ms: the grace opens the gate on the THIRD
+        poll and the first sits behind a 250 ms pre-pause, so a budget of 500 ms or less
+        never reaches it — measured, ``timeout_ms=500`` answers ``matched: false`` where 501
+        answers ``matched: true``. Above that but below about a second the gate can open and
+        the CONDITION then gets one or two polls before the deadline (at 999 ms it is tested
+        at 750 ms and again at 999 ms). A short budget is the pre-grace behaviour, not a
+        faster version of the same one.
+
+        WITH a wait the answer is ``wait_for``'s: ``{ok, matched, elapsed_ms}``. A wait that
+        expires still answers ``ok`` with ``matched: false`` — the navigation WAS issued and
+        the condition simply never became true, which is a verdict, not a failure.
+
+        ``matched: false`` HAS TWO MEANINGS and your next move differs: either the condition
+        never became true (the page is there, the selector is wrong or slower than
+        ``timeout_ms``), or the COMMIT was never recognised, in which case the condition was
+        never tested at all. The answer cannot tell them apart — read the tab's live url
+        (``list_tabs``) before concluding the page is wrong. An extension too old to
+        understand ``wait_until`` is NOT one of the two: it is refused with its OWN code,
+        ``extension_too_old`` (never ``precondition_failed``, which on this verb always means
+        "fix your argument", and never dressed up as ``matched: false``). Retrying or
+        rewording the call cannot help — stop asking THIS copy to wait, or update its
+        extension; the tab WAS navigated either way."""
         return await _guarded(tools.navigate_tab(
             _host(), instance=instance, tab_id=tab_id, url=url, wait_until=wait_until,
             selector=selector, timeout_ms=timeout_ms, auth_ctx=current_mcp_session(),
@@ -289,11 +341,16 @@ def build_mcp(app_ref) -> MCPServer:
         A promise is awaited on EITHER path, with or without the flag: ``fetch(u).then(r =>
         r.json())`` resolves to the parsed body, not to a promise.
 
-        ``await_promise=true`` buys the two KEYWORDS indirect eval cannot parse — a
-        top-level ``await`` and a top-level ``return``. A single EXPRESSION still returns
-        its value (``document.title`` answers the title); MULTI-STATEMENT code must
-        ``return`` explicitly, or the value is null. Reach for the flag when the snippet
-        wants to write ``await``/``return``, not as a default.
+        ``await_promise=true`` is what you reach for to write the two KEYWORDS indirect eval
+        cannot parse — a top-level ``await`` and a top-level ``return``. It is not ONLY
+        that: the flag also re-parses the snippet as an EXPRESSION, so a source that is
+        ambiguous between a block and an object literal changes meaning — ``{a:1};`` answers
+        ``1`` without the flag (eval reads a labelled block) and ``{"a": 1}`` with it.
+        Exotic, and in your favour, but do not read the flag as "the same result plus two
+        keywords". A single EXPRESSION still returns its value on either path, with or
+        without a trailing ``;`` (``document.title`` and ``document.title;`` both answer the
+        title); MULTI-STATEMENT code must ``return`` explicitly, or the value is null. Reach
+        for the flag when the snippet wants to write ``await``/``return``, not as a default.
 
         ``timeout_ms`` raises this one command's budget (clamped to
         EXECUTE_JS_MAX_TIMEOUT_MS) for code that legitimately takes longer than
@@ -304,7 +361,9 @@ def build_mcp(app_ref) -> MCPServer:
         and ``value`` is it. A value chrome could not structured-clone (a DOM node, a
         function, a circular object) arrives as ``{__unserializable, preview}`` instead of a
         silent null. Payloads are capped at ``max_bytes`` (default 40000) with ``truncated``
-        + ``total_bytes`` — no need to ``.slice()`` in the snippet."""
+        + ``total_bytes`` — but that cut happens on the SERVICE, after the whole value has
+        crossed the socket: it protects your context, not the wire. Unlike get_text, this
+        cap does not reach the page, so a snippet that can return less should return less."""
         return await _guarded(tools.execute_js(
             _host(), instance=instance, tab_id=tab_id, code=code, world=world,
             url_at_exec=url_at_exec, await_promise=await_promise, timeout_ms=timeout_ms,

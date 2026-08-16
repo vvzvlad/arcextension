@@ -172,6 +172,25 @@ export const CMD_WAIT_FOR = "wait_for";
 // src/mcpiface/tools.py `_wait_budget_ms`.
 export const WAIT_POLL_MS = 250;
 
+// How many CONSECUTIVE polls of "nothing here suggests a navigation at all" end
+// navigate_tab's commit gate anyway (see `navigationCommitted` in commands.js for the hole
+// this closes). Expressed in polls, not milliseconds, because it is a count of OBSERVATIONS
+// the browser failed to produce, not a duration. Three is deliberate: one `tabs.get` round
+// trip is all a browser needs to expose `pendingUrl` or a `loading` status, so a navigation
+// that has really started shows itself long before the third one — while three quiet polls
+// (750 ms at WAIT_POLL_MS) stay a rounding error against the 30 s the caller may budget.
+//
+// ⚠️ THAT LAST CLAIM IS ABOUT THE DEFAULT, NOT ABOUT EVERY CALLER: a SHORT `timeoutMs`
+// removes the grace silently. The gate opens on the THIRD poll and the first sits behind the
+// 250 ms pre-pause, so a deadline of 2×WAIT_POLL_MS or less can never reach it — measured,
+// 500 ms answers `matched:false` where 501 ms answers `matched:true` — and a deadline under
+// about four intervals leaves the CONDITION one or two polls once the gate does open (at
+// 999 ms it is tested at 750 and again at 999, the last sleep clamped to what remains). A
+// caller passing 300 is therefore back to the pre-grace behaviour, which is why
+// navigate_tab's MCP description says so too: the caller who picks the number is the one who
+// needs to know.
+export const WAIT_COMMIT_GRACE_POLLS = 3;
+
 // The extension's OWN ceiling on how long a wait may occupy this worker, independent of
 // whatever `timeoutMs` the service sends. A worker parked in a poll loop is a worker not
 // running its tick, and a wait longer than a minute would straddle a TICK_MS period.
