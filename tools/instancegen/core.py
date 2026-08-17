@@ -287,7 +287,7 @@ def _sh_quote(value: str) -> str:
 
 def bundle_identifier(instance_id: str) -> str:
     """A per-instance CFBundleIdentifier (§13: unique per bundle)."""
-    return f"xyz.arcextension.instance.{slugify(instance_id)}"
+    return f"xyz.tabscurator.instance.{slugify(instance_id)}"
 
 
 # Apple allows at most THREE integers in CFBundleShortVersionString/CFBundleVersion, while

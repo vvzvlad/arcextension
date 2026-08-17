@@ -87,7 +87,7 @@ def build_stamp(extension_dir: str | Path) -> tuple[str, str, str] | None:
     silent.
 
     That fallback is not free, and the cost lands where the operator is told to look: an
-    unstamped bundle shows the base literal on the extension card ("arcextension 0.1.0"),
+    unstamped bundle shows the base literal on the extension card ("Tabs Curator 0.1.0"),
     which is indistinguishable from an older build that did not reload — the exact question
     the stamp exists to answer. The stderr note is the ONLY signal that this happened. The
     verbatim copy is kept anyway, deliberately: a build must not fail over its own identity.

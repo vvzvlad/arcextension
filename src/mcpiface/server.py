@@ -69,7 +69,7 @@ def build_mcp(app_ref) -> MCPServer:
     the lifespan has populated ``db`` / ``ext_registry`` / ``settings``). The handler
     bodies live in :mod:`src.mcpiface.tools` and are unit-tested directly.
     """
-    mcp = MCPServer("arc-curator")
+    mcp = MCPServer("tabscurator")
 
     def _host():
         return app_ref.app

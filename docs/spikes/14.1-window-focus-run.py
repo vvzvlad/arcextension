@@ -1,4 +1,4 @@
-"""Cross-instance window focus spike (arcextension §14.1).
+"""Cross-instance window focus spike (tabscurator §14.1).
 
 Protocol, per the design doc: exactly ONE chrome.windows.update({focused:true})
 per attempt, a control arm with no call, >=60s dwell, and two window states.
