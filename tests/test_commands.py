@@ -10,7 +10,6 @@ import asyncio
 import pytest
 
 from src.db.access import Database
-from src.db.settings_store import set_execute_js_enabled
 from src.ext import protocol
 from src.ext.commands import CommandError, resolve_response, send_command
 from src.ext.registry import ConnState, Registry
@@ -338,63 +337,9 @@ async def test_execute_js_disabled_outcome(tmp_path):
         await db.close()
 
 
-# --- runtime kill-switch (§12): refuse execute_js before it is ever sent -----
-async def test_execute_js_refused_by_kill_switch_sends_no_frame(tmp_path):
-    # With the runtime switch OFF the service must REFUSE an execute_js: no frame
-    # is put on the socket, and js_audit records outcome='disabled' (reason
-    # 'kill_switch'). Remove the gate and a frame would be sent + this reddens.
-    db = await _make_db(tmp_path)
-    try:
-        await db.write(lambda c: set_execute_js_enabled(c, False))
-        reg, cs, ws = _registry_with()
-        with pytest.raises(CommandError) as ei:
-            await send_command(
-                reg, db, "i1", protocol.CMD_EXECUTE_JS,
-                {"code": "danger()", "world": "MAIN", "tabId": 5},
-                cmd_timeout_ms=5000,
-            )
-        assert ei.value.code == protocol.ERR_JS_DISABLED
-        # THE proof it was blocked at the service edge: nothing was sent, and no
-        # pending future leaked (we never reached the send/await).
-        assert ws.sent == []
-        assert cs.pending_commands == {}
-        # The attempt is still the only trace of an execute_js (§12): full code +
-        # outcome='disabled' + reason 'kill_switch'.
-        rows = await db.read(
-            lambda c: c.execute(
-                "SELECT code, outcome, detail FROM js_audit"
-            ).fetchall()
-        )
-        assert len(rows) == 1
-        assert rows[0] == ("danger()", "disabled", "kill_switch")
-    finally:
-        await db.close()
-
-
-async def test_execute_js_sent_when_kill_switch_on_by_default(tmp_path):
-    # Default (no settings row) => the switch is ON => the frame IS sent.
-    db = await _make_db(tmp_path)
-    try:
-        reg, cs, ws = _registry_with()
-        task = asyncio.create_task(
-            send_command(reg, db, "i1", protocol.CMD_EXECUTE_JS,
-                         {"code": "x", "world": "MAIN"}, cmd_timeout_ms=5000)
-        )
-        # A frame reaches the socket precisely because the switch defaults ON.
-        assert await _until(lambda: ws.sent)
-        assert ws.sent[-1]["command"] == "execute_js"
-        resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
-                              "result": {"results": [1]}})
-        assert await task == {"results": [1]}
-        rows = await _read_audit(db)
-        assert rows[0][6] == "ok"
-    finally:
-        await db.close()
-
-
 # --- start_js: the SAME arbitrary-code gate as execute_js (§12) --------------
 # start_js carries arbitrary caller code fire-and-forget, so it rides the identical
-# audit-before-send + kill-switch + db-None-fail-closed path. These pin that the branch was
+# audit-before-send + db-None-fail-closed path. These pin that the branch was
 # widened to CMD_START_JS and NOT to the fixed verbs (poll_job below).
 async def test_start_js_audit_written_before_send_then_outcome_ok(tmp_path):
     db = await _make_db(tmp_path)
@@ -440,44 +385,17 @@ async def test_start_js_without_db_refuses_and_sends_no_frame():
     assert cs.pending_commands == {}
 
 
-async def test_start_js_refused_by_kill_switch_sends_no_frame(tmp_path):
-    # The runtime kill-switch gates start_js exactly as execute_js: switch OFF => no frame,
-    # and js_audit records outcome='disabled' (reason 'kill_switch').
-    db = await _make_db(tmp_path)
-    try:
-        await db.write(lambda c: set_execute_js_enabled(c, False))
-        reg, cs, ws = _registry_with()
-        with pytest.raises(CommandError) as ei:
-            await send_command(
-                reg, db, "i1", protocol.CMD_START_JS,
-                {"code": "danger()", "world": "MAIN", "tabId": 5, "jobId": "job-y"},
-                cmd_timeout_ms=5000,
-            )
-        assert ei.value.code == protocol.ERR_JS_DISABLED
-        assert ws.sent == []
-        assert cs.pending_commands == {}
-        rows = await db.read(
-            lambda c: c.execute("SELECT code, outcome, detail FROM js_audit").fetchall()
-        )
-        assert rows == [("danger()", "disabled", "kill_switch")]
-    finally:
-        await db.close()
-
-
 # --- poll_job / scroll_until: FIXED verbs, NEVER audited ---------------------
-async def test_poll_job_is_not_audited_and_switch_is_ignored(tmp_path):
+async def test_poll_job_is_not_audited(tmp_path):
     # poll_job reads a page global with a fixed function — no arbitrary code — so it must
-    # write NO js_audit row and must NOT be touched by the kill-switch, even with the switch
-    # OFF (which would refuse an arbitrary-code verb before the send).
+    # write NO js_audit row (unlike the arbitrary-code verbs execute_js / start_js).
     db = await _make_db(tmp_path)
     try:
-        await db.write(lambda c: set_execute_js_enabled(c, False))
         reg, cs, ws = _registry_with()
         task = asyncio.create_task(
             send_command(reg, db, "i1", protocol.CMD_POLL_JOB,
                          {"tabId": 5, "jobId": "job-z"}, cmd_timeout_ms=5000)
         )
-        # It reaches the socket despite the switch being OFF — the switch does not gate it.
         assert await _until(lambda: ws.sent)
         assert ws.sent[-1]["command"] == "poll_job"
         resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,

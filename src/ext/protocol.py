@@ -73,7 +73,7 @@ CMD_WAIT_FOR = "wait_for"
 CMD_SCROLL_UNTIL = "scroll_until"
 # The Job-API pair, formalising "fire arbitrary code into a page global, then poll it":
 #   * ``start_js`` carries ARBITRARY caller code, so it is behind the execute_js checkbox +
-#     the runtime kill-switch + a ``js_audit`` row, EXACTLY like ``execute_js`` (§12 —
+#     a ``js_audit`` row, EXACTLY like ``execute_js`` (§12 —
 #     :func:`src.ext.commands.send_command` audits both before the send). It wraps the code
 #     in an async IIFE that stashes ``{state, value|message}`` under
 #     ``window.__curatorJobs[jobId]`` and returns ``{jobId}`` WITHOUT awaiting the promise.
