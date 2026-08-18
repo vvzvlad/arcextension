@@ -358,9 +358,11 @@ def test_step4_adds_the_capability_columns_with_honest_defaults(tmp_path):
         )
         conn.commit()
 
-        result = migrate(conn, db, backups)  # applies step 4
+        # Only through step 4 — step 6 drops allow_debugger again, so this test pins the
+        # column exactly where v4 introduces it and test_step6 below pins its removal.
+        result = migrate(conn, db, backups, steps=STEPS[:4], max_version=4)  # applies step 4
         assert result.ok and not result.degraded
-        assert _version(conn) == MAX_VERSION
+        assert _version(conn) == 4
         assert {"allow_debugger", "ext_version"} <= _columns(conn, "instances")
 
         row = conn.execute(
@@ -369,6 +371,52 @@ def test_step4_adds_the_capability_columns_with_honest_defaults(tmp_path):
         ).fetchone()
         # The pre-existing opt-in survived; the two new facts read as "not told us".
         assert row == (1, 0, None)
+    finally:
+        conn.close()
+
+
+def test_step6_drops_allow_debugger_after_the_single_gate(tmp_path):
+    """The single JS & Debugger checkbox made a separate ``allow_debugger`` meaningless —
+    nothing reads it — so v6 drops the dead mirror column. The live ``allow_execute_js`` gate
+    (now covering execute_js AND the chrome.debugger path) and ``ext_version`` survive.
+
+    Run on a NON-empty ``instances`` table: to the migration author the drop is one ALTER
+    statement (not a hand-rolled table rebuild), though SQLite may internally rewrite the
+    table to carry it out, and the UNIQUE ``instances_secret_hash`` index must survive that
+    (as it did for the v3 title drop), so the row and its data have to be there for the test
+    to mean anything.
+    """
+    db = str(tmp_path / "curator.db")
+    backups = str(tmp_path / "backups")
+    conn = _open(db)
+    try:
+        # A live-looking v5 database (one enrolled instance that opted into JS & Debugger).
+        migrate(conn, db, backups, steps=STEPS[:5], max_version=5)
+        assert _version(conn) == 5
+        assert "allow_debugger" in _columns(conn, "instances")
+        conn.execute(
+            "INSERT INTO instances (id, status, secret_hash, conn_epoch, allow_execute_js, "
+            "allow_debugger, ext_version) VALUES ('main', 'active', 'hash-main', 7, 1, 1, '0.4.2')"
+        )
+        conn.commit()
+
+        result = migrate(conn, db, backups)  # applies step 6 (head)
+        assert result.ok and not result.degraded
+        assert _version(conn) == MAX_VERSION
+        cols = _columns(conn, "instances")
+        assert "allow_debugger" not in cols
+        assert {"allow_execute_js", "ext_version"} <= cols
+
+        # The live gate and version survived the column drop untouched.
+        row = conn.execute(
+            "SELECT allow_execute_js, ext_version FROM instances WHERE id = 'main'"
+        ).fetchone()
+        assert row == (1, "0.4.2")
+
+        # The UNIQUE secret-hash index survived the table rebuild.
+        conn.execute("INSERT INTO instances (id, status, secret_hash) VALUES ('b', 'active', 'other')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE instances SET secret_hash = 'hash-main' WHERE id = 'b'")
     finally:
         conn.close()
 

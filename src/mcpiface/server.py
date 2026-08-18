@@ -504,6 +504,28 @@ def build_mcp(app_ref) -> MCPServer:
             auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 
+    @mcp.tool()
+    async def set_focus_emulation(instance: str, tab_id: int, enabled: bool,
+                                  expected_session: str | None = None) -> dict:
+        """Toggle focus emulation on a tab via chrome.debugger; answers ``{ok, enabled}``.
+
+        Makes a BACKGROUND tab behave as focused — no timer throttling — WITHOUT taking the
+        screen from the human. The emulation HOLDS ONLY WHILE the debugger is attached, so
+        ``enabled=true`` attaches the debugger and keeps it attached, and ``enabled=false``
+        turns it off and detaches. While it is on, the browser shows its «идёт отладка» bar
+        (and the attached state is detectable by anti-bot systems — the cost of the debugger
+        path).
+
+        Gated by the SINGLE JS & Debugger checkbox (``allow_execute_js`` in list_instances),
+        exactly like execute_js — but it runs no arbitrary code and writes no js_audit row
+        (it only fakes focus). A tab with DevTools open, or already held by another debugger
+        client, cannot be attached and answers ``debugger_attach`` (one debugger client per
+        tab). Refused while paused."""
+        return await _guarded(tools.set_focus_emulation(
+            _host(), instance=instance, tab_id=tab_id, enabled=enabled,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
     # --- exemptions: the agent's «не трогать» lease (§10/§11) ----------------
     @mcp.tool()
     async def list_exemptions(instance: str | None = None,

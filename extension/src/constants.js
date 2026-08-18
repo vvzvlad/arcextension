@@ -115,18 +115,17 @@ export const ENROLL_QUARANTINED = "quarantined"; // server said `unknown_instanc
 // service-side strings in src/ext/protocol.py (REJECT_REVOKED / REJECT_UNKNOWN).
 export const VERDICT_REVOKED = "revoked";
 export const VERDICT_UNKNOWN = "unknown_instance";
-// The execute_js opt-in checkbox (§12): per-copy, default OFF, lives in
+// The single JS & Debugger opt-in checkbox (§12): per-copy, default OFF, lives in
 // chrome.storage.local (survives a session, is set from the options page). It is
-// the AUTHORITATIVE runtime state — read fresh on every execute_js and reported
-// in `hello` — so a copied instance.json cannot smuggle the gate open.
+// the AUTHORITATIVE runtime state — read fresh on every gated verb and reported in
+// `hello` — so a copied instance.json cannot smuggle the gate open. ONE checkbox
+// now gates BOTH execute_js/start_js AND the chrome.debugger (CDP) path (§12,
+// set_focus_emulation and later slices): the storage KEY keeps its historical name
+// `allowExecuteJs` on purpose — renaming it would reset every installed copy's
+// checkbox to OFF, since the key is read per-copy from chrome.storage.local. The
+// former separate `allowDebugger` key is gone (it gated nothing); migration v6 drops
+// its mirror column service-side.
 export const ALLOW_EXECUTE_JS_KEY = "allowExecuteJs";
-// The debugger opt-in checkbox (§12): per-copy, default OFF, chrome.storage.local,
-// reported in `hello` exactly like the execute_js one. NOTHING reads it as a gate yet —
-// no verb in this wave attaches the debugger. It exists now because the CAPABILITY
-// REPORT is the point: an agent must be able to see what a copy will allow BEFORE it
-// calls and fails, and a switch that appears only together with its first consumer means
-// every agent written before that day has to discover the answer by failing.
-export const ALLOW_DEBUGGER_KEY = "allowDebugger";
 // The last known /ext connection facts (§6 `get_connection_state`), kept in
 // chrome.storage.session: an MV3 worker dies between events, so an in-memory-only
 // `lastSeenAt` would read as "never" on every cold start — the startpage would show
@@ -180,6 +179,15 @@ export const CMD_SCROLL_UNTIL = "scroll_until";
 //     and dies with the tab (reload/discard/close): ergonomics, not durability.
 export const CMD_START_JS = "start_js";
 export const CMD_POLL_JOB = "poll_job";
+// The first verb down the chrome.debugger (CDP) path (§12, wave 18). It toggles
+// `Emulation.setFocusEmulationEnabled`, which makes a BACKGROUND tab behave as focused
+// (no timer throttling) WITHOUT taking the screen from the human. STATEFUL by nature: the
+// emulation holds ONLY while the debugger stays attached, so enable = attach + command +
+// KEEP attached, and disable = command(false) + detach. Gated by the single JS & Debugger
+// checkbox (ALLOW_EXECUTE_JS_KEY) at the edge. It carries NO arbitrary code and writes NO
+// js_audit row — focus emulation exfiltrates nothing, it only fakes focus; a later
+// data-bearing CDP verb (screenshot / network) needs its own audit.
+export const CMD_SET_FOCUS_EMULATION = "set_focus_emulation";
 
 // How often `wait_for` (and navigate_tab's waitUntil) re-tests its condition. 250 ms is
 // the usual "fast enough to feel instant, cheap enough to run for 30 s" compromise: at
@@ -235,6 +243,11 @@ export const ERR_BUSY_DRAGGING = "busy_dragging";
 // inside its own window" apart from every other precondition, and act on it
 // without parsing a message string.
 export const ERR_PINNED_CROSS_WINDOW = "pinned_cross_window";
+// set_focus_emulation could not attach the debugger to the target tab (§12): DevTools is
+// open on it, or another debugger client is already attached — a tab takes ONE debugger
+// client. Its own code so the agent can tell "unattachable tab" from every other
+// precondition without parsing a message string.
+export const ERR_DEBUGGER_ATTACH = "debugger_attach";
 // There is deliberately NO extension-side `timeout` code. A waiting verb that reaches its
 // deadline answers `ok:true` with `{matched:false, elapsedMs}` — a definite negative from a
 // browser that is plainly alive. `timeout` (src/ext/protocol.py) stays what §11 defines it

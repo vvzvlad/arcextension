@@ -302,6 +302,27 @@ _V5_STATEMENTS: list[str] = [
     "ALTER TABLE js_audit ADD COLUMN await_promise INTEGER NOT NULL DEFAULT 0",
 ]
 
+# --- Version 6: the single JS & Debugger checkbox (§12) ----------------------
+# ``allow_debugger`` (added in v4) was the mirror of a SECOND per-copy options checkbox that
+# was meant to gate a future chrome.debugger path. That path arrives (wave 18, starting with
+# ``set_focus_emulation``), but the owner's decision is ONE checkbox for both surfaces: the
+# live ``allow_execute_js`` gate now covers execute_js AND the debugger path. That makes a
+# separate ``allow_debugger`` meaningless — nothing reads it, and keeping it would report a
+# capability the product no longer has. So the column goes.
+#
+# The gate KEY on the extension side keeps its historical name ``allowExecuteJs`` on purpose
+# (renaming it would reset every installed copy's checkbox to OFF); only the dead mirror
+# column is dropped here.
+#
+# ``ALTER TABLE ... DROP COLUMN`` needs SQLite >= 3.35 (measured: 3.46.1 in the shipping
+# python:3.11-slim image, 3.53.3 on the dev machine) and refuses a column that is indexed or
+# referenced by a view/trigger — ``allow_debugger`` is a plain, unindexed column (like
+# ``title`` in v3), so from the migration's side this is a single ALTER statement, not a
+# hand-rolled table rebuild — even though SQLite may internally rewrite the table to run it.
+_V6_STATEMENTS: list[str] = [
+    "ALTER TABLE instances DROP COLUMN allow_debugger",
+]
+
 # Ordered list of steps. Append new steps with the next target_version and bump
 # MAX_VERSION; never edit a shipped step (a migrated DB has already run it).
 STEPS: list[tuple[int, list[str]]] = [
@@ -310,6 +331,7 @@ STEPS: list[tuple[int, list[str]]] = [
     (3, _V3_STATEMENTS),
     (4, _V4_STATEMENTS),
     (5, _V5_STATEMENTS),
+    (6, _V6_STATEMENTS),
 ]
 
 MAX_VERSION: int = max(target for target, _ in STEPS)

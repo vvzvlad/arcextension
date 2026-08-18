@@ -285,13 +285,13 @@ async def _freshen_fleet(app) -> dict:
         cap = caps.get(iid) or {}
         envelope[iid] = {
             "snapshot_at": row.get("snapshot_at"),
-            # Capability report (§11/§12). ``allow_execute_js`` gates execute_js at the
-            # extension edge; ``allow_debugger`` gates nothing yet (it is the switch a
-            # later screenshot/CDP path reads) and is reported now so an agent never has
-            # to learn a copy's answer by failing; ``ext_version`` is which bundle is
-            # running — null when that copy has not said hello since the column landed.
+            # Capability report (§11/§12). ``allow_execute_js`` is the SINGLE JS & Debugger
+            # gate at the extension edge — it gates execute_js/start_js AND the
+            # chrome.debugger path (set_focus_emulation, later slices). Kept under this
+            # historical name because agents read it; the former separate ``allow_debugger``
+            # is gone (migration v6). ``ext_version`` is which bundle is running — null when
+            # that copy has not said hello since the column landed.
             "allow_execute_js": cap.get("allow_execute_js"),
-            "allow_debugger": cap.get("allow_debugger"),
             "ext_version": cap.get("ext_version"),
             "fresh": fresh,
             "reason": reason,
@@ -1218,6 +1218,33 @@ async def poll_job(app, *, instance: str, tab_id: int, job_id: str,
     if "message" in result:
         out["message"] = result.get("message")
     return out
+
+
+async def set_focus_emulation(app, *, instance: str, tab_id: int, enabled: bool,
+                              auth_ctx: str | None = None,
+                              expected_session: str | None = None) -> dict:
+    """Toggle ``Emulation.setFocusEmulationEnabled`` on a tab via chrome.debugger (§12).
+
+    The first verb down the CDP path (wave 18). It makes a BACKGROUND tab behave as focused
+    — no timer throttling — WITHOUT taking the screen from the human. STATEFUL by nature: the
+    emulation holds ONLY while the debugger stays attached, so ``enabled=true`` attaches and
+    KEEPS the debugger attached, and ``enabled=false`` turns it off and detaches.
+
+    Gated at the extension edge by the SINGLE JS & Debugger checkbox (``allow_execute_js``),
+    exactly like execute_js. But UNLIKE execute_js it carries no arbitrary code and writes NO
+    js_audit row: focus emulation exfiltrates nothing, it only fakes focus. A future
+    DATA-BEARING CDP verb (screenshot, network capture) will need its own audit — the
+    absence of one here is a property of THIS verb, not of the debugger path.
+
+    Refused while paused (it drives the browser). ``debugger_attach`` comes back when the
+    debugger cannot attach — DevTools is open on the tab, or another client already holds it
+    (a tab takes one debugger client)."""
+    await _ensure_not_paused(app)
+    result = await _command(
+        app, instance, protocol.CMD_SET_FOCUS_EMULATION, {"tabId": tab_id, "enabled": enabled},
+        auth_ctx=auth_ctx, expected_session=expected_session,
+    )
+    return {"ok": True, "enabled": bool(result.get("enabled"))}
 
 
 async def navigate_tab(app, *, instance: str, tab_id: int, url: str,

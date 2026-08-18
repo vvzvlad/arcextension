@@ -66,7 +66,6 @@ import {
   INSTALL_UUID_KEY,
   SESSION_ID_KEY,
   ALLOW_EXECUTE_JS_KEY,
-  ALLOW_DEBUGGER_KEY,
   CONNECTION_STATE_KEY,
   INSTANCE_SECRET_KEY,
   INSTANCE_SECRET_PENDING_KEY,
@@ -614,34 +613,20 @@ export class Connection {
       installUuid: this.installUuid,
       origin: await this._origin(),
       sessionId: this.sessionId,
-      // The AUTHORITATIVE execute_js state is the options checkbox in
-      // storage.local (§12) — a copied bundle sets its own checkbox. Report it.
+      // The AUTHORITATIVE JS & Debugger state is the single options checkbox in
+      // storage.local (§12) — a copied bundle sets its own checkbox. One switch now
+      // gates both execute_js and the chrome.debugger path; the storage KEY keeps its
+      // historical name `allowExecuteJs` (renaming it would reset every installed copy to
+      // OFF). Report it.
       allowExecuteJs: await this._readAllowExecuteJs(),
-      // The CAPABILITY REPORT (§11/§12). An agent must be able to see what this copy
-      // allows BEFORE it calls and fails mid-task; these two ride the same path as
-      // allowExecuteJs and surface in list_instances.
-      //   allowDebugger — the second per-copy checkbox, default OFF. NO verb reads it
-      //     yet; it is the switch a later screenshot/CDP path will read. Reported now so
-      //     an agent never has to discover the answer by failing.
+      // The rest of the CAPABILITY REPORT (§11/§12). An agent must be able to see what
+      // this copy is running BEFORE it calls and fails mid-task.
       //   extVersion — which bundle is actually running. The service and the extension
       //     update by DIFFERENT paths (the Dockerfile does not ship extension/), so
       //     "new service + old extension" is a guaranteed state, and until now nothing
       //     could tell an agent that the copy it is talking to predates a verb.
-      allowDebugger: await this._readAllowDebugger(),
       extVersion: this._manifestVersion(),
     });
-  }
-
-  // Same contract as _readAllowExecuteJs one function down: storage.local is the
-  // authoritative state, an unset key or a read error is OFF.
-  async _readAllowDebugger() {
-    try {
-      const got = await this.env.storageLocalGet(ALLOW_DEBUGGER_KEY);
-      return !!(got && got[ALLOW_DEBUGGER_KEY]);
-    } catch (e) {
-      this.env.log("reading debugger checkbox failed:", e);
-      return false;
-    }
   }
 
   // The running bundle's manifest version. Best-effort and never fatal: a hello that

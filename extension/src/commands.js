@@ -38,6 +38,7 @@ import {
   CMD_SCROLL_UNTIL,
   CMD_START_JS,
   CMD_POLL_JOB,
+  CMD_SET_FOCUS_EMULATION,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
@@ -45,6 +46,7 @@ import {
   ERR_JS_DISABLED,
   ERR_BUSY_DRAGGING,
   ERR_PINNED_CROSS_WINDOW,
+  ERR_DEBUGGER_ATTACH,
   ERR_INTERNAL,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
@@ -493,6 +495,11 @@ export async function dispatchCommand(frame, ctx = {}) {
       // the checkbox here at the edge, and the service's audit/kill-switch before the send.
       case CMD_START_JS:
         return await startJs(params);
+      // The first chrome.debugger (CDP) verb (§12, wave 18): gated by the SAME single
+      // JS & Debugger checkbox as execute_js, but carries no arbitrary code and writes no
+      // js_audit row (it only fakes focus, exfiltrating nothing).
+      case CMD_SET_FOCUS_EMULATION:
+        return await setFocusEmulation(params);
       default:
         return fail(ERR_INTERNAL, `unknown command: ${command}`);
     }
@@ -2042,4 +2049,150 @@ async function executeJs(params) {
     args: [String(params.code == null ? "" : params.code), !!params.awaitPromise],
   });
   return ok({ results });
+}
+
+// --- chrome.debugger foundation + set_focus_emulation (§12, wave 18) ----------
+//
+// The tabs THIS extension currently holds a debugger attached to. Module-level, and
+// deliberately in-memory: the emulation set by `Emulation.setFocusEmulationEnabled` holds
+// ONLY while the debugger stays attached, so an enabled tab must stay attached, and this set
+// is how a second enable knows not to attach twice and how a disable knows there is
+// something to detach.
+//
+// ⚠️ MV3 LIFETIME: the service worker can die and be resurrected, losing this in-memory set
+// (and, with it, chrome.debugger drops every attachment the dead worker held — detach is
+// implicit on worker teardown). For THIS slice that is acceptable: a lost attachment means
+// the emulation lapses and a fresh enable re-attaches cleanly. A later slice moves the set
+// into chrome.storage.session so a resurrected worker can reconcile.
+const debuggerAttachedTabs = new Set();
+
+// The chrome.debugger protocol version to attach with (CDP 1.3).
+const DEBUGGER_PROTOCOL_VERSION = "1.3";
+
+// chrome.debugger.onDetach cleanup (§12). Registered ONCE at SW init (service-worker.js).
+// The debugger detaches on its own for reasons outside this verb — the human closed the tab
+// (`target_closed`) or opened DevTools on it (`canceled_by_user`) — and if the tab is not
+// dropped from our set here, a later enable would skip the attach (thinking it is still
+// attached) and the sendCommand would throw, or a disable would try to detach a tab the
+// browser already released. Keep the set honest by mirroring every detach.
+export function handleDebuggerDetach(source) {
+  if (source && typeof source.tabId === "number") {
+    debuggerAttachedTabs.delete(source.tabId);
+  }
+}
+
+// Test-only: reset the module-level attachment set between cases (the set is process-global,
+// so a leftover entry from one test would leak into the next).
+export function __resetDebuggerState() {
+  debuggerAttachedTabs.clear();
+}
+
+// set_focus_emulation {tabId, enabled} (§12, wave 18). Makes a BACKGROUND tab behave as
+// focused (no timer throttling) without taking the screen from the human. STATEFUL: the
+// emulation holds only while the debugger is attached.
+//
+//   enabled=true  — attach the debugger (unless already ours) and turn emulation on, then
+//                   KEEP it attached. Idempotent: a repeat enable on an already-attached tab
+//                   just re-sends the command, no second attach.
+//   enabled=false — turn emulation off (best-effort) and detach, dropping the tab from our
+//                   set. A tab we do not hold is an idempotent no-op success.
+//
+// Gated at the edge by the SINGLE JS & Debugger checkbox (ALLOW_EXECUTE_JS_KEY), exactly
+// like execute_js — but it carries NO arbitrary code and writes NO js_audit row.
+async function setFocusEmulation(params) {
+  const stored = await chrome.storage.local.get(ALLOW_EXECUTE_JS_KEY);
+  const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
+  if (!allowed) {
+    return fail(ERR_JS_DISABLED, "JS & Debugger is disabled in this copy's options");
+  }
+  const tabId = params.tabId;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${tabId}`);
+  }
+  // Edge-guard the target scheme like every other debugger/scripting verb (§12): the
+  // debugger must never attach to a chrome://, file:// or other privileged surface.
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "set_focus_emulation target is not an http/https tab");
+  }
+
+  const enabled = !!params.enabled;
+
+  if (enabled) {
+    // Track whether THIS call is the one that attached the tab, so the sendCommand catch
+    // below only rolls back an attach we ourselves just made (see there).
+    let attachedNow = false;
+    // Attach only if this tab is not already ours — a tab takes ONE debugger client, so a
+    // second attach on our own tab would throw. A repeat enable is therefore just a
+    // re-issued command.
+    //
+    // Accepted race: frames are dispatched concurrently (`_onMessage` in connection.js does
+    // not await), so two simultaneous enable calls on the SAME tab can both read has()===false
+    // before either add()s. The second attach then throws, and the losing call returns
+    // debugger_attach even though the first call attached successfully. The end state is still
+    // consistent (the tab is in the Set once, attached once), so this is a deliberately
+    // acceptable race. We do NOT "fix" it with an optimistic add() before attach: that would
+    // let the losing call's rollback delete the winner's record — strictly worse.
+    if (!debuggerAttachedTabs.has(tabId)) {
+      try {
+        await chrome.debugger.attach({ tabId }, DEBUGGER_PROTOCOL_VERSION);
+      } catch {
+        return fail(
+          ERR_DEBUGGER_ATTACH,
+          "could not attach debugger — DevTools open on this tab, or another client attached",
+        );
+      }
+      debuggerAttachedTabs.add(tabId);
+      attachedNow = true;
+    }
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", {
+        enabled: true,
+      });
+    } catch (e) {
+      // The attach succeeded but enabling emulation failed. If WE attached the tab in this
+      // very call, roll that attach back (best-effort detach + untrack) so we do not leave a
+      // visible "debugging this tab" session in an indeterminate state with emulation OFF.
+      // If the tab was attached by an EARLIER call (attachedNow===false), leave it alone: that
+      // prior session may well be fine and the failure could be transient — tearing it down
+      // would break the working attachment on the strength of one failed re-issue.
+      if (attachedNow) {
+        try {
+          await chrome.debugger.detach({ tabId });
+        } catch {
+          // Already gone or never fully attached — nothing to undo on the browser side.
+        }
+        debuggerAttachedTabs.delete(tabId);
+      }
+      return fail(
+        ERR_DEBUGGER_ATTACH,
+        `could not enable focus emulation: ${String((e && e.message) || e)}`,
+      );
+    }
+    return ok({ enabled: true });
+  }
+
+  // enabled=false: a tab we never attached is an idempotent success (nothing to undo).
+  if (debuggerAttachedTabs.has(tabId)) {
+    // Best-effort: the detach below is what actually drops the emulation (it lapses when the
+    // debugger leaves), so a sendCommand that throws — e.g. the tab is mid-teardown — must
+    // not stop the detach + untrack.
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", {
+        enabled: false,
+      });
+    } catch {
+      // fall through to detach
+    }
+    try {
+      await chrome.debugger.detach({ tabId });
+    } catch {
+      // Already gone (tab closed, DevTools took it): the onDetach listener may have cleared
+      // it, or will. Either way we drop our record below.
+    }
+    debuggerAttachedTabs.delete(tabId);
+  }
+  return ok({ enabled: false });
 }
