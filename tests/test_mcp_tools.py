@@ -172,11 +172,12 @@ async def test_list_instances_returns_freshness_envelope_and_stopped_at(tmp_path
     # leave `last_seen_at` / `reject_reason` / `reject_at` with no MCP surface at all.
     # The §11 capability report rides the same envelope: what this copy ALLOWS, as it
     # declared in its last hello. An instance that has never said hello reports the column
-    # defaults — both switches OFF, version unknown — which is the honest answer.
+    # defaults — the single JS & Debugger switch OFF, version unknown — which is the honest
+    # answer.
     assert main == {"snapshot_at": 1234, "fresh": False, "reason": "disconnected",
                     "session_id": None, "connected": False, "last_seen_at": None,
                     "reject_reason": None, "reject_at": None,
-                    "allow_execute_js": False, "allow_debugger": False,
+                    "allow_execute_js": False,
                     "ext_version": None}
 
     # A stopped curator surfaces stopped_at so an agent does not read the stop as a break.
@@ -201,7 +202,7 @@ async def test_list_tabs_returns_tabs_and_per_instance_freshness(tmp_path):
         "main": {"snapshot_at": now, "fresh": True, "reason": "fresh",
                  "session_id": "sess-1", "connected": True, "last_seen_at": None,
                  "reject_reason": None, "reject_at": None,
-                 "allow_execute_js": False, "allow_debugger": False, "ext_version": None}
+                 "allow_execute_js": False, "ext_version": None}
     }
 
 
@@ -222,13 +223,11 @@ async def test_list_tabs_freshens_and_flags_a_disconnected_sibling(tmp_path):
     assert inst["main"] == {"snapshot_at": now, "fresh": True, "reason": "fresh",
                             "session_id": "sess-1", "connected": True,
                             "last_seen_at": None, "reject_reason": None, "reject_at": None,
-                            "allow_execute_js": False, "allow_debugger": False,
-                            "ext_version": None}
+                            "allow_execute_js": False, "ext_version": None}
     assert inst["media"] == {"snapshot_at": None, "fresh": False, "reason": "disconnected",
                              "session_id": "sess-2", "connected": False,
                              "last_seen_at": None, "reject_reason": None, "reject_at": None,
-                             "allow_execute_js": False, "allow_debugger": False,
-                             "ext_version": None}
+                             "allow_execute_js": False, "ext_version": None}
     # The disconnected sibling did not drop the fresh instance's tab.
     assert [t["tab_id"] for t in out["tabs"]] == [1]
 
@@ -347,8 +346,7 @@ async def test_list_tabs_reader_error_maps_to_error_and_isolates_siblings(tmp_pa
     assert inst["bad"] == {"snapshot_at": 42, "fresh": False, "reason": "error",
                            "session_id": "sess-2", "connected": True,
                            "last_seen_at": None, "reject_reason": None, "reject_at": None,
-                           "allow_execute_js": False, "allow_debugger": False,
-                           "ext_version": None}
+                           "allow_execute_js": False, "ext_version": None}
     # The sibling with a working reader is returned normally.
     assert inst["main"]["reason"] == "fresh" and inst["main"]["fresh"] is True
 
@@ -528,6 +526,31 @@ async def test_close_and_focus_send_commands(tmp_path):
     _, f2 = await _run_with_response(
         lambda: tools.focus_tab(app, instance="main", tab_id=4), cs, ws, {"ok": True})
     assert f2["command"] == protocol.CMD_FOCUS_TAB and f2["params"] == {"tabId": 4}
+
+
+# --- set_focus_emulation (§12, wave 18 — the chrome.debugger foundation) ------
+async def test_set_focus_emulation_sends_enabled_and_returns_it(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+
+    # enable: the flag rides into the frame and the extension's {enabled} comes back.
+    out_on, f_on = await _run_with_response(
+        lambda: tools.set_focus_emulation(app, instance="main", tab_id=9, enabled=True),
+        cs, ws, {"enabled": True},
+    )
+    assert f_on["command"] == protocol.CMD_SET_FOCUS_EMULATION
+    assert f_on["params"] == {"tabId": 9, "enabled": True}
+    assert out_on == {"ok": True, "enabled": True}
+
+    # disable: the false flag rides through and the response is reflected.
+    out_off, f_off = await _run_with_response(
+        lambda: tools.set_focus_emulation(app, instance="main", tab_id=9, enabled=False),
+        cs, ws, {"enabled": False},
+    )
+    assert f_off["params"] == {"tabId": 9, "enabled": False}
+    assert out_off == {"ok": True, "enabled": False}
 
 
 # --- move_tab (§6/§9) --------------------------------------------------------
@@ -2781,10 +2804,12 @@ async def test_list_instances_reports_what_a_copy_declared_in_its_hello(tmp_path
     await _insert_instance(db, "main")
     await db.write(lambda c: queries.hello_upsert(
         c, "main", "sess-1", True, tools._now_ms(),
-        allow_debugger=True, ext_version="0.4.2",
+        ext_version="0.4.2",
     ))
     out = await tools.list_instances(_app(db))
     envelope = out["instances"]["main"]
+    # The single JS & Debugger gate (it covers execute_js AND the chrome.debugger path);
+    # the former separate `allow_debugger` is gone (migration v6).
     assert envelope["allow_execute_js"] is True
-    assert envelope["allow_debugger"] is True
+    assert "allow_debugger" not in envelope
     assert envelope["ext_version"] == "0.4.2"

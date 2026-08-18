@@ -137,6 +137,9 @@ export function createChromeMock(opts = {}) {
     createWindowError: opts.createWindowError || null, // when set, windows.create throws
     moveError: opts.moveError || null, // when set, tabs.move throws this message
     removeError: opts.removeError || null, // when set, tabs.remove throws this message
+    debuggerAttachError: opts.debuggerAttachError || null, // when set, debugger.attach throws
+    sendCommandError: opts.sendCommandError || null, // when set, debugger.sendCommand throws
+    detachError: opts.detachError || null, // when set, debugger.detach throws
     scriptResults: opts.scriptResults || [{ result: null }], // scripting.executeScript return
     // ⚠️ DEFERRED COMMIT, opt-in. Real `tabs.update({url})` does NOT change `tab.url`:
     // until the navigation commits, `tabs.get` answers the PREVIOUS url and the target
@@ -341,6 +344,30 @@ export function createChromeMock(opts = {}) {
         }
         return state.scriptResults;
       },
+    },
+    // chrome.debugger (§12, set_focus_emulation). Models the ONE-client-per-tab rule and
+    // the promise shapes the verb relies on: attach REJECTS when `debuggerAttachError` is
+    // set (DevTools open / another client), sendCommand/detach resolve. `_attached` lets a
+    // test assert on the live attachment set, and `onDetach._emit(source, reason)` drives
+    // the cleanup-listener test.
+    debugger: {
+      _attached: new Set(),
+      attach: async ({ tabId }, _version) => {
+        await tick();
+        if (state.debuggerAttachError) throw new Error(state.debuggerAttachError);
+        chrome.debugger._attached.add(tabId);
+      },
+      sendCommand: async ({ tabId }, _method, _params) => {
+        await tick();
+        if (state.sendCommandError) throw new Error(state.sendCommandError);
+        return {};
+      },
+      detach: async ({ tabId }) => {
+        await tick();
+        if (state.detachError) throw new Error(state.detachError);
+        chrome.debugger._attached.delete(tabId);
+      },
+      onDetach: new FakeEvent(),
     },
     alarms: {
       _alarms: { ...(opts.alarms || {}) },

@@ -8,6 +8,8 @@ import {
   scrollAndCountInWorld,
   startJobInWorld,
   readJobInWorld,
+  handleDebuggerDetach,
+  __resetDebuggerState,
 } from "../src/commands.js";
 import * as activityMap from "../src/activity-map.js";
 import {
@@ -25,6 +27,7 @@ import {
   CMD_SCROLL_UNTIL,
   CMD_START_JS,
   CMD_POLL_JOB,
+  CMD_SET_FOCUS_EMULATION,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
 } from "../src/constants.js";
@@ -55,6 +58,9 @@ function frame(command, params = {}, sessionId = SID) {
 beforeEach(() => {
   globalThis.chrome = createChromeMock();
   activityMap.__resetQueue();
+  // The debugger attachment set is process-global; clear it so one test's attached tab
+  // does not leak into the next.
+  __resetDebuggerState();
 });
 
 // --- session check (§5): FIRST, before any verb executes --------------------
@@ -3043,5 +3049,197 @@ describe("poll_job dispatch (fixed read — no checkbox §12)", () => {
       ctx(),
     );
     expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
+// --- set_focus_emulation: the chrome.debugger foundation (§12, wave 18) -------
+describe("set_focus_emulation (chrome.debugger)", () => {
+  const FOCUS_METHOD = "Emulation.setFocusEmulationEnabled";
+
+  it("checkbox OFF (default) => js_disabled, and the debugger is NOT touched", async () => {
+    chromeWithOneTab();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: false, error: { code: "js_disabled", message: expect.any(String) } });
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("enable: attaches, turns emulation on, and KEEPS the tab attached", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, FOCUS_METHOD, { enabled: true });
+    expect(detach).not.toHaveBeenCalled(); // held attached — the emulation lapses on detach
+    expect(chrome.debugger._attached.has(5)).toBe(true);
+  });
+
+  it("disable: turns emulation off, detaches, and drops the tab from the set", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // First enable so there is something to tear down.
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, FOCUS_METHOD, { enabled: false });
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("disable on a tab we never attached is an idempotent no-op success", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(detach).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("a repeat enable re-sends the command WITHOUT a second attach", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: true } });
+    expect(attach).not.toHaveBeenCalled(); // already ours — no second client
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, FOCUS_METHOD, { enabled: true });
+  });
+
+  it("a vanished tab is no_such_tab, and the debugger is not touched", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 999, enabled: true }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("a non-http tab is precondition_failed (the debugger never attaches privileged pages)", async () => {
+    chromeWithOneTab("file:///etc/passwd");
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("attach that throws (DevTools open / another client) => debugger_attach, untracked", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.debuggerAttachError = "Another debugger is already attached";
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "debugger_attach", message: expect.any(String) },
+    });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("enable: attach ok but sendCommand throws on a FRESH attach => debugger_attach, and the fresh attach is rolled back", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // attach succeeds, but turning emulation on fails for a reason other than the tab closing.
+    chrome.__state.sendCommandError = "target crashed";
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "debugger_attach", message: expect.any(String) },
+    });
+    // The attach we just made is undone: detached on the browser side and dropped from our set,
+    // so no visible "debugging this tab" session is left hanging with emulation OFF.
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("a repeat enable whose sendCommand fails does NOT tear down the EARLIER attachment", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // First enable succeeds and attaches the tab.
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // A second enable re-issues the command and it fails transiently. Because THIS call did
+    // not attach the tab (attachedNow === false), the working session from the first enable
+    // must be left intact — tearing it down on one failed re-issue would be the bug the
+    // attachedNow guard exists to prevent.
+    chrome.__state.sendCommandError = "target crashed";
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "debugger_attach", message: expect.any(String) },
+    });
+    expect(detach).not.toHaveBeenCalled(); // the prior session is untouched
+    expect(chrome.debugger._attached.has(5)).toBe(true); // still attached from the first enable
+  });
+
+  it("the fresh-attach rollback clears our INTERNAL set too (a later enable re-attaches)", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // A fresh attach whose emulation command fails is rolled back.
+    chrome.__state.sendCommandError = "target crashed";
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // With the failure cleared, a later enable must perform a FRESH attach — which only
+    // happens if the rollback dropped the tab from our module-level set, not just the browser
+    // side. A missing `delete` would leave has()===true and skip this attach.
+    chrome.__state.sendCommandError = null;
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+
+  it("onDetach cleanup lets a later enable re-attach (the human closed the tab / opened DevTools)", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // The debugger detaches for a reason outside the verb; the listener drops it from our set.
+    handleDebuggerDetach({ tabId: 5 });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // A fresh attach happened because the set no longer claimed the tab was ours.
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
   });
 });

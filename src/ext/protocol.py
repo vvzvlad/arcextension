@@ -82,6 +82,14 @@ CMD_SCROLL_UNTIL = "scroll_until"
 #     PAGE and dies with the tab (reload/discard/close): ergonomics, not durability.
 CMD_START_JS = "start_js"
 CMD_POLL_JOB = "poll_job"
+# The first verb down the chrome.debugger (CDP) path (§12, wave 18). Toggles
+# ``Emulation.setFocusEmulationEnabled`` so a BACKGROUND tab behaves as focused (no timer
+# throttling) without taking the screen from the human. STATEFUL: the emulation holds only
+# while the debugger stays attached, so enable = attach + command + KEEP attached, and
+# disable = command(false) + detach. Gated by the SINGLE JS & Debugger checkbox at the
+# extension edge, but carries NO arbitrary code and writes NO ``js_audit`` row — it only
+# fakes focus, exfiltrating nothing; a later data-bearing CDP verb needs its own audit.
+CMD_SET_FOCUS_EMULATION = "set_focus_emulation"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side
@@ -97,6 +105,10 @@ ERR_BUSY_DRAGGING = "busy_dragging"
 # caller can tell the owner's "do not touch by hand" shield apart from every other
 # precondition without parsing a message.
 ERR_PINNED_CROSS_WINDOW = "pinned_cross_window"
+# ``set_focus_emulation`` could not attach the debugger to the target tab (§12): DevTools is
+# open on it, or another debugger client already holds it (a tab takes ONE debugger client).
+# Its own code so the agent can tell "unattachable tab" from every other precondition.
+ERR_DEBUGGER_ATTACH = "debugger_attach"
 ERR_INTERNAL = "internal"
 # Service-side only: no live socket for the instance, and the local send/wait
 # timed out before any `response` arrived.

@@ -17,6 +17,7 @@ import {
 } from "./activity-map.js";
 import { buildSnapshot } from "./snapshot.js";
 import { chromeEnv, Connection } from "./connection.js";
+import { handleDebuggerDetach } from "./commands.js";
 import { enqueueOp, flushQueue } from "./quicklinks.js";
 import {
   TICK_MS,
@@ -92,6 +93,16 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   logFail(onRemoved(tabId));
 });
+
+// --- chrome.debugger detach cleanup (§12, set_focus_emulation) --------------
+// Registered ONCE here so the module-level attached-tabs set in commands.js stays honest
+// when the debugger detaches for a reason outside the verb — the human closed the tab
+// (`target_closed`) or opened DevTools on it (`canceled_by_user`). Without it a stale entry
+// would make a later enable skip its attach and the sendCommand throw. `onDetach` is optional
+// in some builds/tests, so guard the registration.
+if (chrome.debugger && chrome.debugger.onDetach) {
+  chrome.debugger.onDetach.addListener((source, _reason) => handleDebuggerDetach(source));
+}
 
 // --- alarms: reconnect + tick ----------------------------------------------
 

@@ -9,14 +9,17 @@ const manifest = JSON.parse(
 
 // The permission list is an INSTALL-TIME PROMPT, not an implementation detail: adding an
 // entry changes what Chrome asks every operator for on update ("Читать и изменять
-// закладки", "Читать историю просмотров"), and a permission that quietly disappears
-// takes a whole feature down with it (the startpage's two side columns render empty, and
-// nothing anywhere says why). Assert the EXACT set — a subset check would let both
-// accidents through.
+// закладки", "Читать историю просмотров", and for `debugger` a "Доступ ко всем данным
+// вкладок" / debugging warning), and a permission that quietly disappears takes a whole
+// feature down with it (the startpage's two side columns render empty, or the
+// chrome.debugger path can no longer attach, and nothing anywhere says why). Assert the
+// EXACT set — a subset check would let both accidents through.
 describe("manifest permissions (§10 startpage columns)", () => {
   it("is exactly the documented set — nothing added, nothing dropped", () => {
     expect([...manifest.permissions].sort()).toEqual(
-      ["alarms", "bookmarks", "history", "idle", "scripting", "storage", "tabs"].sort(),
+      // `debugger` is the chrome.debugger (CDP) path — set_focus_emulation and later slices
+      // (§12), gated at the edge by the single JS & Debugger checkbox.
+      ["alarms", "bookmarks", "debugger", "history", "idle", "scripting", "storage", "tabs"].sort(),
     );
   });
 

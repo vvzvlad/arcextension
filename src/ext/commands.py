@@ -164,6 +164,16 @@ async def send_command(
         "params": params,
     }
 
+    # GUARDRAIL — the ``(CMD_EXECUTE_JS, CMD_START_JS)`` tuple below (and its twin at the
+    # audit-before-send / kill-switch check) is the ALLOWLIST of verbs that carry arbitrary or
+    # data-exfiltrating code and therefore MUST be audited AND gated by the runtime kill-switch.
+    # Fixed-function / benign verbs (set_focus_emulation, get_text, wait_for, …) are outside it
+    # ON PURPOSE — they reconstruct no code and move no page data. BUT any FUTURE data-bearing
+    # CDP verb built on this same ``send_command`` path — a screenshot verb, network/WebSocket
+    # capture, DOM/page dumps — MUST be added here (or given its own data-bearing flag): a verb
+    # that ships page data out while staying off this allowlist would silently bypass BOTH the
+    # js_audit trail AND the runtime "disable execute_js everywhere now" switch.
+    #
     # execute_js / start_js MUST NOT run without a durable audit sink (§12): both carry
     # ARBITRARY caller code, so with no db to write the js_audit row, refuse fail-closed
     # rather than send it un-audited. The "JS ran without an audit row" code path must not
