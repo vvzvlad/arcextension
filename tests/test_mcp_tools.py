@@ -553,6 +553,135 @@ async def test_set_focus_emulation_sends_enabled_and_returns_it(tmp_path):
     assert out_off == {"ok": True, "enabled": False}
 
 
+# --- WebSocket-frame capture (§12, wave 21) ----------------------------------
+async def test_start_ws_capture_sends_marker_and_returns_ok(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, f = await _run_with_response(
+        lambda: tools.start_ws_capture(app, instance="main", tab_id=7),
+        cs, ws, {"ok": True},
+    )
+    assert f["command"] == protocol.CMD_START_WS_CAPTURE
+    # The synthetic audit marker rides into the frame (the verb carries no caller code).
+    assert f["params"] == {"tabId": 7, "code": "[ws_capture:start]"}
+    assert out == {"ok": True}
+
+
+async def test_read_ws_frames_drains_and_reflects_dropped_url_remaining(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    frames = [
+        {"dir": "recv", "opcode": 1, "ts": 1.0, "text": "hi"},
+        {"dir": "sent", "opcode": 2, "ts": 2.0, "size": 9, "binary": True},
+    ]
+    out, f = await _run_with_response(
+        lambda: tools.read_ws_frames(app, instance="main", tab_id=7, max_bytes=1000),
+        cs, ws,
+        {"frames": frames, "dropped": 3, "url": "wss://chat/socket", "remaining": 5},
+    )
+    assert f["command"] == protocol.CMD_READ_WS_FRAMES
+    # max_bytes rides down as camelCase maxBytes (default 40000 is validated to a positive int).
+    assert f["params"] == {"tabId": 7, "maxBytes": 1000}
+    assert out == {"ok": True, "frames": frames, "dropped": 3,
+                   "url": "wss://chat/socket", "remaining": 5}
+
+
+async def test_read_ws_frames_defaults_and_fills_absent_fields(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    # An extension answering only with what it has: the tool fills the missing keys with safe
+    # defaults (empty frames, zero dropped/remaining, url None), and default max_bytes rides down.
+    out, f = await _run_with_response(
+        lambda: tools.read_ws_frames(app, instance="main", tab_id=7),
+        cs, ws, {},
+    )
+    assert f["params"] == {"tabId": 7, "maxBytes": tools.DEFAULT_MAX_BYTES}
+    assert out == {"ok": True, "frames": [], "dropped": 0, "url": None, "remaining": 0}
+
+
+async def test_read_ws_frames_rejects_bad_max_bytes_and_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.read_ws_frames(app, instance="main", tab_id=7, max_bytes=0)
+    assert ei.value.code == "invalid_args"
+    assert ws.sent == []  # refused before the round trip
+
+
+async def test_stop_ws_capture_sends_command_and_returns_ok(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, f = await _run_with_response(
+        lambda: tools.stop_ws_capture(app, instance="main", tab_id=7),
+        cs, ws, {"ok": True},
+    )
+    assert f["command"] == protocol.CMD_STOP_WS_CAPTURE
+    assert f["params"] == {"tabId": 7}
+    assert out == {"ok": True}
+
+
+async def test_start_ws_capture_refused_while_paused_sends_nothing(tmp_path):
+    # start drives the browser (attach), so the stop gate refuses it and nothing reaches the
+    # socket — same discipline as set_focus_emulation / start_js.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await db.write(lambda c: pause_ops.stop(c, now=tools._now_ms()))
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.start_ws_capture(app, instance="main", tab_id=7)
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
+async def test_read_ws_frames_allowed_while_paused_still_drains(tmp_path):
+    # A passive drain of the in-memory buffer must stay available under a stop, so an ALREADY-
+    # captured conversation is not lost to ring eviction while the capture is still open. UNLIKE
+    # start_ws_capture (browser-driving) read is NOT behind the stop gate — it never reaches the
+    # browser. Without that, a paused curator would silently lose captured frames it could not drain.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await db.write(lambda c: pause_ops.stop(c, now=tools._now_ms()))
+    frames = [{"dir": "recv", "opcode": 1, "ts": 1.0, "text": "hi"}]
+    out, f = await _run_with_response(
+        lambda: tools.read_ws_frames(app, instance="main", tab_id=7, max_bytes=1000),
+        cs, ws,
+        {"frames": frames, "dropped": 0, "url": "wss://chat/socket", "remaining": 0},
+    )
+    # It reached the round trip (was NOT refused with "stopped") and drained the buffer.
+    assert f["command"] == protocol.CMD_READ_WS_FRAMES
+    assert out == {"ok": True, "frames": frames, "dropped": 0,
+                   "url": "wss://chat/socket", "remaining": 0}
+
+
+async def test_stop_ws_capture_runs_even_while_paused(tmp_path):
+    # Teardown must always be able to run: stop is NOT behind the stop gate, so a paused curator
+    # can still end the «идёт отладка» exposure. (start IS gated; read and stop are not.)
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await db.write(lambda c: pause_ops.stop(c, now=tools._now_ms()))
+    out, f = await _run_with_response(
+        lambda: tools.stop_ws_capture(app, instance="main", tab_id=7),
+        cs, ws, {"ok": True},
+    )
+    assert f["command"] == protocol.CMD_STOP_WS_CAPTURE
+    assert out == {"ok": True}
+
+
 # --- move_tab (§6/§9) --------------------------------------------------------
 async def test_move_tab_sends_the_command_and_omits_an_absent_index(tmp_path):
     # The verb that closes §11's gap: relocation BETWEEN instances is the §7 open+close

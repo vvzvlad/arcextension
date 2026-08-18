@@ -1237,13 +1237,114 @@ async def set_focus_emulation(app, *, instance: str, tab_id: int, enabled: bool,
 
     Refused while paused (it drives the browser). ``debugger_attach`` comes back when the
     debugger cannot attach — DevTools is open on the tab, or another client already holds it
-    (a tab takes one debugger client)."""
+    (a tab takes one debugger client). MUTUALLY EXCLUSIVE with ws capture in BOTH directions:
+    ``enabled=true`` on a tab held by an active ``start_ws_capture`` is refused up front with
+    ``debugger_attach`` (and ``enabled=false`` never detaches a live capture — a capture tab is
+    not focus emulation's to release)."""
     await _ensure_not_paused(app)
     result = await _command(
         app, instance, protocol.CMD_SET_FOCUS_EMULATION, {"tabId": tab_id, "enabled": enabled},
         auth_ctx=auth_ctx, expected_session=expected_session,
     )
     return {"ok": True, "enabled": bool(result.get("enabled"))}
+
+
+# --- WebSocket-frame capture (§12, wave 21) ----------------------------------
+async def start_ws_capture(app, *, instance: str, tab_id: int,
+                           auth_ctx: str | None = None,
+                           expected_session: str | None = None) -> dict:
+    """Start capturing a tab's WebSocket frames via chrome.debugger; answers ``{ok}`` (§12).
+
+    The FIRST data-bearing verb down the CDP path. It attaches the debugger and turns on
+    ``Network.*`` delivery so the extension buffers the tab's WS frames for :func:`read_ws_frames`
+    to drain. Because those frames ship PAGE DATA out — a messenger's conversation, i.e. phones,
+    sums, addresses — this is gated EXACTLY like ``execute_js`` (the single JS & Debugger checkbox
+    at the extension edge) AND — UNLIKE ``set_focus_emulation`` — writes a ``js_audit`` row before
+    the send: the verb carries no caller code, so a synthetic ``code`` marker
+    (``[ws_capture:start]``) stands in, and what the row durably fixes is WHO opened the read
+    channel, WHEN and on WHICH tab (:func:`src.ext.commands.send_command` audits it).
+
+    MUTUALLY EXCLUSIVE with focus emulation per tab — one debugger client per tab — so a tab
+    already held by ``set_focus_emulation`` or an active capture answers ``debugger_attach``. The
+    exclusion is SYMMETRIC: the reverse also holds, so ``set_focus_emulation`` refuses a tab this
+    capture already owns rather than detaching it. Refused while paused (it drives the browser). ``no_such_tab`` / ``precondition_failed`` guard a
+    vanished or non-http tab. ANTI-BOT COST: ``Network.enable`` is detectable and the browser shows
+    its «идёт отладка» bar for the WHOLE capture window — the exposure lasts as long as the read
+    channel stays open, not just an instant."""
+    await _ensure_not_paused(app)
+    # No caller code — but the audit branch (§12) requires a `code`, so pass a synthetic marker.
+    # It is what fixes who/when/where the read channel was opened; the extension ignores it.
+    params: dict = {"tabId": tab_id, "code": "[ws_capture:start]"}
+    await _command(app, instance, protocol.CMD_START_WS_CAPTURE, params,
+                   auth_ctx=auth_ctx, expected_session=expected_session)
+    return {"ok": True}
+
+
+async def read_ws_frames(app, *, instance: str, tab_id: int, max_bytes: int | None = None,
+                         auth_ctx: str | None = None,
+                         expected_session: str | None = None) -> dict:
+    """Drain a tab's captured WebSocket frames — ``{ok, frames, dropped, url, remaining}`` (§12).
+
+    A FIXED, DRAINING read of the buffer :func:`start_ws_capture` already authorised: no second
+    ``js_audit`` row (the channel-open was audited once), but still DATA-BEARING — the frames carry
+    personal data from the conversation (phones, sums, addresses) straight into the agent's context
+    AND the session transcript, which outlives the task (§12 privacy).
+
+    NOT gated by the pause stop — UNLIKE ``start_ws_capture`` (which drives the browser: attach +
+    ``Network.enable``), this read never reaches the browser. It is a PASSIVE drain of the
+    in-memory SW buffer, in the same class as ``list_exemptions`` (a read that never leaves the
+    process), and it is deliberately allowed WHILE PAUSED: the ring keeps evicting its oldest
+    frames, so refusing the read under a stop would lose an ALREADY-captured conversation for good
+    while the capture is still open. Reading it out (and then ``stop_ws_capture``, which is also
+    ungated) is how the human ends the exposure without dropping what was already seen.
+
+    DRAINING: the returned frames are REMOVED from the buffer, so a repeat read yields only NEW
+    frames (a stream, not a re-read). The drain is capped at ``max_bytes`` (default 40 kB) of summed
+    text payload; frames past the budget stay buffered as the TAIL — never dropped — and ``remaining``
+    reports how many are left so the agent knows to read again. At least one frame is always returned,
+    so a single frame larger than the budget cannot wedge the buffer. ``dropped`` is how many frames
+    the ring evicted on overflow since the last read (returned, then reset — a silent loss would
+    defeat the point). ``url`` is the socket URL, or ``None`` before ``webSocketCreated`` was seen.
+
+    Each frame is ``{dir, opcode, ts, text}`` for a TEXT frame (opcode 1) or ``{dir, opcode, ts,
+    size, binary}`` for anything else — binary/control frames keep only a size marker, never the
+    payload. A tab with no active capture is ``precondition_failed`` («no active ws capture on this
+    tab») — a distinct fact from an empty buffer."""
+    # NOT paused-gated (see docstring): a passive drain of the in-memory buffer must stay available
+    # under a stop so an already-captured conversation is not lost to ring eviction. Only the
+    # browser-driving verbs (start_ws_capture) sit behind `_ensure_not_paused`.
+    # Validate before the round trip (an extension reading maxBytes<=0 as "no cap" would ship the
+    # whole buffer across the socket first, only to have the cap refuse it here).
+    limit = _validate_max_bytes(max_bytes)
+    params: dict = {"tabId": tab_id, "maxBytes": limit}
+    result = await _command(app, instance, protocol.CMD_READ_WS_FRAMES, params,
+                            auth_ctx=auth_ctx, expected_session=expected_session)
+    return {
+        "ok": True,
+        "frames": result.get("frames") or [],
+        "dropped": result.get("dropped") or 0,
+        "url": result.get("url"),
+        "remaining": result.get("remaining") or 0,
+    }
+
+
+async def stop_ws_capture(app, *, instance: str, tab_id: int,
+                          auth_ctx: str | None = None,
+                          expected_session: str | None = None) -> dict:
+    """Stop a tab's WebSocket capture — best-effort ``Network.disable`` + detach; ``{ok}`` (§12).
+
+    Pure IDEMPOTENT teardown: it disables the Network domain, detaches the debugger and drops the
+    tab's buffer. A tab with no active capture is an idempotent ``{ok: true}``. NOT refused while
+    paused and NOT behind the checkbox — teardown must always be able to run, including after the
+    checkbox was turned off mid-capture, so the «идёт отладка» bar and the anti-bot exposure can
+    always be ended.
+
+    ⚠️ The buffer lives in the extension's MV3 service worker: if that worker dies the capture (and
+    its buffered frames) is lost and chrome.debugger detaches implicitly — acceptable for this slice.
+    A stop after such a death is the idempotent no-op above."""
+    await _command(app, instance, protocol.CMD_STOP_WS_CAPTURE, {"tabId": tab_id},
+                   auth_ctx=auth_ctx, expected_session=expected_session)
+    return {"ok": True}
 
 
 async def navigate_tab(app, *, instance: str, tab_id: int, url: str,

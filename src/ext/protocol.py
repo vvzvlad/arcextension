@@ -90,6 +90,20 @@ CMD_POLL_JOB = "poll_job"
 # extension edge, but carries NO arbitrary code and writes NO ``js_audit`` row — it only
 # fakes focus, exfiltrating nothing; a later data-bearing CDP verb needs its own audit.
 CMD_SET_FOCUS_EMULATION = "set_focus_emulation"
+# WebSocket-frame capture (§12, wave 21) — the FIRST data-bearing verb down the
+# chrome.debugger path. ``start_ws_capture`` attaches the debugger and turns on ``Network.*``
+# event delivery so the extension buffers a tab's WS frames; ``read_ws_frames`` drains that
+# buffer to the agent; ``stop_ws_capture`` disables the domain and detaches. Because the frames
+# ship PAGE DATA out (a messenger's conversation — phones, sums, addresses), ``start_ws_capture``
+# is behind the SAME single JS & Debugger checkbox as ``execute_js`` AND writes a ``js_audit``
+# row before the send (:func:`src.ext.commands.send_command` — it is on the audit ALLOWLIST,
+# unlike ``set_focus_emulation`` which fakes focus and exfiltrates nothing). ``read_ws_frames`` is
+# a FIXED, draining read of the already-authorised buffer (no second audit) but is size-capped
+# for privacy; ``stop_ws_capture`` is pure idempotent teardown. One debugger client per tab, so a
+# tab held by focus emulation OR an active capture refuses a second start (``debugger_attach``).
+CMD_START_WS_CAPTURE = "start_ws_capture"
+CMD_READ_WS_FRAMES = "read_ws_frames"
+CMD_STOP_WS_CAPTURE = "stop_ws_capture"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side

@@ -520,9 +520,74 @@ def build_mcp(app_ref) -> MCPServer:
         exactly like execute_js — but it runs no arbitrary code and writes no js_audit row
         (it only fakes focus). A tab with DevTools open, or already held by another debugger
         client, cannot be attached and answers ``debugger_attach`` (one debugger client per
-        tab). Refused while paused."""
+        tab). MUTUALLY EXCLUSIVE with ws capture in BOTH directions: ``enabled=true`` on a tab
+        under an active start_ws_capture answers ``debugger_attach``, and ``enabled=false`` never
+        detaches a live capture. Refused while paused."""
         return await _guarded(tools.set_focus_emulation(
             _host(), instance=instance, tab_id=tab_id, enabled=enabled,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    # --- WebSocket-frame capture (§12, wave 21) ------------------------------
+    @mcp.tool()
+    async def start_ws_capture(instance: str, tab_id: int,
+                               expected_session: str | None = None) -> dict:
+        """Start capturing a tab's WebSocket frames via chrome.debugger; answers ``{ok}``.
+
+        The first DATA-BEARING verb down the CDP path: it opens a read channel onto the tab's WS
+        traffic (a messenger's live conversation) for ``read_ws_frames`` to drain. Gated by the
+        SINGLE JS & Debugger checkbox (``allow_execute_js`` in list_instances) EXACTLY like
+        execute_js, and — unlike set_focus_emulation — it writes a js_audit row before the send
+        (the durable trace of WHO opened the channel, WHEN and on which tab). Refused while paused.
+
+        MUTUALLY EXCLUSIVE with set_focus_emulation on the same tab — one debugger client per tab —
+        so a tab already under focus emulation or an active capture answers ``debugger_attach``. The
+        exclusion is SYMMETRIC: set_focus_emulation likewise refuses a tab this capture holds.
+        ANTI-BOT COST: ``Network.enable`` is detectable and the «идёт отладка» bar shows for the
+        WHOLE time the capture stays open, not just an instant — the exposure window is the entire
+        read session, so stop it when done."""
+        return await _guarded(tools.start_ws_capture(
+            _host(), instance=instance, tab_id=tab_id,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def read_ws_frames(instance: str, tab_id: int, max_bytes: int | None = None,
+                             expected_session: str | None = None) -> dict:
+        """Drain a tab's captured WS frames — ``{ok, frames, dropped, url, remaining}``.
+
+        A FIXED, DRAINING read of the buffer ``start_ws_capture`` already authorised: no second
+        js_audit row, but DATA-BEARING — the frames carry personal data (phones, sums, addresses)
+        into your context AND the session transcript, which outlives the task. Read only what you
+        need. NOT refused while paused — unlike start_ws_capture it never touches the browser; it is
+        a passive drain of the in-memory buffer (like list_exemptions), allowed under a stop so an
+        already-captured conversation is not lost to ring eviction while the capture is still open.
+
+        DRAINING: returned frames are REMOVED, so a repeat read yields only NEW frames (a stream).
+        Capped at ``max_bytes`` (default 40000) of summed text payload; frames past the budget stay
+        buffered as the tail — never dropped — and ``remaining`` counts them so you know to read
+        again. ``dropped`` is how many frames the ring evicted on overflow since the last read
+        (then reset). ``url`` is the socket URL (``None`` until the socket is seen). Each frame is
+        ``{dir, opcode, ts, text}`` for text (opcode 1) or ``{dir, opcode, ts, size, binary}`` for
+        binary/control frames (payload not captured). A tab with no active capture is
+        ``precondition_failed``."""
+        return await _guarded(tools.read_ws_frames(
+            _host(), instance=instance, tab_id=tab_id, max_bytes=max_bytes,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def stop_ws_capture(instance: str, tab_id: int,
+                              expected_session: str | None = None) -> dict:
+        """Stop a tab's WS capture — best-effort ``Network.disable`` + detach; answers ``{ok}``.
+
+        Pure IDEMPOTENT teardown: disables the Network domain, detaches the debugger, drops the
+        buffer. A tab with no active capture is an idempotent ``{ok: true}``. NOT gated by the
+        checkbox and NOT refused while paused — teardown must always be able to run so the «идёт
+        отладка» bar and the anti-bot exposure can always be ended. The buffer lives in the MV3
+        worker, so a worker death loses the capture on its own and a later stop is the no-op."""
+        return await _guarded(tools.stop_ws_capture(
+            _host(), instance=instance, tab_id=tab_id,
             auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 

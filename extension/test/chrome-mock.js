@@ -368,6 +368,11 @@ export function createChromeMock(opts = {}) {
         chrome.debugger._attached.delete(tabId);
       },
       onDetach: new FakeEvent(),
+      // WebSocket-frame capture (§12, wave 21) drives `Network.*` events into the buffer via
+      // this hub. Tests call `handleDebuggerEvent` directly, but the service worker registers a
+      // listener here on import, so the hub must exist. `onEvent._emit(source, method, params)`
+      // is available for any test that wants to drive the registered path end-to-end.
+      onEvent: new FakeEvent(),
     },
     alarms: {
       _alarms: { ...(opts.alarms || {}) },

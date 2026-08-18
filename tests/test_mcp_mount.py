@@ -112,6 +112,8 @@ def test_mcp_tools_list_exposes_every_phase11_tool(tmp_path):
         "scroll_until", "start_js", "poll_job",
         # The chrome.debugger foundation (wave 18): the first CDP verb.
         "set_focus_emulation",
+        # The WebSocket-capture trio (wave 21): the first DATA-BEARING CDP verbs.
+        "start_ws_capture", "read_ws_frames", "stop_ws_capture",
     }
     with TestClient(app) as client:
         r = client.post("/mcp", json=_init_body(), headers=_headers())

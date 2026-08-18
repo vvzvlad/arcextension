@@ -17,7 +17,7 @@ import {
 } from "./activity-map.js";
 import { buildSnapshot } from "./snapshot.js";
 import { chromeEnv, Connection } from "./connection.js";
-import { handleDebuggerDetach } from "./commands.js";
+import { handleDebuggerDetach, handleDebuggerEvent } from "./commands.js";
 import { enqueueOp, flushQueue } from "./quicklinks.js";
 import {
   TICK_MS,
@@ -102,6 +102,17 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // in some builds/tests, so guard the registration.
 if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener((source, _reason) => handleDebuggerDetach(source));
+}
+
+// --- chrome.debugger event sink (§12, wave 21: WebSocket-frame capture) ------
+// Registered ONCE here so the `Network.*` events an active capture relies on reach the buffer
+// in commands.js. Only tabs with a live capture record are serviced; every other event is
+// ignored inside the handler. `onEvent` is optional in some builds/tests, so guard it like
+// onDetach above.
+if (chrome.debugger && chrome.debugger.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, params) =>
+    handleDebuggerEvent(source, method, params),
+  );
 }
 
 // --- alarms: reconnect + tick ----------------------------------------------

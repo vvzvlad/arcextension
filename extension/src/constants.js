@@ -188,6 +188,19 @@ export const CMD_POLL_JOB = "poll_job";
 // js_audit row — focus emulation exfiltrates nothing, it only fakes focus; a later
 // data-bearing CDP verb (screenshot / network) needs its own audit.
 export const CMD_SET_FOCUS_EMULATION = "set_focus_emulation";
+// WebSocket-frame capture (§12, wave 21) — the FIRST data-bearing verb down the
+// chrome.debugger path. `start_ws_capture` attaches the debugger and turns on `Network.*`
+// event delivery so the extension buffers a tab's WS frames; `read_ws_frames` drains that
+// buffer to the agent; `stop_ws_capture` disables the domain and detaches. Because the
+// frames carry PAGE DATA out (a messenger's conversation — phones, sums, addresses), start
+// is gated by the SAME single JS & Debugger checkbox as execute_js AND writes a js_audit
+// row (unlike set_focus_emulation, which fakes focus and exfiltrates nothing). read is a
+// FIXED, draining read of the already-authorised buffer (no second audit) but is size-capped
+// for privacy; stop is pure idempotent teardown. One debugger client per tab — a tab held by
+// focus emulation OR an active capture refuses a second `start_ws_capture` (`debugger_attach`).
+export const CMD_START_WS_CAPTURE = "start_ws_capture";
+export const CMD_READ_WS_FRAMES = "read_ws_frames";
+export const CMD_STOP_WS_CAPTURE = "stop_ws_capture";
 
 // How often `wait_for` (and navigate_tab's waitUntil) re-tests its condition. 250 ms is
 // the usual "fast enough to feel instant, cheap enough to run for 30 s" compromise: at

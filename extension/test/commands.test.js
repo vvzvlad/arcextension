@@ -9,6 +9,7 @@ import {
   startJobInWorld,
   readJobInWorld,
   handleDebuggerDetach,
+  handleDebuggerEvent,
   __resetDebuggerState,
 } from "../src/commands.js";
 import * as activityMap from "../src/activity-map.js";
@@ -28,6 +29,9 @@ import {
   CMD_START_JS,
   CMD_POLL_JOB,
   CMD_SET_FOCUS_EMULATION,
+  CMD_START_WS_CAPTURE,
+  CMD_READ_WS_FRAMES,
+  CMD_STOP_WS_CAPTURE,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
 } from "../src/constants.js";
@@ -3241,5 +3245,348 @@ describe("set_focus_emulation (chrome.debugger)", () => {
     await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
     // A fresh attach happened because the set no longer claimed the tab was ours.
     expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+});
+
+// --- WebSocket-frame capture (§12, wave 21) ----------------------------------
+describe("start_ws_capture / read_ws_frames / stop_ws_capture (chrome.debugger)", () => {
+  // Build a captured frame event as the CDP delivers it: params.response carries opcode +
+  // payloadData, params.timestamp the monotonic clock.
+  function frameEvent(method, tabId, opcode, payloadData, ts = 1.0) {
+    return [
+      { tabId },
+      method,
+      { requestId: "r1", timestamp: ts, response: { opcode, mask: false, payloadData } },
+    ];
+  }
+
+  async function startCapture(tabId = 5) {
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    return dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId }), ctx());
+  }
+
+  it("checkbox OFF (default) => js_disabled, and the debugger is NOT touched", async () => {
+    chromeWithOneTab();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_START_WS_CAPTURE, { tabId: 5 }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: false, error: { code: "js_disabled", message: expect.any(String) } });
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("start: attaches, enables the Network domain, and records the capture", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, "Network.enable", {});
+    expect(chrome.debugger._attached.has(5)).toBe(true);
+  });
+
+  it("a vanished tab is no_such_tab, and the debugger is not touched", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 999 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("a non-http tab is precondition_failed (the debugger never attaches privileged pages)", async () => {
+    chromeWithOneTab("file:///etc/passwd");
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("mutual exclusion: a tab already held by focus emulation refuses with debugger_attach", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // focus emulation attaches and KEEPS the tab — it is now in debuggerAttachedTabs.
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    // Refused UP FRONT — no second attach was even attempted (one client per tab).
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("mutual exclusion: a second start on a capturing tab refuses with debugger_attach", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("attach that throws (DevTools open / another client) => debugger_attach, untracked", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.debuggerAttachError = "Another debugger is already attached";
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("Network.enable failing on a FRESH attach rolls the attach back (detach + untrack, no record)", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.sendCommandError = "target crashed";
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+    // No capture record was left behind: a read now reports precondition_failed.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error.code).toBe("precondition_failed");
+  });
+
+  it("handleDebuggerEvent: a TEXT frame (opcode 1) is buffered with its text, recv and sent", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "hello", 1.5));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameSent", 5, 1, "world", 2.5));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames).toEqual([
+      { dir: "recv", opcode: 1, ts: 1.5, text: "hello" },
+      { dir: "sent", opcode: 1, ts: 2.5, text: "world" },
+    ]);
+    expect(res.result.dropped).toBe(0);
+    expect(res.result.remaining).toBe(0);
+  });
+
+  it("handleDebuggerEvent: a BINARY frame keeps only {opcode, size, binary}, never the payload", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 2, "AAAABBBB", 3.0));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames).toEqual([
+      { dir: "recv", opcode: 2, ts: 3.0, size: 8, binary: true },
+    ]);
+  });
+
+  it("handleDebuggerEvent: webSocketCreated stamps the socket url onto the record", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent({ tabId: 5 }, "Network.webSocketCreated", { requestId: "r", url: "wss://chat/s" });
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.url).toBe("wss://chat/s");
+  });
+
+  it("handleDebuggerEvent ignores a tab with no active capture", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // No start_ws_capture for tab 5 — the event must be dropped silently.
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "leak", 1.0));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+  });
+
+  it("ring buffer: the FRAME cap evicts oldest-first and grows dropped", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // Push 502 tiny text frames (cap is 500) — the two oldest are evicted, dropped === 2.
+    for (let i = 0; i < 502; i++) {
+      handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, `f${i}`, i));
+    }
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.length).toBe(500);
+    expect(res.result.dropped).toBe(2);
+    // The survivors are the NEWEST 500: the first kept frame is f2, the last is f501.
+    expect(res.result.frames[0].text).toBe("f2");
+    expect(res.result.frames[499].text).toBe("f501");
+  });
+
+  it("read drains: a second read after no new frames returns an empty batch", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "one", 1.0));
+    const first = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(first.result.frames.length).toBe(1);
+    const second = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(second.result.frames).toEqual([]);
+    expect(second.result.remaining).toBe(0);
+  });
+
+  it("read maxBytes: leaves the over-budget tail buffered and reports remaining", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // Three 10-byte text frames; a 15-byte budget fits exactly one, leaving two as the tail.
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "0123456789", 1));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "abcdefghij", 2));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "klmnopqrst", 3));
+    const first = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5, maxBytes: 15 }), ctx());
+    expect(first.result.frames.map((f) => f.text)).toEqual(["0123456789"]);
+    expect(first.result.remaining).toBe(2);
+    // Draining continues: the tail comes out on the next reads (never lost).
+    const second = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5, maxBytes: 15 }), ctx());
+    expect(second.result.frames.map((f) => f.text)).toEqual(["abcdefghij"]);
+    expect(second.result.remaining).toBe(1);
+  });
+
+  it("read maxBytes: a single frame larger than the budget still makes progress (at least one)", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "0123456789", 1));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5, maxBytes: 3 }), ctx());
+    expect(res.result.frames.map((f) => f.text)).toEqual(["0123456789"]);
+    expect(res.result.remaining).toBe(0);
+  });
+
+  it("read on a tab with no capture is precondition_failed", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+  });
+
+  it("stop: disables Network, detaches, and clears BOTH structures", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(frame(CMD_STOP_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, "Network.disable", {});
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+    // The capture record is gone: a read now fails precondition, and a fresh start re-attaches.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error.code).toBe("precondition_failed");
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const restart = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(restart).toEqual({ ok: true, result: { ok: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+
+  it("stop on a tab with no capture is an idempotent no-op success", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(frame(CMD_STOP_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(detach).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("onDetach cleanup drops the capture record too (the human closed the tab / opened DevTools)", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "before", 1.0));
+    // The debugger detaches for a reason outside the verb; the listener drops BOTH structures so
+    // the buffer does not hang forever with no verb left to detach it.
+    handleDebuggerDetach({ tabId: 5 });
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error.code).toBe("precondition_failed");
+    // A later start re-attaches cleanly (the set no longer claims the tab was ours).
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const restart = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(restart.ok).toBe(true);
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+
+  // --- collision with focus emulation: symmetric mutual exclusion (§12) -------
+  it("collision: set_focus_emulation(enabled=true) on a ws-capture tab is refused, capture untouched", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "hi", 1.0));
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    // Refused UP FRONT: the tab is held by an active ws capture, so focus emulation may not
+    // attach a second debugger client onto it (symmetric to start_ws_capture refusing a
+    // focus-emulation tab). No attach, no detach — the debugger is not touched.
+    expect(res.error.code).toBe("debugger_attach");
+    expect(attach).not.toHaveBeenCalled();
+    expect(detach).not.toHaveBeenCalled();
+    // The capture is intact: its buffer still drains the frame it had.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.result.frames).toEqual([{ dir: "recv", opcode: 1, ts: 1.0, text: "hi" }]);
+  });
+
+  it("collision: set_focus_emulation(enabled=false) on a ws-capture tab does NOT detach and does NOT kill the capture", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "keepme", 1.0));
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    // A capture tab is NOT in debuggerAttachedTabs (it lives only in wsCaptureTabs), so disabling
+    // focus emulation is a natural no-op for it — it must not detach the debugger the capture is
+    // riding on. (Before the fix, start added the tab to BOTH sets, so disable saw it as its own
+    // and detached it — silently killing the capture.)
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(detach).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(chrome.debugger._attached.has(5)).toBe(true); // the capture's debugger is still attached
+    // The capture is alive: read still returns the buffered frame, not precondition_failed.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error).toBeUndefined();
+    expect(read.result.frames).toEqual([{ dir: "recv", opcode: 1, ts: 1.0, text: "keepme" }]);
+  });
+
+  // --- ring buffer: eviction by BYTE weight (WS_MAX_BUFFER_BYTES), not by count ------
+  it("ring buffer: the BYTE cap evicts oldest-first before the frame count is reached, and grows dropped", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // WS_MAX_BUFFER_BYTES ≈ 1e6. Four 300 kB ASCII text frames sum to 1.2 MB with only FOUR frames
+    // buffered — far under the 500-frame cap — so the eviction here is driven by WEIGHT, not count.
+    // Pushing the 4th tips the sum past 1 MB and the oldest (A) is evicted back to 900 kB; dropped
+    // is 1 and B/C/D survive. Each frame carries a distinct leading tag so the survivors are checked.
+    const big = (tag) => tag + "x".repeat(300000 - tag.length); // 300000 bytes of ASCII
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("A"), 1));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("B"), 2));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("C"), 3));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("D"), 4));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.length).toBe(3);
+    expect(res.result.dropped).toBe(1);
+    // The oldest (A) was evicted by weight; the survivors are B, C, D in order.
+    expect(res.result.frames.map((f) => f.text[0])).toEqual(["B", "C", "D"]);
+    expect(res.result.frames[0].text.length).toBe(300000);
+  });
+
+  it("ring buffer: a single frame heavier than the whole byte budget is still held (>=1 guarantee), dropped stays 0", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // One frame heavier than WS_MAX_BUFFER_BYTES (≈1e6). The byte cap only evicts while MORE THAN
+    // one frame is buffered, so the SOLE oversized frame is retained (never dropped) — read caps it
+    // at fetch time instead. dropped stays 0: nothing was evicted, consistent with the ≥1 guarantee.
+    const huge = "z".repeat(1200000); // > WS_MAX_BUFFER_BYTES (1e6)
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, huge, 1));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.length).toBe(1);
+    expect(res.result.frames[0].text.length).toBe(1200000);
+    expect(res.result.dropped).toBe(0);
+  });
+
+  it("ring buffer: once a NEWER frame joins an oversized one, the byte cap evicts the oversized (oldest-first)", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // The oversized frame is retained while alone (previous test), but the ≥1 guarantee protects
+    // it only until a newer frame arrives. With TWO frames buffered the byte cap kicks in and the
+    // oldest — the oversized one — is evicted, leaving just the small frame and dropped === 1. No
+    // intervening read here, so both frames are in the ring together when the cap runs.
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "z".repeat(1200000), 1));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "small", 2));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.map((f) => f.text)).toEqual(["small"]);
+    expect(res.result.dropped).toBe(1);
   });
 });

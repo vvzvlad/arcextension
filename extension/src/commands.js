@@ -39,6 +39,9 @@ import {
   CMD_START_JS,
   CMD_POLL_JOB,
   CMD_SET_FOCUS_EMULATION,
+  CMD_START_WS_CAPTURE,
+  CMD_READ_WS_FRAMES,
+  CMD_STOP_WS_CAPTURE,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
@@ -500,6 +503,15 @@ export async function dispatchCommand(frame, ctx = {}) {
       // js_audit row (it only fakes focus, exfiltrating nothing).
       case CMD_SET_FOCUS_EMULATION:
         return await setFocusEmulation(params);
+      // WebSocket-frame capture (§12, wave 21). start is DATA-BEARING — the same JS & Debugger
+      // checkbox as execute_js, and (service side) a js_audit row before the send. read drains
+      // the already-authorised buffer (no second audit); stop is idempotent teardown.
+      case CMD_START_WS_CAPTURE:
+        return await startWsCapture(params);
+      case CMD_READ_WS_FRAMES:
+        return await readWsFrames(params);
+      case CMD_STOP_WS_CAPTURE:
+        return await stopWsCapture(params);
       default:
         return fail(ERR_INTERNAL, `unknown command: ${command}`);
     }
@@ -2066,6 +2078,65 @@ async function executeJs(params) {
 // into chrome.storage.session so a resurrected worker can reconcile.
 const debuggerAttachedTabs = new Set();
 
+// WebSocket-frame capture buffers (§12, wave 21): tabId -> { url|null, frames: [], dropped,
+// bytes }. `frames` is a ring buffer of the tab's captured WS frames; `url` is the socket URL
+// learned from `Network.webSocketCreated`; `dropped` counts frames the ring evicted on
+// overflow (surfaced to the agent, never a silent loss); `bytes` is the running weight of the
+// buffered text payloads, kept incrementally so the byte cap does not rescan on every frame.
+//
+// OWNERSHIP INVARIANT (§12): `debuggerAttachedTabs` and `wsCaptureTabs` are each the ownership
+// marker of ONE feature — focus emulation and ws capture respectively — and a tab lives in AT
+// MOST ONE of them at a time (one debugger client per tab). The two are therefore MUTUALLY
+// EXCLUSIVE in BOTH directions: each start verb refuses with `debugger_attach` when the OTHER
+// set already holds the tab (`start_ws_capture` checks `debuggerAttachedTabs`,
+// `set_focus_emulation` checks `wsCaptureTabs`), and each feature only ever attaches/detaches a
+// tab of its OWN set — so neither can pull the debugger out from under the other. The cross-
+// feature cleanup in `handleDebuggerDetach` and `__resetDebuggerState` is the sole exception:
+// a real detach event / a test reset clear BOTH sets, because they cannot know which feature
+// owned the tab.
+//
+// Deliberately in-memory and lost on MV3 SW death (the debugger detaches implicitly then, too):
+// a resurrected worker starts with no capture and a fresh `start_ws_capture` re-attaches
+// cleanly. The buffer is never persisted — page data does not outlive the worker on disk.
+const wsCaptureTabs = new Map();
+
+// Ring-buffer ceilings for a single tab's capture. On overflow the OLDEST frame is evicted and
+// `dropped` is incremented — no silent truncation. WS_MAX_BUFFER_BYTES caps the summed weight
+// of buffered TEXT payloads (binary frames store only a size marker, so they weigh nothing);
+// the byte cap never evicts the sole newest frame, so a single frame larger than the whole
+// budget is still held (and size-capped at read time) rather than dropped on arrival.
+const WS_MAX_FRAMES = 500;
+const WS_MAX_BUFFER_BYTES = 1_000_000;
+
+// UTF-8 weight of a frame's stored payload: text frames weigh their bytes, binary frames weigh
+// nothing (their payload is not stored — only an {opcode, size} marker). One encoder instance,
+// reused, so a busy socket does not allocate one per frame. Called EXACTLY ONCE per frame, at
+// push time — the result is cached on the frame (see `wsPushFrame`) and reused everywhere else.
+const wsTextEncoder = new TextEncoder();
+function wsFrameWeight(frame) {
+  return typeof frame.text === "string" ? wsTextEncoder.encode(frame.text).length : 0;
+}
+
+// Append one captured frame and enforce the ring ceilings, dropping OLDEST-first on overflow.
+function wsPushFrame(rec, frame) {
+  // Compute the UTF-8 weight ONCE, here at push, and cache it on the frame as `_w`. Eviction
+  // below and the later drain in `readWsFrames` both reuse `_w` rather than re-encoding the
+  // payload — a busy socket would otherwise encode the same text up to 3× (push + evict + read).
+  // `_w` is INTERNAL bookkeeping: it is stripped from every frame handed back to the agent (see
+  // `readWsFrames`), never surfaced.
+  frame._w = wsFrameWeight(frame);
+  rec.frames.push(frame);
+  rec.bytes += frame._w;
+  while (
+    rec.frames.length > WS_MAX_FRAMES ||
+    (rec.bytes > WS_MAX_BUFFER_BYTES && rec.frames.length > 1)
+  ) {
+    const old = rec.frames.shift();
+    rec.bytes -= old._w;
+    rec.dropped += 1;
+  }
+}
+
 // The chrome.debugger protocol version to attach with (CDP 1.3).
 const DEBUGGER_PROTOCOL_VERSION = "1.3";
 
@@ -2078,13 +2149,54 @@ const DEBUGGER_PROTOCOL_VERSION = "1.3";
 export function handleDebuggerDetach(source) {
   if (source && typeof source.tabId === "number") {
     debuggerAttachedTabs.delete(source.tabId);
+    // Also drop any WS-capture record for the tab (§12, wave 21): the debugger is gone, so the
+    // `Network.*` events stop arriving and the buffer would otherwise HANG forever after the
+    // human closed the tab / opened DevTools — pinning page data in worker memory with no verb
+    // left that could ever detach it (stop_ws_capture would try to detach a tab already gone).
+    wsCaptureTabs.delete(source.tabId);
   }
 }
 
-// Test-only: reset the module-level attachment set between cases (the set is process-global,
-// so a leftover entry from one test would leak into the next).
+// chrome.debugger.onEvent sink (§12, wave 21). Registered ONCE at SW init (service-worker.js)
+// alongside onDetach. Only tabs with a live capture record are serviced; every other tab's
+// events (and every non-WS method) are ignored. On `Network.webSocketCreated` the socket URL is
+// stamped onto the record; on a frame received/sent a compact entry is buffered — for a TEXT
+// frame (opcode 1) the payload is kept as `text`, for anything else ONLY an {opcode, size}
+// marker is kept so binary blobs never flood the buffer (or, later, the agent's context).
+export function handleDebuggerEvent(source, method, params) {
+  if (!source || typeof source.tabId !== "number") return;
+  const rec = wsCaptureTabs.get(source.tabId);
+  if (!rec) return; // not capturing this tab
+  if (method === "Network.webSocketCreated") {
+    if (params && typeof params.url === "string") rec.url = params.url;
+    return;
+  }
+  const dir =
+    method === "Network.webSocketFrameReceived"
+      ? "recv"
+      : method === "Network.webSocketFrameSent"
+        ? "sent"
+        : null;
+  if (dir === null) return; // any other Network.* event is not a frame we buffer
+  const response = (params && params.response) || {};
+  const opcode = response.opcode;
+  const ts = params && params.timestamp;
+  const payloadData = typeof response.payloadData === "string" ? response.payloadData : "";
+  // opcode 1 = text (payloadData is a UTF-8 string, kept verbatim). Every other opcode —
+  // binary (2), or a control frame (close/ping/pong) — carries base64 or nothing useful to the
+  // agent, so store only its size, never the payload.
+  const frame =
+    opcode === 1
+      ? { dir, opcode, ts, text: payloadData }
+      : { dir, opcode, ts, size: payloadData.length, binary: true };
+  wsPushFrame(rec, frame);
+}
+
+// Test-only: reset the module-level debugger state between cases (both structures are
+// process-global, so a leftover entry from one test would leak into the next).
 export function __resetDebuggerState() {
   debuggerAttachedTabs.clear();
+  wsCaptureTabs.clear();
 }
 
 // set_focus_emulation {tabId, enabled} (§12, wave 18). Makes a BACKGROUND tab behave as
@@ -2121,6 +2233,18 @@ async function setFocusEmulation(params) {
   const enabled = !!params.enabled;
 
   if (enabled) {
+    // MUTUAL EXCLUSION (§12), symmetric to how `startWsCapture` refuses a tab held by focus
+    // emulation: if a ws capture already owns this tab, refuse UP FRONT with `debugger_attach`
+    // rather than attaching a second debugger client — which would throw — or, worse, letting a
+    // later `enabled=false` detach the capture out from under itself. A capture tab lives ONLY in
+    // `wsCaptureTabs`, never in `debuggerAttachedTabs`, so this check is the only thing that keeps
+    // focus emulation off it.
+    if (wsCaptureTabs.has(tabId)) {
+      return fail(
+        ERR_DEBUGGER_ATTACH,
+        "tab is held by an active ws capture — stop it first",
+      );
+    }
     // Track whether THIS call is the one that attached the tab, so the sendCommand catch
     // below only rolls back an attach we ourselves just made (see there).
     let attachedNow = false;
@@ -2174,7 +2298,10 @@ async function setFocusEmulation(params) {
     return ok({ enabled: true });
   }
 
-  // enabled=false: a tab we never attached is an idempotent success (nothing to undo).
+  // enabled=false: a tab we never attached is an idempotent success (nothing to undo). A tab held
+  // by a ws capture is NOT in `debuggerAttachedTabs` (that set is focus emulation's own marker), so
+  // it falls straight through as a no-op here — disabling focus emulation NEVER detaches a live
+  // capture. Only a tab focus emulation itself attached is torn down below.
   if (debuggerAttachedTabs.has(tabId)) {
     // Best-effort: the detach below is what actually drops the emulation (it lapses when the
     // debugger leaves), so a sendCommand that throws — e.g. the tab is mid-teardown — must
@@ -2195,4 +2322,144 @@ async function setFocusEmulation(params) {
     debuggerAttachedTabs.delete(tabId);
   }
   return ok({ enabled: false });
+}
+
+// --- WebSocket-frame capture (§12, wave 21) ---------------------------------
+//
+// The FIRST data-bearing verb down the chrome.debugger path. start attaches the debugger,
+// turns on `Network.*` delivery, and opens a ring buffer that `handleDebuggerEvent` fills;
+// read drains that buffer to the agent; stop disables the domain and detaches. The frames
+// carry PAGE DATA (a messenger's conversation), so start rides the SAME gate as execute_js —
+// the checkbox here, and a js_audit row on the service side (src/ext/commands.py) before the
+// send. read/stop carry no code and no new authorisation, so neither writes a row.
+
+// start_ws_capture {tabId} -> {ok}. Gated by the single JS & Debugger checkbox, guards the
+// target scheme, and is MUTUALLY EXCLUSIVE with focus emulation and with a running capture
+// (one debugger client per tab). On a FRESH attach whose `Network.enable` then fails, the
+// attach is rolled back so no visible "debugging this tab" session is left with no capture.
+async function startWsCapture(params) {
+  const stored = await chrome.storage.local.get(ALLOW_EXECUTE_JS_KEY);
+  const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
+  if (!allowed) {
+    return fail(ERR_JS_DISABLED, "JS & Debugger is disabled in this copy's options");
+  }
+  const tabId = params.tabId;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${tabId}`);
+  }
+  // Edge-guard the target scheme like every other debugger verb (§12): never attach to a
+  // chrome://, file:// or other privileged surface.
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "start_ws_capture target is not an http/https tab");
+  }
+  // One debugger client per tab. If focus emulation already holds this tab, or a capture is
+  // already running on it, refuse up front rather than letting `chrome.debugger.attach` throw
+  // "Another debugger is already attached". Deliberately NOT ref-counted — a single client per
+  // tab is the acknowledged limit of this slice.
+  if (debuggerAttachedTabs.has(tabId) || wsCaptureTabs.has(tabId)) {
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      "debugger already attached to this tab (focus emulation or ws capture)",
+    );
+  }
+  try {
+    await chrome.debugger.attach({ tabId }, DEBUGGER_PROTOCOL_VERSION);
+  } catch {
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      "could not attach debugger — DevTools open on this tab, or another client attached",
+    );
+  }
+  // Ownership marker for THIS feature ONLY: a live capture tab goes into `wsCaptureTabs`, never
+  // into `debuggerAttachedTabs` (that set belongs to focus emulation). The capture record is
+  // written only AFTER `Network.enable` succeeds, below, so a fresh attach whose enable fails
+  // leaves no record at all.
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Network.enable", {});
+  } catch (e) {
+    // The attach succeeded but enabling the Network domain failed. This call is the one that
+    // attached the tab (the has()-guards above proved it was not ours before), so roll that
+    // attach back — best-effort detach — and write NO capture record. There is nothing to untrack
+    // in a Set: this feature never adds the tab to `debuggerAttachedTabs`, and the `wsCaptureTabs`
+    // record is only written past this catch.
+    try {
+      await chrome.debugger.detach({ tabId });
+    } catch {
+      // Already gone or never fully attached — nothing to undo on the browser side.
+    }
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      `could not enable Network domain: ${String((e && e.message) || e)}`,
+    );
+  }
+  wsCaptureTabs.set(tabId, { url: null, frames: [], dropped: 0, bytes: 0 });
+  return ok({ ok: true });
+}
+
+// read_ws_frames {tabId, maxBytes?} -> {ok, frames, dropped, url, remaining}. DRAINING: the
+// returned frames are removed from the buffer, so a repeat read yields only NEW frames. The
+// drain is bounded by `maxBytes` of summed text payload — frames past the budget stay in the
+// buffer as the TAIL (never dropped), reported via `remaining` so the agent knows to read
+// again. At least one frame is always returned, so a single frame larger than the budget
+// cannot wedge the buffer. `dropped` (overflow evictions since the last read) is returned and
+// reset. A tab with no active capture is `precondition_failed` — a distinct fact from an
+// empty buffer.
+function readWsFrames(params) {
+  const tabId = params.tabId;
+  const rec = wsCaptureTabs.get(tabId);
+  if (!rec) {
+    return fail(ERR_PRECONDITION_FAILED, "no active ws capture on this tab");
+  }
+  // maxBytes <= 0 / non-numeric means "no cap" here; the service validates it to a positive
+  // integer before the round trip, so this is only the extension's own belt-and-suspenders.
+  const limit =
+    typeof params.maxBytes === "number" && params.maxBytes > 0 ? params.maxBytes : Infinity;
+  const frames = [];
+  let used = 0;
+  while (rec.frames.length > 0) {
+    // Reuse the weight cached at push (`_w`) instead of re-encoding the payload here.
+    const weight = rec.frames[0]._w;
+    // Stop BEFORE exceeding the budget — but always take at least the first frame, so an
+    // oversized single frame still makes progress instead of pinning the buffer forever.
+    if (frames.length > 0 && used + weight > limit) break;
+    // Drain the frame, stripping the internal `_w` cache from the OUTBOUND copy so it never
+    // reaches the agent — the returned shape stays exactly {dir, opcode, ts, ...}. `_w` is
+    // destructured off only to omit it; the rest (`outbound`) is what ships.
+    const { _w, ...outbound } = rec.frames.shift();
+    frames.push(outbound);
+    rec.bytes -= weight;
+    used += weight;
+  }
+  const dropped = rec.dropped;
+  rec.dropped = 0;
+  return ok({ frames, dropped, url: rec.url, remaining: rec.frames.length });
+}
+
+// stop_ws_capture {tabId} -> {ok}. Pure idempotent teardown: best-effort `Network.disable` +
+// detach (both in try — a tab mid-teardown must not stop the cleanup), then drop the tab from
+// BOTH the capture map and the attached set. A tab with no capture is an idempotent success —
+// there is nothing to gate here (no checkbox, no scheme guard): teardown must always be able
+// to run, including after the checkbox was turned off mid-capture.
+async function stopWsCapture(params) {
+  const tabId = params.tabId;
+  if (!wsCaptureTabs.has(tabId)) {
+    return ok({ ok: true });
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Network.disable", {});
+  } catch {
+    // fall through to detach — the detach is what actually releases the debugger
+  }
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch {
+    // Already gone (tab closed, DevTools took it): the onDetach listener may have cleared it,
+    // or will. Either way we drop our records below.
+  }
+  wsCaptureTabs.delete(tabId);
+  debuggerAttachedTabs.delete(tabId);
+  return ok({ ok: true });
 }
