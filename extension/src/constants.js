@@ -163,6 +163,23 @@ export const CMD_MOVE_TAB = "move_tab";
 // revoke checks, and the http/https edge guard on the target tab.
 export const CMD_GET_TEXT = "get_text";
 export const CMD_WAIT_FOR = "wait_for";
+// Scroll a tab until the element count for a selector stops growing (or a target /
+// deadline is hit). FIXED-function like get_text/wait_for: its parameters are selectors
+// and a direction — DATA fed to querySelector/scrollTop, never source spliced into a
+// page eval — so it carries NO execute_js checkbox and writes NO js_audit row. The
+// scheduler is the SERVICE WORKER's loop (a fresh chrome.scripting inject per step, like
+// wait_for/pollUntil): pacing survives a page throttling its own timers.
+export const CMD_SCROLL_UNTIL = "scroll_until";
+// The Job-API pair (fire arbitrary code into a page global, then poll it):
+//   - start_js carries ARBITRARY caller code, so it is behind the execute_js checkbox +
+//     the kill-switch + a js_audit row, EXACTLY like execute_js (§12). It wraps the code
+//     in an async IIFE that stashes {state,value|message} under window.__curatorJobs[jobId]
+//     and returns {jobId} WITHOUT awaiting the promise.
+//   - poll_job is a FIXED read of that global (readJobInWorld takes only the jobId as
+//     DATA), so — like get_text — no checkbox, no audit row. Job state lives IN THE PAGE
+//     and dies with the tab (reload/discard/close): ergonomics, not durability.
+export const CMD_START_JS = "start_js";
+export const CMD_POLL_JOB = "poll_job";
 
 // How often `wait_for` (and navigate_tab's waitUntil) re-tests its condition. 250 ms is
 // the usual "fast enough to feel instant, cheap enough to run for 30 s" compromise: at

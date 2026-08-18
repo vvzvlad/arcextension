@@ -164,18 +164,22 @@ async def send_command(
         "params": params,
     }
 
-    # execute_js MUST NOT run without a durable audit sink (§12): with no db to
-    # write the js_audit row, refuse fail-closed rather than send arbitrary code
-    # un-audited. The "JS ran without an audit row" code path must not exist.
-    if command == protocol.CMD_EXECUTE_JS and db is None:
+    # execute_js / start_js MUST NOT run without a durable audit sink (§12): both carry
+    # ARBITRARY caller code, so with no db to write the js_audit row, refuse fail-closed
+    # rather than send it un-audited. The "JS ran without an audit row" code path must not
+    # exist for EITHER verb (start_js is fire-and-forget, which makes the trace matter more,
+    # not less — the code keeps running in the page after the frame is answered).
+    if command in (protocol.CMD_EXECUTE_JS, protocol.CMD_START_JS) and db is None:
         raise CommandError(
-            protocol.ERR_INTERNAL, "execute_js requires an audit sink (db is None)"
+            protocol.ERR_INTERNAL, f"{command} requires an audit sink (db is None)"
         )
 
-    # execute_js: audit BEFORE sending, so a disabled/rejected/timed-out call is
-    # still the only durable trace of arbitrary code execution (§12).
+    # execute_js / start_js: audit BEFORE sending, so a disabled/rejected/timed-out call is
+    # still the only durable trace of arbitrary code execution (§12). ONLY these two arbitrary-
+    # code verbs are audited — the FIXED-function verbs (get_text, wait_for, scroll_until,
+    # poll_job) carry committed functions and no reconstructable code, so they write no row.
     audit_id: int | None = None
-    if command == protocol.CMD_EXECUTE_JS and db is not None:
+    if command in (protocol.CMD_EXECUTE_JS, protocol.CMD_START_JS) and db is not None:
         # url_at_exec is NOT a §6 command param — the caller (a later MCP/pass phase)
         # passes `urlAtExec` in params when it knows the tab's URL, else it stays
         # NULL. The audit still records who/what/where via the other fields.

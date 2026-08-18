@@ -658,6 +658,175 @@ async def test_execute_js_refused_by_kill_switch_still_audited_and_not_sent(tmp_
     assert outcome == ("disabled", "mcp")
 
 
+# --- scroll_until: FIXED verb, wait-budget socket, snake_case shape ----------
+async def test_scroll_until_sends_command_and_renames_shape(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.scroll_until(
+            app, instance="main", tab_id=3, count_selector=".msg",
+            container_selector="#feed", direction="up", target_count=200,
+            stable_rounds=4, interval_ms=500, focus=True, auth_ctx="s",
+        ),
+        cs, ws, {"count": 200, "rounds": 12, "stopped": "target", "elapsedMs": 6000},
+    )
+    assert frame["command"] == protocol.CMD_SCROLL_UNTIL
+    p = frame["params"]
+    assert p["countSelector"] == ".msg" and p["containerSelector"] == "#feed"
+    assert p["direction"] == "up" and p["targetCount"] == 200
+    assert p["stableRounds"] == 4 and p["intervalMs"] == 500 and p["focus"] is True
+    assert isinstance(p["timeoutMs"], int) and p["timeoutMs"] > 0
+    # elapsedMs -> elapsed_ms; the rest carried through.
+    assert out == {"ok": True, "count": 200, "rounds": 12, "stopped": "target",
+                   "elapsed_ms": 6000}
+    # A fixed verb writes NO audit row.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_scroll_until_omits_optional_keys_and_defaults_direction(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.scroll_until(app, instance="main", tab_id=3, count_selector=".msg"),
+        cs, ws, {"count": 10, "rounds": 3, "stopped": "stable", "elapsedMs": 2100},
+    )
+    p = frame["params"]
+    assert "containerSelector" not in p and "targetCount" not in p and "focus" not in p
+    assert p["direction"] == "down" and p["stableRounds"] == 3 and p["intervalMs"] == 700
+    assert out["stopped"] == "stable" and out["count"] == 10
+
+
+async def test_scroll_until_rejects_bad_direction_and_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.scroll_until(app, instance="main", tab_id=3, count_selector=".m",
+                                 direction="sideways")
+    assert ei.value.code == "invalid_args"
+    assert ws.sent == []
+
+
+async def test_scroll_until_refused_while_paused_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.scroll_until(app, instance="main", tab_id=3, count_selector=".m")
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
+# --- Job-API: start_js (audited) + poll_job (fixed) --------------------------
+async def test_start_js_mints_job_id_audits_and_returns_it(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.start_js(app, instance="main", tab_id=2, code="await scrape()",
+                               world="MAIN", url_at_exec="https://a", auth_ctx="mcp-sess-j"),
+        cs, ws, {"jobId": None},  # the extension echoes back; None => server's minted id wins
+    )
+    assert frame["command"] == protocol.CMD_START_JS
+    minted = frame["params"]["jobId"]
+    assert minted.startswith("job-")
+    assert frame["params"]["code"] == "await scrape()" and frame["params"]["world"] == "MAIN"
+    # start_js ALWAYS runs the code as an awaited async body, so the frame (and the js_audit
+    # row it drives) unconditionally carries awaitPromise=true — there is no MCP-surface
+    # parameter to toggle it, and the audit cannot misstate how the code ran.
+    assert frame["params"]["awaitPromise"] is True
+    assert out == {"ok": True, "job_id": minted}
+    # Audited like execute_js: initiator='mcp', the MCP session as auth_ctx, outcome ok.
+    row = await db.read(lambda c: c.execute(
+        "SELECT initiator, auth_ctx, code, outcome, url_at_exec FROM js_audit").fetchone())
+    assert row == ("mcp", "mcp-sess-j", "await scrape()", "ok", "https://a")
+
+
+async def test_start_js_refused_while_paused_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.start_js(app, instance="main", tab_id=2, code="x", auth_ctx="s")
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+    # Refused BEFORE the audit-writing send, so no row either.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_poll_job_returns_state_and_caps_value(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    # done + a value under the cap: passed straight through.
+    out, frame = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-1"),
+        cs, ws, {"state": "done", "value": {"n": 3}},
+    )
+    assert frame["command"] == protocol.CMD_POLL_JOB
+    assert frame["params"] == {"tabId": 2, "jobId": "job-1"}
+    assert out == {"ok": True, "state": "done", "value": {"n": 3}}
+    # A fixed verb writes NO audit row.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+    # A value over max_bytes is cut and flagged with the true size.
+    big = "x" * 5000
+    out2, _ = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-1", max_bytes=100),
+        cs, ws, {"state": "done", "value": big},
+    )
+    assert out2["state"] == "done" and out2["truncated"] is True
+    assert out2["total_bytes"] == 5000 and len(out2["value"]) == 100
+
+
+async def test_poll_job_unknown_and_error_states(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    # unknown: the page-resident state is gone (reload/discard/close, or a wrong id).
+    out, _ = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="gone"),
+        cs, ws, {"state": "unknown"},
+    )
+    assert out == {"ok": True, "state": "unknown"}  # no value, no message
+    # error carries the message, not a value.
+    out2, _ = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-2"),
+        cs, ws, {"state": "error", "message": "boom"},
+    )
+    assert out2 == {"ok": True, "state": "error", "message": "boom"}
+
+
+async def test_poll_job_world_rides_the_frame(tmp_path):
+    # A job started in ISOLATED lives in that world's global, so poll_job must be able to say
+    # which world to read: `world` (when given) goes on the frame verbatim so the extension's
+    # readJobInWorld inject lands where start_js wrote the record. MAIN default matches
+    # start_js's default, so an unqualified pair puts no `world` on the wire.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-9", world="ISOLATED"),
+        cs, ws, {"state": "running"},
+    )
+    assert frame["command"] == protocol.CMD_POLL_JOB
+    assert frame["params"] == {"tabId": 2, "jobId": "job-9", "world": "ISOLATED"}
+    assert out == {"ok": True, "state": "running"}
+
+
 # --- relocate_tab (#48): synchronous open + close in one call ----------------
 def _reloc_responder(open_id=99):
     """A default extension responder for a synchronous relocate: open the copy with

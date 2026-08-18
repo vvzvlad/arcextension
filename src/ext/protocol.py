@@ -64,6 +64,24 @@ CMD_MOVE_TAB = "move_tab"
 # own http/https edge guard on the target tab.
 CMD_GET_TEXT = "get_text"
 CMD_WAIT_FOR = "wait_for"
+# Scroll a tab until the element count for a selector stops growing (or a target / deadline
+# is hit). FIXED-function like ``get_text`` / ``wait_for``: its parameters are selectors and
+# a direction — DATA fed to ``querySelector`` / ``scrollTop``, never source spliced into a
+# page eval — so it is NOT behind the execute_js checkbox and writes NO ``js_audit`` row.
+# The scheduling loop lives in the extension's service worker (a fresh ``chrome.scripting``
+# inject per step), so its pacing survives a page throttling its own timers.
+CMD_SCROLL_UNTIL = "scroll_until"
+# The Job-API pair, formalising "fire arbitrary code into a page global, then poll it":
+#   * ``start_js`` carries ARBITRARY caller code, so it is behind the execute_js checkbox +
+#     the runtime kill-switch + a ``js_audit`` row, EXACTLY like ``execute_js`` (§12 —
+#     :func:`src.ext.commands.send_command` audits both before the send). It wraps the code
+#     in an async IIFE that stashes ``{state, value|message}`` under
+#     ``window.__curatorJobs[jobId]`` and returns ``{jobId}`` WITHOUT awaiting the promise.
+#   * ``poll_job`` is a FIXED read of that global (the injected body takes only the jobId as
+#     DATA), so — like ``get_text`` — no checkbox and no audit row. Job state lives IN THE
+#     PAGE and dies with the tab (reload/discard/close): ergonomics, not durability.
+CMD_START_JS = "start_js"
+CMD_POLL_JOB = "poll_job"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side
