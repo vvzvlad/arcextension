@@ -28,6 +28,17 @@ from src.db.audit import insert_js_audit, update_js_audit_outcome
 from src.db.queries import instance_status
 from src.ext import protocol
 
+# The ALLOWLIST of verbs that MUST write a ``js_audit`` row before the send (§12): the two
+# arbitrary-code verbs plus the data-bearing WebSocket-capture opener. See the GUARDRAIL comment
+# in :func:`send_command` for the rule a future data-bearing CDP verb has to follow. Named once,
+# used at both the db-None fail-closed check and the audit-before-send branch, so the two can
+# never drift apart.
+_AUDITED_COMMANDS = (
+    protocol.CMD_EXECUTE_JS,
+    protocol.CMD_START_JS,
+    protocol.CMD_START_WS_CAPTURE,
+)
+
 
 async def _safe_update_outcome(db, audit_id: int, outcome: str, detail: str | None) -> None:
     """Best-effort js_audit outcome update.
@@ -121,8 +132,9 @@ async def send_command(
     back as ``None`` and is thus fail-open: it cannot be stale-protected until it has a
     real session. Inherent, not a bug.)
 
-    For ``execute_js`` a ``js_audit`` row is written BEFORE the send (so rejected
-    and timed-out executions are also recorded, §12) and its ``outcome`` is updated
+    For an audited verb (``_AUDITED_COMMANDS`` — the arbitrary-code pair plus the
+    data-bearing ``start_ws_capture``) a ``js_audit`` row is written BEFORE the send (so
+    rejected and timed-out calls are also recorded, §12) and its ``outcome`` is updated
     once known.
     """
     conn_state = registry.get(instance_id)
@@ -162,32 +174,40 @@ async def send_command(
         "params": params,
     }
 
-    # GUARDRAIL — the ``(CMD_EXECUTE_JS, CMD_START_JS)`` tuple below (and its twin at the
-    # audit-before-send check) is the ALLOWLIST of verbs that carry arbitrary or
-    # data-exfiltrating code and therefore MUST write a ``js_audit`` row before the send.
-    # Fixed-function / benign verbs (set_focus_emulation, get_text, wait_for, …) are outside it
-    # ON PURPOSE — they reconstruct no code and move no page data. BUT any FUTURE data-bearing
-    # CDP verb built on this same ``send_command`` path — a screenshot verb, network/WebSocket
-    # capture, DOM/page dumps — MUST be added here (or given its own data-bearing flag): a verb
-    # that ships page data out while staying off this allowlist would silently bypass the
-    # js_audit trail.
+    # GUARDRAIL — the ``_AUDITED_COMMANDS`` tuple below (used at BOTH the db-None fail-closed
+    # check and the audit-before-send check) is the ALLOWLIST of verbs that carry arbitrary code
+    # OR ship page data out, and therefore MUST write a ``js_audit`` row before the send. There
+    # are THREE now: ``execute_js`` / ``start_js`` (arbitrary caller code) and ``start_ws_capture``
+    # (data-bearing — it opens a durable read channel onto a tab's WebSocket traffic, i.e. a
+    # messenger's conversation). ``start_ws_capture`` has no caller code of its own, so its audit
+    # row carries a synthetic ``code`` marker (``[ws_capture:start]``) that the MCP layer supplies
+    # — what the row fixes is WHO opened the channel, WHEN and on WHICH tab.
     #
-    # execute_js / start_js MUST NOT run without a durable audit sink (§12): both carry
-    # ARBITRARY caller code, so with no db to write the js_audit row, refuse fail-closed
-    # rather than send it un-audited. The "JS ran without an audit row" code path must not
-    # exist for EITHER verb (start_js is fire-and-forget, which makes the trace matter more,
-    # not less — the code keeps running in the page after the frame is answered).
-    if command in (protocol.CMD_EXECUTE_JS, protocol.CMD_START_JS) and db is None:
+    # Fixed-function / benign verbs (set_focus_emulation, get_text, wait_for, read_ws_frames,
+    # stop_ws_capture, …) are outside it ON PURPOSE — they reconstruct no code and open no new
+    # data channel (read_ws_frames only drains a buffer start_ws_capture already authorised;
+    # stop tears it down). BUT any FUTURE data-bearing CDP verb built on this same
+    # ``send_command`` path — a screenshot verb, further network capture, DOM/page dumps — MUST
+    # be added here (or given its own data-bearing flag): a verb that ships page data out while
+    # staying off this allowlist would silently bypass the js_audit trail.
+    #
+    # An audited verb MUST NOT run without a durable audit sink (§12): with no db to write the
+    # js_audit row, refuse fail-closed rather than send it un-audited. The "ran without an audit
+    # row" code path must not exist for ANY of them (start_js is fire-and-forget and
+    # start_ws_capture opens a channel that keeps reading — which makes the trace matter more,
+    # not less).
+    if command in _AUDITED_COMMANDS and db is None:
         raise CommandError(
             protocol.ERR_INTERNAL, f"{command} requires an audit sink (db is None)"
         )
 
-    # execute_js / start_js: audit BEFORE sending, so a disabled/rejected/timed-out call is
-    # still the only durable trace of arbitrary code execution (§12). ONLY these two arbitrary-
-    # code verbs are audited — the FIXED-function verbs (get_text, wait_for, scroll_until,
-    # poll_job) carry committed functions and no reconstructable code, so they write no row.
+    # Audit BEFORE sending, so a disabled/rejected/timed-out call is still the only durable trace
+    # of arbitrary-code execution or a data channel being opened (§12). ONLY the allowlisted verbs
+    # are audited — the FIXED-function verbs (get_text, wait_for, scroll_until, poll_job,
+    # read_ws_frames, stop_ws_capture) carry committed functions / no new authorisation and write
+    # no row.
     audit_id: int | None = None
-    if command in (protocol.CMD_EXECUTE_JS, protocol.CMD_START_JS) and db is not None:
+    if command in _AUDITED_COMMANDS and db is not None:
         # url_at_exec is NOT a §6 command param — the caller (a later MCP/pass phase)
         # passes `urlAtExec` in params when it knows the tab's URL, else it stays
         # NULL. The audit still records who/what/where via the other fields.

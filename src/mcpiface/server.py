@@ -268,6 +268,31 @@ def build_mcp(app_ref) -> MCPServer:
         ))
 
     @mcp.tool()
+    async def wake_tab(instance: str, tab_id: int,
+                       expected_session: str | None = None) -> dict:
+        """Wake a DISCARDED tab and wait for it to load (§6, issue #68).
+
+        The browser unloads idle tabs from memory to save RAM. Such a tab still shows up in
+        ``list_tabs`` with its url, but injecting/attaching verbs (``get_text``, ``execute_js``,
+        ``wait_for`` with a selector, ``set_focus_emulation``, …) refuse it with ``tab_discarded``
+        rather than the opaque "Extension manifest must request permission…" the browser raises.
+        ``wake_tab`` reloads the tab (a reload re-materialises a discarded one) and waits for it to
+        finish loading, so you can inject the moment it returns; then retry the verb that hit
+        ``tab_discarded``. ``navigate_tab`` to the tab's own url wakes it too — use that when you
+        already want to move it.
+
+        ``was_discarded`` reports whether the reload was a real wake (the tab was discarded) or a
+        reload of an already-live tab — note ``wake_tab`` ALWAYS reloads, so on a live tab it is a
+        full reload that loses page state, not a no-op; call it in answer to ``tab_discarded``.
+        This is a MUTATION (it reloads), so it is refused while
+        the curator is stopped — but the reload is a FIXED action, so it is neither behind the
+        JS & Debugger checkbox nor audited (like ``navigate_tab``)."""
+        return await _guarded(tools.wake_tab(
+            _host(), instance=instance, tab_id=tab_id, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
+        ))
+
+    @mcp.tool()
     async def close_tab(instance: str, tab_id: int | None = None,
                         tab_ids: list[int] | None = None,
                         expected_session: str | None = None) -> dict:
@@ -385,6 +410,35 @@ def build_mcp(app_ref) -> MCPServer:
             _host(), instance=instance, tab_id=tab_id, selector=selector,
             max_bytes=max_bytes, auth_ctx=current_mcp_session(),
             expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def set_input(instance: str, tab_id: int, selector: str, value: str,
+                        expected_session: str | None = None) -> dict:
+        """Set a controlled (React/Vue) field's value in ONE call; answers ``{ok, kind}``.
+
+        A FIXED injected function, so — unlike execute_js — it needs NO execute_js checkbox
+        and writes no js_audit row (``selector`` and ``value`` are DATA, not source). But it
+        is a WRITE — the value lands in the field as if the user typed it — so it IS gated by
+        the pause/stop switch, like the other mutating verbs; the http/https target guard
+        applies too.
+
+        The extension writes through the element's NATIVE prototype value setter and fires a
+        bubbling ``input`` (plus ``change``), which is what makes a controlled React/Vue input
+        actually see the value — a plain ``el.value = …`` is reverted by React's value-tracker.
+        ``kind`` is ``"input"`` for an ``<input>`` / ``<textarea>`` and ``"contenteditable"``
+        for a contenteditable element. HONEST LIMIT: set_input drives TEXT-LIKE fields — text-type
+        ``<input>`` (text, email, password, search, url, number, date, hidden, …), ``<textarea>``,
+        and ordinary contenteditable / textbox composers. It does NOT drive ``checkbox`` / ``radio``
+        (their state is ``checked``, not ``value``), ``file`` (the native setter throws), or the
+        button subtypes (submit / reset / button / image) — those are ``precondition_failed`` — and
+        it does not drive rich editors (Slate / ProseMirror / Draft), which keep their model
+        separate from the DOM and may discard a contenteditable write. A ``selector`` matching
+        nothing, not parsing, matching a non-editable element, or matching an unsupported
+        ``<input>`` subtype is ``precondition_failed``."""
+        return await _guarded(tools.set_input(
+            _host(), instance=instance, tab_id=tab_id, selector=selector, value=value,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 
     @mcp.tool()
@@ -520,9 +574,74 @@ def build_mcp(app_ref) -> MCPServer:
         exactly like execute_js — but it runs no arbitrary code and writes no js_audit row
         (it only fakes focus). A tab with DevTools open, or already held by another debugger
         client, cannot be attached and answers ``debugger_attach`` (one debugger client per
-        tab). Refused while paused."""
+        tab). MUTUALLY EXCLUSIVE with ws capture in BOTH directions: ``enabled=true`` on a tab
+        under an active start_ws_capture answers ``debugger_attach``, and ``enabled=false`` never
+        detaches a live capture. Refused while paused."""
         return await _guarded(tools.set_focus_emulation(
             _host(), instance=instance, tab_id=tab_id, enabled=enabled,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    # --- WebSocket-frame capture (§12, wave 21) ------------------------------
+    @mcp.tool()
+    async def start_ws_capture(instance: str, tab_id: int,
+                               expected_session: str | None = None) -> dict:
+        """Start capturing a tab's WebSocket frames via chrome.debugger; answers ``{ok}``.
+
+        The first DATA-BEARING verb down the CDP path: it opens a read channel onto the tab's WS
+        traffic (a messenger's live conversation) for ``read_ws_frames`` to drain. Gated by the
+        SINGLE JS & Debugger checkbox (``allow_execute_js`` in list_instances) EXACTLY like
+        execute_js, and — unlike set_focus_emulation — it writes a js_audit row before the send
+        (the durable trace of WHO opened the channel, WHEN and on which tab). Refused while paused.
+
+        MUTUALLY EXCLUSIVE with set_focus_emulation on the same tab — one debugger client per tab —
+        so a tab already under focus emulation or an active capture answers ``debugger_attach``. The
+        exclusion is SYMMETRIC: set_focus_emulation likewise refuses a tab this capture holds.
+        ANTI-BOT COST: ``Network.enable`` is detectable and the «идёт отладка» bar shows for the
+        WHOLE time the capture stays open, not just an instant — the exposure window is the entire
+        read session, so stop it when done."""
+        return await _guarded(tools.start_ws_capture(
+            _host(), instance=instance, tab_id=tab_id,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def read_ws_frames(instance: str, tab_id: int, max_bytes: int | None = None,
+                             expected_session: str | None = None) -> dict:
+        """Drain a tab's captured WS frames — ``{ok, frames, dropped, url, remaining}``.
+
+        A FIXED, DRAINING read of the buffer ``start_ws_capture`` already authorised: no second
+        js_audit row, but DATA-BEARING — the frames carry personal data (phones, sums, addresses)
+        into your context AND the session transcript, which outlives the task. Read only what you
+        need. NOT refused while paused — unlike start_ws_capture it never touches the browser; it is
+        a passive drain of the in-memory buffer (like list_exemptions), allowed under a stop so an
+        already-captured conversation is not lost to ring eviction while the capture is still open.
+
+        DRAINING: returned frames are REMOVED, so a repeat read yields only NEW frames (a stream).
+        Capped at ``max_bytes`` (default 40000) of summed text payload; frames past the budget stay
+        buffered as the tail — never dropped — and ``remaining`` counts them so you know to read
+        again. ``dropped`` is how many frames the ring evicted on overflow since the last read
+        (then reset). ``url`` is the socket URL (``None`` until the socket is seen). Each frame is
+        ``{dir, opcode, ts, text}`` for text (opcode 1) or ``{dir, opcode, ts, size, binary}`` for
+        binary/control frames (payload not captured). A tab with no active capture is
+        ``precondition_failed``."""
+        return await _guarded(tools.read_ws_frames(
+            _host(), instance=instance, tab_id=tab_id, max_bytes=max_bytes,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def stop_ws_capture(instance: str, tab_id: int,
+                              expected_session: str | None = None) -> dict:
+        """Stop a tab's WS capture — best-effort ``Network.disable`` + detach; answers ``{ok}``.
+
+        Pure IDEMPOTENT teardown: disables the Network domain, detaches the debugger, drops the
+        buffer. A tab with no active capture is an idempotent ``{ok: true}``. NOT gated by the
+        checkbox and NOT refused while paused — teardown must always be able to run so the «идёт
+        отладка» bar and the anti-bot exposure can always be ended. The buffer lives in the MV3
+        worker, so a worker death loses the capture on its own and a later stop is the no-op."""
+        return await _guarded(tools.stop_ws_capture(
+            _host(), instance=instance, tab_id=tab_id,
             auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 

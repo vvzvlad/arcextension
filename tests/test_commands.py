@@ -428,3 +428,76 @@ async def test_scroll_until_is_not_audited(tmp_path):
         assert rows == []
     finally:
         await db.close()
+
+
+# --- start_ws_capture: DATA-BEARING, so audited like execute_js (§12) --------
+# start_ws_capture opens a durable read channel onto a tab's WS traffic. It carries no caller
+# code, so the MCP layer supplies a synthetic `code` marker; the row still fixes who/when/where
+# the channel was opened. read_ws_frames / stop_ws_capture are NOT audited (drain / teardown).
+async def test_start_ws_capture_audit_written_before_send_then_outcome_ok(tmp_path):
+    db = await _make_db(tmp_path)
+    try:
+        reg, cs, ws = _registry_with()
+        task = asyncio.create_task(
+            send_command(
+                reg, db, "i1", protocol.CMD_START_WS_CAPTURE,
+                {"tabId": 12, "code": "[ws_capture:start]"},
+                cmd_timeout_ms=5000, initiator="mcp", auth_ctx="mcp:sess-ws",
+            )
+        )
+        # The row exists BEFORE we reply (outcome still NULL) — proof it was written before the
+        # send, so a rejected/timed-out channel-open is also recorded. The synthetic marker is
+        # what stands in for the code the verb does not carry.
+        assert await _until(lambda: ws.sent)
+        assert ws.sent[-1]["command"] == "start_ws_capture"
+        rows = await _read_audit(db)
+        assert len(rows) == 1
+        assert rows[0] == ("i1", 12, None, "[ws_capture:start]", "mcp", "mcp:sess-ws", None)
+
+        resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                              "result": {"ok": True}})
+        await task
+        rows = await _read_audit(db)
+        assert rows[0][6] == "ok"  # outcome updated after
+    finally:
+        await db.close()
+
+
+async def test_start_ws_capture_without_db_refuses_and_sends_no_frame():
+    # start_ws_capture is data-bearing, so — like execute_js / start_js — it MUST NOT be sent
+    # without a db to write the js_audit row (§12): fail-closed with `internal`, nothing reaches
+    # the socket. Opening a read channel un-audited is exactly the trace the guardrail forbids.
+    reg, cs, ws = _registry_with()
+    with pytest.raises(CommandError) as ei:
+        await send_command(
+            reg, None, "i1", protocol.CMD_START_WS_CAPTURE,
+            {"tabId": 3, "code": "[ws_capture:start]"}, cmd_timeout_ms=5000,
+        )
+    assert ei.value.code == "internal"
+    assert ws.sent == []
+    assert cs.pending_commands == {}
+
+
+async def test_read_and_stop_ws_capture_are_not_audited(tmp_path):
+    # read_ws_frames drains an already-authorised buffer and stop_ws_capture tears it down —
+    # neither carries code nor opens a new channel, so neither writes a js_audit row.
+    db = await _make_db(tmp_path)
+    try:
+        reg, cs, ws = _registry_with()
+        for cmd, params, result in (
+            (protocol.CMD_READ_WS_FRAMES, {"tabId": 5, "maxBytes": 40000},
+             {"frames": [], "dropped": 0, "url": None, "remaining": 0}),
+            (protocol.CMD_STOP_WS_CAPTURE, {"tabId": 5}, {"ok": True}),
+        ):
+            before = len(ws.sent)
+            task = asyncio.create_task(
+                send_command(reg, db, "i1", cmd, params, cmd_timeout_ms=5000)
+            )
+            assert await _until(lambda: len(ws.sent) > before)
+            resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                                  "result": result})
+            await task
+        rows = await _read_audit(db)
+        assert rows == []  # NO audit row for either fixed verb
+    finally:
+        await db.close()

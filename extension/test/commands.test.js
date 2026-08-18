@@ -4,11 +4,13 @@ import {
   dispatchCommand,
   evalInWorld,
   readTextInWorld,
+  setInputInWorld,
   matchInWorld,
   scrollAndCountInWorld,
   startJobInWorld,
   readJobInWorld,
   handleDebuggerDetach,
+  handleDebuggerEvent,
   __resetDebuggerState,
 } from "../src/commands.js";
 import * as activityMap from "../src/activity-map.js";
@@ -23,11 +25,16 @@ import {
   CMD_EXECUTE_JS,
   CMD_MOVE_TAB,
   CMD_GET_TEXT,
+  CMD_SET_INPUT,
   CMD_WAIT_FOR,
   CMD_SCROLL_UNTIL,
   CMD_START_JS,
   CMD_POLL_JOB,
   CMD_SET_FOCUS_EMULATION,
+  CMD_START_WS_CAPTURE,
+  CMD_READ_WS_FRAMES,
+  CMD_STOP_WS_CAPTURE,
+  CMD_WAKE_TAB,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
 } from "../src/constants.js";
@@ -79,6 +86,10 @@ describe("stale_session rejects every verb without executing", () => {
     // frame from a dead session names tab ids this extension no longer owns, so reading
     // one is reading a stranger's tab.
     [CMD_GET_TEXT, { tabId: 1 }],
+    // set_input is a MUTATION, but the session check still runs FIRST — a frame from a dead
+    // session names tab ids this extension no longer owns, so writing to one is writing a
+    // stranger's tab.
+    [CMD_SET_INPUT, { tabId: 1, selector: "#a", value: "x" }],
     [CMD_WAIT_FOR, { tabId: 1, urlMatches: "x", timeoutMs: 1000 }],
     [CMD_SCROLL_UNTIL, { tabId: 1, countSelector: ".x", timeoutMs: 1000 }],
     // start_js carries arbitrary code but the session check runs FIRST, before its checkbox.
@@ -1966,6 +1977,416 @@ describe("get_text", () => {
   });
 });
 
+// --- set_input: the FIXED-but-MUTATING write (§12) ---------------------------
+// A DOM environment for setInputInWorld. The injected body reads global constructors the
+// node test runtime does not provide — HTMLInputElement / HTMLTextAreaElement (for `instanceof`
+// and the NATIVE prototype `value` setter) and Event / InputEvent (for the dispatched events) —
+// so the harness installs doubles and restores them afterwards. The prototype `value` setters
+// are `vi.fn` spies so a test can PROVE the code wrote through the native setter (the thing that
+// bypasses React's value-tracker), not a plain `el.value = …`. `env.events` collects every
+// dispatched event in order.
+function withEditableEnv(fn) {
+  const saved = {
+    document: globalThis.document,
+    HTMLInputElement: globalThis.HTMLInputElement,
+    HTMLTextAreaElement: globalThis.HTMLTextAreaElement,
+    Event: globalThis.Event,
+    InputEvent: globalThis.InputEvent,
+  };
+  const events = [];
+  class FakeEvent {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.bubbles = !!init.bubbles;
+    }
+  }
+  class FakeInputEvent extends FakeEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.inputType = init.inputType;
+      this.data = init.data;
+    }
+  }
+  const inputSetter = vi.fn(function (v) {
+    this._value = v;
+  });
+  const textareaSetter = vi.fn(function (v) {
+    this._value = v;
+  });
+  class FakeInput {
+    constructor() {
+      this._value = "";
+    }
+    dispatchEvent(ev) {
+      events.push(ev);
+      return true;
+    }
+    focus() {
+      this._focused = true;
+    }
+  }
+  Object.defineProperty(FakeInput.prototype, "value", {
+    configurable: true,
+    get() {
+      return this._value;
+    },
+    set: inputSetter,
+  });
+  class FakeTextArea {
+    constructor() {
+      this._value = "";
+    }
+    dispatchEvent(ev) {
+      events.push(ev);
+      return true;
+    }
+    focus() {
+      this._focused = true;
+    }
+  }
+  Object.defineProperty(FakeTextArea.prototype, "value", {
+    configurable: true,
+    get() {
+      return this._value;
+    },
+    set: textareaSetter,
+  });
+  globalThis.HTMLInputElement = FakeInput;
+  globalThis.HTMLTextAreaElement = FakeTextArea;
+  globalThis.Event = FakeEvent;
+  globalThis.InputEvent = FakeInputEvent;
+
+  const env = {
+    events,
+    inputSetter,
+    textareaSetter,
+    input: () => new FakeInput(),
+    textarea: () => new FakeTextArea(),
+    // A contenteditable double: NOT a form field (so `instanceof` is false); the body reads
+    // isContentEditable, focus(), textContent and dispatchEvent.
+    editable: () => ({
+      isContentEditable: true,
+      _text: "",
+      get textContent() {
+        return this._text;
+      },
+      set textContent(v) {
+        this._text = v;
+      },
+      focus() {
+        this._focused = true;
+      },
+      dispatchEvent(ev) {
+        events.push(ev);
+        return true;
+      },
+    }),
+    // A plain <div>: neither a form field nor contenteditable.
+    plain: () => ({ isContentEditable: false }),
+    // Install a document whose querySelector maps selectors to elements; `bad` selectors are
+    // rejected with a real SyntaxError, the way a browser engine rejects a malformed one.
+    setDoc(matches = {}, bad = []) {
+      globalThis.document = {
+        querySelector: (sel) => {
+          if (bad.includes(sel)) {
+            const e = new Error(`'${sel}' is not a valid selector`);
+            e.name = "SyntaxError";
+            throw e;
+          }
+          return sel in matches ? matches[sel] : null;
+        },
+      };
+    },
+  };
+  try {
+    return fn(env);
+  } finally {
+    globalThis.document = saved.document;
+    globalThis.HTMLInputElement = saved.HTMLInputElement;
+    globalThis.HTMLTextAreaElement = saved.HTMLTextAreaElement;
+    globalThis.Event = saved.Event;
+    globalThis.InputEvent = saved.InputEvent;
+  }
+}
+
+describe("setInputInWorld — set_input's injected body", () => {
+  it("writes an <input> through the NATIVE prototype setter, then bubbles input+change", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      env.setDoc({ "#email": el });
+      const res = setInputInWorld("#email", "a@b.c");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      // The load-bearing fact: the value went through the prototype's OWN setter (bypassing
+      // React's value-tracker), not a direct assignment — and it stuck.
+      expect(env.inputSetter).toHaveBeenCalledWith("a@b.c");
+      expect(el.value).toBe("a@b.c");
+      // input BEFORE change, both bubbling — exactly what a real keystroke fires.
+      expect(env.events.map((e) => [e.type, e.bubbles])).toEqual([
+        ["input", true],
+        ["change", true],
+      ]);
+    });
+  });
+
+  it("reaches the PROTO setter past an instance `value` override (React's value-tracker)", () => {
+    // React's value-tracker installs its OWN `value` accessor ON THE ELEMENT INSTANCE, shadowing
+    // the prototype's. A plain `el.value = …` would hit THAT instance setter (which React then
+    // reverts on the next render) and never reach the native one — the exact bug set_input exists
+    // to avoid. Prove the body writes through the PROTOTYPE setter, not the instance override, by
+    // spying on an instance-level setter that must stay UNTOUCHED. (If the body were changed to a
+    // direct `el.value = String(value)`, trackerSetter would fire and inputSetter would not —
+    // this test would then fail, which is precisely the regression it guards.)
+    withEditableEnv((env) => {
+      const el = env.input();
+      const trackerSetter = vi.fn();
+      Object.defineProperty(el, "value", {
+        configurable: true,
+        get() {
+          return this._value;
+        },
+        set: trackerSetter,
+      });
+      env.setDoc({ "#email": el });
+      const res = setInputInWorld("#email", "a@b.c");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      // The native prototype setter ran…
+      expect(env.inputSetter).toHaveBeenCalledWith("a@b.c");
+      // …and the instance-level (tracker) setter did NOT — i.e. it was not a direct `el.value =`.
+      expect(trackerSetter).not.toHaveBeenCalled();
+    });
+  });
+
+  it("coerces a non-string value with String() before the native setter", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      env.setDoc({ "#n": el });
+      const res = setInputInWorld("#n", 42);
+      expect(res).toEqual({ ok: true, kind: "input" });
+      expect(env.inputSetter).toHaveBeenCalledWith("42");
+      expect(el.value).toBe("42");
+    });
+  });
+
+  it("uses the HTMLTextAreaElement prototype for a <textarea>", () => {
+    withEditableEnv((env) => {
+      const el = env.textarea();
+      env.setDoc({ "#bio": el });
+      const res = setInputInWorld("#bio", "line");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      // The textarea proto's setter ran; the input proto's did NOT — proof the branch picked
+      // the right prototype (a plain input setter would not fire a textarea's value tracker).
+      expect(env.textareaSetter).toHaveBeenCalledWith("line");
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(el.value).toBe("line");
+      expect(env.events.map((e) => e.type)).toEqual(["input", "change"]);
+    });
+  });
+
+  it("sets textContent and fires an InputEvent for a contenteditable element", () => {
+    withEditableEnv((env) => {
+      const el = env.editable();
+      env.setDoc({ "[contenteditable]": el });
+      const res = setInputInWorld("[contenteditable]", "hello");
+      expect(res).toEqual({ ok: true, kind: "contenteditable" });
+      expect(el._focused).toBe(true);
+      expect(el.textContent).toBe("hello");
+      expect(env.events.length).toBe(1);
+      const ev = env.events[0];
+      expect(ev.type).toBe("input");
+      expect(ev.bubbles).toBe(true);
+      // The InputEvent-specific fields distinguish it from a plain Event.
+      expect(ev.inputType).toBe("insertText");
+      expect(ev.data).toBe("hello");
+    });
+  });
+
+  it("a selector that matches NOTHING is found:false, never a write", () => {
+    withEditableEnv((env) => {
+      env.setDoc({});
+      expect(setInputInWorld("#nope", "x")).toEqual({ found: false });
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("a MALFORMED selector is reported as a value, never a throw", () => {
+    // A throw is indistinguishable from a torn-down frame; the typo has to travel as data so
+    // the dispatcher can map it to precondition_failed rather than `internal`.
+    withEditableEnv((env) => {
+      env.setDoc({}, ["#a:has(>"]);
+      const got = setInputInWorld("#a:has(>", "x");
+      expect(got.badSelector).toBe(true);
+      expect(got.message).toMatch(/not a valid selector/);
+    });
+  });
+
+  it("an element that is neither a form field nor contenteditable is notEditable", () => {
+    withEditableEnv((env) => {
+      env.setDoc({ "div": env.plain() });
+      expect(setInputInWorld("div", "x")).toEqual({ notEditable: true });
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("REFUSES a checkbox <input> (value is a no-op there) as unsupportedType, never a write", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      el.type = "checkbox";
+      env.setDoc({ "#agree": el });
+      expect(setInputInWorld("#agree", "x")).toEqual({ unsupportedType: true, inputType: "checkbox" });
+      // Not written and no events — the state of a checkbox lives in `checked`, not `value`.
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("REFUSES a file <input> (native setter would throw SecurityError) as unsupportedType", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      el.type = "file";
+      env.setDoc({ "#upload": el });
+      expect(setInputInWorld("#upload", "/etc/passwd")).toEqual({ unsupportedType: true, inputType: "file" });
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("a TEXT-like <input> subtype still writes through the native setter", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      el.type = "email"; // a text-like subtype — supported, unlike checkbox/file
+      env.setDoc({ "#email": el });
+      const res = setInputInWorld("#email", "a@b.c");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      expect(env.inputSetter).toHaveBeenCalledWith("a@b.c");
+    });
+  });
+});
+
+function chromeWithOneTab5(url = "https://x/") {
+  globalThis.chrome = createChromeMock({ tabs: [{ id: 5, windowId: 1, url }] });
+}
+
+describe("set_input", () => {
+  it("runs with the execute_js checkbox OFF — a fixed function is not eval (§12)", async () => {
+    // The verb writes to the page (a mutation, pause-gated on the service side), but its BODY
+    // is fixed and takes only DATA, so the extension edge needs no execute_js checkbox.
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { ok: true, kind: "input" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }), ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { kind: "input" } });
+  });
+
+  it("passes selector + value to the FIXED function, never a code string", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { ok: true, kind: "input" } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    await dispatchCommand(frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "hi" }), ctx());
+    const injection = exec.mock.calls[0][0];
+    expect(injection.args).toEqual(["#a", "hi"]);
+    expect(typeof injection.func).toBe("function");
+  });
+
+  it("carries the contenteditable kind through", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { ok: true, kind: "contenteditable" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "[contenteditable]", value: "x" }), ctx(),
+    );
+    expect(res.result).toEqual({ kind: "contenteditable" });
+  });
+
+  it("a MALFORMED selector is precondition_failed, not `internal`", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [
+      { result: { badSelector: true, message: "'#a:has(>' is not a valid selector" } },
+    ];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a:has(>", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#a:has(>");
+  });
+
+  it("a selector that matched nothing => precondition_failed", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { found: false } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#nope", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#nope");
+  });
+
+  it("a non-editable element => precondition_failed", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { notEditable: true } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "div", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toMatch(/input\/textarea\/contenteditable/);
+  });
+
+  it("an unsupported <input> subtype (checkbox) => precondition_failed naming the type", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { unsupportedType: true, inputType: "checkbox" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#agree", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("checkbox");
+  });
+
+  it("a <input type=file> => precondition_failed (unsupported), never a false ok", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { unsupportedType: true, inputType: "file" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#upload", value: "/etc/passwd" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("file");
+  });
+
+  it("an EMPTY injected result (torn-down/re-injected frame) => internal, not a false ok", async () => {
+    // A destroyed or re-injected frame answers with no `result` (or a body that threw) — got={}.
+    // Without the positive-flag check that would fall through to ok({kind:undefined}), a silent
+    // false success. It must be `internal` instead.
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: undefined }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("internal");
+  });
+
+  it("keeps execute_js's http/https target guard (§12)", async () => {
+    chromeWithOneTab5("file:///etc/passwd");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }), ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a vanished tab is no_such_tab, not internal", async () => {
+    chromeWithOneTab5();
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 999, selector: "#a", value: "x" }), ctx(),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
 // --- wait_for ----------------------------------------------------------------
 // A fake clock whose SLEEP is what advances time: the poll loop then runs to its deadline
 // instantly and deterministically, instead of spending real seconds.
@@ -3241,5 +3662,512 @@ describe("set_focus_emulation (chrome.debugger)", () => {
     await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
     // A fresh attach happened because the set no longer claimed the tab was ours.
     expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+});
+
+// --- WebSocket-frame capture (§12, wave 21) ----------------------------------
+describe("start_ws_capture / read_ws_frames / stop_ws_capture (chrome.debugger)", () => {
+  // Build a captured frame event as the CDP delivers it: params.response carries opcode +
+  // payloadData, params.timestamp the monotonic clock.
+  function frameEvent(method, tabId, opcode, payloadData, ts = 1.0) {
+    return [
+      { tabId },
+      method,
+      { requestId: "r1", timestamp: ts, response: { opcode, mask: false, payloadData } },
+    ];
+  }
+
+  async function startCapture(tabId = 5) {
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    return dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId }), ctx());
+  }
+
+  it("checkbox OFF (default) => js_disabled, and the debugger is NOT touched", async () => {
+    chromeWithOneTab();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_START_WS_CAPTURE, { tabId: 5 }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: false, error: { code: "js_disabled", message: expect.any(String) } });
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("start: attaches, enables the Network domain, and records the capture", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, "Network.enable", {});
+    expect(chrome.debugger._attached.has(5)).toBe(true);
+  });
+
+  it("a vanished tab is no_such_tab, and the debugger is not touched", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 999 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("a non-http tab is precondition_failed (the debugger never attaches privileged pages)", async () => {
+    chromeWithOneTab("file:///etc/passwd");
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("mutual exclusion: a tab already held by focus emulation refuses with debugger_attach", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // focus emulation attaches and KEEPS the tab — it is now in debuggerAttachedTabs.
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    // Refused UP FRONT — no second attach was even attempted (one client per tab).
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("mutual exclusion: a second start on a capturing tab refuses with debugger_attach", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("attach that throws (DevTools open / another client) => debugger_attach, untracked", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.debuggerAttachError = "Another debugger is already attached";
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("Network.enable failing on a FRESH attach rolls the attach back (detach + untrack, no record)", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.sendCommandError = "target crashed";
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("debugger_attach");
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+    // No capture record was left behind: a read now reports precondition_failed.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error.code).toBe("precondition_failed");
+  });
+
+  it("handleDebuggerEvent: a TEXT frame (opcode 1) is buffered with its text, recv and sent", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "hello", 1.5));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameSent", 5, 1, "world", 2.5));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames).toEqual([
+      { dir: "recv", opcode: 1, ts: 1.5, text: "hello" },
+      { dir: "sent", opcode: 1, ts: 2.5, text: "world" },
+    ]);
+    expect(res.result.dropped).toBe(0);
+    expect(res.result.remaining).toBe(0);
+  });
+
+  it("handleDebuggerEvent: a BINARY frame keeps only {opcode, size, binary}, never the payload", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 2, "AAAABBBB", 3.0));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames).toEqual([
+      { dir: "recv", opcode: 2, ts: 3.0, size: 8, binary: true },
+    ]);
+  });
+
+  it("handleDebuggerEvent: webSocketCreated stamps the socket url onto the record", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent({ tabId: 5 }, "Network.webSocketCreated", { requestId: "r", url: "wss://chat/s" });
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.url).toBe("wss://chat/s");
+  });
+
+  it("handleDebuggerEvent ignores a tab with no active capture", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // No start_ws_capture for tab 5 — the event must be dropped silently.
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "leak", 1.0));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+  });
+
+  it("ring buffer: the FRAME cap evicts oldest-first and grows dropped", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // Push 502 tiny text frames (cap is 500) — the two oldest are evicted, dropped === 2.
+    for (let i = 0; i < 502; i++) {
+      handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, `f${i}`, i));
+    }
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.length).toBe(500);
+    expect(res.result.dropped).toBe(2);
+    // The survivors are the NEWEST 500: the first kept frame is f2, the last is f501.
+    expect(res.result.frames[0].text).toBe("f2");
+    expect(res.result.frames[499].text).toBe("f501");
+  });
+
+  it("read drains: a second read after no new frames returns an empty batch", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "one", 1.0));
+    const first = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(first.result.frames.length).toBe(1);
+    const second = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(second.result.frames).toEqual([]);
+    expect(second.result.remaining).toBe(0);
+  });
+
+  it("read maxBytes: leaves the over-budget tail buffered and reports remaining", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // Three 10-byte text frames; a 15-byte budget fits exactly one, leaving two as the tail.
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "0123456789", 1));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "abcdefghij", 2));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "klmnopqrst", 3));
+    const first = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5, maxBytes: 15 }), ctx());
+    expect(first.result.frames.map((f) => f.text)).toEqual(["0123456789"]);
+    expect(first.result.remaining).toBe(2);
+    // Draining continues: the tail comes out on the next reads (never lost).
+    const second = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5, maxBytes: 15 }), ctx());
+    expect(second.result.frames.map((f) => f.text)).toEqual(["abcdefghij"]);
+    expect(second.result.remaining).toBe(1);
+  });
+
+  it("read maxBytes: a single frame larger than the budget still makes progress (at least one)", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "0123456789", 1));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5, maxBytes: 3 }), ctx());
+    expect(res.result.frames.map((f) => f.text)).toEqual(["0123456789"]);
+    expect(res.result.remaining).toBe(0);
+  });
+
+  it("read on a tab with no capture is precondition_failed", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+  });
+
+  it("stop: disables Network, detaches, and clears BOTH structures", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(frame(CMD_STOP_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, "Network.disable", {});
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+    // The capture record is gone: a read now fails precondition, and a fresh start re-attaches.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error.code).toBe("precondition_failed");
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const restart = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(restart).toEqual({ ok: true, result: { ok: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+
+  it("stop on a tab with no capture is an idempotent no-op success", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(frame(CMD_STOP_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(res).toEqual({ ok: true, result: { ok: true } });
+    expect(detach).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("onDetach cleanup drops the capture record too (the human closed the tab / opened DevTools)", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "before", 1.0));
+    // The debugger detaches for a reason outside the verb; the listener drops BOTH structures so
+    // the buffer does not hang forever with no verb left to detach it.
+    handleDebuggerDetach({ tabId: 5 });
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error.code).toBe("precondition_failed");
+    // A later start re-attaches cleanly (the set no longer claims the tab was ours).
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const restart = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(restart.ok).toBe(true);
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+
+  // --- collision with focus emulation: symmetric mutual exclusion (§12) -------
+  it("collision: set_focus_emulation(enabled=true) on a ws-capture tab is refused, capture untouched", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "hi", 1.0));
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    // Refused UP FRONT: the tab is held by an active ws capture, so focus emulation may not
+    // attach a second debugger client onto it (symmetric to start_ws_capture refusing a
+    // focus-emulation tab). No attach, no detach — the debugger is not touched.
+    expect(res.error.code).toBe("debugger_attach");
+    expect(attach).not.toHaveBeenCalled();
+    expect(detach).not.toHaveBeenCalled();
+    // The capture is intact: its buffer still drains the frame it had.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.result.frames).toEqual([{ dir: "recv", opcode: 1, ts: 1.0, text: "hi" }]);
+  });
+
+  it("collision: set_focus_emulation(enabled=false) on a ws-capture tab does NOT detach and does NOT kill the capture", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "keepme", 1.0));
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    // A capture tab is NOT in debuggerAttachedTabs (it lives only in wsCaptureTabs), so disabling
+    // focus emulation is a natural no-op for it — it must not detach the debugger the capture is
+    // riding on. (Before the fix, start added the tab to BOTH sets, so disable saw it as its own
+    // and detached it — silently killing the capture.)
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(detach).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(chrome.debugger._attached.has(5)).toBe(true); // the capture's debugger is still attached
+    // The capture is alive: read still returns the buffered frame, not precondition_failed.
+    const read = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(read.error).toBeUndefined();
+    expect(read.result.frames).toEqual([{ dir: "recv", opcode: 1, ts: 1.0, text: "keepme" }]);
+  });
+
+  // --- ring buffer: eviction by BYTE weight (WS_MAX_BUFFER_BYTES), not by count ------
+  it("ring buffer: the BYTE cap evicts oldest-first before the frame count is reached, and grows dropped", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // WS_MAX_BUFFER_BYTES ≈ 1e6. Four 300 kB ASCII text frames sum to 1.2 MB with only FOUR frames
+    // buffered — far under the 500-frame cap — so the eviction here is driven by WEIGHT, not count.
+    // Pushing the 4th tips the sum past 1 MB and the oldest (A) is evicted back to 900 kB; dropped
+    // is 1 and B/C/D survive. Each frame carries a distinct leading tag so the survivors are checked.
+    const big = (tag) => tag + "x".repeat(300000 - tag.length); // 300000 bytes of ASCII
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("A"), 1));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("B"), 2));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("C"), 3));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, big("D"), 4));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.length).toBe(3);
+    expect(res.result.dropped).toBe(1);
+    // The oldest (A) was evicted by weight; the survivors are B, C, D in order.
+    expect(res.result.frames.map((f) => f.text[0])).toEqual(["B", "C", "D"]);
+    expect(res.result.frames[0].text.length).toBe(300000);
+  });
+
+  it("ring buffer: a single frame heavier than the whole byte budget is still held (>=1 guarantee), dropped stays 0", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // One frame heavier than WS_MAX_BUFFER_BYTES (≈1e6). The byte cap only evicts while MORE THAN
+    // one frame is buffered, so the SOLE oversized frame is retained (never dropped) — read caps it
+    // at fetch time instead. dropped stays 0: nothing was evicted, consistent with the ≥1 guarantee.
+    const huge = "z".repeat(1200000); // > WS_MAX_BUFFER_BYTES (1e6)
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, huge, 1));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.length).toBe(1);
+    expect(res.result.frames[0].text.length).toBe(1200000);
+    expect(res.result.dropped).toBe(0);
+  });
+
+  it("ring buffer: once a NEWER frame joins an oversized one, the byte cap evicts the oversized (oldest-first)", async () => {
+    chromeWithOneTab();
+    await startCapture(5);
+    // The oversized frame is retained while alone (previous test), but the ≥1 guarantee protects
+    // it only until a newer frame arrives. With TWO frames buffered the byte cap kicks in and the
+    // oldest — the oversized one — is evicted, leaving just the small frame and dropped === 1. No
+    // intervening read here, so both frames are in the ring together when the cap runs.
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "z".repeat(1200000), 1));
+    handleDebuggerEvent(...frameEvent("Network.webSocketFrameReceived", 5, 1, "small", 2));
+    const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
+    expect(res.result.frames.map((f) => f.text)).toEqual(["small"]);
+    expect(res.result.dropped).toBe(1);
+  });
+});
+
+// --- tab_discarded guard (#68) ----------------------------------------------
+// A DISCARDED tab (the browser unloaded it from memory) still answers chrome.tabs.get, so it is
+// NOT no_such_tab, and its url is http/https, so it is NOT the "wrong scheme" precondition_failed
+// either — yet injecting into it fails with the opaque "Extension manifest must request
+// permission…". Every injecting/attaching verb must refuse it honestly with `tab_discarded`
+// BEFORE it injects, so the agent wakes the tab instead of chasing a manifest bug.
+describe("tab_discarded guard (#68)", () => {
+  // Verbs that inject/write with NO JS & Debugger checkbox (fixed reads/writes).
+  const fixedVerbs = [
+    ["get_text", CMD_GET_TEXT, { tabId: 5 }],
+    ["set_input", CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }],
+    ["scroll_until", CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m", timeoutMs: 1000 }],
+    ["poll_job", CMD_POLL_JOB, { tabId: 5, jobId: "job-1" }],
+    ["wait_for selector", CMD_WAIT_FOR, { tabId: 5, selector: ".ready", timeoutMs: 1000 }],
+    ["wait_for textContains", CMD_WAIT_FOR, { tabId: 5, textContains: "hi", timeoutMs: 1000 }],
+  ];
+
+  it.each(fixedVerbs)(
+    "%s on a discarded tab => tab_discarded, executeScript NOT called",
+    async (_name, cmd, params) => {
+      chromeWithOneTab("https://x/", { discarded: true });
+      const exec = vi.spyOn(chrome.scripting, "executeScript");
+      const res = await dispatchCommand(frame(cmd, params), ctx());
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("tab_discarded");
+      expect(res.error.message).toMatch(/discarded/);
+      expect(res.error.message).toMatch(/wake_tab/);
+      expect(exec).not.toHaveBeenCalled();
+    },
+  );
+
+  // Verbs behind the JS & Debugger checkbox: the discarded check fires AFTER the checkbox passes
+  // (so with it ON) and BEFORE the inject/attach — neither the script nor the debugger is touched.
+  const gatedVerbs = [
+    ["execute_js", CMD_EXECUTE_JS, { tabId: 5, code: "1" }],
+    ["start_js", CMD_START_JS, { tabId: 5, code: "1", jobId: "job-1" }],
+    ["set_focus_emulation", CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }],
+    ["start_ws_capture", CMD_START_WS_CAPTURE, { tabId: 5 }],
+  ];
+
+  it.each(gatedVerbs)(
+    "%s on a discarded tab => tab_discarded (checkbox ON), no inject and no attach",
+    async (_name, cmd, params) => {
+      chromeWithOneTab("https://x/", { discarded: true });
+      await chrome.storage.local.set({ allowExecuteJs: true });
+      const exec = vi.spyOn(chrome.scripting, "executeScript");
+      const attach = vi.spyOn(chrome.debugger, "attach");
+      const res = await dispatchCommand(frame(cmd, params), ctx());
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("tab_discarded");
+      expect(exec).not.toHaveBeenCalled();
+      expect(attach).not.toHaveBeenCalled();
+    },
+  );
+
+  it("wait_for urlMatches is NOT gated: a discarded tab still waits on its url", async () => {
+    // urlMatches reads ONLY chrome.tabs.get().url — which a discarded tab answers — so an agent
+    // can legitimately wait for a discarded tab to wake or navigate. It must NOT be tab_discarded.
+    chromeWithOneTab("https://shop/checkout", { discarded: true });
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/checkout", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { matched: true, elapsedMs: 0 } });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("ORDER: existence is checked first — a vanished tab is still no_such_tab", async () => {
+    chromeWithOneTab("https://x/", { discarded: true });
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 999 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("a LIVE (non-discarded) tab is NOT tab_discarded — the guard fires only on discarded", async () => {
+    chromeWithOneTab("https://x/");
+    chrome.__state.scriptResults = [{ result: { found: true, text: "ok", totalBytes: 2 } }];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5 }), ctx());
+    expect(res.ok).toBe(true);
+  });
+
+  it("set_focus_emulation(enabled=false) on a discarded tab is an idempotent success, NOT tab_discarded", async () => {
+    // The discarded guard belongs on the ATTACH (enable) path only. Disabling is a teardown that
+    // never injects or attaches, and a discarded tab's debugger has already auto-detached — so
+    // refusing it with tab_discarded would reject a state that is already reached.
+    chromeWithOneTab("https://x/", { discarded: true });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(attach).not.toHaveBeenCalled();
+    expect(detach).not.toHaveBeenCalled();
+  });
+});
+
+// --- wake_tab (#68): reload a discarded tab and wait for it to load ----------
+describe("wake_tab (#68)", () => {
+  it("reloads a discarded tab, waits for status:complete, returns was_discarded:true", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 5, windowId: 1, url: "https://x/", discarded: true, status: "unloaded" }],
+      reloadCompleteAfterGets: 2, // stays `loading` for two status-polls after the reload
+    });
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAKE_TAB, { tabId: 5, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { wasDiscarded: true } });
+    expect(reload).toHaveBeenCalledWith(5);
+    // It genuinely waited: the tab is loaded and no longer discarded.
+    expect(chrome.__state.tabs[0].status).toBe("complete");
+    expect(chrome.__state.tabs[0].discarded).toBe(false);
+  });
+
+  it("a LIVE tab still reloads (was_discarded:false) — a real reload, not a no-op", async () => {
+    chromeWithOneTab("https://x/"); // no discarded flag
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAKE_TAB, { tabId: 5, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { wasDiscarded: false } });
+    expect(reload).toHaveBeenCalledWith(5);
+  });
+
+  it("a vanished tab is no_such_tab, and reload is NOT called", async () => {
+    chromeWithOneTab("https://x/");
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const res = await dispatchCommand(frame(CMD_WAKE_TAB, { tabId: 999, timeoutMs: 5000 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("a tab that vanishes DURING the load wait ends as no_such_tab", async () => {
+    chromeWithOneTab("https://x/", { discarded: true });
+    chrome.__state.reloadCompleteAfterGets = 5; // never completes within our removal window
+    const c = fakeClock();
+    // The human closes the tab after the first pre-pause; the status poll then throws.
+    c.onSleep(() => {
+      chrome.__state.tabs.length = 0;
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAKE_TAB, { tabId: 5, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("a hand-crafted frame without a positive timeoutMs is precondition_failed, no reload", async () => {
+    chromeWithOneTab("https://x/", { discarded: true });
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const res = await dispatchCommand(frame(CMD_WAKE_TAB, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+    expect(reload).not.toHaveBeenCalled();
   });
 });

@@ -162,6 +162,16 @@ export const CMD_MOVE_TAB = "move_tab";
 // revoke checks, and the http/https edge guard on the target tab.
 export const CMD_GET_TEXT = "get_text";
 export const CMD_WAIT_FOR = "wait_for";
+// Set the value of a controlled (React/Vue) input in ONE call: the NATIVE prototype value
+// setter (which bypasses React's value-tracker — a plain `el.value = …` is reverted on the
+// next render) followed by bubbling `input`/`change`, plus `contenteditable` coverage.
+// FIXED-function like get_text/wait_for: `selector` and `value` are DATA — fed to
+// querySelector and to the value assignment, never source spliced into a page eval — so it
+// carries NO execute_js checkbox and writes NO js_audit row. But it is a MUTATION (it writes
+// into the page AS THE USER), so the SERVICE side gates it behind the pause/stop switch, exactly
+// like navigate_tab — as it gates every verb that reaches the browser, the read-only fixed ones
+// (get_text/wait_for) included; the mutation is what sets set_input apart from those, not the gate.
+export const CMD_SET_INPUT = "set_input";
 // Scroll a tab until the element count for a selector stops growing (or a target /
 // deadline is hit). FIXED-function like get_text/wait_for: its parameters are selectors
 // and a direction — DATA fed to querySelector/scrollTop, never source spliced into a
@@ -188,6 +198,28 @@ export const CMD_POLL_JOB = "poll_job";
 // js_audit row — focus emulation exfiltrates nothing, it only fakes focus; a later
 // data-bearing CDP verb (screenshot / network) needs its own audit.
 export const CMD_SET_FOCUS_EMULATION = "set_focus_emulation";
+// WebSocket-frame capture (§12, wave 21) — the FIRST data-bearing verb down the
+// chrome.debugger path. `start_ws_capture` attaches the debugger and turns on `Network.*`
+// event delivery so the extension buffers a tab's WS frames; `read_ws_frames` drains that
+// buffer to the agent; `stop_ws_capture` disables the domain and detaches. Because the
+// frames carry PAGE DATA out (a messenger's conversation — phones, sums, addresses), start
+// is gated by the SAME single JS & Debugger checkbox as execute_js AND writes a js_audit
+// row (unlike set_focus_emulation, which fakes focus and exfiltrates nothing). read is a
+// FIXED, draining read of the already-authorised buffer (no second audit) but is size-capped
+// for privacy; stop is pure idempotent teardown. One debugger client per tab — a tab held by
+// focus emulation OR an active capture refuses a second `start_ws_capture` (`debugger_attach`).
+export const CMD_START_WS_CAPTURE = "start_ws_capture";
+export const CMD_READ_WS_FRAMES = "read_ws_frames";
+export const CMD_STOP_WS_CAPTURE = "stop_ws_capture";
+// Wake a DISCARDED tab (issue #68): the browser unloaded it from memory to save RAM, so
+// every injecting/attaching verb answers the opaque "Cannot access contents of the page.
+// Extension manifest must request permission…" — a message that blames the manifest for a
+// tab that merely needs reloading. wake_tab reloads it (a reload re-materialises a discarded
+// tab) and waits for `status:complete`. A FIXED action, not arbitrary code — no execute_js
+// checkbox, no js_audit row (like navigate_tab). Answers {wasDiscarded} so the caller learns
+// whether it was a real wake or a plain reload of an already-live tab — wake_tab ALWAYS reloads,
+// so on a live tab it loses page state, it is not a no-op.
+export const CMD_WAKE_TAB = "wake_tab";
 
 // How often `wait_for` (and navigate_tab's waitUntil) re-tests its condition. 250 ms is
 // the usual "fast enough to feel instant, cheap enough to run for 30 s" compromise: at
@@ -234,6 +266,14 @@ export const WAIT_MAX_TIMEOUT_MS = 60000;
 export const ERR_STALE_SESSION = "stale_session";
 export const ERR_PRECONDITION_FAILED = "precondition_failed";
 export const ERR_NO_SUCH_TAB = "no_such_tab";
+// The target tab EXISTS but the browser has DISCARDED it — unloaded it from memory to save
+// RAM (issue #68). It still answers `chrome.tabs.get` (with `discarded:true` and its url), so
+// it is NOT `no_such_tab`, and its url is usually http/https, so it is NOT the `precondition_failed`
+// "wrong scheme" either. Yet every injecting/attaching verb fails on it with the opaque "Extension
+// manifest must request permission…" — a message that blames the manifest for a tab that only needs
+// waking. Its OWN code so the agent stops fixing the manifest and calls wake_tab (or navigate_tab to
+// its url) instead. Read BEFORE the injection from `chrome.tabs.get(tabId).discarded`.
+export const ERR_TAB_DISCARDED = "tab_discarded";
 export const ERR_NO_WINDOW = "no_window";
 export const ERR_JS_DISABLED = "js_disabled";
 export const ERR_BUSY_DRAGGING = "busy_dragging";

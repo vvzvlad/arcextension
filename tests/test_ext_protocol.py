@@ -211,14 +211,19 @@ def test_command_verbs_mirror_the_extension_exactly():
     js = {k: v for k, v in _js_wire_constants().items() if k.startswith("CMD_")}
     assert js == _py_wire_constants("CMD_")
     # The seven original verbs plus move_tab, focus_window, the FIXED-function observation
-    # verbs (get_text, wait_for, scroll_until, poll_job), the arbitrary-code start_js, and
-    # the first chrome.debugger verb set_focus_emulation — spelled out so a silent RENAME of
+    # verbs (get_text, wait_for, scroll_until, poll_job), the FIXED-but-MUTATING set_input
+    # (fixed body, yet pause-gated on the service side), the arbitrary-code start_js, the
+    # first chrome.debugger verb set_focus_emulation, and the WebSocket-capture trio
+    # (start_ws_capture / read_ws_frames / stop_ws_capture) — spelled out so a silent RENAME of
     # a live wire string (which would keep both sides equal, and break every deployed copy of
     # the other half) still reddens.
     assert set(js.values()) == {
         "open_tab", "close_tab", "get_tab", "focus_tab", "focus_window", "navigate_tab",
-        "merge_windows", "execute_js", "move_tab", "get_text", "wait_for",
+        "merge_windows", "execute_js", "move_tab", "get_text", "set_input", "wait_for",
         "scroll_until", "start_js", "poll_job", "set_focus_emulation",
+        "start_ws_capture", "read_ws_frames", "stop_ws_capture",
+        # wake_tab (issue #68): reload a discarded tab and wait for it to load.
+        "wake_tab",
     }
 
 
@@ -241,3 +246,7 @@ def test_command_error_codes_mirror_the_extension():
     # debugger client), and the extension produces it, so it lives on BOTH sides identically.
     assert protocol.ERR_DEBUGGER_ATTACH == "debugger_attach"
     assert js["ERR_DEBUGGER_ATTACH"] == protocol.ERR_DEBUGGER_ATTACH
+    # tab_discarded (#68) is a code the EXTENSION produces (an injecting verb hit a tab the
+    # browser unloaded), so it must live on BOTH sides identically — not a service-only code.
+    assert protocol.ERR_TAB_DISCARDED == "tab_discarded"
+    assert js["ERR_TAB_DISCARDED"] == protocol.ERR_TAB_DISCARDED

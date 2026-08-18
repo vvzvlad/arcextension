@@ -107,11 +107,18 @@ def test_mcp_tools_list_exposes_every_phase11_tool(tmp_path):
         # tool whose signature the MCP SDK cannot serialize would still pass there and be
         # invisible to every agent.
         "get_text", "wait_for", "navigate_tab",
+        # wake_tab (#68): un-discards a tab so the injecting verbs stop answering tab_discarded.
+        "wake_tab",
+        # The fixed-but-mutating write verb: a fixed body (no checkbox / audit) that is still
+        # pause-gated on the service side, like navigate_tab.
+        "set_input",
         "list_exemptions", "set_exemption", "clear_exemption",
         # The long-running agent verbs (wave 19): the scroll scheduler and the Job-API pair.
         "scroll_until", "start_js", "poll_job",
         # The chrome.debugger foundation (wave 18): the first CDP verb.
         "set_focus_emulation",
+        # The WebSocket-capture trio (wave 21): the first DATA-BEARING CDP verbs.
+        "start_ws_capture", "read_ws_frames", "stop_ws_capture",
     }
     with TestClient(app) as client:
         r = client.post("/mcp", json=_init_body(), headers=_headers())

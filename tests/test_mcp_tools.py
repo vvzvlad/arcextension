@@ -553,6 +553,135 @@ async def test_set_focus_emulation_sends_enabled_and_returns_it(tmp_path):
     assert out_off == {"ok": True, "enabled": False}
 
 
+# --- WebSocket-frame capture (§12, wave 21) ----------------------------------
+async def test_start_ws_capture_sends_marker_and_returns_ok(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, f = await _run_with_response(
+        lambda: tools.start_ws_capture(app, instance="main", tab_id=7),
+        cs, ws, {"ok": True},
+    )
+    assert f["command"] == protocol.CMD_START_WS_CAPTURE
+    # The synthetic audit marker rides into the frame (the verb carries no caller code).
+    assert f["params"] == {"tabId": 7, "code": "[ws_capture:start]"}
+    assert out == {"ok": True}
+
+
+async def test_read_ws_frames_drains_and_reflects_dropped_url_remaining(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    frames = [
+        {"dir": "recv", "opcode": 1, "ts": 1.0, "text": "hi"},
+        {"dir": "sent", "opcode": 2, "ts": 2.0, "size": 9, "binary": True},
+    ]
+    out, f = await _run_with_response(
+        lambda: tools.read_ws_frames(app, instance="main", tab_id=7, max_bytes=1000),
+        cs, ws,
+        {"frames": frames, "dropped": 3, "url": "wss://chat/socket", "remaining": 5},
+    )
+    assert f["command"] == protocol.CMD_READ_WS_FRAMES
+    # max_bytes rides down as camelCase maxBytes (default 40000 is validated to a positive int).
+    assert f["params"] == {"tabId": 7, "maxBytes": 1000}
+    assert out == {"ok": True, "frames": frames, "dropped": 3,
+                   "url": "wss://chat/socket", "remaining": 5}
+
+
+async def test_read_ws_frames_defaults_and_fills_absent_fields(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    # An extension answering only with what it has: the tool fills the missing keys with safe
+    # defaults (empty frames, zero dropped/remaining, url None), and default max_bytes rides down.
+    out, f = await _run_with_response(
+        lambda: tools.read_ws_frames(app, instance="main", tab_id=7),
+        cs, ws, {},
+    )
+    assert f["params"] == {"tabId": 7, "maxBytes": tools.DEFAULT_MAX_BYTES}
+    assert out == {"ok": True, "frames": [], "dropped": 0, "url": None, "remaining": 0}
+
+
+async def test_read_ws_frames_rejects_bad_max_bytes_and_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.read_ws_frames(app, instance="main", tab_id=7, max_bytes=0)
+    assert ei.value.code == "invalid_args"
+    assert ws.sent == []  # refused before the round trip
+
+
+async def test_stop_ws_capture_sends_command_and_returns_ok(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, f = await _run_with_response(
+        lambda: tools.stop_ws_capture(app, instance="main", tab_id=7),
+        cs, ws, {"ok": True},
+    )
+    assert f["command"] == protocol.CMD_STOP_WS_CAPTURE
+    assert f["params"] == {"tabId": 7}
+    assert out == {"ok": True}
+
+
+async def test_start_ws_capture_refused_while_paused_sends_nothing(tmp_path):
+    # start drives the browser (attach), so the stop gate refuses it and nothing reaches the
+    # socket — same discipline as set_focus_emulation / start_js.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await db.write(lambda c: pause_ops.stop(c, now=tools._now_ms()))
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.start_ws_capture(app, instance="main", tab_id=7)
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
+async def test_read_ws_frames_allowed_while_paused_still_drains(tmp_path):
+    # A passive drain of the in-memory buffer must stay available under a stop, so an ALREADY-
+    # captured conversation is not lost to ring eviction while the capture is still open. UNLIKE
+    # start_ws_capture (browser-driving) read is NOT behind the stop gate — it never reaches the
+    # browser. Without that, a paused curator would silently lose captured frames it could not drain.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await db.write(lambda c: pause_ops.stop(c, now=tools._now_ms()))
+    frames = [{"dir": "recv", "opcode": 1, "ts": 1.0, "text": "hi"}]
+    out, f = await _run_with_response(
+        lambda: tools.read_ws_frames(app, instance="main", tab_id=7, max_bytes=1000),
+        cs, ws,
+        {"frames": frames, "dropped": 0, "url": "wss://chat/socket", "remaining": 0},
+    )
+    # It reached the round trip (was NOT refused with "stopped") and drained the buffer.
+    assert f["command"] == protocol.CMD_READ_WS_FRAMES
+    assert out == {"ok": True, "frames": frames, "dropped": 0,
+                   "url": "wss://chat/socket", "remaining": 0}
+
+
+async def test_stop_ws_capture_runs_even_while_paused(tmp_path):
+    # Teardown must always be able to run: stop is NOT behind the stop gate, so a paused curator
+    # can still end the «идёт отладка» exposure. (start IS gated; read and stop are not.)
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await db.write(lambda c: pause_ops.stop(c, now=tools._now_ms()))
+    out, f = await _run_with_response(
+        lambda: tools.stop_ws_capture(app, instance="main", tab_id=7),
+        cs, ws, {"ok": True},
+    )
+    assert f["command"] == protocol.CMD_STOP_WS_CAPTURE
+    assert out == {"ok": True}
+
+
 # --- move_tab (§6/§9) --------------------------------------------------------
 async def test_move_tab_sends_the_command_and_omits_an_absent_index(tmp_path):
     # The verb that closes §11's gap: relocation BETWEEN instances is the §7 open+close
@@ -2369,6 +2498,54 @@ async def test_get_text_is_refused_while_stopped_and_sends_nothing(tmp_path):
     assert ws.sent == []
 
 
+# --- set_input: the FIXED-but-MUTATING write (§12) ---------------------------
+async def test_set_input_sends_selector_and_value_and_returns_kind(tmp_path):
+    """FIXED body like get_text (no js_audit row), but a WRITE. selector+value ride as DATA,
+    the extension answers `kind` (what it wrote), and the tool passes it straight through."""
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.set_input(_app(db, reg), instance="main", tab_id=2,
+                                selector="#email", value="a@b.c"),
+        cs, ws, {"kind": "input"},
+    )
+    assert out == {"ok": True, "kind": "input"}
+    assert frame["command"] == protocol.CMD_SET_INPUT
+    assert frame["params"] == {"tabId": 2, "selector": "#email", "value": "a@b.c"}
+    # No arbitrary code ran, so there is nothing to audit — the same §12 line as get_text.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_set_input_carries_the_contenteditable_kind_through(tmp_path):
+    # `kind` distinguishes what was written; the tool must not flatten it to a bare ok.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.set_input(_app(db, reg), instance="main", tab_id=2,
+                                selector="[contenteditable]", value="hi"),
+        cs, ws, {"kind": "contenteditable"},
+    )
+    assert out == {"ok": True, "kind": "contenteditable"}
+
+
+async def test_set_input_is_refused_while_paused_and_sends_nothing(tmp_path):
+    # A MUTATION: gated by the stop switch exactly like navigate_tab. The stop gates every
+    # browser-reaching verb, get_text included (see test_get_text_is_refused_while_stopped above);
+    # the mutation is what sets set_input apart, not the gate. The refusal must land BEFORE the
+    # frame reaches the socket.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.set_input(app, instance="main", tab_id=2, selector="#a", value="x")
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
 # --- wait_for ----------------------------------------------------------------
 async def test_wait_for_requires_exactly_one_predicate_and_sends_nothing(tmp_path):
     db = await _make_db(tmp_path)
@@ -2576,6 +2753,55 @@ async def test_navigate_tab_without_a_wait_keeps_its_pre_wave_answer(tmp_path):
         cs, ws, {"ok": True},
     )
     assert out == {"ok": True, "result": {"ok": True}}
+
+
+# --- wake_tab (#68): reload a discarded tab and wait for it to load ----------
+async def test_wake_tab_sends_command_and_renames_was_discarded(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    # A real wake: the extension answers `wasDiscarded:true` (camelCase wire), which the tool
+    # renames to snake_case `was_discarded` — the same rename wait_for/navigate_tab do.
+    out, frame = await _run_with_response(
+        lambda: tools.wake_tab(_app(db, reg), instance="main", tab_id=2),
+        cs, ws, {"wasDiscarded": True},
+    )
+    assert frame["command"] == protocol.CMD_WAKE_TAB
+    assert frame["params"]["tabId"] == 2
+    assert out == {"ok": True, "was_discarded": True}
+    # A no-op reload of an already-live tab reports `was_discarded:false`.
+    out2, _ = await _run_with_response(
+        lambda: tools.wake_tab(_app(db, reg), instance="main", tab_id=2),
+        cs, ws, {"wasDiscarded": False},
+    )
+    assert out2 == {"ok": True, "was_discarded": False}
+
+
+async def test_wake_tab_carries_the_wait_and_a_longer_socket_budget(tmp_path, monkeypatch):
+    # The extension polls `status:complete` inside a deadline; the tool hands it the
+    # EXECUTE_JS_MAX_TIMEOUT_MS ceiling and a socket budget that OUTLIVES it, the same ordering
+    # rule as wait_for / navigate_tab {waitUntil} — else the command times out on the wire first.
+    db = await _make_db(tmp_path)
+    app = _app(db, Registry(), _settings(cmd_timeout_ms=1000, execute_js_max_timeout_ms=30000))
+    seen = await _capture_budget(monkeypatch, lambda: tools.wake_tab(
+        app, instance="main", tab_id=2), {"wasDiscarded": True})
+    assert seen["command"] == protocol.CMD_WAKE_TAB
+    assert seen["params"] == {"tabId": 2, "timeoutMs": 30000}
+    assert seen["cmd_timeout_ms"] > 30000  # the socket outlives the poll deadline
+
+
+async def test_wake_tab_is_refused_while_stopped_and_sends_nothing(tmp_path):
+    # wake_tab reloads the tab — a MUTATION — so the stop switch refuses it, like navigate_tab,
+    # and no frame leaves the socket.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.wake_tab(app, instance="main", tab_id=2)
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
 
 
 # --- exemptions: the agent's «не трогать» lease (§10/§11) --------------------

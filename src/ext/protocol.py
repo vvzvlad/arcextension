@@ -64,6 +64,17 @@ CMD_MOVE_TAB = "move_tab"
 # own http/https edge guard on the target tab.
 CMD_GET_TEXT = "get_text"
 CMD_WAIT_FOR = "wait_for"
+# Set the value of a controlled (React/Vue) input in ONE call. The extension writes through
+# the element's NATIVE prototype value setter (a plain ``el.value = …`` is reverted by React's
+# value-tracker on the next render) and then dispatches bubbling ``input`` / ``change`` events,
+# with ``contenteditable`` coverage. FIXED-function like ``get_text`` / ``wait_for``: ``selector``
+# and ``value`` are DATA fed to ``querySelector`` and a value assignment, never source spliced
+# into a page eval — so it is NOT behind the execute_js checkbox and writes NO ``js_audit`` row.
+# It IS a MUTATION (it writes into the page as the user), so the service side gates it behind the
+# pause/stop switch, exactly like ``navigate_tab`` — as it gates every verb that reaches the
+# browser, the read-only fixed ones (``get_text`` / ``wait_for``) included; the mutation is what
+# sets set_input apart from those, not the gate.
+CMD_SET_INPUT = "set_input"
 # Scroll a tab until the element count for a selector stops growing (or a target / deadline
 # is hit). FIXED-function like ``get_text`` / ``wait_for``: its parameters are selectors and
 # a direction — DATA fed to ``querySelector`` / ``scrollTop``, never source spliced into a
@@ -90,6 +101,30 @@ CMD_POLL_JOB = "poll_job"
 # extension edge, but carries NO arbitrary code and writes NO ``js_audit`` row — it only
 # fakes focus, exfiltrating nothing; a later data-bearing CDP verb needs its own audit.
 CMD_SET_FOCUS_EMULATION = "set_focus_emulation"
+# WebSocket-frame capture (§12, wave 21) — the FIRST data-bearing verb down the
+# chrome.debugger path. ``start_ws_capture`` attaches the debugger and turns on ``Network.*``
+# event delivery so the extension buffers a tab's WS frames; ``read_ws_frames`` drains that
+# buffer to the agent; ``stop_ws_capture`` disables the domain and detaches. Because the frames
+# ship PAGE DATA out (a messenger's conversation — phones, sums, addresses), ``start_ws_capture``
+# is behind the SAME single JS & Debugger checkbox as ``execute_js`` AND writes a ``js_audit``
+# row before the send (:func:`src.ext.commands.send_command` — it is on the audit ALLOWLIST,
+# unlike ``set_focus_emulation`` which fakes focus and exfiltrates nothing). ``read_ws_frames`` is
+# a FIXED, draining read of the already-authorised buffer (no second audit) but is size-capped
+# for privacy; ``stop_ws_capture`` is pure idempotent teardown. One debugger client per tab, so a
+# tab held by focus emulation OR an active capture refuses a second start (``debugger_attach``).
+CMD_START_WS_CAPTURE = "start_ws_capture"
+CMD_READ_WS_FRAMES = "read_ws_frames"
+CMD_STOP_WS_CAPTURE = "stop_ws_capture"
+# Wake a DISCARDED tab (issue #68). The browser unloads an idle tab from memory to save RAM;
+# the tab still EXISTS (``chrome.tabs.get`` answers it, with ``discarded:true`` and its url) but
+# every injecting/attaching verb fails on it with the opaque "Extension manifest must request
+# permission…". ``wake_tab`` reloads it — a reload re-materialises a discarded tab — and waits for
+# ``status:complete``. A FIXED action, not arbitrary code (like ``navigate_tab``): no execute_js
+# checkbox, no ``js_audit`` row. It IS a mutation (it reloads), so the SERVICE side gates it behind
+# the pause/stop switch. Answers ``{wasDiscarded}`` so the caller learns whether it was a real wake
+# or a reload of an already-live tab — ``wake_tab`` ALWAYS reloads, so on a live tab it is a full
+# reload that loses page state, not a no-op.
+CMD_WAKE_TAB = "wake_tab"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side
@@ -97,6 +132,13 @@ CMD_SET_FOCUS_EMULATION = "set_focus_emulation"
 ERR_STALE_SESSION = "stale_session"
 ERR_PRECONDITION_FAILED = "precondition_failed"
 ERR_NO_SUCH_TAB = "no_such_tab"
+# The target tab EXISTS but the browser has DISCARDED it — unloaded it from memory to save RAM
+# (issue #68). It still answers ``chrome.tabs.get`` (``discarded:true`` + its url), so it is not
+# ``no_such_tab``; its url is usually http/https, so it is not the ``precondition_failed`` "wrong
+# scheme" either. But every injecting/attaching verb fails on it with the opaque "Extension manifest
+# must request permission…", which blames the manifest for a tab that only needs waking. Its OWN code
+# so the agent calls ``wake_tab`` (or ``navigate_tab`` to its url) instead of chasing a permission bug.
+ERR_TAB_DISCARDED = "tab_discarded"
 ERR_NO_WINDOW = "no_window"
 ERR_JS_DISABLED = "js_disabled"
 ERR_BUSY_DRAGGING = "busy_dragging"

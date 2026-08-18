@@ -34,14 +34,20 @@ import {
   CMD_EXECUTE_JS,
   CMD_MOVE_TAB,
   CMD_GET_TEXT,
+  CMD_SET_INPUT,
   CMD_WAIT_FOR,
   CMD_SCROLL_UNTIL,
   CMD_START_JS,
   CMD_POLL_JOB,
   CMD_SET_FOCUS_EMULATION,
+  CMD_START_WS_CAPTURE,
+  CMD_READ_WS_FRAMES,
+  CMD_STOP_WS_CAPTURE,
+  CMD_WAKE_TAB,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
+  ERR_TAB_DISCARDED,
   ERR_NO_WINDOW,
   ERR_JS_DISABLED,
   ERR_BUSY_DRAGGING,
@@ -75,6 +81,30 @@ export function isHttpUrl(url) {
     return false;
   }
   return u.protocol === "http:" || u.protocol === "https:";
+}
+
+// A DISCARDED tab is one the browser unloaded from memory to save RAM (issue #68). It still
+// EXISTS — `chrome.tabs.get` answers it with `discarded:true` and its url — so it is not
+// `no_such_tab`; and its url is usually http/https, so it is not the "wrong scheme"
+// `precondition_failed` either. But `chrome.scripting.executeScript` / `chrome.debugger.attach`
+// into it fails with the opaque "Cannot access contents of the page. Extension manifest must
+// request permission…", which blames the manifest for a tab that only needs reloading. So EVERY
+// verb that INJECTS into the page or ATTACHES the debugger reads `tab.discarded` right after its
+// `chrome.tabs.get` and refuses with `tab_discarded` — a code the agent can act on (wake_tab, or
+// navigate_tab to its url) — BEFORE the injection produces that misleading manifest error.
+//
+// Returns a `fail(...)` outcome when `tab` is discarded, else `null` (caller proceeds). Placed
+// AFTER the existence check (a thrown `tabs.get` is `no_such_tab`) and BEFORE `isHttpUrl`, so the
+// honest "it's discarded" is not hidden behind the scheme guard.
+function discardedFail(tab, tabId) {
+  if (tab && tab.discarded) {
+    return fail(
+      ERR_TAB_DISCARDED,
+      `tab ${tabId} is discarded (unloaded from memory by the browser); ` +
+        `wake it with wake_tab (or navigate_tab to its url) before injecting`,
+    );
+  }
+  return null;
 }
 
 // --- injected function bodies ------------------------------------------------
@@ -248,6 +278,73 @@ export function readTextInWorld(selector, maxBytes) {
   // flushed). Costs at most 3 dropped bytes, never a mojibake tail.
   const cut = new TextDecoder("utf-8").decode(bytes.slice(0, limit), { stream: true });
   return { found: true, text: cut, totalBytes: bytes.length, truncated: true };
+}
+
+// The body injected by set_input. FIXED like readTextInWorld (§12): `selector` and `value`
+// are DATA — one goes to querySelector, the other to a value assignment — nothing is spliced
+// into an eval, so this verb needs no execute_js checkbox and writes no js_audit row. It is
+// still a MUTATION, which the SERVICE side gates behind the pause switch (see set_input in
+// tools.py); the extension applies the usual session + http/https edge guards.
+//
+// Returns a VALUE for every outcome (never a throw, same reason as readTextInWorld — a throw
+// is indistinguishable from a torn-down frame): `{badSelector, message}` for a selector that
+// does not parse, `{found:false}` for one that matches nothing, `{notEditable:true}` for an
+// element that is neither a form field nor contenteditable, `{unsupportedType, inputType}` for
+// a non-text <input> subtype (checkbox/radio/file/buttons), and `{ok:true, kind}` on success.
+export function setInputInWorld(selector, value) {
+  let el;
+  try {
+    el = document.querySelector(selector);
+  } catch (e) {
+    // A malformed selector is the CALLER's typo, carried back as a value so the dispatcher
+    // can map it to precondition_failed rather than let it escape as `internal`.
+    if (e && e.name === "SyntaxError") {
+      return { badSelector: true, message: String((e && e.message) || e) };
+    }
+    throw e;
+  }
+  if (!el) return { found: false };
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+    // set_input writes TEXT-LIKE fields only. Non-text <input> subtypes must be REFUSED, not
+    // written: `file` throws a SecurityError from the native value setter (a scripted value is
+    // a forgery risk the engine forbids), and `checkbox`/`radio` ignore `value` entirely — the
+    // state lives in `checked`, so a `value` write is a visual no-op reported as success — while
+    // `submit`/`reset`/`button`/`image` carry a label, not a field. Everything else (text,
+    // email, password, search, url, tel, number, date, hidden, …) and every <textarea> is a
+    // text-like field and proceeds through the native setter below.
+    if (el instanceof HTMLInputElement) {
+      const unsupportedInputTypes = ["file", "checkbox", "radio", "submit", "reset", "button", "image"];
+      if (unsupportedInputTypes.includes(el.type)) {
+        return { unsupportedType: true, inputType: el.type };
+      }
+    }
+    // React (and Vue) wrap the element's `value` with their own tracker and REVERT a direct
+    // `el.value = …` on the next render, because they never saw the change. Writing through
+    // the element's NATIVE prototype setter, then dispatching a BUBBLING `input` event, is
+    // exactly what a real keystroke does — the framework's onChange sees it and commits.
+    const proto = el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    setter.call(el, String(value));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true, kind: "input" };
+  }
+  if (el.isContentEditable) {
+    // Base coverage for ordinary contenteditable / textbox composers: focus, replace the
+    // text, and fire a bubbling InputEvent so a listener that mirrors the DOM into its model
+    // updates. HONEST LIMIT: rich editors (Slate / ProseMirror / Draft) keep their model
+    // SEPARATE from the DOM and rebuild it from their own state, so they may DISCARD this
+    // write; set_input does not attempt to drive their internal APIs.
+    el.focus();
+    el.textContent = String(value);
+    el.dispatchEvent(
+      new InputEvent("input", { bubbles: true, inputType: "insertText", data: String(value) }),
+    );
+    return { ok: true, kind: "contenteditable" };
+  }
+  return { notEditable: true };
 }
 
 // The body injected by wait_for's `selector` / `textContains` predicates, and by
@@ -483,6 +580,10 @@ export async function dispatchCommand(frame, ctx = {}) {
       // see the comment above the injected bodies for why that separation is sound.
       case CMD_GET_TEXT:
         return await getText(params);
+      // set_input is FIXED-function too (selector + value are DATA), so no checkbox and no
+      // js_audit row — but it is a MUTATION, gated by the service-side pause switch.
+      case CMD_SET_INPUT:
+        return await setInput(params);
       case CMD_WAIT_FOR:
         return await waitFor(params, nowFn, sleep);
       // scroll_until and poll_job are FIXED-function verbs too (§12): selectors/direction
@@ -500,6 +601,19 @@ export async function dispatchCommand(frame, ctx = {}) {
       // js_audit row (it only fakes focus, exfiltrating nothing).
       case CMD_SET_FOCUS_EMULATION:
         return await setFocusEmulation(params);
+      // WebSocket-frame capture (§12, wave 21). start is DATA-BEARING — the same JS & Debugger
+      // checkbox as execute_js, and (service side) a js_audit row before the send. read drains
+      // the already-authorised buffer (no second audit); stop is idempotent teardown.
+      case CMD_START_WS_CAPTURE:
+        return await startWsCapture(params);
+      case CMD_READ_WS_FRAMES:
+        return await readWsFrames(params);
+      case CMD_STOP_WS_CAPTURE:
+        return await stopWsCapture(params);
+      // Wake a discarded tab (issue #68): a reload re-materialises it and we wait for load.
+      // A FIXED action (like navigate_tab) — no execute_js checkbox, no js_audit row.
+      case CMD_WAKE_TAB:
+        return await wakeTab(params, nowFn, sleep);
       default:
         return fail(ERR_INTERNAL, `unknown command: ${command}`);
     }
@@ -1155,6 +1269,8 @@ async function getText(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "get_text target is not an http/https tab");
   }
@@ -1192,6 +1308,66 @@ async function getText(params) {
     result.totalBytes = got.totalBytes;
   }
   return ok(result);
+}
+
+// set_input {tabId, selector, value} -> {kind} (`kind` ∈ "input" | "contenteditable").
+//
+// A FIXED injected function (setInputInWorld), so — like get_text — NO execute_js checkbox and
+// NO js_audit row: the parameters are DATA, not source. The http/https edge guard IS applied,
+// exactly as get_text/execute_js apply it. The MUTATION gate (pause/stop) lives on the SERVICE
+// side (see set_input in tools.py), which refuses before the frame is ever sent.
+async function setInput(params) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "set_input target is not an http/https tab");
+  }
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: params.tabId },
+    func: setInputInWorld,
+    args: [params.selector, params.value],
+  });
+  const got = ((results || [])[0] || {}).result || {};
+  if (got.badSelector) {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `invalid CSS selector ${JSON.stringify(params.selector)}: ${got.message}`,
+    );
+  }
+  if (got.found === false) {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `selector ${JSON.stringify(params.selector)} matched no element in tab ${params.tabId}`,
+    );
+  }
+  if (got.notEditable) {
+    // Matched, but nothing this verb can write to: not an <input>/<textarea> and not
+    // contenteditable. A distinct message so the agent fixes the selector, not the value.
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `element is not an input/textarea/contenteditable in tab ${params.tabId}`,
+    );
+  }
+  if (got.unsupportedType) {
+    // Matched an <input>, but a non-text subtype set_input refuses on purpose (see
+    // setInputInWorld): a `value` write would throw (file) or be a silent no-op (checkbox/radio).
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `set_input does not support <input type=${got.inputType}>: it writes text-like fields and contenteditable, not checkboxes/radios/file pickers/buttons`,
+    );
+  }
+  if (got.ok !== true) {
+    // No positive success flag: an empty frame (destroyed/re-injected mid-write) or a body that
+    // threw leaves `got={}`, which must NOT be reported as a success with kind:undefined.
+    return fail(ERR_INTERNAL, "set_input got no result from the injected frame");
+  }
+  return ok({ kind: got.kind });
 }
 
 // wait_for {tabId, urlMatches?|selector?|textContains?, timeoutMs} ->
@@ -1242,8 +1418,17 @@ async function waitFor(params, nowFn, sleep) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
-  if (key !== "urlMatches" && !isHttpUrl(tab.url)) {
-    return fail(ERR_PRECONDITION_FAILED, "wait_for target is not an http/https tab");
+  // GATE THE INJECTING PREDICATES ONLY (issue #68). `selector` / `textContains` inject into the
+  // page, so a discarded tab would fail them with the opaque manifest error — refuse honestly
+  // with `tab_discarded` first. `urlMatches` is deliberately NOT gated: it reads only
+  // `chrome.tabs.get(...).url`, which a discarded tab answers, so an agent can legitimately wait
+  // for a discarded tab to WAKE or navigate (e.g. after wake_tab / navigate_tab) via urlMatches.
+  if (key !== "urlMatches") {
+    const discarded = discardedFail(tab, params.tabId);
+    if (discarded) return discarded;
+    if (!isHttpUrl(tab.url)) {
+      return fail(ERR_PRECONDITION_FAILED, "wait_for target is not an http/https tab");
+    }
   }
 
   const started = nowFn();
@@ -1286,6 +1471,8 @@ async function scrollUntil(params, nowFn, sleep) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "scroll_until target is not an http/https tab");
   }
@@ -1411,6 +1598,8 @@ async function startJs(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "start_js target is not an http/https tab");
   }
@@ -1438,6 +1627,8 @@ async function pollJob(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "poll_job target is not an http/https tab");
   }
@@ -2039,6 +2230,8 @@ async function executeJs(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "execute_js target is not an http/https tab");
   }
@@ -2066,6 +2259,65 @@ async function executeJs(params) {
 // into chrome.storage.session so a resurrected worker can reconcile.
 const debuggerAttachedTabs = new Set();
 
+// WebSocket-frame capture buffers (§12, wave 21): tabId -> { url|null, frames: [], dropped,
+// bytes }. `frames` is a ring buffer of the tab's captured WS frames; `url` is the socket URL
+// learned from `Network.webSocketCreated`; `dropped` counts frames the ring evicted on
+// overflow (surfaced to the agent, never a silent loss); `bytes` is the running weight of the
+// buffered text payloads, kept incrementally so the byte cap does not rescan on every frame.
+//
+// OWNERSHIP INVARIANT (§12): `debuggerAttachedTabs` and `wsCaptureTabs` are each the ownership
+// marker of ONE feature — focus emulation and ws capture respectively — and a tab lives in AT
+// MOST ONE of them at a time (one debugger client per tab). The two are therefore MUTUALLY
+// EXCLUSIVE in BOTH directions: each start verb refuses with `debugger_attach` when the OTHER
+// set already holds the tab (`start_ws_capture` checks `debuggerAttachedTabs`,
+// `set_focus_emulation` checks `wsCaptureTabs`), and each feature only ever attaches/detaches a
+// tab of its OWN set — so neither can pull the debugger out from under the other. The cross-
+// feature cleanup in `handleDebuggerDetach` and `__resetDebuggerState` is the sole exception:
+// a real detach event / a test reset clear BOTH sets, because they cannot know which feature
+// owned the tab.
+//
+// Deliberately in-memory and lost on MV3 SW death (the debugger detaches implicitly then, too):
+// a resurrected worker starts with no capture and a fresh `start_ws_capture` re-attaches
+// cleanly. The buffer is never persisted — page data does not outlive the worker on disk.
+const wsCaptureTabs = new Map();
+
+// Ring-buffer ceilings for a single tab's capture. On overflow the OLDEST frame is evicted and
+// `dropped` is incremented — no silent truncation. WS_MAX_BUFFER_BYTES caps the summed weight
+// of buffered TEXT payloads (binary frames store only a size marker, so they weigh nothing);
+// the byte cap never evicts the sole newest frame, so a single frame larger than the whole
+// budget is still held (and size-capped at read time) rather than dropped on arrival.
+const WS_MAX_FRAMES = 500;
+const WS_MAX_BUFFER_BYTES = 1_000_000;
+
+// UTF-8 weight of a frame's stored payload: text frames weigh their bytes, binary frames weigh
+// nothing (their payload is not stored — only an {opcode, size} marker). One encoder instance,
+// reused, so a busy socket does not allocate one per frame. Called EXACTLY ONCE per frame, at
+// push time — the result is cached on the frame (see `wsPushFrame`) and reused everywhere else.
+const wsTextEncoder = new TextEncoder();
+function wsFrameWeight(frame) {
+  return typeof frame.text === "string" ? wsTextEncoder.encode(frame.text).length : 0;
+}
+
+// Append one captured frame and enforce the ring ceilings, dropping OLDEST-first on overflow.
+function wsPushFrame(rec, frame) {
+  // Compute the UTF-8 weight ONCE, here at push, and cache it on the frame as `_w`. Eviction
+  // below and the later drain in `readWsFrames` both reuse `_w` rather than re-encoding the
+  // payload — a busy socket would otherwise encode the same text up to 3× (push + evict + read).
+  // `_w` is INTERNAL bookkeeping: it is stripped from every frame handed back to the agent (see
+  // `readWsFrames`), never surfaced.
+  frame._w = wsFrameWeight(frame);
+  rec.frames.push(frame);
+  rec.bytes += frame._w;
+  while (
+    rec.frames.length > WS_MAX_FRAMES ||
+    (rec.bytes > WS_MAX_BUFFER_BYTES && rec.frames.length > 1)
+  ) {
+    const old = rec.frames.shift();
+    rec.bytes -= old._w;
+    rec.dropped += 1;
+  }
+}
+
 // The chrome.debugger protocol version to attach with (CDP 1.3).
 const DEBUGGER_PROTOCOL_VERSION = "1.3";
 
@@ -2078,13 +2330,54 @@ const DEBUGGER_PROTOCOL_VERSION = "1.3";
 export function handleDebuggerDetach(source) {
   if (source && typeof source.tabId === "number") {
     debuggerAttachedTabs.delete(source.tabId);
+    // Also drop any WS-capture record for the tab (§12, wave 21): the debugger is gone, so the
+    // `Network.*` events stop arriving and the buffer would otherwise HANG forever after the
+    // human closed the tab / opened DevTools — pinning page data in worker memory with no verb
+    // left that could ever detach it (stop_ws_capture would try to detach a tab already gone).
+    wsCaptureTabs.delete(source.tabId);
   }
 }
 
-// Test-only: reset the module-level attachment set between cases (the set is process-global,
-// so a leftover entry from one test would leak into the next).
+// chrome.debugger.onEvent sink (§12, wave 21). Registered ONCE at SW init (service-worker.js)
+// alongside onDetach. Only tabs with a live capture record are serviced; every other tab's
+// events (and every non-WS method) are ignored. On `Network.webSocketCreated` the socket URL is
+// stamped onto the record; on a frame received/sent a compact entry is buffered — for a TEXT
+// frame (opcode 1) the payload is kept as `text`, for anything else ONLY an {opcode, size}
+// marker is kept so binary blobs never flood the buffer (or, later, the agent's context).
+export function handleDebuggerEvent(source, method, params) {
+  if (!source || typeof source.tabId !== "number") return;
+  const rec = wsCaptureTabs.get(source.tabId);
+  if (!rec) return; // not capturing this tab
+  if (method === "Network.webSocketCreated") {
+    if (params && typeof params.url === "string") rec.url = params.url;
+    return;
+  }
+  const dir =
+    method === "Network.webSocketFrameReceived"
+      ? "recv"
+      : method === "Network.webSocketFrameSent"
+        ? "sent"
+        : null;
+  if (dir === null) return; // any other Network.* event is not a frame we buffer
+  const response = (params && params.response) || {};
+  const opcode = response.opcode;
+  const ts = params && params.timestamp;
+  const payloadData = typeof response.payloadData === "string" ? response.payloadData : "";
+  // opcode 1 = text (payloadData is a UTF-8 string, kept verbatim). Every other opcode —
+  // binary (2), or a control frame (close/ping/pong) — carries base64 or nothing useful to the
+  // agent, so store only its size, never the payload.
+  const frame =
+    opcode === 1
+      ? { dir, opcode, ts, text: payloadData }
+      : { dir, opcode, ts, size: payloadData.length, binary: true };
+  wsPushFrame(rec, frame);
+}
+
+// Test-only: reset the module-level debugger state between cases (both structures are
+// process-global, so a leftover entry from one test would leak into the next).
 export function __resetDebuggerState() {
   debuggerAttachedTabs.clear();
+  wsCaptureTabs.clear();
 }
 
 // set_focus_emulation {tabId, enabled} (§12, wave 18). Makes a BACKGROUND tab behave as
@@ -2121,6 +2414,25 @@ async function setFocusEmulation(params) {
   const enabled = !!params.enabled;
 
   if (enabled) {
+    // A discarded tab (issue #68) cannot be attached: `chrome.debugger.attach` on it fails with
+    // the opaque manifest error, so refuse honestly with `tab_discarded` before the attach. Only
+    // the ENABLE (attach) path needs this — `enabled=false` below is an idempotent teardown (like
+    // stop_ws_capture), and a discarded tab's debugger has already auto-detached anyway, so
+    // gating the teardown would return `tab_discarded` for a state that is already reached.
+    const discarded = discardedFail(tab, tabId);
+    if (discarded) return discarded;
+    // MUTUAL EXCLUSION (§12), symmetric to how `startWsCapture` refuses a tab held by focus
+    // emulation: if a ws capture already owns this tab, refuse UP FRONT with `debugger_attach`
+    // rather than attaching a second debugger client — which would throw — or, worse, letting a
+    // later `enabled=false` detach the capture out from under itself. A capture tab lives ONLY in
+    // `wsCaptureTabs`, never in `debuggerAttachedTabs`, so this check is the only thing that keeps
+    // focus emulation off it.
+    if (wsCaptureTabs.has(tabId)) {
+      return fail(
+        ERR_DEBUGGER_ATTACH,
+        "tab is held by an active ws capture — stop it first",
+      );
+    }
     // Track whether THIS call is the one that attached the tab, so the sendCommand catch
     // below only rolls back an attach we ourselves just made (see there).
     let attachedNow = false;
@@ -2174,7 +2486,10 @@ async function setFocusEmulation(params) {
     return ok({ enabled: true });
   }
 
-  // enabled=false: a tab we never attached is an idempotent success (nothing to undo).
+  // enabled=false: a tab we never attached is an idempotent success (nothing to undo). A tab held
+  // by a ws capture is NOT in `debuggerAttachedTabs` (that set is focus emulation's own marker), so
+  // it falls straight through as a no-op here — disabling focus emulation NEVER detaches a live
+  // capture. Only a tab focus emulation itself attached is torn down below.
   if (debuggerAttachedTabs.has(tabId)) {
     // Best-effort: the detach below is what actually drops the emulation (it lapses when the
     // debugger leaves), so a sendCommand that throws — e.g. the tab is mid-teardown — must
@@ -2195,4 +2510,209 @@ async function setFocusEmulation(params) {
     debuggerAttachedTabs.delete(tabId);
   }
   return ok({ enabled: false });
+}
+
+// --- WebSocket-frame capture (§12, wave 21) ---------------------------------
+//
+// The FIRST data-bearing verb down the chrome.debugger path. start attaches the debugger,
+// turns on `Network.*` delivery, and opens a ring buffer that `handleDebuggerEvent` fills;
+// read drains that buffer to the agent; stop disables the domain and detaches. The frames
+// carry PAGE DATA (a messenger's conversation), so start rides the SAME gate as execute_js —
+// the checkbox here, and a js_audit row on the service side (src/ext/commands.py) before the
+// send. read/stop carry no code and no new authorisation, so neither writes a row.
+
+// start_ws_capture {tabId} -> {ok}. Gated by the single JS & Debugger checkbox, guards the
+// target scheme, and is MUTUALLY EXCLUSIVE with focus emulation and with a running capture
+// (one debugger client per tab). On a FRESH attach whose `Network.enable` then fails, the
+// attach is rolled back so no visible "debugging this tab" session is left with no capture.
+async function startWsCapture(params) {
+  const stored = await chrome.storage.local.get(ALLOW_EXECUTE_JS_KEY);
+  const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
+  if (!allowed) {
+    return fail(ERR_JS_DISABLED, "JS & Debugger is disabled in this copy's options");
+  }
+  const tabId = params.tabId;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${tabId}`);
+  }
+  // A discarded tab (issue #68) cannot be attached — `chrome.debugger.attach` fails on it with the
+  // opaque manifest error — so refuse honestly with `tab_discarded` before the attach.
+  const discarded = discardedFail(tab, tabId);
+  if (discarded) return discarded;
+  // Edge-guard the target scheme like every other debugger verb (§12): never attach to a
+  // chrome://, file:// or other privileged surface.
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "start_ws_capture target is not an http/https tab");
+  }
+  // One debugger client per tab. If focus emulation already holds this tab, or a capture is
+  // already running on it, refuse up front rather than letting `chrome.debugger.attach` throw
+  // "Another debugger is already attached". Deliberately NOT ref-counted — a single client per
+  // tab is the acknowledged limit of this slice.
+  if (debuggerAttachedTabs.has(tabId) || wsCaptureTabs.has(tabId)) {
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      "debugger already attached to this tab (focus emulation or ws capture)",
+    );
+  }
+  try {
+    await chrome.debugger.attach({ tabId }, DEBUGGER_PROTOCOL_VERSION);
+  } catch {
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      "could not attach debugger — DevTools open on this tab, or another client attached",
+    );
+  }
+  // Ownership marker for THIS feature ONLY: a live capture tab goes into `wsCaptureTabs`, never
+  // into `debuggerAttachedTabs` (that set belongs to focus emulation). The capture record is
+  // written only AFTER `Network.enable` succeeds, below, so a fresh attach whose enable fails
+  // leaves no record at all.
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Network.enable", {});
+  } catch (e) {
+    // The attach succeeded but enabling the Network domain failed. This call is the one that
+    // attached the tab (the has()-guards above proved it was not ours before), so roll that
+    // attach back — best-effort detach — and write NO capture record. There is nothing to untrack
+    // in a Set: this feature never adds the tab to `debuggerAttachedTabs`, and the `wsCaptureTabs`
+    // record is only written past this catch.
+    try {
+      await chrome.debugger.detach({ tabId });
+    } catch {
+      // Already gone or never fully attached — nothing to undo on the browser side.
+    }
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      `could not enable Network domain: ${String((e && e.message) || e)}`,
+    );
+  }
+  wsCaptureTabs.set(tabId, { url: null, frames: [], dropped: 0, bytes: 0 });
+  return ok({ ok: true });
+}
+
+// read_ws_frames {tabId, maxBytes?} -> {ok, frames, dropped, url, remaining}. DRAINING: the
+// returned frames are removed from the buffer, so a repeat read yields only NEW frames. The
+// drain is bounded by `maxBytes` of summed text payload — frames past the budget stay in the
+// buffer as the TAIL (never dropped), reported via `remaining` so the agent knows to read
+// again. At least one frame is always returned, so a single frame larger than the budget
+// cannot wedge the buffer. `dropped` (overflow evictions since the last read) is returned and
+// reset. A tab with no active capture is `precondition_failed` — a distinct fact from an
+// empty buffer.
+function readWsFrames(params) {
+  const tabId = params.tabId;
+  const rec = wsCaptureTabs.get(tabId);
+  if (!rec) {
+    return fail(ERR_PRECONDITION_FAILED, "no active ws capture on this tab");
+  }
+  // maxBytes <= 0 / non-numeric means "no cap" here; the service validates it to a positive
+  // integer before the round trip, so this is only the extension's own belt-and-suspenders.
+  const limit =
+    typeof params.maxBytes === "number" && params.maxBytes > 0 ? params.maxBytes : Infinity;
+  const frames = [];
+  let used = 0;
+  while (rec.frames.length > 0) {
+    // Reuse the weight cached at push (`_w`) instead of re-encoding the payload here.
+    const weight = rec.frames[0]._w;
+    // Stop BEFORE exceeding the budget — but always take at least the first frame, so an
+    // oversized single frame still makes progress instead of pinning the buffer forever.
+    if (frames.length > 0 && used + weight > limit) break;
+    // Drain the frame, stripping the internal `_w` cache from the OUTBOUND copy so it never
+    // reaches the agent — the returned shape stays exactly {dir, opcode, ts, ...}. `_w` is
+    // destructured off only to omit it; the rest (`outbound`) is what ships.
+    const { _w, ...outbound } = rec.frames.shift();
+    frames.push(outbound);
+    rec.bytes -= weight;
+    used += weight;
+  }
+  const dropped = rec.dropped;
+  rec.dropped = 0;
+  return ok({ frames, dropped, url: rec.url, remaining: rec.frames.length });
+}
+
+// stop_ws_capture {tabId} -> {ok}. Pure idempotent teardown: best-effort `Network.disable` +
+// detach (both in try — a tab mid-teardown must not stop the cleanup), then drop the tab from
+// BOTH the capture map and the attached set. A tab with no capture is an idempotent success —
+// there is nothing to gate here (no checkbox, no scheme guard): teardown must always be able
+// to run, including after the checkbox was turned off mid-capture.
+async function stopWsCapture(params) {
+  const tabId = params.tabId;
+  if (!wsCaptureTabs.has(tabId)) {
+    return ok({ ok: true });
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Network.disable", {});
+  } catch {
+    // fall through to detach — the detach is what actually releases the debugger
+  }
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch {
+    // Already gone (tab closed, DevTools took it): the onDetach listener may have cleared it,
+    // or will. Either way we drop our records below.
+  }
+  wsCaptureTabs.delete(tabId);
+  debuggerAttachedTabs.delete(tabId);
+  return ok({ ok: true });
+}
+
+// --- wake_tab: wake a discarded tab (issue #68) ------------------------------
+//
+// wake_tab {tabId, timeoutMs} -> {wasDiscarded}. The cure for `tab_discarded`: the browser
+// unloaded the tab from memory (`tab.discarded === true`), so every injecting/attaching verb
+// answers the opaque "Extension manifest must request permission…". `chrome.tabs.reload`
+// re-materialises a discarded tab, and then we WAIT for it to finish loading (`status:complete`)
+// so the caller can inject the moment wake_tab returns — the whole point is to leave the tab
+// ready, not merely re-issued.
+//
+// A FIXED action (a reload), not arbitrary code — so no execute_js checkbox and no js_audit row,
+// exactly like navigate_tab. `wasDiscarded` is read BEFORE the reload (which clears the flag) so
+// the caller can tell a real wake from a plain reload of an already-live tab. NOTE: wake_tab
+// ALWAYS reloads — on a live tab (e.g. one that self-woke between a failed verb and this call)
+// that is a FULL reload which loses page state, NOT a no-op — so call it in answer to
+// `tab_discarded`, when a reload is acceptable.
+//
+// The wait reuses the same machinery as wait_for / navigate_tab {waitUntil}: `clampWaitMs` caps
+// the deadline to WAIT_MAX_TIMEOUT_MS, and `pollUntil` polls `status` every WAIT_POLL_MS until
+// complete or the deadline. A tab that VANISHES mid-wait ends as `no_such_tab` (pollUntil's own
+// rule); reaching the deadline without `complete` is NOT an error — the reload WAS issued, so we
+// still answer ok with `wasDiscarded` (the tab is awake even if the page is still loading).
+async function wakeTab(params, nowFn, sleep) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  const wasDiscarded = !!tab.discarded;
+  const budget = clampWaitMs(params.timeoutMs);
+  if (budget === null) {
+    return fail(ERR_PRECONDITION_FAILED, "wake_tab timeoutMs must be a positive integer");
+  }
+  try {
+    await chrome.tabs.reload(params.tabId);
+  } catch {
+    // The tab vanished between the get and the reload — a genuine no_such_tab.
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  const started = nowFn();
+  const deadline = started + budget;
+  // ONE poll interval before the first check, deliberately: right after `reload` the tab can
+  // still report the PRE-reload `status:complete` for a tick — accepting that would answer
+  // "loaded" before the reload has even started. Costs one interval (bounded by the deadline).
+  await sleep(Math.min(WAIT_POLL_MS, budget));
+  const outcome = await pollUntil(
+    async () => {
+      const live = await chrome.tabs.get(params.tabId);
+      return !!(live && live.status === "complete");
+    },
+    deadline,
+    nowFn,
+    sleep,
+    params.tabId,
+  );
+  // Only a vanished tab is an error; a deadline reached without `complete` still leaves the tab
+  // awake, so we report success either way (see the header comment).
+  if (outcome.error) return fail(outcome.error, outcome.message);
+  return ok({ wasDiscarded });
 }

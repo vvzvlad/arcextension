@@ -982,6 +982,44 @@ async def get_text(app, *, instance: str, tab_id: int, selector: str | None = No
     return {"ok": True, "text": text, **meta}
 
 
+async def set_input(app, *, instance: str, tab_id: int, selector: str, value: str,
+                    auth_ctx: str | None = None, expected_session: str | None = None) -> dict:
+    """Set a controlled (React/Vue) field's value in ONE call; answer ``{ok, kind}``.
+
+    FIXED-function like :func:`get_text`: ``selector`` and ``value`` are DATA — one goes to
+    ``querySelector``, the other to a value assignment — never source spliced into a page
+    eval, so this verb is NOT behind the execute_js checkbox and writes NO ``js_audit`` row.
+
+    It is nonetheless a WRITE — the value lands in the field AS IF the user typed it — so it
+    is gated by the stop switch here (:func:`_ensure_not_paused`), like EVERY verb that reaches
+    the browser — the reading fixed ones included: ``get_text`` / ``wait_for`` inject into the
+    page too and are stop-gated the same way. What sets ``set_input`` apart from those is not
+    the stop gate (all three sit behind it) but that it is a MUTATION — a write into the page —
+    whereas they only read. Every other gate still applies: revoke, ``stale_session``, and the
+    extension's http/https edge guard.
+
+    The extension writes through the element's NATIVE prototype value setter and dispatches a
+    bubbling ``input`` (plus ``change``), which is what makes a controlled React/Vue input
+    actually update — a plain ``el.value = …`` is reverted by React's value-tracker. ``kind``
+    reports what was written: ``"input"`` for an ``<input>`` / ``<textarea>``,
+    ``"contenteditable"`` for a contenteditable element.
+
+    SCOPE: set_input drives TEXT-LIKE fields — ``<input>`` of a text subtype (text, email,
+    password, search, url, tel, number, date, hidden, …), ``<textarea>``, and ordinary
+    contenteditable / textbox composers. It does NOT drive ``checkbox`` / ``radio`` (state lives
+    in ``checked``, not ``value``), ``file`` (the native setter throws), or the button subtypes
+    (``submit`` / ``reset`` / ``button`` / ``image``) — those return ``precondition_failed`` — and
+    it does not attempt the internal APIs of rich editors (Slate / ProseMirror / Draft), which
+    keep their model separate from the DOM and may discard a contenteditable write. A ``selector``
+    that matches nothing, that does not parse, that matches a non-editable element, or that matches
+    an unsupported ``<input>`` subtype is ``precondition_failed``."""
+    await _ensure_not_paused(app)
+    params: dict = {"tabId": tab_id, "selector": selector, "value": value}
+    result = await _command(app, instance, protocol.CMD_SET_INPUT, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session)
+    return {"ok": True, "kind": result.get("kind")}
+
+
 async def wait_for(app, *, instance: str, tab_id: int, url_matches: str | None = None,
                    selector: str | None = None, text_contains: str | None = None,
                    timeout_ms: int | None = None, auth_ctx: str | None = None,
@@ -1237,13 +1275,114 @@ async def set_focus_emulation(app, *, instance: str, tab_id: int, enabled: bool,
 
     Refused while paused (it drives the browser). ``debugger_attach`` comes back when the
     debugger cannot attach — DevTools is open on the tab, or another client already holds it
-    (a tab takes one debugger client)."""
+    (a tab takes one debugger client). MUTUALLY EXCLUSIVE with ws capture in BOTH directions:
+    ``enabled=true`` on a tab held by an active ``start_ws_capture`` is refused up front with
+    ``debugger_attach`` (and ``enabled=false`` never detaches a live capture — a capture tab is
+    not focus emulation's to release)."""
     await _ensure_not_paused(app)
     result = await _command(
         app, instance, protocol.CMD_SET_FOCUS_EMULATION, {"tabId": tab_id, "enabled": enabled},
         auth_ctx=auth_ctx, expected_session=expected_session,
     )
     return {"ok": True, "enabled": bool(result.get("enabled"))}
+
+
+# --- WebSocket-frame capture (§12, wave 21) ----------------------------------
+async def start_ws_capture(app, *, instance: str, tab_id: int,
+                           auth_ctx: str | None = None,
+                           expected_session: str | None = None) -> dict:
+    """Start capturing a tab's WebSocket frames via chrome.debugger; answers ``{ok}`` (§12).
+
+    The FIRST data-bearing verb down the CDP path. It attaches the debugger and turns on
+    ``Network.*`` delivery so the extension buffers the tab's WS frames for :func:`read_ws_frames`
+    to drain. Because those frames ship PAGE DATA out — a messenger's conversation, i.e. phones,
+    sums, addresses — this is gated EXACTLY like ``execute_js`` (the single JS & Debugger checkbox
+    at the extension edge) AND — UNLIKE ``set_focus_emulation`` — writes a ``js_audit`` row before
+    the send: the verb carries no caller code, so a synthetic ``code`` marker
+    (``[ws_capture:start]``) stands in, and what the row durably fixes is WHO opened the read
+    channel, WHEN and on WHICH tab (:func:`src.ext.commands.send_command` audits it).
+
+    MUTUALLY EXCLUSIVE with focus emulation per tab — one debugger client per tab — so a tab
+    already held by ``set_focus_emulation`` or an active capture answers ``debugger_attach``. The
+    exclusion is SYMMETRIC: the reverse also holds, so ``set_focus_emulation`` refuses a tab this
+    capture already owns rather than detaching it. Refused while paused (it drives the browser). ``no_such_tab`` / ``precondition_failed`` guard a
+    vanished or non-http tab. ANTI-BOT COST: ``Network.enable`` is detectable and the browser shows
+    its «идёт отладка» bar for the WHOLE capture window — the exposure lasts as long as the read
+    channel stays open, not just an instant."""
+    await _ensure_not_paused(app)
+    # No caller code — but the audit branch (§12) requires a `code`, so pass a synthetic marker.
+    # It is what fixes who/when/where the read channel was opened; the extension ignores it.
+    params: dict = {"tabId": tab_id, "code": "[ws_capture:start]"}
+    await _command(app, instance, protocol.CMD_START_WS_CAPTURE, params,
+                   auth_ctx=auth_ctx, expected_session=expected_session)
+    return {"ok": True}
+
+
+async def read_ws_frames(app, *, instance: str, tab_id: int, max_bytes: int | None = None,
+                         auth_ctx: str | None = None,
+                         expected_session: str | None = None) -> dict:
+    """Drain a tab's captured WebSocket frames — ``{ok, frames, dropped, url, remaining}`` (§12).
+
+    A FIXED, DRAINING read of the buffer :func:`start_ws_capture` already authorised: no second
+    ``js_audit`` row (the channel-open was audited once), but still DATA-BEARING — the frames carry
+    personal data from the conversation (phones, sums, addresses) straight into the agent's context
+    AND the session transcript, which outlives the task (§12 privacy).
+
+    NOT gated by the pause stop — UNLIKE ``start_ws_capture`` (which drives the browser: attach +
+    ``Network.enable``), this read never reaches the browser. It is a PASSIVE drain of the
+    in-memory SW buffer, in the same class as ``list_exemptions`` (a read that never leaves the
+    process), and it is deliberately allowed WHILE PAUSED: the ring keeps evicting its oldest
+    frames, so refusing the read under a stop would lose an ALREADY-captured conversation for good
+    while the capture is still open. Reading it out (and then ``stop_ws_capture``, which is also
+    ungated) is how the human ends the exposure without dropping what was already seen.
+
+    DRAINING: the returned frames are REMOVED from the buffer, so a repeat read yields only NEW
+    frames (a stream, not a re-read). The drain is capped at ``max_bytes`` (default 40 kB) of summed
+    text payload; frames past the budget stay buffered as the TAIL — never dropped — and ``remaining``
+    reports how many are left so the agent knows to read again. At least one frame is always returned,
+    so a single frame larger than the budget cannot wedge the buffer. ``dropped`` is how many frames
+    the ring evicted on overflow since the last read (returned, then reset — a silent loss would
+    defeat the point). ``url`` is the socket URL, or ``None`` before ``webSocketCreated`` was seen.
+
+    Each frame is ``{dir, opcode, ts, text}`` for a TEXT frame (opcode 1) or ``{dir, opcode, ts,
+    size, binary}`` for anything else — binary/control frames keep only a size marker, never the
+    payload. A tab with no active capture is ``precondition_failed`` («no active ws capture on this
+    tab») — a distinct fact from an empty buffer."""
+    # NOT paused-gated (see docstring): a passive drain of the in-memory buffer must stay available
+    # under a stop so an already-captured conversation is not lost to ring eviction. Only the
+    # browser-driving verbs (start_ws_capture) sit behind `_ensure_not_paused`.
+    # Validate before the round trip (an extension reading maxBytes<=0 as "no cap" would ship the
+    # whole buffer across the socket first, only to have the cap refuse it here).
+    limit = _validate_max_bytes(max_bytes)
+    params: dict = {"tabId": tab_id, "maxBytes": limit}
+    result = await _command(app, instance, protocol.CMD_READ_WS_FRAMES, params,
+                            auth_ctx=auth_ctx, expected_session=expected_session)
+    return {
+        "ok": True,
+        "frames": result.get("frames") or [],
+        "dropped": result.get("dropped") or 0,
+        "url": result.get("url"),
+        "remaining": result.get("remaining") or 0,
+    }
+
+
+async def stop_ws_capture(app, *, instance: str, tab_id: int,
+                          auth_ctx: str | None = None,
+                          expected_session: str | None = None) -> dict:
+    """Stop a tab's WebSocket capture — best-effort ``Network.disable`` + detach; ``{ok}`` (§12).
+
+    Pure IDEMPOTENT teardown: it disables the Network domain, detaches the debugger and drops the
+    tab's buffer. A tab with no active capture is an idempotent ``{ok: true}``. NOT refused while
+    paused and NOT behind the checkbox — teardown must always be able to run, including after the
+    checkbox was turned off mid-capture, so the «идёт отладка» bar and the anti-bot exposure can
+    always be ended.
+
+    ⚠️ The buffer lives in the extension's MV3 service worker: if that worker dies the capture (and
+    its buffered frames) is lost and chrome.debugger detaches implicitly — acceptable for this slice.
+    A stop after such a death is the idempotent no-op above."""
+    await _command(app, instance, protocol.CMD_STOP_WS_CAPTURE, {"tabId": tab_id},
+                   auth_ctx=auth_ctx, expected_session=expected_session)
+    return {"ok": True}
 
 
 async def navigate_tab(app, *, instance: str, tab_id: int, url: str,
@@ -1342,6 +1481,42 @@ async def navigate_tab(app, *, instance: str, tab_id: int, url: str,
         "matched": bool(result.get("matched")),
         "elapsed_ms": int(result.get("elapsedMs") or 0),
     }
+
+
+async def wake_tab(app, *, instance: str, tab_id: int, auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
+    """Wake a DISCARDED tab (issue #68): reload it and wait for the page to load.
+
+    The browser unloads an idle tab from memory to save RAM. The tab still EXISTS — it answers
+    ``list_tabs`` with its url — but every injecting/attaching verb (``get_text``, ``execute_js``,
+    ``wait_for`` with a selector, the debugger verbs, …) fails on it with ``tab_discarded`` instead
+    of the opaque "Extension manifest must request permission…" the browser would otherwise raise.
+    ``wake_tab`` is the cure: the extension ``chrome.tabs.reload``s the tab (a reload re-materialises
+    a discarded tab) and WAITS for it to report ``complete``, so the caller can inject the moment
+    this returns.
+
+    ``was_discarded`` tells whether the reload was a REAL wake (the tab was discarded) or a reload
+    of an already-live tab. ``wake_tab`` ALWAYS reloads: on a live tab that is a FULL reload which
+    loses page state (unsubmitted forms, scroll, in-page JS state), NOT a no-op — so call it in
+    answer to ``tab_discarded``, and mind the race where the tab self-woke between the failed verb
+    and this call. An agent recovering from ``tab_discarded`` confirms the wake via ``was_discarded``.
+
+    This is a MUTATION (it reloads the tab), so it sits behind the stop switch
+    (:func:`_ensure_not_paused`) like ``navigate_tab``. But the reload is a FIXED action, not
+    arbitrary code, so it carries NO execute_js checkbox and writes NO ``js_audit`` row — again like
+    ``navigate_tab``. The extension polls ``status`` inside a bounded deadline; we hand it the
+    ``EXECUTE_JS_MAX_TIMEOUT_MS`` ceiling and a socket budget that OUTLIVES that deadline
+    (:func:`_wait_budget_ms`), the same ordering rule as ``wait_for`` / ``navigate_tab {waitUntil}``,
+    so the command does not time out on the wire before the page can finish loading."""
+    await _ensure_not_paused(app)
+    wait_ms = app.state.settings.execute_js_max_timeout_ms
+    params = {"tabId": tab_id, "timeoutMs": wait_ms}
+    result = await _command(
+        app, instance, protocol.CMD_WAKE_TAB, params, auth_ctx=auth_ctx,
+        expected_session=expected_session, cmd_timeout_ms=_wait_budget_ms(app, wait_ms),
+    )
+    # camelCase on the WIRE (§6), snake_case out to the agent — the same rename wait_for does.
+    return {"ok": True, "was_discarded": bool(result.get("wasDiscarded"))}
 
 
 # --- relocate: synchronous open + guarded source close in one call (#48, §11) ---
