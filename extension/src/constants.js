@@ -211,6 +211,15 @@ export const CMD_SET_FOCUS_EMULATION = "set_focus_emulation";
 export const CMD_START_WS_CAPTURE = "start_ws_capture";
 export const CMD_READ_WS_FRAMES = "read_ws_frames";
 export const CMD_STOP_WS_CAPTURE = "stop_ws_capture";
+// Wake a DISCARDED tab (issue #68): the browser unloaded it from memory to save RAM, so
+// every injecting/attaching verb answers the opaque "Cannot access contents of the page.
+// Extension manifest must request permission…" — a message that blames the manifest for a
+// tab that merely needs reloading. wake_tab reloads it (a reload re-materialises a discarded
+// tab) and waits for `status:complete`. A FIXED action, not arbitrary code — no execute_js
+// checkbox, no js_audit row (like navigate_tab). Answers {wasDiscarded} so the caller learns
+// whether it was a real wake or a plain reload of an already-live tab — wake_tab ALWAYS reloads,
+// so on a live tab it loses page state, it is not a no-op.
+export const CMD_WAKE_TAB = "wake_tab";
 
 // How often `wait_for` (and navigate_tab's waitUntil) re-tests its condition. 250 ms is
 // the usual "fast enough to feel instant, cheap enough to run for 30 s" compromise: at
@@ -257,6 +266,14 @@ export const WAIT_MAX_TIMEOUT_MS = 60000;
 export const ERR_STALE_SESSION = "stale_session";
 export const ERR_PRECONDITION_FAILED = "precondition_failed";
 export const ERR_NO_SUCH_TAB = "no_such_tab";
+// The target tab EXISTS but the browser has DISCARDED it — unloaded it from memory to save
+// RAM (issue #68). It still answers `chrome.tabs.get` (with `discarded:true` and its url), so
+// it is NOT `no_such_tab`, and its url is usually http/https, so it is NOT the `precondition_failed`
+// "wrong scheme" either. Yet every injecting/attaching verb fails on it with the opaque "Extension
+// manifest must request permission…" — a message that blames the manifest for a tab that only needs
+// waking. Its OWN code so the agent stops fixing the manifest and calls wake_tab (or navigate_tab to
+// its url) instead. Read BEFORE the injection from `chrome.tabs.get(tabId).discarded`.
+export const ERR_TAB_DISCARDED = "tab_discarded";
 export const ERR_NO_WINDOW = "no_window";
 export const ERR_JS_DISABLED = "js_disabled";
 export const ERR_BUSY_DRAGGING = "busy_dragging";

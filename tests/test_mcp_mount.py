@@ -107,6 +107,8 @@ def test_mcp_tools_list_exposes_every_phase11_tool(tmp_path):
         # tool whose signature the MCP SDK cannot serialize would still pass there and be
         # invisible to every agent.
         "get_text", "wait_for", "navigate_tab",
+        # wake_tab (#68): un-discards a tab so the injecting verbs stop answering tab_discarded.
+        "wake_tab",
         # The fixed-but-mutating write verb: a fixed body (no checkbox / audit) that is still
         # pause-gated on the service side, like navigate_tab.
         "set_input",

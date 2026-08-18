@@ -268,6 +268,31 @@ def build_mcp(app_ref) -> MCPServer:
         ))
 
     @mcp.tool()
+    async def wake_tab(instance: str, tab_id: int,
+                       expected_session: str | None = None) -> dict:
+        """Wake a DISCARDED tab and wait for it to load (§6, issue #68).
+
+        The browser unloads idle tabs from memory to save RAM. Such a tab still shows up in
+        ``list_tabs`` with its url, but injecting/attaching verbs (``get_text``, ``execute_js``,
+        ``wait_for`` with a selector, ``set_focus_emulation``, …) refuse it with ``tab_discarded``
+        rather than the opaque "Extension manifest must request permission…" the browser raises.
+        ``wake_tab`` reloads the tab (a reload re-materialises a discarded one) and waits for it to
+        finish loading, so you can inject the moment it returns; then retry the verb that hit
+        ``tab_discarded``. ``navigate_tab`` to the tab's own url wakes it too — use that when you
+        already want to move it.
+
+        ``was_discarded`` reports whether the reload was a real wake (the tab was discarded) or a
+        reload of an already-live tab — note ``wake_tab`` ALWAYS reloads, so on a live tab it is a
+        full reload that loses page state, not a no-op; call it in answer to ``tab_discarded``.
+        This is a MUTATION (it reloads), so it is refused while
+        the curator is stopped — but the reload is a FIXED action, so it is neither behind the
+        JS & Debugger checkbox nor audited (like ``navigate_tab``)."""
+        return await _guarded(tools.wake_tab(
+            _host(), instance=instance, tab_id=tab_id, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
+        ))
+
+    @mcp.tool()
     async def close_tab(instance: str, tab_id: int | None = None,
                         tab_ids: list[int] | None = None,
                         expected_session: str | None = None) -> dict:

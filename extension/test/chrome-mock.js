@@ -137,6 +137,12 @@ export function createChromeMock(opts = {}) {
     createWindowError: opts.createWindowError || null, // when set, windows.create throws
     moveError: opts.moveError || null, // when set, tabs.move throws this message
     removeError: opts.removeError || null, // when set, tabs.remove throws this message
+    reloadError: opts.reloadError || null, // when set, tabs.reload throws this message (wake_tab)
+    // wake_tab (§6, #68): a reload un-discards the tab and drives it to `complete`. Left 0, the
+    // reload lands `complete` at once (the collapsed default); set to N and `status` stays
+    // `loading` until the Nth subsequent `tabs.get`, counted in GETS so it is deterministic under
+    // the fake clock — the same discipline as `navCommitAfterGets`.
+    reloadCompleteAfterGets: opts.reloadCompleteAfterGets || 0,
     debuggerAttachError: opts.debuggerAttachError || null, // when set, debugger.attach throws
     sendCommandError: opts.sendCommandError || null, // when set, debugger.sendCommand throws
     detachError: opts.detachError || null, // when set, debugger.detach throws
@@ -163,7 +169,9 @@ export function createChromeMock(opts = {}) {
 
   // Strip the deferred-commit bookkeeping from a tab before it leaves the mock: the real
   // API has no such keys, and a test asserting on a whole tab object must not see them.
-  const tabView = ({ __navGets, __commitAt, __completeAt, __commitUrl, ...view }) => view;
+  const tabView = ({
+    __navGets, __commitAt, __completeAt, __commitUrl, __reloadGets, __reloadCompleteAt, ...view
+  }) => view;
 
   const chrome = {
     storage: {
@@ -201,6 +209,16 @@ export function createChromeMock(opts = {}) {
             delete t.__commitAt;
             delete t.__completeAt;
             delete t.__commitUrl;
+          }
+        }
+        // The deferred RELOAD advances here the same way (wake_tab, #68): after
+        // `reloadCompleteAfterGets` gets the reloaded tab flips from `loading` to `complete`.
+        if (t.__reloadGets !== undefined) {
+          t.__reloadGets += 1;
+          if (t.__reloadGets >= t.__reloadCompleteAt) {
+            t.status = "complete";
+            delete t.__reloadGets;
+            delete t.__reloadCompleteAt;
           }
         }
         return tabView(t);
@@ -247,6 +265,24 @@ export function createChromeMock(opts = {}) {
         }
         Object.assign(t, props);
         return tabView(t);
+      },
+      // wake_tab (§6, #68): reload un-discards the tab and starts it loading. REJECTS "no such
+      // tab" for a vanished target (wake_tab maps that to no_such_tab). With
+      // `reloadCompleteAfterGets` unset the tab lands `complete` at once; set, it stays `loading`
+      // until that many subsequent gets, so a test can observe the wait.
+      reload: async (tabId) => {
+        await tick();
+        if (state.reloadError) throw new Error(state.reloadError);
+        const t = state.tabs.find((x) => x.id === tabId);
+        if (!t) throw new Error(`No tab with id: ${tabId}.`);
+        t.discarded = false; // a reload re-materialises a discarded tab
+        if (state.reloadCompleteAfterGets > 0) {
+          t.status = "loading";
+          t.__reloadGets = 0;
+          t.__reloadCompleteAt = state.reloadCompleteAfterGets;
+        } else {
+          t.status = "complete";
+        }
       },
       move: async (tabIds, moveProps) => {
         await tick();

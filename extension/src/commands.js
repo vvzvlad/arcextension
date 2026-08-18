@@ -43,9 +43,11 @@ import {
   CMD_START_WS_CAPTURE,
   CMD_READ_WS_FRAMES,
   CMD_STOP_WS_CAPTURE,
+  CMD_WAKE_TAB,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
+  ERR_TAB_DISCARDED,
   ERR_NO_WINDOW,
   ERR_JS_DISABLED,
   ERR_BUSY_DRAGGING,
@@ -79,6 +81,30 @@ export function isHttpUrl(url) {
     return false;
   }
   return u.protocol === "http:" || u.protocol === "https:";
+}
+
+// A DISCARDED tab is one the browser unloaded from memory to save RAM (issue #68). It still
+// EXISTS — `chrome.tabs.get` answers it with `discarded:true` and its url — so it is not
+// `no_such_tab`; and its url is usually http/https, so it is not the "wrong scheme"
+// `precondition_failed` either. But `chrome.scripting.executeScript` / `chrome.debugger.attach`
+// into it fails with the opaque "Cannot access contents of the page. Extension manifest must
+// request permission…", which blames the manifest for a tab that only needs reloading. So EVERY
+// verb that INJECTS into the page or ATTACHES the debugger reads `tab.discarded` right after its
+// `chrome.tabs.get` and refuses with `tab_discarded` — a code the agent can act on (wake_tab, or
+// navigate_tab to its url) — BEFORE the injection produces that misleading manifest error.
+//
+// Returns a `fail(...)` outcome when `tab` is discarded, else `null` (caller proceeds). Placed
+// AFTER the existence check (a thrown `tabs.get` is `no_such_tab`) and BEFORE `isHttpUrl`, so the
+// honest "it's discarded" is not hidden behind the scheme guard.
+function discardedFail(tab, tabId) {
+  if (tab && tab.discarded) {
+    return fail(
+      ERR_TAB_DISCARDED,
+      `tab ${tabId} is discarded (unloaded from memory by the browser); ` +
+        `wake it with wake_tab (or navigate_tab to its url) before injecting`,
+    );
+  }
+  return null;
 }
 
 // --- injected function bodies ------------------------------------------------
@@ -584,6 +610,10 @@ export async function dispatchCommand(frame, ctx = {}) {
         return await readWsFrames(params);
       case CMD_STOP_WS_CAPTURE:
         return await stopWsCapture(params);
+      // Wake a discarded tab (issue #68): a reload re-materialises it and we wait for load.
+      // A FIXED action (like navigate_tab) — no execute_js checkbox, no js_audit row.
+      case CMD_WAKE_TAB:
+        return await wakeTab(params, nowFn, sleep);
       default:
         return fail(ERR_INTERNAL, `unknown command: ${command}`);
     }
@@ -1239,6 +1269,8 @@ async function getText(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "get_text target is not an http/https tab");
   }
@@ -1291,6 +1323,8 @@ async function setInput(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "set_input target is not an http/https tab");
   }
@@ -1384,8 +1418,17 @@ async function waitFor(params, nowFn, sleep) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
-  if (key !== "urlMatches" && !isHttpUrl(tab.url)) {
-    return fail(ERR_PRECONDITION_FAILED, "wait_for target is not an http/https tab");
+  // GATE THE INJECTING PREDICATES ONLY (issue #68). `selector` / `textContains` inject into the
+  // page, so a discarded tab would fail them with the opaque manifest error — refuse honestly
+  // with `tab_discarded` first. `urlMatches` is deliberately NOT gated: it reads only
+  // `chrome.tabs.get(...).url`, which a discarded tab answers, so an agent can legitimately wait
+  // for a discarded tab to WAKE or navigate (e.g. after wake_tab / navigate_tab) via urlMatches.
+  if (key !== "urlMatches") {
+    const discarded = discardedFail(tab, params.tabId);
+    if (discarded) return discarded;
+    if (!isHttpUrl(tab.url)) {
+      return fail(ERR_PRECONDITION_FAILED, "wait_for target is not an http/https tab");
+    }
   }
 
   const started = nowFn();
@@ -1428,6 +1471,8 @@ async function scrollUntil(params, nowFn, sleep) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "scroll_until target is not an http/https tab");
   }
@@ -1553,6 +1598,8 @@ async function startJs(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "start_js target is not an http/https tab");
   }
@@ -1580,6 +1627,8 @@ async function pollJob(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "poll_job target is not an http/https tab");
   }
@@ -2181,6 +2230,8 @@ async function executeJs(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
   }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "execute_js target is not an http/https tab");
   }
@@ -2363,6 +2414,13 @@ async function setFocusEmulation(params) {
   const enabled = !!params.enabled;
 
   if (enabled) {
+    // A discarded tab (issue #68) cannot be attached: `chrome.debugger.attach` on it fails with
+    // the opaque manifest error, so refuse honestly with `tab_discarded` before the attach. Only
+    // the ENABLE (attach) path needs this — `enabled=false` below is an idempotent teardown (like
+    // stop_ws_capture), and a discarded tab's debugger has already auto-detached anyway, so
+    // gating the teardown would return `tab_discarded` for a state that is already reached.
+    const discarded = discardedFail(tab, tabId);
+    if (discarded) return discarded;
     // MUTUAL EXCLUSION (§12), symmetric to how `startWsCapture` refuses a tab held by focus
     // emulation: if a ws capture already owns this tab, refuse UP FRONT with `debugger_attach`
     // rather than attaching a second debugger client — which would throw — or, worse, letting a
@@ -2480,6 +2538,10 @@ async function startWsCapture(params) {
   } catch {
     return fail(ERR_NO_SUCH_TAB, `no such tab: ${tabId}`);
   }
+  // A discarded tab (issue #68) cannot be attached — `chrome.debugger.attach` fails on it with the
+  // opaque manifest error — so refuse honestly with `tab_discarded` before the attach.
+  const discarded = discardedFail(tab, tabId);
+  if (discarded) return discarded;
   // Edge-guard the target scheme like every other debugger verb (§12): never attach to a
   // chrome://, file:// or other privileged surface.
   if (!isHttpUrl(tab.url)) {
@@ -2592,4 +2654,65 @@ async function stopWsCapture(params) {
   wsCaptureTabs.delete(tabId);
   debuggerAttachedTabs.delete(tabId);
   return ok({ ok: true });
+}
+
+// --- wake_tab: wake a discarded tab (issue #68) ------------------------------
+//
+// wake_tab {tabId, timeoutMs} -> {wasDiscarded}. The cure for `tab_discarded`: the browser
+// unloaded the tab from memory (`tab.discarded === true`), so every injecting/attaching verb
+// answers the opaque "Extension manifest must request permission…". `chrome.tabs.reload`
+// re-materialises a discarded tab, and then we WAIT for it to finish loading (`status:complete`)
+// so the caller can inject the moment wake_tab returns — the whole point is to leave the tab
+// ready, not merely re-issued.
+//
+// A FIXED action (a reload), not arbitrary code — so no execute_js checkbox and no js_audit row,
+// exactly like navigate_tab. `wasDiscarded` is read BEFORE the reload (which clears the flag) so
+// the caller can tell a real wake from a plain reload of an already-live tab. NOTE: wake_tab
+// ALWAYS reloads — on a live tab (e.g. one that self-woke between a failed verb and this call)
+// that is a FULL reload which loses page state, NOT a no-op — so call it in answer to
+// `tab_discarded`, when a reload is acceptable.
+//
+// The wait reuses the same machinery as wait_for / navigate_tab {waitUntil}: `clampWaitMs` caps
+// the deadline to WAIT_MAX_TIMEOUT_MS, and `pollUntil` polls `status` every WAIT_POLL_MS until
+// complete or the deadline. A tab that VANISHES mid-wait ends as `no_such_tab` (pollUntil's own
+// rule); reaching the deadline without `complete` is NOT an error — the reload WAS issued, so we
+// still answer ok with `wasDiscarded` (the tab is awake even if the page is still loading).
+async function wakeTab(params, nowFn, sleep) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  const wasDiscarded = !!tab.discarded;
+  const budget = clampWaitMs(params.timeoutMs);
+  if (budget === null) {
+    return fail(ERR_PRECONDITION_FAILED, "wake_tab timeoutMs must be a positive integer");
+  }
+  try {
+    await chrome.tabs.reload(params.tabId);
+  } catch {
+    // The tab vanished between the get and the reload — a genuine no_such_tab.
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  const started = nowFn();
+  const deadline = started + budget;
+  // ONE poll interval before the first check, deliberately: right after `reload` the tab can
+  // still report the PRE-reload `status:complete` for a tick — accepting that would answer
+  // "loaded" before the reload has even started. Costs one interval (bounded by the deadline).
+  await sleep(Math.min(WAIT_POLL_MS, budget));
+  const outcome = await pollUntil(
+    async () => {
+      const live = await chrome.tabs.get(params.tabId);
+      return !!(live && live.status === "complete");
+    },
+    deadline,
+    nowFn,
+    sleep,
+    params.tabId,
+  );
+  // Only a vanished tab is an error; a deadline reached without `complete` still leaves the tab
+  // awake, so we report success either way (see the header comment).
+  if (outcome.error) return fail(outcome.error, outcome.message);
+  return ok({ wasDiscarded });
 }

@@ -1163,8 +1163,8 @@ worker умирает через 30 с и внутренний таймер не
 
 `command {id, sessionId, command, params}` → `response {id, ok, result|error}`,
 где `error = {code, message}`. Коды: `stale_session`, `precondition_failed`,
-`no_such_tab`, `no_window`, `js_disabled`, `busy_dragging`, `pinned_cross_window`,
-`debugger_attach`, `internal`.
+`no_such_tab`, `tab_discarded`, `no_window`, `js_disabled`, `busy_dragging`,
+`pinned_cross_window`, `debugger_attach`, `internal`.
 
 | Команда | Параметры | Результат |
 |---|---|---|
@@ -1186,12 +1186,42 @@ worker умирает через 30 с и внутренний таймер не
 | `start_ws_capture` | `{tabId, code}` — `code` = синтетический маркер `[ws_capture:start]` для аудита (§12), расширение его игнорирует | `{ok}` / `js_disabled` / `debugger_attach` |
 | `read_ws_frames` | `{tabId, maxBytes?}` | `{frames, dropped, url, remaining}` / `precondition_failed` |
 | `stop_ws_capture` | `{tabId}` | `{ok}` — идемпотентно |
+| `wake_tab` | `{tabId, timeoutMs}` | `{wasDiscarded}` / `no_such_tab` — будит выгруженную вкладку (§12, #68) |
 
 `get_text`/`wait_for` и параметры `waitUntil` / `awaitPromise` — **волна 17 (§16)**;
 `scroll_until` и пара `start_js`/`poll_job` — **волна 19 (§16)**; `set_focus_emulation` —
 **волна 18 (§16)**, первый верб пути через `chrome.debugger`; трио перехвата WS-фреймов
 (`start_ws_capture`/`read_ws_frames`/`stop_ws_capture`) — **волна 21 (§16)**, первые
-data-несущие вербы этого пути; `set_input` — **волна 23 (§16)**, фиксированный ПИШУЩИЙ верб.
+data-несущие вербы этого пути; `set_input` — **волна 23 (§16)**, фиксированный ПИШУЩИЙ верб;
+`wake_tab` — **волна 24 (§16)**, пробуждение выгруженной вкладки (issue #68).
+
+**`tab_discarded` — честный код вместо манифест-ошибки (§12, #68).** Браузер, экономя память,
+**выгружает** простаивающую вкладку из RAM (`tab.discarded === true`). Такая вкладка **существует**
+— `chrome.tabs.get` отдаёт её вместе с `url`, — но любой инжектящий/цепляющий верб (`get_text`,
+`execute_js`, `wait_for` c селектором, вербы `chrome.debugger`, …) падает на ней с невнятным
+«Cannot access contents of the page. Extension manifest must request permission…». Это не
+`no_such_tab` (вкладка есть) и не `precondition_failed` «не тот scheme» (url обычно http/https),
+поэтому у неё **свой** код `tab_discarded`: расширение читает `tab.discarded` сразу после
+`chrome.tabs.get` — **до** инъекции, порядок `no_such_tab` → `tab_discarded` → `isHttpUrl` — и
+отказывает честно, чтобы агент **разбудил** вкладку, а не чинил несуществующий баг манифеста.
+Гейт стоит на всех инжектящих/цепляющих вербах (`get_text`, `execute_js`, `start_js`, `poll_job`,
+`scroll_until`, `set_input`, `set_focus_emulation`, `start_ws_capture`) и на **инжектящих**
+предикатах `wait_for` (`selector`/`textContains`). На `urlMatches` гейта **нет** намеренно: он
+читает только `chrome.tabs.get().url`, доступный и выгруженной вкладке, так что агент вправе
+ждать через него **пробуждения** или навигации. `navigate_tab` тоже не гейтится — навигация в
+выгруженную вкладку легальна и сама её будит.
+
+**`wake_tab` — пробуждение выгруженной вкладки (§12, #68).** Лечение `tab_discarded`:
+`chrome.tabs.reload` ре-материализует выгруженную вкладку, после чего верб **дожидается** её
+загрузки (`status:complete`), опрашивая `chrome.tabs.get` каждый `WAIT_POLL_MS` до дедлайна
+(зажатого `clampWaitMs` тем же потолком, что `wait_for`/`scroll_until`), — чтобы вызывающий мог
+инжектить сразу по возврату. `wasDiscarded` сообщает, была ли вкладка реально выгружена: `wake_tab`
+перезагружает **всегда**, и на живой вкладке это полный reload с потерей состояния страницы, а не
+no-op. **Фиксированное действие** (reload, не произвольный код), как
+`navigate_tab`: галочки `execute_js` не требует и строку `js_audit` не пишет. Но это **мутация**
+(перезагрузка), поэтому на сервисе — **под стоп-гейтом** (`_ensure_not_paused`). Дедлайн, дошедший
+без `complete`, — **не** ошибка: reload выдан, вкладка разбужена, верб отвечает `ok` с
+`wasDiscarded` в любом случае; ошибка — только **исчезнувшая** в процессе вкладка (`no_such_tab`).
 
 **`set_input` — фиксированный верб, но МУТАЦИЯ.** Ставит значение управляемого
 (React/Vue) поля одним вызовом. `selector` и `value` — **данные** (§12): один уходит в
@@ -3012,6 +3042,19 @@ React/Vue-инпут увидеть значение (прямое `el.value = �
 запись отбросить. Селектор без совпадения, без разбора или на не-редактируемом элементе —
 `precondition_failed`.
 
+Волна 24 (§16) добавляет `wake_tab` — пробуждение **выгруженной** (discarded) вкладки
+(issue #68). Браузер, экономя память, выгружает простаивающую вкладку из RAM; она остаётся в
+`list_tabs` со своим url, но инжектящие/цепляющие вербы (`get_text`, `execute_js`, `wait_for` c
+селектором, вербы `chrome.debugger`, …) отказывают ей кодом `tab_discarded` вместо невнятной
+манифест-ошибки браузера. `wake_tab` перезагружает вкладку (reload ре-материализует выгруженную)
+и **дожидается** её загрузки, ответ `{ok, was_discarded}` — так вызывающий инжектит сразу по
+возврату и повторяет верб, упавший в `tab_discarded`; `navigate_tab` на собственный url вкладки
+будит её тоже. `was_discarded` отличает реальное пробуждение от полного reload уже живой вкладки (с
+потерей состояния страницы — `wake_tab` перезагружает всегда, это не no-op).
+Это **мутация** (reload), поэтому под стоп-гейтом, но действие **фиксированное** — ни галочки
+JS & Debugger, ни `js_audit` (как `navigate_tab`); срок по умолчанию — `EXECUTE_JS_MAX_TIMEOUT_MS`,
+сокет-бюджет переживает его через `_wait_budget_ms` (та же дисциплина, что `wait_for`).
+
 Волна 17 (§16) добавляет к перечислению `get_text`, `wait_for`, `navigate_tab`,
 `set_exemption`, `list_exemptions` и `clear_exemption`. ⚠️ `navigate_tab` в этом списке
 **новый инструмент, а не новая команда**: команда протокола (§6) существует с самого
@@ -4011,4 +4054,17 @@ design; дубли, которые создал бы сам куратор, не
     `el.value = …`); `contenteditable` покрыт базово (`textContent` + `InputEvent`) с честной
     оговоркой про rich-редакторы (Slate / ProseMirror / Draft держат модель отдельно от DOM).
     Селектор без совпадения / без разбора / на не-редактируемом элементе — `precondition_failed`
+    (§6, §11, §12).
+24. **`tab_discarded` + `wake_tab` — честное пробуждение выгруженной вкладки (волна 24,
+    issue #68):** браузер выгружает простаивающую вкладку из RAM (`tab.discarded`), и любой
+    инжектящий/цепляющий верб падал на ней невнятной манифест-ошибкой. Новый код `tab_discarded`
+    (зеркало в `constants.js`/`protocol.py`) читается из `tab.discarded` сразу после
+    `chrome.tabs.get` — до инъекции, порядок `no_such_tab` → `tab_discarded` → `isHttpUrl` — на
+    всех инжектящих вербах (`get_text`, `execute_js`, `start_js`, `poll_job`, `scroll_until`,
+    `set_input`, `set_focus_emulation`, `start_ws_capture`) и на инжектящих предикатах `wait_for`
+    (`selector`/`textContains`), но НЕ на `urlMatches` и НЕ на `navigate_tab` (оба легальны для
+    выгруженной вкладки, а навигация её будит). Верб `wake_tab` (`{tabId, timeoutMs}` →
+    `{wasDiscarded}`) перезагружает вкладку и ждёт `status:complete` тем же wait-паттерном, что
+    `wait_for`; фиксированное действие (reload) — без галочки и без `js_audit`, как `navigate_tab`,
+    но мутация — под стоп-гейтом. MCP `wake_tab(instance, tab_id)` → `{ok, was_discarded}`
     (§6, §11, §12).

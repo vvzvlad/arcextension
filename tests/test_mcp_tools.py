@@ -2755,6 +2755,55 @@ async def test_navigate_tab_without_a_wait_keeps_its_pre_wave_answer(tmp_path):
     assert out == {"ok": True, "result": {"ok": True}}
 
 
+# --- wake_tab (#68): reload a discarded tab and wait for it to load ----------
+async def test_wake_tab_sends_command_and_renames_was_discarded(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    # A real wake: the extension answers `wasDiscarded:true` (camelCase wire), which the tool
+    # renames to snake_case `was_discarded` — the same rename wait_for/navigate_tab do.
+    out, frame = await _run_with_response(
+        lambda: tools.wake_tab(_app(db, reg), instance="main", tab_id=2),
+        cs, ws, {"wasDiscarded": True},
+    )
+    assert frame["command"] == protocol.CMD_WAKE_TAB
+    assert frame["params"]["tabId"] == 2
+    assert out == {"ok": True, "was_discarded": True}
+    # A no-op reload of an already-live tab reports `was_discarded:false`.
+    out2, _ = await _run_with_response(
+        lambda: tools.wake_tab(_app(db, reg), instance="main", tab_id=2),
+        cs, ws, {"wasDiscarded": False},
+    )
+    assert out2 == {"ok": True, "was_discarded": False}
+
+
+async def test_wake_tab_carries_the_wait_and_a_longer_socket_budget(tmp_path, monkeypatch):
+    # The extension polls `status:complete` inside a deadline; the tool hands it the
+    # EXECUTE_JS_MAX_TIMEOUT_MS ceiling and a socket budget that OUTLIVES it, the same ordering
+    # rule as wait_for / navigate_tab {waitUntil} — else the command times out on the wire first.
+    db = await _make_db(tmp_path)
+    app = _app(db, Registry(), _settings(cmd_timeout_ms=1000, execute_js_max_timeout_ms=30000))
+    seen = await _capture_budget(monkeypatch, lambda: tools.wake_tab(
+        app, instance="main", tab_id=2), {"wasDiscarded": True})
+    assert seen["command"] == protocol.CMD_WAKE_TAB
+    assert seen["params"] == {"tabId": 2, "timeoutMs": 30000}
+    assert seen["cmd_timeout_ms"] > 30000  # the socket outlives the poll deadline
+
+
+async def test_wake_tab_is_refused_while_stopped_and_sends_nothing(tmp_path):
+    # wake_tab reloads the tab — a MUTATION — so the stop switch refuses it, like navigate_tab,
+    # and no frame leaves the socket.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.wake_tab(app, instance="main", tab_id=2)
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
 # --- exemptions: the agent's «не трогать» lease (§10/§11) --------------------
 async def _known_instance(db, iid="main"):
     await _insert_instance(db, iid)

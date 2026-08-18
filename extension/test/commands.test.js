@@ -34,6 +34,7 @@ import {
   CMD_START_WS_CAPTURE,
   CMD_READ_WS_FRAMES,
   CMD_STOP_WS_CAPTURE,
+  CMD_WAKE_TAB,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
 } from "../src/constants.js";
@@ -4004,5 +4005,169 @@ describe("start_ws_capture / read_ws_frames / stop_ws_capture (chrome.debugger)"
     const res = await dispatchCommand(frame(CMD_READ_WS_FRAMES, { tabId: 5 }), ctx());
     expect(res.result.frames.map((f) => f.text)).toEqual(["small"]);
     expect(res.result.dropped).toBe(1);
+  });
+});
+
+// --- tab_discarded guard (#68) ----------------------------------------------
+// A DISCARDED tab (the browser unloaded it from memory) still answers chrome.tabs.get, so it is
+// NOT no_such_tab, and its url is http/https, so it is NOT the "wrong scheme" precondition_failed
+// either — yet injecting into it fails with the opaque "Extension manifest must request
+// permission…". Every injecting/attaching verb must refuse it honestly with `tab_discarded`
+// BEFORE it injects, so the agent wakes the tab instead of chasing a manifest bug.
+describe("tab_discarded guard (#68)", () => {
+  // Verbs that inject/write with NO JS & Debugger checkbox (fixed reads/writes).
+  const fixedVerbs = [
+    ["get_text", CMD_GET_TEXT, { tabId: 5 }],
+    ["set_input", CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }],
+    ["scroll_until", CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m", timeoutMs: 1000 }],
+    ["poll_job", CMD_POLL_JOB, { tabId: 5, jobId: "job-1" }],
+    ["wait_for selector", CMD_WAIT_FOR, { tabId: 5, selector: ".ready", timeoutMs: 1000 }],
+    ["wait_for textContains", CMD_WAIT_FOR, { tabId: 5, textContains: "hi", timeoutMs: 1000 }],
+  ];
+
+  it.each(fixedVerbs)(
+    "%s on a discarded tab => tab_discarded, executeScript NOT called",
+    async (_name, cmd, params) => {
+      chromeWithOneTab("https://x/", { discarded: true });
+      const exec = vi.spyOn(chrome.scripting, "executeScript");
+      const res = await dispatchCommand(frame(cmd, params), ctx());
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("tab_discarded");
+      expect(res.error.message).toMatch(/discarded/);
+      expect(res.error.message).toMatch(/wake_tab/);
+      expect(exec).not.toHaveBeenCalled();
+    },
+  );
+
+  // Verbs behind the JS & Debugger checkbox: the discarded check fires AFTER the checkbox passes
+  // (so with it ON) and BEFORE the inject/attach — neither the script nor the debugger is touched.
+  const gatedVerbs = [
+    ["execute_js", CMD_EXECUTE_JS, { tabId: 5, code: "1" }],
+    ["start_js", CMD_START_JS, { tabId: 5, code: "1", jobId: "job-1" }],
+    ["set_focus_emulation", CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }],
+    ["start_ws_capture", CMD_START_WS_CAPTURE, { tabId: 5 }],
+  ];
+
+  it.each(gatedVerbs)(
+    "%s on a discarded tab => tab_discarded (checkbox ON), no inject and no attach",
+    async (_name, cmd, params) => {
+      chromeWithOneTab("https://x/", { discarded: true });
+      await chrome.storage.local.set({ allowExecuteJs: true });
+      const exec = vi.spyOn(chrome.scripting, "executeScript");
+      const attach = vi.spyOn(chrome.debugger, "attach");
+      const res = await dispatchCommand(frame(cmd, params), ctx());
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("tab_discarded");
+      expect(exec).not.toHaveBeenCalled();
+      expect(attach).not.toHaveBeenCalled();
+    },
+  );
+
+  it("wait_for urlMatches is NOT gated: a discarded tab still waits on its url", async () => {
+    // urlMatches reads ONLY chrome.tabs.get().url — which a discarded tab answers — so an agent
+    // can legitimately wait for a discarded tab to wake or navigate. It must NOT be tab_discarded.
+    chromeWithOneTab("https://shop/checkout", { discarded: true });
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAIT_FOR, { tabId: 5, urlMatches: "/checkout", timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { matched: true, elapsedMs: 0 } });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("ORDER: existence is checked first — a vanished tab is still no_such_tab", async () => {
+    chromeWithOneTab("https://x/", { discarded: true });
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 999 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("a LIVE (non-discarded) tab is NOT tab_discarded — the guard fires only on discarded", async () => {
+    chromeWithOneTab("https://x/");
+    chrome.__state.scriptResults = [{ result: { found: true, text: "ok", totalBytes: 2 } }];
+    const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 5 }), ctx());
+    expect(res.ok).toBe(true);
+  });
+
+  it("set_focus_emulation(enabled=false) on a discarded tab is an idempotent success, NOT tab_discarded", async () => {
+    // The discarded guard belongs on the ATTACH (enable) path only. Disabling is a teardown that
+    // never injects or attaches, and a discarded tab's debugger has already auto-detached — so
+    // refusing it with tab_discarded would reject a state that is already reached.
+    chromeWithOneTab("https://x/", { discarded: true });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(attach).not.toHaveBeenCalled();
+    expect(detach).not.toHaveBeenCalled();
+  });
+});
+
+// --- wake_tab (#68): reload a discarded tab and wait for it to load ----------
+describe("wake_tab (#68)", () => {
+  it("reloads a discarded tab, waits for status:complete, returns was_discarded:true", async () => {
+    globalThis.chrome = createChromeMock({
+      tabs: [{ id: 5, windowId: 1, url: "https://x/", discarded: true, status: "unloaded" }],
+      reloadCompleteAfterGets: 2, // stays `loading` for two status-polls after the reload
+    });
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAKE_TAB, { tabId: 5, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { wasDiscarded: true } });
+    expect(reload).toHaveBeenCalledWith(5);
+    // It genuinely waited: the tab is loaded and no longer discarded.
+    expect(chrome.__state.tabs[0].status).toBe("complete");
+    expect(chrome.__state.tabs[0].discarded).toBe(false);
+  });
+
+  it("a LIVE tab still reloads (was_discarded:false) — a real reload, not a no-op", async () => {
+    chromeWithOneTab("https://x/"); // no discarded flag
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_WAKE_TAB, { tabId: 5, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res).toEqual({ ok: true, result: { wasDiscarded: false } });
+    expect(reload).toHaveBeenCalledWith(5);
+  });
+
+  it("a vanished tab is no_such_tab, and reload is NOT called", async () => {
+    chromeWithOneTab("https://x/");
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const res = await dispatchCommand(frame(CMD_WAKE_TAB, { tabId: 999, timeoutMs: 5000 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("a tab that vanishes DURING the load wait ends as no_such_tab", async () => {
+    chromeWithOneTab("https://x/", { discarded: true });
+    chrome.__state.reloadCompleteAfterGets = 5; // never completes within our removal window
+    const c = fakeClock();
+    // The human closes the tab after the first pre-pause; the status poll then throws.
+    c.onSleep(() => {
+      chrome.__state.tabs.length = 0;
+    });
+    const res = await dispatchCommand(
+      frame(CMD_WAKE_TAB, { tabId: 5, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("a hand-crafted frame without a positive timeoutMs is precondition_failed, no reload", async () => {
+    chromeWithOneTab("https://x/", { discarded: true });
+    const reload = vi.spyOn(chrome.tabs, "reload");
+    const res = await dispatchCommand(frame(CMD_WAKE_TAB, { tabId: 5 }), ctx());
+    expect(res.error.code).toBe("precondition_failed");
+    expect(reload).not.toHaveBeenCalled();
   });
 });

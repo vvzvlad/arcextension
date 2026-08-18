@@ -115,6 +115,16 @@ CMD_SET_FOCUS_EMULATION = "set_focus_emulation"
 CMD_START_WS_CAPTURE = "start_ws_capture"
 CMD_READ_WS_FRAMES = "read_ws_frames"
 CMD_STOP_WS_CAPTURE = "stop_ws_capture"
+# Wake a DISCARDED tab (issue #68). The browser unloads an idle tab from memory to save RAM;
+# the tab still EXISTS (``chrome.tabs.get`` answers it, with ``discarded:true`` and its url) but
+# every injecting/attaching verb fails on it with the opaque "Extension manifest must request
+# permission…". ``wake_tab`` reloads it — a reload re-materialises a discarded tab — and waits for
+# ``status:complete``. A FIXED action, not arbitrary code (like ``navigate_tab``): no execute_js
+# checkbox, no ``js_audit`` row. It IS a mutation (it reloads), so the SERVICE side gates it behind
+# the pause/stop switch. Answers ``{wasDiscarded}`` so the caller learns whether it was a real wake
+# or a reload of an already-live tab — ``wake_tab`` ALWAYS reloads, so on a live tab it is a full
+# reload that loses page state, not a no-op.
+CMD_WAKE_TAB = "wake_tab"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side
@@ -122,6 +132,13 @@ CMD_STOP_WS_CAPTURE = "stop_ws_capture"
 ERR_STALE_SESSION = "stale_session"
 ERR_PRECONDITION_FAILED = "precondition_failed"
 ERR_NO_SUCH_TAB = "no_such_tab"
+# The target tab EXISTS but the browser has DISCARDED it — unloaded it from memory to save RAM
+# (issue #68). It still answers ``chrome.tabs.get`` (``discarded:true`` + its url), so it is not
+# ``no_such_tab``; its url is usually http/https, so it is not the ``precondition_failed`` "wrong
+# scheme" either. But every injecting/attaching verb fails on it with the opaque "Extension manifest
+# must request permission…", which blames the manifest for a tab that only needs waking. Its OWN code
+# so the agent calls ``wake_tab`` (or ``navigate_tab`` to its url) instead of chasing a permission bug.
+ERR_TAB_DISCARDED = "tab_discarded"
 ERR_NO_WINDOW = "no_window"
 ERR_JS_DISABLED = "js_disabled"
 ERR_BUSY_DRAGGING = "busy_dragging"

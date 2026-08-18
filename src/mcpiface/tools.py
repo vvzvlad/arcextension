@@ -1483,6 +1483,42 @@ async def navigate_tab(app, *, instance: str, tab_id: int, url: str,
     }
 
 
+async def wake_tab(app, *, instance: str, tab_id: int, auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
+    """Wake a DISCARDED tab (issue #68): reload it and wait for the page to load.
+
+    The browser unloads an idle tab from memory to save RAM. The tab still EXISTS — it answers
+    ``list_tabs`` with its url — but every injecting/attaching verb (``get_text``, ``execute_js``,
+    ``wait_for`` with a selector, the debugger verbs, …) fails on it with ``tab_discarded`` instead
+    of the opaque "Extension manifest must request permission…" the browser would otherwise raise.
+    ``wake_tab`` is the cure: the extension ``chrome.tabs.reload``s the tab (a reload re-materialises
+    a discarded tab) and WAITS for it to report ``complete``, so the caller can inject the moment
+    this returns.
+
+    ``was_discarded`` tells whether the reload was a REAL wake (the tab was discarded) or a reload
+    of an already-live tab. ``wake_tab`` ALWAYS reloads: on a live tab that is a FULL reload which
+    loses page state (unsubmitted forms, scroll, in-page JS state), NOT a no-op — so call it in
+    answer to ``tab_discarded``, and mind the race where the tab self-woke between the failed verb
+    and this call. An agent recovering from ``tab_discarded`` confirms the wake via ``was_discarded``.
+
+    This is a MUTATION (it reloads the tab), so it sits behind the stop switch
+    (:func:`_ensure_not_paused`) like ``navigate_tab``. But the reload is a FIXED action, not
+    arbitrary code, so it carries NO execute_js checkbox and writes NO ``js_audit`` row — again like
+    ``navigate_tab``. The extension polls ``status`` inside a bounded deadline; we hand it the
+    ``EXECUTE_JS_MAX_TIMEOUT_MS`` ceiling and a socket budget that OUTLIVES that deadline
+    (:func:`_wait_budget_ms`), the same ordering rule as ``wait_for`` / ``navigate_tab {waitUntil}``,
+    so the command does not time out on the wire before the page can finish loading."""
+    await _ensure_not_paused(app)
+    wait_ms = app.state.settings.execute_js_max_timeout_ms
+    params = {"tabId": tab_id, "timeoutMs": wait_ms}
+    result = await _command(
+        app, instance, protocol.CMD_WAKE_TAB, params, auth_ctx=auth_ctx,
+        expected_session=expected_session, cmd_timeout_ms=_wait_budget_ms(app, wait_ms),
+    )
+    # camelCase on the WIRE (§6), snake_case out to the agent — the same rename wait_for does.
+    return {"ok": True, "was_discarded": bool(result.get("wasDiscarded"))}
+
+
 # --- relocate: synchronous open + guarded source close in one call (#48, §11) ---
 def _read_relocate_inputs(instance_from: str, tab_id: int, instance_to: str):
     """Reader ``fn(conn)``: the source tab row (incl. pinned/audible/active), both
