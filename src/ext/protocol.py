@@ -64,6 +64,17 @@ CMD_MOVE_TAB = "move_tab"
 # own http/https edge guard on the target tab.
 CMD_GET_TEXT = "get_text"
 CMD_WAIT_FOR = "wait_for"
+# Set the value of a controlled (React/Vue) input in ONE call. The extension writes through
+# the element's NATIVE prototype value setter (a plain ``el.value = …`` is reverted by React's
+# value-tracker on the next render) and then dispatches bubbling ``input`` / ``change`` events,
+# with ``contenteditable`` coverage. FIXED-function like ``get_text`` / ``wait_for``: ``selector``
+# and ``value`` are DATA fed to ``querySelector`` and a value assignment, never source spliced
+# into a page eval — so it is NOT behind the execute_js checkbox and writes NO ``js_audit`` row.
+# It IS a MUTATION (it writes into the page as the user), so the service side gates it behind the
+# pause/stop switch, exactly like ``navigate_tab`` — as it gates every verb that reaches the
+# browser, the read-only fixed ones (``get_text`` / ``wait_for``) included; the mutation is what
+# sets set_input apart from those, not the gate.
+CMD_SET_INPUT = "set_input"
 # Scroll a tab until the element count for a selector stops growing (or a target / deadline
 # is hit). FIXED-function like ``get_text`` / ``wait_for``: its parameters are selectors and
 # a direction — DATA fed to ``querySelector`` / ``scrollTop``, never source spliced into a

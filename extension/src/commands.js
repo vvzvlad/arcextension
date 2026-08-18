@@ -34,6 +34,7 @@ import {
   CMD_EXECUTE_JS,
   CMD_MOVE_TAB,
   CMD_GET_TEXT,
+  CMD_SET_INPUT,
   CMD_WAIT_FOR,
   CMD_SCROLL_UNTIL,
   CMD_START_JS,
@@ -251,6 +252,73 @@ export function readTextInWorld(selector, maxBytes) {
   // flushed). Costs at most 3 dropped bytes, never a mojibake tail.
   const cut = new TextDecoder("utf-8").decode(bytes.slice(0, limit), { stream: true });
   return { found: true, text: cut, totalBytes: bytes.length, truncated: true };
+}
+
+// The body injected by set_input. FIXED like readTextInWorld (§12): `selector` and `value`
+// are DATA — one goes to querySelector, the other to a value assignment — nothing is spliced
+// into an eval, so this verb needs no execute_js checkbox and writes no js_audit row. It is
+// still a MUTATION, which the SERVICE side gates behind the pause switch (see set_input in
+// tools.py); the extension applies the usual session + http/https edge guards.
+//
+// Returns a VALUE for every outcome (never a throw, same reason as readTextInWorld — a throw
+// is indistinguishable from a torn-down frame): `{badSelector, message}` for a selector that
+// does not parse, `{found:false}` for one that matches nothing, `{notEditable:true}` for an
+// element that is neither a form field nor contenteditable, `{unsupportedType, inputType}` for
+// a non-text <input> subtype (checkbox/radio/file/buttons), and `{ok:true, kind}` on success.
+export function setInputInWorld(selector, value) {
+  let el;
+  try {
+    el = document.querySelector(selector);
+  } catch (e) {
+    // A malformed selector is the CALLER's typo, carried back as a value so the dispatcher
+    // can map it to precondition_failed rather than let it escape as `internal`.
+    if (e && e.name === "SyntaxError") {
+      return { badSelector: true, message: String((e && e.message) || e) };
+    }
+    throw e;
+  }
+  if (!el) return { found: false };
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+    // set_input writes TEXT-LIKE fields only. Non-text <input> subtypes must be REFUSED, not
+    // written: `file` throws a SecurityError from the native value setter (a scripted value is
+    // a forgery risk the engine forbids), and `checkbox`/`radio` ignore `value` entirely — the
+    // state lives in `checked`, so a `value` write is a visual no-op reported as success — while
+    // `submit`/`reset`/`button`/`image` carry a label, not a field. Everything else (text,
+    // email, password, search, url, tel, number, date, hidden, …) and every <textarea> is a
+    // text-like field and proceeds through the native setter below.
+    if (el instanceof HTMLInputElement) {
+      const unsupportedInputTypes = ["file", "checkbox", "radio", "submit", "reset", "button", "image"];
+      if (unsupportedInputTypes.includes(el.type)) {
+        return { unsupportedType: true, inputType: el.type };
+      }
+    }
+    // React (and Vue) wrap the element's `value` with their own tracker and REVERT a direct
+    // `el.value = …` on the next render, because they never saw the change. Writing through
+    // the element's NATIVE prototype setter, then dispatching a BUBBLING `input` event, is
+    // exactly what a real keystroke does — the framework's onChange sees it and commits.
+    const proto = el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    setter.call(el, String(value));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true, kind: "input" };
+  }
+  if (el.isContentEditable) {
+    // Base coverage for ordinary contenteditable / textbox composers: focus, replace the
+    // text, and fire a bubbling InputEvent so a listener that mirrors the DOM into its model
+    // updates. HONEST LIMIT: rich editors (Slate / ProseMirror / Draft) keep their model
+    // SEPARATE from the DOM and rebuild it from their own state, so they may DISCARD this
+    // write; set_input does not attempt to drive their internal APIs.
+    el.focus();
+    el.textContent = String(value);
+    el.dispatchEvent(
+      new InputEvent("input", { bubbles: true, inputType: "insertText", data: String(value) }),
+    );
+    return { ok: true, kind: "contenteditable" };
+  }
+  return { notEditable: true };
 }
 
 // The body injected by wait_for's `selector` / `textContains` predicates, and by
@@ -486,6 +554,10 @@ export async function dispatchCommand(frame, ctx = {}) {
       // see the comment above the injected bodies for why that separation is sound.
       case CMD_GET_TEXT:
         return await getText(params);
+      // set_input is FIXED-function too (selector + value are DATA), so no checkbox and no
+      // js_audit row — but it is a MUTATION, gated by the service-side pause switch.
+      case CMD_SET_INPUT:
+        return await setInput(params);
       case CMD_WAIT_FOR:
         return await waitFor(params, nowFn, sleep);
       // scroll_until and poll_job are FIXED-function verbs too (§12): selectors/direction
@@ -1204,6 +1276,64 @@ async function getText(params) {
     result.totalBytes = got.totalBytes;
   }
   return ok(result);
+}
+
+// set_input {tabId, selector, value} -> {kind} (`kind` ∈ "input" | "contenteditable").
+//
+// A FIXED injected function (setInputInWorld), so — like get_text — NO execute_js checkbox and
+// NO js_audit row: the parameters are DATA, not source. The http/https edge guard IS applied,
+// exactly as get_text/execute_js apply it. The MUTATION gate (pause/stop) lives on the SERVICE
+// side (see set_input in tools.py), which refuses before the frame is ever sent.
+async function setInput(params) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "set_input target is not an http/https tab");
+  }
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: params.tabId },
+    func: setInputInWorld,
+    args: [params.selector, params.value],
+  });
+  const got = ((results || [])[0] || {}).result || {};
+  if (got.badSelector) {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `invalid CSS selector ${JSON.stringify(params.selector)}: ${got.message}`,
+    );
+  }
+  if (got.found === false) {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `selector ${JSON.stringify(params.selector)} matched no element in tab ${params.tabId}`,
+    );
+  }
+  if (got.notEditable) {
+    // Matched, but nothing this verb can write to: not an <input>/<textarea> and not
+    // contenteditable. A distinct message so the agent fixes the selector, not the value.
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `element is not an input/textarea/contenteditable in tab ${params.tabId}`,
+    );
+  }
+  if (got.unsupportedType) {
+    // Matched an <input>, but a non-text subtype set_input refuses on purpose (see
+    // setInputInWorld): a `value` write would throw (file) or be a silent no-op (checkbox/radio).
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `set_input does not support <input type=${got.inputType}>: it writes text-like fields and contenteditable, not checkboxes/radios/file pickers/buttons`,
+    );
+  }
+  if (got.ok !== true) {
+    // No positive success flag: an empty frame (destroyed/re-injected mid-write) or a body that
+    // threw leaves `got={}`, which must NOT be reported as a success with kind:undefined.
+    return fail(ERR_INTERNAL, "set_input got no result from the injected frame");
+  }
+  return ok({ kind: got.kind });
 }
 
 // wait_for {tabId, urlMatches?|selector?|textContains?, timeoutMs} ->

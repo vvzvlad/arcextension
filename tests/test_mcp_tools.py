@@ -2498,6 +2498,54 @@ async def test_get_text_is_refused_while_stopped_and_sends_nothing(tmp_path):
     assert ws.sent == []
 
 
+# --- set_input: the FIXED-but-MUTATING write (§12) ---------------------------
+async def test_set_input_sends_selector_and_value_and_returns_kind(tmp_path):
+    """FIXED body like get_text (no js_audit row), but a WRITE. selector+value ride as DATA,
+    the extension answers `kind` (what it wrote), and the tool passes it straight through."""
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.set_input(_app(db, reg), instance="main", tab_id=2,
+                                selector="#email", value="a@b.c"),
+        cs, ws, {"kind": "input"},
+    )
+    assert out == {"ok": True, "kind": "input"}
+    assert frame["command"] == protocol.CMD_SET_INPUT
+    assert frame["params"] == {"tabId": 2, "selector": "#email", "value": "a@b.c"}
+    # No arbitrary code ran, so there is nothing to audit — the same §12 line as get_text.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_set_input_carries_the_contenteditable_kind_through(tmp_path):
+    # `kind` distinguishes what was written; the tool must not flatten it to a bare ok.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.set_input(_app(db, reg), instance="main", tab_id=2,
+                                selector="[contenteditable]", value="hi"),
+        cs, ws, {"kind": "contenteditable"},
+    )
+    assert out == {"ok": True, "kind": "contenteditable"}
+
+
+async def test_set_input_is_refused_while_paused_and_sends_nothing(tmp_path):
+    # A MUTATION: gated by the stop switch exactly like navigate_tab. The stop gates every
+    # browser-reaching verb, get_text included (see test_get_text_is_refused_while_stopped above);
+    # the mutation is what sets set_input apart, not the gate. The refusal must land BEFORE the
+    # frame reaches the socket.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.set_input(app, instance="main", tab_id=2, selector="#a", value="x")
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
 # --- wait_for ----------------------------------------------------------------
 async def test_wait_for_requires_exactly_one_predicate_and_sends_nothing(tmp_path):
     db = await _make_db(tmp_path)

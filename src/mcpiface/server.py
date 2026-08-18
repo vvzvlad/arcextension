@@ -388,6 +388,35 @@ def build_mcp(app_ref) -> MCPServer:
         ))
 
     @mcp.tool()
+    async def set_input(instance: str, tab_id: int, selector: str, value: str,
+                        expected_session: str | None = None) -> dict:
+        """Set a controlled (React/Vue) field's value in ONE call; answers ``{ok, kind}``.
+
+        A FIXED injected function, so — unlike execute_js — it needs NO execute_js checkbox
+        and writes no js_audit row (``selector`` and ``value`` are DATA, not source). But it
+        is a WRITE — the value lands in the field as if the user typed it — so it IS gated by
+        the pause/stop switch, like the other mutating verbs; the http/https target guard
+        applies too.
+
+        The extension writes through the element's NATIVE prototype value setter and fires a
+        bubbling ``input`` (plus ``change``), which is what makes a controlled React/Vue input
+        actually see the value — a plain ``el.value = …`` is reverted by React's value-tracker.
+        ``kind`` is ``"input"`` for an ``<input>`` / ``<textarea>`` and ``"contenteditable"``
+        for a contenteditable element. HONEST LIMIT: set_input drives TEXT-LIKE fields — text-type
+        ``<input>`` (text, email, password, search, url, number, date, hidden, …), ``<textarea>``,
+        and ordinary contenteditable / textbox composers. It does NOT drive ``checkbox`` / ``radio``
+        (their state is ``checked``, not ``value``), ``file`` (the native setter throws), or the
+        button subtypes (submit / reset / button / image) — those are ``precondition_failed`` — and
+        it does not drive rich editors (Slate / ProseMirror / Draft), which keep their model
+        separate from the DOM and may discard a contenteditable write. A ``selector`` matching
+        nothing, not parsing, matching a non-editable element, or matching an unsupported
+        ``<input>`` subtype is ``precondition_failed``."""
+        return await _guarded(tools.set_input(
+            _host(), instance=instance, tab_id=tab_id, selector=selector, value=value,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
     async def wait_for(instance: str, tab_id: int, url_matches: str | None = None,
                        selector: str | None = None, text_contains: str | None = None,
                        timeout_ms: int | None = None,

@@ -1177,6 +1177,7 @@ worker умирает через 30 с и внутренний таймер не
 | `move_tab` | `{tabId, windowId: int\|null, index?}` | `{tabId, windowId, index}` / `pinned_cross_window` / `no_window` |
 | `execute_js` | `{code, tabId?, world?, awaitPromise?}` | `{results}` / `js_disabled` |
 | `get_text` | `{tabId, selector?, maxBytes?}` | `{text, truncated?, totalBytes?}` / `precondition_failed` |
+| `set_input` | `{tabId, selector, value}` | `{kind}`, `kind∈{input,contenteditable}` / `precondition_failed` |
 | `wait_for` | `{tabId, urlMatches?\|selector?\|textContains?, timeoutMs}` | `{matched, elapsedMs}` — `matched:false` при истечении срока |
 | `scroll_until` | `{tabId, countSelector, containerSelector?, direction?, targetCount?, stableRounds?, intervalMs?, timeoutMs, focus?}` | `{count, rounds, stopped, elapsedMs}`, `stopped∈{stable,target,deadline}` |
 | `start_js` | `{tabId, code, world?, jobId, awaitPromise}` — `awaitPromise` всегда `true` (джоба всегда исполняется как awaited async-тело) | `{jobId}` / `js_disabled` |
@@ -1190,7 +1191,28 @@ worker умирает через 30 с и внутренний таймер не
 `scroll_until` и пара `start_js`/`poll_job` — **волна 19 (§16)**; `set_focus_emulation` —
 **волна 18 (§16)**, первый верб пути через `chrome.debugger`; трио перехвата WS-фреймов
 (`start_ws_capture`/`read_ws_frames`/`stop_ws_capture`) — **волна 21 (§16)**, первые
-data-несущие вербы этого пути.
+data-несущие вербы этого пути; `set_input` — **волна 23 (§16)**, фиксированный ПИШУЩИЙ верб.
+
+**`set_input` — фиксированный верб, но МУТАЦИЯ.** Ставит значение управляемого
+(React/Vue) поля одним вызовом. `selector` и `value` — **данные** (§12): один уходит в
+`querySelector`, другой в присваивание значения, исходником в eval не становится ни один,
+— поэтому верб **фиксированный**: галочки `execute_js` не требует и строку `js_audit` не
+пишет, ровно как `get_text`. Но `set_input` **пишет в страницу от имени пользователя** — это
+**мутация**, поэтому на сервисе он **под стоп-гейтом** (`_ensure_not_paused`, как
+`navigate_tab`). Стоп-гейт при этом ловит **всё, что достигает браузера**, — и читающие
+фиксированные вербы тоже (`get_text`/`wait_for` инжектят в страницу и потому тоже гейтятся);
+от них `set_input` отличается не гейтом, а тем, что это запись. Прочие гарды — как у
+`get_text`: `no_such_tab`, http/https на краю → `precondition_failed`. Тело `setInputInWorld` для `<input>`/`<textarea>`
+пишет через **нативный прототипный сеттер** `value` и диспатчит **всплывающий** `input`
+(плюс `change`): прямое `el.value = …` React откатывает своим value-tracker'ом на следующем
+рендере, а нативный сеттер + bubbling-событие — это ровно то, что делает настоящее нажатие
+клавиши, так что контролируемый инпут изменение видит. `kind` сообщает, ЧТО записали:
+`input` для поля формы, `contenteditable` — для `contenteditable`-элемента (туда пишется
+`textContent` + `InputEvent`). ⚠️ **Честный предел `contenteditable`:** сложные редакторы
+(Slate / ProseMirror / Draft) держат модель ОТДЕЛЬНО от DOM и могут такую запись
+ОТБРОСИТЬ — это базовое покрытие обычных `contenteditable`/textbox-композеров, не их.
+Селектор, не нашедший элемента, не разобравшийся или указавший на не-редактируемый элемент,
+— `precondition_failed`.
 
 **`set_focus_emulation` — первый верб через `chrome.debugger` (§12).** Переключает
 `Emulation.setFocusEmulationEnabled`: фоновая вкладка ведёт себя как в фокусе (без
@@ -2975,6 +2997,21 @@ allowlist из трёх вербов). ⚠️ **Антибот-цена**: `Netw
 под стоп-гейтом: свернуть экспозицию должно быть можно всегда. **Взаимное исключение с
 focus-emulation** по вкладке (один debugger-клиент на вкладку) — `debugger_attach`.
 
+Волна 23 (§16) добавляет `set_input` — фиксированный, но **пишущий** верб: ставит значение
+управляемого поля одним вызовом, ответ `{ok, kind}` (`kind` ∈ `input` / `contenteditable`).
+Фиксированный, как `get_text` (`selector` и `value` — данные, а не исходник: галочки
+`execute_js` не требует, `js_audit` не пишет), но при этом **мутация** — значение попадёт в
+поле как от пользователя, — поэтому он **под стоп-гейтом** (`_ensure_not_paused`, как
+`navigate_tab`). Стоп-гейт общий для всего, что достигает браузера: читающие `get_text`/
+`wait_for` тоже инжектят и тоже под ним; `set_input` отличается от них не гейтом, а тем, что
+это запись. http/https на краю применяется тоже. Нативный
+прототипный сеттер + всплывающий `input`/`change` — то, что заставляет контролируемый
+React/Vue-инпут увидеть значение (прямое `el.value = …` откатывает value-tracker React).
+`contenteditable` покрыт базово (`textContent` + `InputEvent`) с честной оговоркой в докстроке:
+сложные rich-редакторы (Slate / ProseMirror / Draft) держат модель отдельно от DOM и могут
+запись отбросить. Селектор без совпадения, без разбора или на не-редактируемом элементе —
+`precondition_failed`.
+
 Волна 17 (§16) добавляет к перечислению `get_text`, `wait_for`, `navigate_tab`,
 `set_exemption`, `list_exemptions` и `clear_exemption`. ⚠️ `navigate_tab` в этом списке
 **новый инструмент, а не новая команда**: команда протокола (§6) существует с самого
@@ -3558,6 +3595,25 @@ MCP не работала бы ни одна: превью живёт в UI и �
   является и обязан идти через гейт `execute_js` целиком: галочка на краю и
   `js_audit` до отправки. Иначе весь этот раздел обходится заведением
   «фиксированного» верба `run_snippet {code}`, то есть переименованием.
+
+  ⚠️ **Фиксированный ≠ читающий: `set_input` — фиксированный ПИШУЩИЙ верб (волна 23).**
+  `selector` и `value` — данные (§12): один в `querySelector`, другой в присваивание
+  значения, исходником в eval не становится ни один, — поэтому границу «по исходнику» верб
+  проходит и **фиксирован**: галочки `execute_js` не требует, `js_audit` не пишет, как
+  `get_text`. Но «фиксированный» — про гейт `execute_js`, а не про безвредность: `set_input`
+  **пишет в страницу от имени пользователя**, и это **мутация**, поэтому её ловит второй,
+  независимый гейт — **пауза/стоп** на сервисе (`_ensure_not_paused`), ровно как у
+  `navigate_tab`. Оси «фиксированный vs исходник» и «мутация vs чтение» не совпадают, но
+  стоп-гейт при этом не привязан ни к одной из них: он ловит **всё, что достигает браузера**, —
+  и `set_input`, и читающие фиксированные вербы (`get_text`, `wait_for` тоже инжектят в страницу,
+  поэтому тоже под стоп-гейтом). `set_input` отличается от них не стоп-гейтом (он общий для всех
+  троих), а тем, что это **мутация** — запись в страницу, — оставаясь при этом без галочки
+  `execute_js` и аудита. Тело пишет через **нативный прототипный сеттер** `value` и всплывающий
+  `input` — именно это обходит React value-tracker (прямое `el.value = …` он откатывает). Верб
+  покрывает **текстовые** поля (`<input>` текстовых подтипов, `<textarea>`) и `contenteditable`;
+  `checkbox`/`radio`/`file`/кнопки он отклоняет (`precondition_failed`), а по `contenteditable`
+  честно оговаривает rich-редакторы (Slate / ProseMirror / Draft держат модель отдельно от DOM и
+  могут запись отбросить).
 - **Развилка `chrome.debugger`: выбран гибрид, и дефолт — дешёвый путь.** Половина
   желаемого агентского инструментария достижима **только** через `chrome.debugger`
   (CDP), и это не вопрос удобства: скриншот **фоновой** вкладки; лог сетевых запросов
@@ -3946,3 +4002,13 @@ design; дубли, которые создал бы сам куратор, не
     хвостом в `remaining` (приватность ПД, §12). `stop_ws_capture` — идемпотентный teardown.
     Взаимное исключение с `set_focus_emulation` по вкладке (один debugger-клиент), код
     `debugger_attach`; буфер в памяти MV3 SW теряется при смерти воркера (§6, §11, §12).
+23. **`set_input` — фиксированный ПИШУЩИЙ верб (волна 23):** ставит значение управляемого
+    (React/Vue) поля одним вызовом, ответ `{ok, kind}` (`kind` ∈ `input`/`contenteditable`).
+    Фиксированный, как `get_text` (`selector`/`value` — данные: без галочки `execute_js`, без
+    `js_audit`), но **мутация**, поэтому под стоп-гейтом (`_ensure_not_paused`), как
+    `navigate_tab`. Тело `setInputInWorld` пишет через **нативный прототипный сеттер** `value` +
+    всплывающий `input`/`change` (обходит React value-tracker, который откатывает прямое
+    `el.value = …`); `contenteditable` покрыт базово (`textContent` + `InputEvent`) с честной
+    оговоркой про rich-редакторы (Slate / ProseMirror / Draft держат модель отдельно от DOM).
+    Селектор без совпадения / без разбора / на не-редактируемом элементе — `precondition_failed`
+    (§6, §11, §12).

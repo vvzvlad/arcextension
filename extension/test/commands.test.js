@@ -4,6 +4,7 @@ import {
   dispatchCommand,
   evalInWorld,
   readTextInWorld,
+  setInputInWorld,
   matchInWorld,
   scrollAndCountInWorld,
   startJobInWorld,
@@ -24,6 +25,7 @@ import {
   CMD_EXECUTE_JS,
   CMD_MOVE_TAB,
   CMD_GET_TEXT,
+  CMD_SET_INPUT,
   CMD_WAIT_FOR,
   CMD_SCROLL_UNTIL,
   CMD_START_JS,
@@ -83,6 +85,10 @@ describe("stale_session rejects every verb without executing", () => {
     // frame from a dead session names tab ids this extension no longer owns, so reading
     // one is reading a stranger's tab.
     [CMD_GET_TEXT, { tabId: 1 }],
+    // set_input is a MUTATION, but the session check still runs FIRST — a frame from a dead
+    // session names tab ids this extension no longer owns, so writing to one is writing a
+    // stranger's tab.
+    [CMD_SET_INPUT, { tabId: 1, selector: "#a", value: "x" }],
     [CMD_WAIT_FOR, { tabId: 1, urlMatches: "x", timeoutMs: 1000 }],
     [CMD_SCROLL_UNTIL, { tabId: 1, countSelector: ".x", timeoutMs: 1000 }],
     // start_js carries arbitrary code but the session check runs FIRST, before its checkbox.
@@ -1966,6 +1972,416 @@ describe("get_text", () => {
   it("a vanished tab is no_such_tab, not internal", async () => {
     chromeWithOneTab();
     const res = await dispatchCommand(frame(CMD_GET_TEXT, { tabId: 999 }), ctx());
+    expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
+// --- set_input: the FIXED-but-MUTATING write (§12) ---------------------------
+// A DOM environment for setInputInWorld. The injected body reads global constructors the
+// node test runtime does not provide — HTMLInputElement / HTMLTextAreaElement (for `instanceof`
+// and the NATIVE prototype `value` setter) and Event / InputEvent (for the dispatched events) —
+// so the harness installs doubles and restores them afterwards. The prototype `value` setters
+// are `vi.fn` spies so a test can PROVE the code wrote through the native setter (the thing that
+// bypasses React's value-tracker), not a plain `el.value = …`. `env.events` collects every
+// dispatched event in order.
+function withEditableEnv(fn) {
+  const saved = {
+    document: globalThis.document,
+    HTMLInputElement: globalThis.HTMLInputElement,
+    HTMLTextAreaElement: globalThis.HTMLTextAreaElement,
+    Event: globalThis.Event,
+    InputEvent: globalThis.InputEvent,
+  };
+  const events = [];
+  class FakeEvent {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.bubbles = !!init.bubbles;
+    }
+  }
+  class FakeInputEvent extends FakeEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.inputType = init.inputType;
+      this.data = init.data;
+    }
+  }
+  const inputSetter = vi.fn(function (v) {
+    this._value = v;
+  });
+  const textareaSetter = vi.fn(function (v) {
+    this._value = v;
+  });
+  class FakeInput {
+    constructor() {
+      this._value = "";
+    }
+    dispatchEvent(ev) {
+      events.push(ev);
+      return true;
+    }
+    focus() {
+      this._focused = true;
+    }
+  }
+  Object.defineProperty(FakeInput.prototype, "value", {
+    configurable: true,
+    get() {
+      return this._value;
+    },
+    set: inputSetter,
+  });
+  class FakeTextArea {
+    constructor() {
+      this._value = "";
+    }
+    dispatchEvent(ev) {
+      events.push(ev);
+      return true;
+    }
+    focus() {
+      this._focused = true;
+    }
+  }
+  Object.defineProperty(FakeTextArea.prototype, "value", {
+    configurable: true,
+    get() {
+      return this._value;
+    },
+    set: textareaSetter,
+  });
+  globalThis.HTMLInputElement = FakeInput;
+  globalThis.HTMLTextAreaElement = FakeTextArea;
+  globalThis.Event = FakeEvent;
+  globalThis.InputEvent = FakeInputEvent;
+
+  const env = {
+    events,
+    inputSetter,
+    textareaSetter,
+    input: () => new FakeInput(),
+    textarea: () => new FakeTextArea(),
+    // A contenteditable double: NOT a form field (so `instanceof` is false); the body reads
+    // isContentEditable, focus(), textContent and dispatchEvent.
+    editable: () => ({
+      isContentEditable: true,
+      _text: "",
+      get textContent() {
+        return this._text;
+      },
+      set textContent(v) {
+        this._text = v;
+      },
+      focus() {
+        this._focused = true;
+      },
+      dispatchEvent(ev) {
+        events.push(ev);
+        return true;
+      },
+    }),
+    // A plain <div>: neither a form field nor contenteditable.
+    plain: () => ({ isContentEditable: false }),
+    // Install a document whose querySelector maps selectors to elements; `bad` selectors are
+    // rejected with a real SyntaxError, the way a browser engine rejects a malformed one.
+    setDoc(matches = {}, bad = []) {
+      globalThis.document = {
+        querySelector: (sel) => {
+          if (bad.includes(sel)) {
+            const e = new Error(`'${sel}' is not a valid selector`);
+            e.name = "SyntaxError";
+            throw e;
+          }
+          return sel in matches ? matches[sel] : null;
+        },
+      };
+    },
+  };
+  try {
+    return fn(env);
+  } finally {
+    globalThis.document = saved.document;
+    globalThis.HTMLInputElement = saved.HTMLInputElement;
+    globalThis.HTMLTextAreaElement = saved.HTMLTextAreaElement;
+    globalThis.Event = saved.Event;
+    globalThis.InputEvent = saved.InputEvent;
+  }
+}
+
+describe("setInputInWorld — set_input's injected body", () => {
+  it("writes an <input> through the NATIVE prototype setter, then bubbles input+change", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      env.setDoc({ "#email": el });
+      const res = setInputInWorld("#email", "a@b.c");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      // The load-bearing fact: the value went through the prototype's OWN setter (bypassing
+      // React's value-tracker), not a direct assignment — and it stuck.
+      expect(env.inputSetter).toHaveBeenCalledWith("a@b.c");
+      expect(el.value).toBe("a@b.c");
+      // input BEFORE change, both bubbling — exactly what a real keystroke fires.
+      expect(env.events.map((e) => [e.type, e.bubbles])).toEqual([
+        ["input", true],
+        ["change", true],
+      ]);
+    });
+  });
+
+  it("reaches the PROTO setter past an instance `value` override (React's value-tracker)", () => {
+    // React's value-tracker installs its OWN `value` accessor ON THE ELEMENT INSTANCE, shadowing
+    // the prototype's. A plain `el.value = …` would hit THAT instance setter (which React then
+    // reverts on the next render) and never reach the native one — the exact bug set_input exists
+    // to avoid. Prove the body writes through the PROTOTYPE setter, not the instance override, by
+    // spying on an instance-level setter that must stay UNTOUCHED. (If the body were changed to a
+    // direct `el.value = String(value)`, trackerSetter would fire and inputSetter would not —
+    // this test would then fail, which is precisely the regression it guards.)
+    withEditableEnv((env) => {
+      const el = env.input();
+      const trackerSetter = vi.fn();
+      Object.defineProperty(el, "value", {
+        configurable: true,
+        get() {
+          return this._value;
+        },
+        set: trackerSetter,
+      });
+      env.setDoc({ "#email": el });
+      const res = setInputInWorld("#email", "a@b.c");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      // The native prototype setter ran…
+      expect(env.inputSetter).toHaveBeenCalledWith("a@b.c");
+      // …and the instance-level (tracker) setter did NOT — i.e. it was not a direct `el.value =`.
+      expect(trackerSetter).not.toHaveBeenCalled();
+    });
+  });
+
+  it("coerces a non-string value with String() before the native setter", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      env.setDoc({ "#n": el });
+      const res = setInputInWorld("#n", 42);
+      expect(res).toEqual({ ok: true, kind: "input" });
+      expect(env.inputSetter).toHaveBeenCalledWith("42");
+      expect(el.value).toBe("42");
+    });
+  });
+
+  it("uses the HTMLTextAreaElement prototype for a <textarea>", () => {
+    withEditableEnv((env) => {
+      const el = env.textarea();
+      env.setDoc({ "#bio": el });
+      const res = setInputInWorld("#bio", "line");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      // The textarea proto's setter ran; the input proto's did NOT — proof the branch picked
+      // the right prototype (a plain input setter would not fire a textarea's value tracker).
+      expect(env.textareaSetter).toHaveBeenCalledWith("line");
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(el.value).toBe("line");
+      expect(env.events.map((e) => e.type)).toEqual(["input", "change"]);
+    });
+  });
+
+  it("sets textContent and fires an InputEvent for a contenteditable element", () => {
+    withEditableEnv((env) => {
+      const el = env.editable();
+      env.setDoc({ "[contenteditable]": el });
+      const res = setInputInWorld("[contenteditable]", "hello");
+      expect(res).toEqual({ ok: true, kind: "contenteditable" });
+      expect(el._focused).toBe(true);
+      expect(el.textContent).toBe("hello");
+      expect(env.events.length).toBe(1);
+      const ev = env.events[0];
+      expect(ev.type).toBe("input");
+      expect(ev.bubbles).toBe(true);
+      // The InputEvent-specific fields distinguish it from a plain Event.
+      expect(ev.inputType).toBe("insertText");
+      expect(ev.data).toBe("hello");
+    });
+  });
+
+  it("a selector that matches NOTHING is found:false, never a write", () => {
+    withEditableEnv((env) => {
+      env.setDoc({});
+      expect(setInputInWorld("#nope", "x")).toEqual({ found: false });
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("a MALFORMED selector is reported as a value, never a throw", () => {
+    // A throw is indistinguishable from a torn-down frame; the typo has to travel as data so
+    // the dispatcher can map it to precondition_failed rather than `internal`.
+    withEditableEnv((env) => {
+      env.setDoc({}, ["#a:has(>"]);
+      const got = setInputInWorld("#a:has(>", "x");
+      expect(got.badSelector).toBe(true);
+      expect(got.message).toMatch(/not a valid selector/);
+    });
+  });
+
+  it("an element that is neither a form field nor contenteditable is notEditable", () => {
+    withEditableEnv((env) => {
+      env.setDoc({ "div": env.plain() });
+      expect(setInputInWorld("div", "x")).toEqual({ notEditable: true });
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("REFUSES a checkbox <input> (value is a no-op there) as unsupportedType, never a write", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      el.type = "checkbox";
+      env.setDoc({ "#agree": el });
+      expect(setInputInWorld("#agree", "x")).toEqual({ unsupportedType: true, inputType: "checkbox" });
+      // Not written and no events — the state of a checkbox lives in `checked`, not `value`.
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("REFUSES a file <input> (native setter would throw SecurityError) as unsupportedType", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      el.type = "file";
+      env.setDoc({ "#upload": el });
+      expect(setInputInWorld("#upload", "/etc/passwd")).toEqual({ unsupportedType: true, inputType: "file" });
+      expect(env.inputSetter).not.toHaveBeenCalled();
+      expect(env.events).toEqual([]);
+    });
+  });
+
+  it("a TEXT-like <input> subtype still writes through the native setter", () => {
+    withEditableEnv((env) => {
+      const el = env.input();
+      el.type = "email"; // a text-like subtype — supported, unlike checkbox/file
+      env.setDoc({ "#email": el });
+      const res = setInputInWorld("#email", "a@b.c");
+      expect(res).toEqual({ ok: true, kind: "input" });
+      expect(env.inputSetter).toHaveBeenCalledWith("a@b.c");
+    });
+  });
+});
+
+function chromeWithOneTab5(url = "https://x/") {
+  globalThis.chrome = createChromeMock({ tabs: [{ id: 5, windowId: 1, url }] });
+}
+
+describe("set_input", () => {
+  it("runs with the execute_js checkbox OFF — a fixed function is not eval (§12)", async () => {
+    // The verb writes to the page (a mutation, pause-gated on the service side), but its BODY
+    // is fixed and takes only DATA, so the extension edge needs no execute_js checkbox.
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { ok: true, kind: "input" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }), ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { kind: "input" } });
+  });
+
+  it("passes selector + value to the FIXED function, never a code string", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { ok: true, kind: "input" } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    await dispatchCommand(frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "hi" }), ctx());
+    const injection = exec.mock.calls[0][0];
+    expect(injection.args).toEqual(["#a", "hi"]);
+    expect(typeof injection.func).toBe("function");
+  });
+
+  it("carries the contenteditable kind through", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { ok: true, kind: "contenteditable" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "[contenteditable]", value: "x" }), ctx(),
+    );
+    expect(res.result).toEqual({ kind: "contenteditable" });
+  });
+
+  it("a MALFORMED selector is precondition_failed, not `internal`", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [
+      { result: { badSelector: true, message: "'#a:has(>' is not a valid selector" } },
+    ];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a:has(>", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#a:has(>");
+  });
+
+  it("a selector that matched nothing => precondition_failed", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { found: false } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#nope", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#nope");
+  });
+
+  it("a non-editable element => precondition_failed", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { notEditable: true } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "div", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toMatch(/input\/textarea\/contenteditable/);
+  });
+
+  it("an unsupported <input> subtype (checkbox) => precondition_failed naming the type", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { unsupportedType: true, inputType: "checkbox" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#agree", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("checkbox");
+  });
+
+  it("a <input type=file> => precondition_failed (unsupported), never a false ok", async () => {
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: { unsupportedType: true, inputType: "file" } }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#upload", value: "/etc/passwd" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("file");
+  });
+
+  it("an EMPTY injected result (torn-down/re-injected frame) => internal, not a false ok", async () => {
+    // A destroyed or re-injected frame answers with no `result` (or a body that threw) — got={}.
+    // Without the positive-flag check that would fall through to ok({kind:undefined}), a silent
+    // false success. It must be `internal` instead.
+    chromeWithOneTab5();
+    chrome.__state.scriptResults = [{ result: undefined }];
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }), ctx(),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("internal");
+  });
+
+  it("keeps execute_js's http/https target guard (§12)", async () => {
+    chromeWithOneTab5("file:///etc/passwd");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 5, selector: "#a", value: "x" }), ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a vanished tab is no_such_tab, not internal", async () => {
+    chromeWithOneTab5();
+    const res = await dispatchCommand(
+      frame(CMD_SET_INPUT, { tabId: 999, selector: "#a", value: "x" }), ctx(),
+    );
     expect(res.error.code).toBe("no_such_tab");
   });
 });

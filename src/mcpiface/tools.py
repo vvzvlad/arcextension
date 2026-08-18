@@ -982,6 +982,44 @@ async def get_text(app, *, instance: str, tab_id: int, selector: str | None = No
     return {"ok": True, "text": text, **meta}
 
 
+async def set_input(app, *, instance: str, tab_id: int, selector: str, value: str,
+                    auth_ctx: str | None = None, expected_session: str | None = None) -> dict:
+    """Set a controlled (React/Vue) field's value in ONE call; answer ``{ok, kind}``.
+
+    FIXED-function like :func:`get_text`: ``selector`` and ``value`` are DATA — one goes to
+    ``querySelector``, the other to a value assignment — never source spliced into a page
+    eval, so this verb is NOT behind the execute_js checkbox and writes NO ``js_audit`` row.
+
+    It is nonetheless a WRITE — the value lands in the field AS IF the user typed it — so it
+    is gated by the stop switch here (:func:`_ensure_not_paused`), like EVERY verb that reaches
+    the browser — the reading fixed ones included: ``get_text`` / ``wait_for`` inject into the
+    page too and are stop-gated the same way. What sets ``set_input`` apart from those is not
+    the stop gate (all three sit behind it) but that it is a MUTATION — a write into the page —
+    whereas they only read. Every other gate still applies: revoke, ``stale_session``, and the
+    extension's http/https edge guard.
+
+    The extension writes through the element's NATIVE prototype value setter and dispatches a
+    bubbling ``input`` (plus ``change``), which is what makes a controlled React/Vue input
+    actually update — a plain ``el.value = …`` is reverted by React's value-tracker. ``kind``
+    reports what was written: ``"input"`` for an ``<input>`` / ``<textarea>``,
+    ``"contenteditable"`` for a contenteditable element.
+
+    SCOPE: set_input drives TEXT-LIKE fields — ``<input>`` of a text subtype (text, email,
+    password, search, url, tel, number, date, hidden, …), ``<textarea>``, and ordinary
+    contenteditable / textbox composers. It does NOT drive ``checkbox`` / ``radio`` (state lives
+    in ``checked``, not ``value``), ``file`` (the native setter throws), or the button subtypes
+    (``submit`` / ``reset`` / ``button`` / ``image``) — those return ``precondition_failed`` — and
+    it does not attempt the internal APIs of rich editors (Slate / ProseMirror / Draft), which
+    keep their model separate from the DOM and may discard a contenteditable write. A ``selector``
+    that matches nothing, that does not parse, that matches a non-editable element, or that matches
+    an unsupported ``<input>`` subtype is ``precondition_failed``."""
+    await _ensure_not_paused(app)
+    params: dict = {"tabId": tab_id, "selector": selector, "value": value}
+    result = await _command(app, instance, protocol.CMD_SET_INPUT, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session)
+    return {"ok": True, "kind": result.get("kind")}
+
+
 async def wait_for(app, *, instance: str, tab_id: int, url_matches: str | None = None,
                    selector: str | None = None, text_contains: str | None = None,
                    timeout_ms: int | None = None, auth_ctx: str | None = None,
