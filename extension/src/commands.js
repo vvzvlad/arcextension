@@ -89,7 +89,7 @@ export function isHttpUrl(url) {
 // function, so an un-exported injected body is untestable.
 //
 // THE SPLIT THAT MATTERS (§12): `evalInWorld` carries ARBITRARY code and is therefore
-// behind the execute_js checkbox + the kill-switch + a js_audit row. `readTextInWorld` and
+// behind the execute_js checkbox + a js_audit row. `readTextInWorld` and
 // `matchInWorld` are FIXED — committed here, known at build time, taking only a selector
 // or a substring — so there is nothing to reconstruct after the fact and they are NOT
 // behind that gate and write NO audit row. They are still subject to every other gate: the
@@ -331,7 +331,7 @@ export function scrollAndCountInWorld(containerSelector, direction, countSelecto
 
 // The body injected by start_js. THIS is the arbitrary-code path (§12): `source` is the
 // caller's code, which is precisely why start_js — like execute_js — is behind the
-// execute_js checkbox + the kill-switch + a js_audit row on the service. The body itself is
+// execute_js checkbox + a js_audit row on the service. The body itself is
 // fixed and committed; what it COMPILES is not.
 //
 // It wraps `source` in an async IIFE and does NOT await it: the result of executeScript is
@@ -492,7 +492,7 @@ export async function dispatchCommand(frame, ctx = {}) {
       case CMD_POLL_JOB:
         return await pollJob(params);
       // start_js carries ARBITRARY code, so it goes through the same gate as execute_js —
-      // the checkbox here at the edge, and the service's audit/kill-switch before the send.
+      // the checkbox here at the edge, and the service's js_audit row before the send.
       case CMD_START_JS:
         return await startJs(params);
       // The first chrome.debugger (CDP) verb (§12, wave 18): gated by the SAME single
@@ -1395,7 +1395,7 @@ async function scrollUntil(params, nowFn, sleep) {
 
 // start_js {tabId, code, world?, jobId} -> {jobId}. ARBITRARY code, so gated on the
 // execute_js checkbox HERE at the edge (read FRESH, default OFF) exactly like execute_js —
-// while the service writes the js_audit row and enforces the runtime kill-switch BEFORE the
+// while the service writes the js_audit row BEFORE the
 // send (§12). The injected startJobInWorld wraps the code fire-and-forget and answers
 // {jobId} at once; the promise runs on in the page. `jobId` is minted by the service and
 // echoed back so the caller can poll it.

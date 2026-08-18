@@ -892,10 +892,9 @@ async def execute_js(app, *, instance: str, tab_id: int, code: str,
                      auth_ctx: str | None = None,
                      expected_session: str | None = None) -> dict:
     """Run JS in a tab as an MCP verb. ``send_command`` writes the js_audit row
-    BEFORE the send and enforces the runtime kill-switch (§12): a disabled/rejected
-    call is still audited (with ``initiator='mcp'`` + the MCP ``auth_ctx``), and the
-    extension's own execute_js checkbox still gates it at the edge. Refused while
-    paused.
+    BEFORE the send (§12): a rejected call is still audited (with
+    ``initiator='mcp'`` + the MCP ``auth_ctx``), and the extension's own execute_js
+    checkbox gates it at the edge. Refused while paused.
 
     ``await_promise`` (default False) makes the code the body of an async function in the
     page, so top-level ``await`` and ``return`` both work and the promise is awaited before
@@ -1128,10 +1127,10 @@ async def start_js(app, *, instance: str, tab_id: int, code: str,
     """Fire ``code`` into a tab's global as a JOB and return ``{ok, job_id}`` at once (§11).
 
     ARBITRARY code, so — EXACTLY like :func:`execute_js` — ``send_command`` writes the
-    ``js_audit`` row BEFORE the send and enforces the runtime kill-switch (§12), and the
-    extension's own execute_js checkbox still gates it at the edge. Refused while paused.
+    ``js_audit`` row BEFORE the send (§12), and the extension's own execute_js checkbox
+    gates it at the edge. Refused while paused.
 
-    THE GATE STOPS NEW STARTS, NOT A RUNNING JOB: the runtime kill-switch and pause (§12)
+    THE GATE STOPS NEW STARTS, NOT A RUNNING JOB: the extension-edge checkbox and pause (§12)
     refuse the NEXT start_js/execute_js, but neither can reach INTO a page to abort a job
     that already fired — its code runs to completion in the page regardless. This widens the
     §12 surface MORE than execute_js, whose code at least finishes within its one blocking call.

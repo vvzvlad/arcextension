@@ -171,7 +171,7 @@ export const CMD_WAIT_FOR = "wait_for";
 export const CMD_SCROLL_UNTIL = "scroll_until";
 // The Job-API pair (fire arbitrary code into a page global, then poll it):
 //   - start_js carries ARBITRARY caller code, so it is behind the execute_js checkbox +
-//     the kill-switch + a js_audit row, EXACTLY like execute_js (§12). It wraps the code
+//     a js_audit row, EXACTLY like execute_js (§12). It wraps the code
 //     in an async IIFE that stashes {state,value|message} under window.__curatorJobs[jobId]
 //     and returns {jobId} WITHOUT awaiting the promise.
 //   - poll_job is a FIXED read of that global (readJobInWorld takes only the jobId as

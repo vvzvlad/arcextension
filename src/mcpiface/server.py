@@ -336,7 +336,7 @@ def build_mcp(app_ref) -> MCPServer:
         max_bytes: int | None = None,
         expected_session: str | None = None,
     ) -> dict:
-        """Run JS in a tab (§12: audited before send, gated by the checkbox+kill-switch).
+        """Run JS in a tab (§12: audited before send, gated by the extension-edge checkbox).
 
         A promise is awaited on EITHER path, with or without the flag: ``fetch(u).then(r =>
         r.json())`` resolves to the parsed body, not to a promise.
@@ -457,15 +457,15 @@ def build_mcp(app_ref) -> MCPServer:
 
         For code that legitimately outlives a single command (a long scrape, a slow fetch
         chain) without holding the socket open. ARBITRARY code, so gated EXACTLY like
-        execute_js: audited before send, gated by the checkbox + the runtime kill-switch
-        (§12). Refused while paused.
+        execute_js: audited before send, gated by the extension-edge checkbox (§12).
+        Refused while paused.
 
         The code is wrapped fire-and-forget: it runs on in the page after this returns, and
         stashes its outcome under a page global keyed by ``job_id``. Read it with
         ``poll_job(instance, tab_id, job_id)`` — ``state`` walks ``running`` -> ``done`` (with
         ``value``) or ``error`` (with ``message``).
 
-        The gate stops NEW starts, not a RUNNING job: the kill-switch and pause refuse the
+        The gate stops NEW starts, not a RUNNING job: the checkbox and pause refuse the
         next start_js/execute_js but cannot abort a job already firing in the page (§12) — a
         wider surface than execute_js. The job always runs as an awaited async body, so its
         audit row always carries ``awaitPromise:true`` (there is no non-await path here).

@@ -2,7 +2,7 @@
 
 Covers each tool's handler plus the guards the reviewer mutation-checks:
 * confirm_impact on an MCP rule write,
-* execute_js audited (initiator='mcp' + the MCP session as auth_ctx) and kill-switch,
+* execute_js audited (initiator='mcp' + the MCP session as auth_ctx),
 * relocate_tab writing a live ``relocate`` row (initiator='mcp'),
 * a stopped system refusing a mutating verb (and no command leaving the socket).
 """
@@ -22,7 +22,7 @@ from src.curator import pause as pause_ops
 from src.db import state as state_read
 from src.db.access import Database
 from src.db.audit import insert_js_audit  # noqa: F401  (schema presence)
-from src.db.settings_store import get_setting, set_execute_js_enabled, set_setting
+from src.db.settings_store import get_setting, set_setting
 from src.ext import protocol
 from src.ext.commands import resolve_response
 from src.ext.registry import ConnState, Registry
@@ -643,7 +643,7 @@ async def test_move_tab_is_refused_while_stopped_and_sends_nothing(tmp_path):
     assert ws.sent == []
 
 
-# --- execute_js: audited (§12) + kill-switch --------------------------------
+# --- execute_js: audited (§12) ----------------------------------------------
 async def test_execute_js_audited_with_mcp_session_as_auth_ctx(tmp_path):
     db = await _make_db(tmp_path)
     reg = Registry()
@@ -665,20 +665,6 @@ async def test_execute_js_audited_with_mcp_session_as_auth_ctx(tmp_path):
     # §12: the js_audit trace names the MCP SESSION, not a token, and initiator='mcp'.
     assert initiator == "mcp" and auth_ctx == "mcp-session-xyz"
     assert code == "1+1" and outcome == "ok" and url == "https://a"
-
-
-async def test_execute_js_refused_by_kill_switch_still_audited_and_not_sent(tmp_path):
-    db = await _make_db(tmp_path)
-    await db.write(lambda c: set_execute_js_enabled(c, False))
-    reg = Registry()
-    cs, ws = _put_conn(reg, "main")
-    app = _app(db, reg)
-    with pytest.raises(tools.ToolError) as ei:
-        await tools.execute_js(app, instance="main", tab_id=2, code="evil()", auth_ctx="s")
-    assert ei.value.code == protocol.ERR_JS_DISABLED
-    assert ws.sent == []  # refused before any frame reached the socket
-    outcome = await db.read(lambda c: c.execute("SELECT outcome, initiator FROM js_audit").fetchone())
-    assert outcome == ("disabled", "mcp")
 
 
 # --- scroll_until: FIXED verb, wait-budget socket, snake_case shape ----------
@@ -2304,7 +2290,7 @@ async def test_execute_js_timeout_is_clamped_to_the_ceiling(tmp_path, monkeypatc
 
 # --- get_text: the FIXED-function read (§12) ---------------------------------
 async def test_get_text_returns_the_text_and_writes_NO_js_audit_row(tmp_path):
-    """THE §12 line this wave draws. The execute_js gate (checkbox + kill-switch + an
+    """THE §12 line this wave draws. The execute_js gate (the extension-edge checkbox + an
     audit row before the send) exists because ARBITRARY code arrives there and truncated
     code cannot be reconstructed. get_text injects a function committed into the extension
     and known at build time — there is nothing to reconstruct, so it is NOT behind that
