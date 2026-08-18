@@ -35,6 +35,10 @@ import {
   CMD_MOVE_TAB,
   CMD_GET_TEXT,
   CMD_WAIT_FOR,
+  CMD_SCROLL_UNTIL,
+  CMD_START_JS,
+  CMD_POLL_JOB,
+  CMD_SET_FOCUS_EMULATION,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
@@ -42,6 +46,7 @@ import {
   ERR_JS_DISABLED,
   ERR_BUSY_DRAGGING,
   ERR_PINNED_CROSS_WINDOW,
+  ERR_DEBUGGER_ATTACH,
   ERR_INTERNAL,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
@@ -84,7 +89,7 @@ export function isHttpUrl(url) {
 // function, so an un-exported injected body is untestable.
 //
 // THE SPLIT THAT MATTERS (§12): `evalInWorld` carries ARBITRARY code and is therefore
-// behind the execute_js checkbox + the kill-switch + a js_audit row. `readTextInWorld` and
+// behind the execute_js checkbox + a js_audit row. `readTextInWorld` and
 // `matchInWorld` are FIXED — committed here, known at build time, taking only a selector
 // or a substring — so there is nothing to reconstruct after the fact and they are NOT
 // behind that gate and write NO audit row. They are still subject to every other gate: the
@@ -273,6 +278,159 @@ export function matchInWorld(selector, textContains) {
   return { matched: text.includes(textContains) };
 }
 
+// The body injected by scroll_until on EVERY step. FIXED like readTextInWorld/matchInWorld
+// (§12): `countSelector` / `containerSelector` are DATA handed to querySelector(All) and
+// `direction` is one of two literals — nothing is spliced into an eval — so this verb needs
+// no execute_js checkbox and writes no js_audit row.
+//
+// Scrolls the target (a container element, or the document viewport when
+// `containerSelector` is null) to the far end for the direction, then answers
+// `{count}` = how many `countSelector` matches the page now holds. A malformed selector is
+// reported as a `{badSelector, message}` VALUE, never a throw — same reason as matchInWorld:
+// the scroll_until loop reads a thrown injection as a frame being torn down and would poll
+// to the deadline, turning a typo into a full budget spent on the wrong question. A
+// `containerSelector` that matched nothing is `{noContainer}`, distinct from a bad selector.
+export function scrollAndCountInWorld(containerSelector, direction, countSelector) {
+  const up = direction === "up";
+  if (containerSelector) {
+    let scroller;
+    try {
+      scroller = document.querySelector(containerSelector);
+    } catch (e) {
+      if (e && e.name === "SyntaxError") {
+        return { badSelector: true, message: String((e && e.message) || e) };
+      }
+      throw e;
+    }
+    if (!scroller) return { noContainer: true };
+    // up => history/chat feeds load OLDER items by pulling to the top; down => the ordinary
+    // infinite feed grows off the bottom.
+    scroller.scrollTop = up ? 0 : scroller.scrollHeight;
+  } else {
+    // The whole document. `scrollingElement` (documentElement fallback) owns `scrollTop`;
+    // `window.scrollTo` is the same move on the window, and doing both covers pages where
+    // one path is a quirks-mode no-op.
+    const doc = document.scrollingElement || document.documentElement;
+    const target = up ? 0 : doc ? doc.scrollHeight : 0;
+    if (doc) doc.scrollTop = target;
+    if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+      window.scrollTo(0, target);
+    }
+  }
+  let count;
+  try {
+    count = document.querySelectorAll(countSelector).length;
+  } catch (e) {
+    if (e && e.name === "SyntaxError") {
+      return { badSelector: true, message: String((e && e.message) || e) };
+    }
+    throw e;
+  }
+  return { count };
+}
+
+// The body injected by start_js. THIS is the arbitrary-code path (§12): `source` is the
+// caller's code, which is precisely why start_js — like execute_js — is behind the
+// execute_js checkbox + a js_audit row on the service. The body itself is
+// fixed and committed; what it COMPILES is not.
+//
+// It wraps `source` in an async IIFE and does NOT await it: the result of executeScript is
+// `{jobId}`, returned at once, while the promise runs on in the page and settles the job
+// record under `window.__curatorJobs[jobId]` to `{state:'done', value}` or
+// `{state:'error', message}`. `poll_job` (readJobInWorld) reads that record later.
+//
+// `source` is compiled the SAME three ways as evalInWorld's await_promise path — expression
+// first (so a bare `fetch(u)` answers its value), then the trimmed expression (so a trailing
+// `;` does not lose it), then the untouched body (where writing `return` is the caller's
+// job). The describe() probe names a value structuredClone cannot carry out of the page,
+// instead of storing a silent null. Both helpers are inlined because an injected function is
+// serialized to source and cannot capture evalInWorld from this module.
+export function startJobInWorld(jobId, source) {
+  const describe = (v) => {
+    // v is ALREADY the awaited value (the IIFE below awaits fn()), so — unlike evalInWorld —
+    // there is no promise to chain here, only the clone probe. MAIN world can delete
+    // structuredClone; with no probe available, say nothing rather than fabricate.
+    if (typeof structuredClone !== "function") return v;
+    try {
+      structuredClone(v);
+      return v;
+    } catch {
+      let kind = typeof v;
+      try {
+        if (v && v.constructor && v.constructor.name) kind = v.constructor.name;
+      } catch {
+        // An exotic proxy can throw on `.constructor`; `typeof` is still an answer.
+      }
+      let preview = "";
+      try {
+        preview = String(v).slice(0, 200);
+      } catch {
+        preview = "<unstringifiable>";
+      }
+      return { __unserializable: kind, preview };
+    }
+  };
+  // The job record exists from HERE ON, whatever happens next: `running` is written BEFORE
+  // compilation so that a syntactically broken `source` cannot leave start_js with NO record.
+  // Invariant: after start_js the record ALWAYS exists (running/error), so poll_job reports
+  // `unknown` ONLY on real page-state loss (reload/discard/close/wrong id), never on a
+  // compile failure.
+  window.__curatorJobs = window.__curatorJobs || {};
+  window.__curatorJobs[jobId] = { state: "running" };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  let fn;
+  try {
+    // The three compile forms (see the block comment above), now INSIDE this try so the last
+    // one throwing on garbage `source` is caught here instead of escaping the function.
+    try {
+      fn = new AsyncFunction(`return (${source}\n);`);
+    } catch (e) {
+      if (!(e instanceof SyntaxError)) throw e;
+      try {
+        fn = new AsyncFunction(`return (${source.replace(/[\s;]+$/, "")}\n);`);
+      } catch (e2) {
+        if (!(e2 instanceof SyntaxError)) throw e2;
+        fn = new AsyncFunction(source);
+      }
+    }
+  } catch (e) {
+    // Every form failed to compile: downgrade the job to an HONEST error and return normally.
+    // Throwing OUT of the injected function would leave the running record unsettled — and
+    // for garbage that never even parses, poll_job must say `error`, not `unknown`.
+    window.__curatorJobs[jobId] = { state: "error", message: String((e && e.message) || e) };
+    return { jobId };
+  }
+  (async () => {
+    try {
+      const v = await fn();
+      window.__curatorJobs[jobId] = { state: "done", value: describe(v) };
+    } catch (e) {
+      window.__curatorJobs[jobId] = { state: "error", message: String((e && e.message) || e) };
+    }
+  })();
+  return { jobId };
+}
+
+// The body injected by poll_job. FIXED (takes only the jobId as DATA), so — like get_text —
+// no checkbox and no audit row. Reads the record start_js stashed under
+// `window.__curatorJobs[jobId]`.
+//
+// `state:"unknown"` (no global, or no such key) is a DISTINCT, honest signal from
+// `"running"`: it means the page-resident state is GONE — the tab reloaded/discarded/closed,
+// or the id is wrong — not that the job is still working. The value/message already carry
+// describe()'s output from start_js, so they are serializable here.
+export function readJobInWorld(jobId) {
+  const jobs = typeof window !== "undefined" ? window.__curatorJobs : undefined;
+  if (!jobs || !Object.prototype.hasOwnProperty.call(jobs, jobId)) {
+    return { state: "unknown" };
+  }
+  const rec = jobs[jobId] || {};
+  const out = { state: typeof rec.state === "string" ? rec.state : "unknown" };
+  if ("value" in rec) out.value = rec.value;
+  if ("message" in rec) out.message = rec.message;
+  return out;
+}
+
 // --- the dispatcher ---------------------------------------------------------
 
 // Execute one command frame. `ctx`:
@@ -327,6 +485,21 @@ export async function dispatchCommand(frame, ctx = {}) {
         return await getText(params);
       case CMD_WAIT_FOR:
         return await waitFor(params, nowFn, sleep);
+      // scroll_until and poll_job are FIXED-function verbs too (§12): selectors/direction
+      // and a jobId, all DATA — no execute_js checkbox, no js_audit row.
+      case CMD_SCROLL_UNTIL:
+        return await scrollUntil(params, nowFn, sleep);
+      case CMD_POLL_JOB:
+        return await pollJob(params);
+      // start_js carries ARBITRARY code, so it goes through the same gate as execute_js —
+      // the checkbox here at the edge, and the service's js_audit row before the send.
+      case CMD_START_JS:
+        return await startJs(params);
+      // The first chrome.debugger (CDP) verb (§12, wave 18): gated by the SAME single
+      // JS & Debugger checkbox as execute_js, but carries no arbitrary code and writes no
+      // js_audit row (it only fakes focus, exfiltrating nothing).
+      case CMD_SET_FOCUS_EMULATION:
+        return await setFocusEmulation(params);
       default:
         return fail(ERR_INTERNAL, `unknown command: ${command}`);
     }
@@ -1094,6 +1267,193 @@ async function waitFor(params, nowFn, sleep) {
   return ok({ matched: !!outcome.matched, elapsedMs: nowFn() - started });
 }
 
+// scroll_until {tabId, countSelector, containerSelector?, direction?, targetCount?,
+// stableRounds?, intervalMs?, timeoutMs, focus?} -> {count, rounds, stopped, elapsedMs}.
+//
+// FIXED-function (see scrollAndCountInWorld): NOT behind the execute_js checkbox, writes no
+// js_audit row. The scheduler lives HERE in the worker — each step is a fresh
+// chrome.scripting inject with `await sleep(intervalMs)` between steps — so its pacing does
+// not depend on the page's own (throttleable) timers, the same reason wait_for polls here.
+//
+// Guards: no_such_tab and the http/https edge check up front like get_text, PLUS a
+// per-step existence AND scheme re-check (the pollUntil pattern) because the loop keeps
+// injecting for up to a minute and a page can move under us onto a file:// url — a guard
+// that expires mid-scroll is not a guard.
+async function scrollUntil(params, nowFn, sleep) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "scroll_until target is not an http/https tab");
+  }
+  const countSelector =
+    typeof params.countSelector === "string" && params.countSelector !== "" ? params.countSelector : null;
+  if (countSelector === null) {
+    return fail(ERR_PRECONDITION_FAILED, "scroll_until requires a non-empty countSelector");
+  }
+  const containerSelector =
+    typeof params.containerSelector === "string" && params.containerSelector !== ""
+      ? params.containerSelector
+      : null;
+  const direction = params.direction === "up" ? "up" : "down";
+  const budget = clampWaitMs(params.timeoutMs);
+  if (budget === null) {
+    return fail(ERR_PRECONDITION_FAILED, "scroll_until timeoutMs must be a positive integer");
+  }
+  // Floors: a non-positive interval would spin, a non-positive stableRounds would stop
+  // before the first non-growing step is even observed. The MCP layer supplies defaults, so
+  // these only backstop a hand-crafted frame.
+  const intervalMs = Number.isInteger(params.intervalMs) && params.intervalMs > 0 ? params.intervalMs : 700;
+  const stableRounds =
+    Number.isInteger(params.stableRounds) && params.stableRounds > 0 ? params.stableRounds : 3;
+  const targetCount = Number.isInteger(params.targetCount) && params.targetCount > 0 ? params.targetCount : null;
+
+  // focus: hand the SCREEN to this tab before the loop. Documented cost (§16): feeds built
+  // on IntersectionObserver do not fire in a BACKGROUND tab (the IO never intersects a tab
+  // that is not rendered — confirmed by measurement), so their content never loads and the
+  // count never grows. Focusing fixes that but takes the screen away from the human, which
+  // is exactly why it is an explicit opt-in rather than the default.
+  if (params.focus) {
+    await chrome.tabs.update(params.tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+  }
+
+  const started = nowFn();
+  const deadline = started + budget;
+  let count = 0;
+  let rounds = 0;
+  let stable = 0;
+  let stopped = "deadline";
+  for (;;) {
+    let live;
+    try {
+      live = await chrome.tabs.get(params.tabId);
+    } catch {
+      return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+    }
+    if (!isHttpUrl(live && live.url)) {
+      return fail(ERR_PRECONDITION_FAILED, "scroll_until target is not an http/https tab");
+    }
+    let results;
+    try {
+      results = await chrome.scripting.executeScript({
+        target: { tabId: params.tabId },
+        func: scrollAndCountInWorld,
+        args: [containerSelector, direction, countSelector],
+      });
+    } catch (e) {
+      // A thrown inject mid-scroll means the frame is being replaced (a navigation, a
+      // discard) — the tab still exists (checked above), so treat it as a transient step:
+      // wait and retry rather than counting it as "no growth" or dying as `internal`. The
+      // deadline still bounds the loop.
+      void e;
+      const remainingT = deadline - nowFn();
+      if (remainingT <= 0) {
+        stopped = "deadline";
+        break;
+      }
+      await sleep(Math.min(intervalMs, remainingT));
+      continue;
+    }
+    const got = ((results || [])[0] || {}).result || {};
+    if (got.badSelector) {
+      return fail(ERR_PRECONDITION_FAILED, `invalid CSS selector: ${got.message}`);
+    }
+    if (got.noContainer) {
+      return fail(
+        ERR_PRECONDITION_FAILED,
+        `scroll_until container ${containerSelector} matched no element in tab ${params.tabId}`,
+      );
+    }
+    const newCount = Number.isInteger(got.count) ? got.count : 0;
+    rounds += 1;
+    // Growth resets the stability counter; a step that did not grow increments it.
+    if (newCount > count) stable = 0;
+    else stable += 1;
+    count = newCount;
+    // target first: reaching the wanted count is a success even on the step it grew to it.
+    if (targetCount !== null && count >= targetCount) {
+      stopped = "target";
+      break;
+    }
+    if (stable >= stableRounds) {
+      stopped = "stable";
+      break;
+    }
+    const remaining = deadline - nowFn();
+    if (remaining <= 0) {
+      stopped = "deadline";
+      break;
+    }
+    await sleep(Math.min(intervalMs, remaining));
+  }
+  return ok({ count, rounds, stopped, elapsedMs: nowFn() - started });
+}
+
+// start_js {tabId, code, world?, jobId} -> {jobId}. ARBITRARY code, so gated on the
+// execute_js checkbox HERE at the edge (read FRESH, default OFF) exactly like execute_js —
+// while the service writes the js_audit row BEFORE the
+// send (§12). The injected startJobInWorld wraps the code fire-and-forget and answers
+// {jobId} at once; the promise runs on in the page. `jobId` is minted by the service and
+// echoed back so the caller can poll it.
+async function startJs(params) {
+  const stored = await chrome.storage.local.get(ALLOW_EXECUTE_JS_KEY);
+  const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
+  if (!allowed) {
+    return fail(ERR_JS_DISABLED, "start_js is disabled in this copy's options");
+  }
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "start_js target is not an http/https tab");
+  }
+  const jobId = String(params.jobId == null ? "" : params.jobId);
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: params.tabId },
+    world: params.world || "MAIN",
+    func: startJobInWorld,
+    args: [jobId, String(params.code == null ? "" : params.code)],
+  });
+  const got = ((results || [])[0] || {}).result || {};
+  return ok({ jobId: got.jobId || jobId });
+}
+
+// poll_job {tabId, jobId, world?} -> {state, value?, message?}. FIXED read (readJobInWorld),
+// so no execute_js checkbox and no js_audit row; the http/https edge guard still applies
+// like get_text. Injects into MAIN by default — the world start_js runs in unless told
+// otherwise — so the job global it reads is the one start_js wrote. `state:"unknown"` means
+// the page-resident record is gone (reload/discard/close, or a wrong id), distinct from
+// `"running"`.
+async function pollJob(params) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "poll_job target is not an http/https tab");
+  }
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: params.tabId },
+    world: params.world || "MAIN",
+    func: readJobInWorld,
+    args: [String(params.jobId == null ? "" : params.jobId)],
+  });
+  const got = ((results || [])[0] || {}).result || {};
+  const result = { state: typeof got.state === "string" ? got.state : "unknown" };
+  if ("value" in got) result.value = got.value;
+  if ("message" in got) result.message = got.message;
+  return ok(result);
+}
+
 // merge_windows {windowIds?, targetWindowId?}. Move the source windows' tabs into
 // the target window. Mark BOTH the source and target windows BEFORE moving (a
 // move activates a neighbour in the emptied source and re-activates in the
@@ -1689,4 +2049,150 @@ async function executeJs(params) {
     args: [String(params.code == null ? "" : params.code), !!params.awaitPromise],
   });
   return ok({ results });
+}
+
+// --- chrome.debugger foundation + set_focus_emulation (§12, wave 18) ----------
+//
+// The tabs THIS extension currently holds a debugger attached to. Module-level, and
+// deliberately in-memory: the emulation set by `Emulation.setFocusEmulationEnabled` holds
+// ONLY while the debugger stays attached, so an enabled tab must stay attached, and this set
+// is how a second enable knows not to attach twice and how a disable knows there is
+// something to detach.
+//
+// ⚠️ MV3 LIFETIME: the service worker can die and be resurrected, losing this in-memory set
+// (and, with it, chrome.debugger drops every attachment the dead worker held — detach is
+// implicit on worker teardown). For THIS slice that is acceptable: a lost attachment means
+// the emulation lapses and a fresh enable re-attaches cleanly. A later slice moves the set
+// into chrome.storage.session so a resurrected worker can reconcile.
+const debuggerAttachedTabs = new Set();
+
+// The chrome.debugger protocol version to attach with (CDP 1.3).
+const DEBUGGER_PROTOCOL_VERSION = "1.3";
+
+// chrome.debugger.onDetach cleanup (§12). Registered ONCE at SW init (service-worker.js).
+// The debugger detaches on its own for reasons outside this verb — the human closed the tab
+// (`target_closed`) or opened DevTools on it (`canceled_by_user`) — and if the tab is not
+// dropped from our set here, a later enable would skip the attach (thinking it is still
+// attached) and the sendCommand would throw, or a disable would try to detach a tab the
+// browser already released. Keep the set honest by mirroring every detach.
+export function handleDebuggerDetach(source) {
+  if (source && typeof source.tabId === "number") {
+    debuggerAttachedTabs.delete(source.tabId);
+  }
+}
+
+// Test-only: reset the module-level attachment set between cases (the set is process-global,
+// so a leftover entry from one test would leak into the next).
+export function __resetDebuggerState() {
+  debuggerAttachedTabs.clear();
+}
+
+// set_focus_emulation {tabId, enabled} (§12, wave 18). Makes a BACKGROUND tab behave as
+// focused (no timer throttling) without taking the screen from the human. STATEFUL: the
+// emulation holds only while the debugger is attached.
+//
+//   enabled=true  — attach the debugger (unless already ours) and turn emulation on, then
+//                   KEEP it attached. Idempotent: a repeat enable on an already-attached tab
+//                   just re-sends the command, no second attach.
+//   enabled=false — turn emulation off (best-effort) and detach, dropping the tab from our
+//                   set. A tab we do not hold is an idempotent no-op success.
+//
+// Gated at the edge by the SINGLE JS & Debugger checkbox (ALLOW_EXECUTE_JS_KEY), exactly
+// like execute_js — but it carries NO arbitrary code and writes NO js_audit row.
+async function setFocusEmulation(params) {
+  const stored = await chrome.storage.local.get(ALLOW_EXECUTE_JS_KEY);
+  const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
+  if (!allowed) {
+    return fail(ERR_JS_DISABLED, "JS & Debugger is disabled in this copy's options");
+  }
+  const tabId = params.tabId;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${tabId}`);
+  }
+  // Edge-guard the target scheme like every other debugger/scripting verb (§12): the
+  // debugger must never attach to a chrome://, file:// or other privileged surface.
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "set_focus_emulation target is not an http/https tab");
+  }
+
+  const enabled = !!params.enabled;
+
+  if (enabled) {
+    // Track whether THIS call is the one that attached the tab, so the sendCommand catch
+    // below only rolls back an attach we ourselves just made (see there).
+    let attachedNow = false;
+    // Attach only if this tab is not already ours — a tab takes ONE debugger client, so a
+    // second attach on our own tab would throw. A repeat enable is therefore just a
+    // re-issued command.
+    //
+    // Accepted race: frames are dispatched concurrently (`_onMessage` in connection.js does
+    // not await), so two simultaneous enable calls on the SAME tab can both read has()===false
+    // before either add()s. The second attach then throws, and the losing call returns
+    // debugger_attach even though the first call attached successfully. The end state is still
+    // consistent (the tab is in the Set once, attached once), so this is a deliberately
+    // acceptable race. We do NOT "fix" it with an optimistic add() before attach: that would
+    // let the losing call's rollback delete the winner's record — strictly worse.
+    if (!debuggerAttachedTabs.has(tabId)) {
+      try {
+        await chrome.debugger.attach({ tabId }, DEBUGGER_PROTOCOL_VERSION);
+      } catch {
+        return fail(
+          ERR_DEBUGGER_ATTACH,
+          "could not attach debugger — DevTools open on this tab, or another client attached",
+        );
+      }
+      debuggerAttachedTabs.add(tabId);
+      attachedNow = true;
+    }
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", {
+        enabled: true,
+      });
+    } catch (e) {
+      // The attach succeeded but enabling emulation failed. If WE attached the tab in this
+      // very call, roll that attach back (best-effort detach + untrack) so we do not leave a
+      // visible "debugging this tab" session in an indeterminate state with emulation OFF.
+      // If the tab was attached by an EARLIER call (attachedNow===false), leave it alone: that
+      // prior session may well be fine and the failure could be transient — tearing it down
+      // would break the working attachment on the strength of one failed re-issue.
+      if (attachedNow) {
+        try {
+          await chrome.debugger.detach({ tabId });
+        } catch {
+          // Already gone or never fully attached — nothing to undo on the browser side.
+        }
+        debuggerAttachedTabs.delete(tabId);
+      }
+      return fail(
+        ERR_DEBUGGER_ATTACH,
+        `could not enable focus emulation: ${String((e && e.message) || e)}`,
+      );
+    }
+    return ok({ enabled: true });
+  }
+
+  // enabled=false: a tab we never attached is an idempotent success (nothing to undo).
+  if (debuggerAttachedTabs.has(tabId)) {
+    // Best-effort: the detach below is what actually drops the emulation (it lapses when the
+    // debugger leaves), so a sendCommand that throws — e.g. the tab is mid-teardown — must
+    // not stop the detach + untrack.
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", {
+        enabled: false,
+      });
+    } catch {
+      // fall through to detach
+    }
+    try {
+      await chrome.debugger.detach({ tabId });
+    } catch {
+      // Already gone (tab closed, DevTools took it): the onDetach listener may have cleared
+      // it, or will. Either way we drop our record below.
+    }
+    debuggerAttachedTabs.delete(tabId);
+  }
+  return ok({ enabled: false });
 }

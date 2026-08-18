@@ -162,7 +162,7 @@ jobs:
         SHA: ${{ github.sha }}
       run: |
         # Gitea allows uppercase letters in repository names, docker does not
-        # accept them in an image path — a repo like `ArcExtension` would fail the
+        # accept them in an image path — a repo like `TabsCurator` would fail the
         # build with `invalid reference format`, so lowercase it here.
         IMAGE="gitea.vvzvlad.xyz/$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
         # ⚠️ DO NOT "FIX" THIS TO `develop`, EVEN THOUGH `develop` IS THIS REPO'S
@@ -170,7 +170,7 @@ jobs:
         # Everywhere else in the fleet the default branch is `main` and this check
         # selects the production tag, so the obvious-looking correction here is to
         # swap in `develop`. Do not. Production on nebula pulls
-        # `gitea.vvzvlad.xyz/projects/arcextension:develop`, and that tag is produced
+        # `gitea.vvzvlad.xyz/projects/tabscurator:develop`, and that tag is produced
         # by the ELSE branch below, where the sanitiser turns the branch name
         # `develop` into the tag `develop`. Changing the condition would send
         # `develop` down the `main` path instead, publishing `:latest` + `:<sha>` and

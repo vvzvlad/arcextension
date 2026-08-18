@@ -197,11 +197,13 @@ def _read_active_sessions(conn: sqlite3.Connection) -> dict[str, str | None]:
 
 
 def _read_capabilities(conn: sqlite3.Connection) -> dict[str, dict]:
-    """``{instance_id: {allow_execute_js, allow_debugger, ext_version}}`` per ACTIVE instance.
+    """``{instance_id: {allow_execute_js, ext_version}}`` per ACTIVE instance.
 
     The §11 capability report: what a copy will ALLOW, as that copy itself declared it in
     its last ``hello``. An agent reads this BEFORE it calls, instead of discovering
     ``js_disabled`` — or a verb an older bundle has never heard of — halfway through a task.
+    ``allow_execute_js`` is now the SINGLE JS & Debugger gate (it gates execute_js AND the
+    chrome.debugger path); the former ``allow_debugger`` column is gone (migration v6).
 
     A separate reader for the same reason as :func:`_read_active_sessions`: the §10
     ``StateResponse`` shape (:func:`_read_instances`) must stay byte-identical, so a field
@@ -212,13 +214,12 @@ def _read_capabilities(conn: sqlite3.Connection) -> dict[str, dict]:
     """
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT id, allow_execute_js, allow_debugger, ext_version FROM instances "
+        "SELECT id, allow_execute_js, ext_version FROM instances "
         f"{_ACTIVE_ONLY}"
     ).fetchall()
     return {
         r["id"]: {
             "allow_execute_js": bool(r["allow_execute_js"]),
-            "allow_debugger": bool(r["allow_debugger"]),
             "ext_version": r["ext_version"],
         }
         for r in rows

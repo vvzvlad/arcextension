@@ -285,13 +285,13 @@ async def _freshen_fleet(app) -> dict:
         cap = caps.get(iid) or {}
         envelope[iid] = {
             "snapshot_at": row.get("snapshot_at"),
-            # Capability report (§11/§12). ``allow_execute_js`` gates execute_js at the
-            # extension edge; ``allow_debugger`` gates nothing yet (it is the switch a
-            # later screenshot/CDP path reads) and is reported now so an agent never has
-            # to learn a copy's answer by failing; ``ext_version`` is which bundle is
-            # running — null when that copy has not said hello since the column landed.
+            # Capability report (§11/§12). ``allow_execute_js`` is the SINGLE JS & Debugger
+            # gate at the extension edge — it gates execute_js/start_js AND the
+            # chrome.debugger path (set_focus_emulation, later slices). Kept under this
+            # historical name because agents read it; the former separate ``allow_debugger``
+            # is gone (migration v6). ``ext_version`` is which bundle is running — null when
+            # that copy has not said hello since the column landed.
             "allow_execute_js": cap.get("allow_execute_js"),
-            "allow_debugger": cap.get("allow_debugger"),
             "ext_version": cap.get("ext_version"),
             "fresh": fresh,
             "reason": reason,
@@ -892,10 +892,9 @@ async def execute_js(app, *, instance: str, tab_id: int, code: str,
                      auth_ctx: str | None = None,
                      expected_session: str | None = None) -> dict:
     """Run JS in a tab as an MCP verb. ``send_command`` writes the js_audit row
-    BEFORE the send and enforces the runtime kill-switch (§12): a disabled/rejected
-    call is still audited (with ``initiator='mcp'`` + the MCP ``auth_ctx``), and the
-    extension's own execute_js checkbox still gates it at the edge. Refused while
-    paused.
+    BEFORE the send (§12): a rejected call is still audited (with
+    ``initiator='mcp'`` + the MCP ``auth_ctx``), and the extension's own execute_js
+    checkbox gates it at the edge. Refused while paused.
 
     ``await_promise`` (default False) makes the code the body of an async function in the
     page, so top-level ``await`` and ``return`` both work and the promise is awaited before
@@ -1050,6 +1049,201 @@ async def wait_for(app, *, instance: str, tab_id: int, url_matches: str | None =
         "matched": bool(result.get("matched")),
         "elapsed_ms": int(result.get("elapsedMs") or 0),
     }
+
+
+async def scroll_until(app, *, instance: str, tab_id: int, count_selector: str,
+                       container_selector: str | None = None, direction: str = "down",
+                       target_count: int | None = None, stable_rounds: int = 3,
+                       interval_ms: int = 700, timeout_ms: int | None = None,
+                       focus: bool = False, auth_ctx: str | None = None,
+                       expected_session: str | None = None) -> dict:
+    """Scroll a tab until the ``count_selector`` match count stops growing (§11).
+
+    A FIXED injected function (``scrollAndCountInWorld``), so — like :func:`get_text` and
+    :func:`wait_for` — NO execute_js checkbox and no ``js_audit`` row: the parameters are
+    selectors and a direction (DATA fed to ``querySelector`` / ``scrollTop``), never source
+    spliced into a page eval. Every other gate applies: the stop gate here, the revoke check
+    and ``stale_session`` in ``send_command``, and the extension's http/https edge guard.
+
+    The scheduler is the extension's SERVICE WORKER: each step is a fresh
+    ``chrome.scripting`` inject with ``interval_ms`` between steps, so the pacing survives a
+    background tab throttling its own timers — the same shape as ``wait_for``.
+
+    Stops with ``stopped`` = ``"stable"`` (``stable_rounds`` consecutive steps with no
+    growth), ``"target"`` (``count >= target_count``), or ``"deadline"`` (the budget ran
+    out). ``count`` is the last measured element count; ``rounds`` is how many steps ran.
+
+    ``focus`` (default False) activates the tab and raises its window BEFORE the loop, and
+    it exists for one measured reason: feeds built on ``IntersectionObserver`` do NOT fire
+    in a BACKGROUND tab, so their content never loads and the count never grows — the scroll
+    would spin to its deadline at a flat count. Focusing fixes that but takes the screen away
+    from the human, so it is an explicit opt-in, not the default. Turn it on only when a
+    background scroll stays flat.
+
+    ``timeout_ms`` defaults to ``EXECUTE_JS_MAX_TIMEOUT_MS`` and is clamped to it, exactly as
+    ``wait_for`` — a scroll with no stated length wants the longest the operator permits."""
+    await _ensure_not_paused(app)
+    if direction not in ("down", "up"):
+        raise ToolError("invalid_args", "direction must be 'down' or 'up'")
+    # An omitted timeout means "the ceiling", not CMD_TIMEOUT_MS (same rule as wait_for).
+    wait_ms = _clamp_timeout_ms(app, timeout_ms)
+    if wait_ms is None:
+        wait_ms = app.state.settings.execute_js_max_timeout_ms
+    params: dict = {
+        "tabId": tab_id,
+        "countSelector": count_selector,
+        "direction": direction,
+        "stableRounds": stable_rounds,
+        "intervalMs": interval_ms,
+        "timeoutMs": wait_ms,
+    }
+    if container_selector is not None:
+        params["containerSelector"] = container_selector
+    if target_count is not None:
+        params["targetCount"] = target_count
+    # Sent ONLY when true, so an unchanged call puts an unchanged frame on the wire.
+    if focus:
+        params["focus"] = True
+    # Same ordering rule as wait_for: the SOCKET budget must outlast the extension's poll
+    # deadline, or the command dies on the wire before the scroll can finish (:func:`_wait_budget_ms`).
+    result = await _command(
+        app, instance, protocol.CMD_SCROLL_UNTIL, params, auth_ctx=auth_ctx,
+        expected_session=expected_session, cmd_timeout_ms=_wait_budget_ms(app, wait_ms),
+    )
+    return {
+        "ok": True,
+        "count": int(result.get("count") or 0),
+        "rounds": int(result.get("rounds") or 0),
+        "stopped": result.get("stopped"),
+        "elapsed_ms": int(result.get("elapsedMs") or 0),
+    }
+
+
+# --- Job-API: fire-and-forget arbitrary code (start_js) + poll it (poll_job) --
+async def start_js(app, *, instance: str, tab_id: int, code: str,
+                   world: str | None = None,
+                   url_at_exec: str | None = None, auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
+    """Fire ``code`` into a tab's global as a JOB and return ``{ok, job_id}`` at once (§11).
+
+    ARBITRARY code, so — EXACTLY like :func:`execute_js` — ``send_command`` writes the
+    ``js_audit`` row BEFORE the send (§12), and the extension's own execute_js checkbox
+    gates it at the edge. Refused while paused.
+
+    THE GATE STOPS NEW STARTS, NOT A RUNNING JOB: the extension-edge checkbox and pause (§12)
+    refuse the NEXT start_js/execute_js, but neither can reach INTO a page to abort a job
+    that already fired — its code runs to completion in the page regardless. This widens the
+    §12 surface MORE than execute_js, whose code at least finishes within its one blocking call.
+
+    The extension wraps the code fire-and-forget: it stashes ``{state, value|message}`` under
+    ``window.__curatorJobs[job_id]`` and answers immediately WITHOUT awaiting the promise, so
+    the code runs on in the page after this call returns. Poll it with :func:`poll_job`.
+
+    The job ALWAYS executes as an awaited async body (``await fn()`` inside the injected
+    IIFE), and that is exactly what the audit fixes: ``awaitPromise`` is ALWAYS true for
+    start_js — there is no non-await path to misreport, so the ``js_audit`` row cannot lie
+    about how the code ran.
+
+    BE HONEST ABOUT THE LIMIT: the job state lives IN THE PAGE and dies with the tab — a
+    reload, a discard, or a close loses it, after which ``poll_job`` reports ``state:
+    "unknown"``. This is ergonomics (a clean way to run something slow without holding the
+    socket open), NOT a durable job queue. The flip side is GROWTH: each job's record
+    accumulates under its ``job_id`` in ``window.__curatorJobs`` and is never dropped until
+    that same navigation/reload — ``poll_job`` does NOT consume it (a re-read must stay
+    idempotent). A long-lived tab running many jobs is worth re-opening or navigating to
+    reclaim those globals.
+
+    ``job_id`` is minted HERE (``job-<uuid4>``), not in the page, so the caller always has
+    the id even if the inject is slow to answer. ``world`` (MAIN default) picks the world the
+    code — and thus the job global — lives in; ``poll_job`` also reads MAIN by default, so a
+    job started in ISOLATED must be polled with the SAME ``world`` handed to ``poll_job``."""
+    await _ensure_not_paused(app)
+    job_id = f"job-{uuid4()}"
+    params: dict = {"tabId": tab_id, "code": code, "jobId": job_id}
+    if world is not None:
+        params["world"] = world
+    if url_at_exec is not None:
+        params["urlAtExec"] = url_at_exec
+    # start_js ALWAYS runs the code as an awaited async body (the injected IIFE does
+    # `await fn()`), so the audit must record awaitPromise=true unconditionally — anything
+    # else would misstate how the code actually executed.
+    params["awaitPromise"] = True
+    result = await _command(app, instance, protocol.CMD_START_JS, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session)
+    return {"ok": True, "job_id": result.get("jobId") or job_id}
+
+
+async def poll_job(app, *, instance: str, tab_id: int, job_id: str,
+                   world: str | None = None, max_bytes: int | None = None,
+                   auth_ctx: str | None = None,
+                   expected_session: str | None = None) -> dict:
+    """Read a :func:`start_js` job's state — ``{ok, state, value?, message?}`` (§11).
+
+    A FIXED read (``readJobInWorld`` takes only the job id as DATA), so — like
+    :func:`get_text` — NO execute_js checkbox and no ``js_audit`` row; the http/https edge
+    guard still applies. Refused while paused (it injects into the page).
+
+    ``state`` is ``"running"`` | ``"done"`` | ``"error"`` | ``"unknown"``. ``"unknown"`` is a
+    DISTINCT, honest signal from ``"running"``: it means the page-resident state is GONE —
+    the tab reloaded/discarded/closed, or the id is wrong — not that the job is still working.
+    ``value`` (on ``done``) is capped at ``max_bytes`` (default 40 kB) with ``truncated`` +
+    ``total_bytes``; ``message`` (on ``error``) is the error string.
+
+    ``world`` (MAIN default) must match the world the job lives in: to read a job that
+    :func:`start_js` launched with ``world="ISOLATED"``, pass the SAME ``world`` here — the
+    job global is per-world, so a MAIN-default poll of an ISOLATED job reads a different
+    global and reports ``"unknown"``. The MAIN default matches start_js's own default, so a
+    plain start_js/poll_job pair needs no ``world`` on either side.
+
+    HONEST LIMIT on GROWTH: poll_job does NOT consume the record — the read is idempotent, so
+    a job's entry lingers under its ``job_id`` in ``window.__curatorJobs`` and is never
+    dropped until the tab navigates/reloads (the same page-resident lifetime that kills the
+    state with the tab). A long-lived tab accumulating many jobs is worth re-opening or
+    navigating to reclaim the globals."""
+    await _ensure_not_paused(app)
+    limit = _validate_max_bytes(max_bytes)
+    params: dict = {"tabId": tab_id, "jobId": job_id}
+    if world is not None:
+        params["world"] = world
+    result = await _command(
+        app, instance, protocol.CMD_POLL_JOB, params,
+        auth_ctx=auth_ctx, expected_session=expected_session,
+    )
+    out: dict = {"ok": True, "state": result.get("state") or "unknown"}
+    if "value" in result:
+        value, meta = truncate_payload(result.get("value"), limit)
+        out["value"] = value
+        out.update(meta)
+    if "message" in result:
+        out["message"] = result.get("message")
+    return out
+
+
+async def set_focus_emulation(app, *, instance: str, tab_id: int, enabled: bool,
+                              auth_ctx: str | None = None,
+                              expected_session: str | None = None) -> dict:
+    """Toggle ``Emulation.setFocusEmulationEnabled`` on a tab via chrome.debugger (§12).
+
+    The first verb down the CDP path (wave 18). It makes a BACKGROUND tab behave as focused
+    — no timer throttling — WITHOUT taking the screen from the human. STATEFUL by nature: the
+    emulation holds ONLY while the debugger stays attached, so ``enabled=true`` attaches and
+    KEEPS the debugger attached, and ``enabled=false`` turns it off and detaches.
+
+    Gated at the extension edge by the SINGLE JS & Debugger checkbox (``allow_execute_js``),
+    exactly like execute_js. But UNLIKE execute_js it carries no arbitrary code and writes NO
+    js_audit row: focus emulation exfiltrates nothing, it only fakes focus. A future
+    DATA-BEARING CDP verb (screenshot, network capture) will need its own audit — the
+    absence of one here is a property of THIS verb, not of the debugger path.
+
+    Refused while paused (it drives the browser). ``debugger_attach`` comes back when the
+    debugger cannot attach — DevTools is open on the tab, or another client already holds it
+    (a tab takes one debugger client)."""
+    await _ensure_not_paused(app)
+    result = await _command(
+        app, instance, protocol.CMD_SET_FOCUS_EMULATION, {"tabId": tab_id, "enabled": enabled},
+        auth_ctx=auth_ctx, expected_session=expected_session,
+    )
+    return {"ok": True, "enabled": bool(result.get("enabled"))}
 
 
 async def navigate_tab(app, *, instance: str, tab_id: int, url: str,

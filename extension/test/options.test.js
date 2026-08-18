@@ -243,7 +243,6 @@ function fakeDoc(ids) {
 const IDS = [
   "status",
   "allow-execute-js",
-  "allow-debugger",
   "service-address",
   "service-address-error",
   "browser-name",

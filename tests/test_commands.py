@@ -10,7 +10,6 @@ import asyncio
 import pytest
 
 from src.db.access import Database
-from src.db.settings_store import set_execute_js_enabled
 from src.ext import protocol
 from src.ext.commands import CommandError, resolve_response, send_command
 from src.ext.registry import ConnState, Registry
@@ -338,55 +337,94 @@ async def test_execute_js_disabled_outcome(tmp_path):
         await db.close()
 
 
-# --- runtime kill-switch (§12): refuse execute_js before it is ever sent -----
-async def test_execute_js_refused_by_kill_switch_sends_no_frame(tmp_path):
-    # With the runtime switch OFF the service must REFUSE an execute_js: no frame
-    # is put on the socket, and js_audit records outcome='disabled' (reason
-    # 'kill_switch'). Remove the gate and a frame would be sent + this reddens.
-    db = await _make_db(tmp_path)
-    try:
-        await db.write(lambda c: set_execute_js_enabled(c, False))
-        reg, cs, ws = _registry_with()
-        with pytest.raises(CommandError) as ei:
-            await send_command(
-                reg, db, "i1", protocol.CMD_EXECUTE_JS,
-                {"code": "danger()", "world": "MAIN", "tabId": 5},
-                cmd_timeout_ms=5000,
-            )
-        assert ei.value.code == protocol.ERR_JS_DISABLED
-        # THE proof it was blocked at the service edge: nothing was sent, and no
-        # pending future leaked (we never reached the send/await).
-        assert ws.sent == []
-        assert cs.pending_commands == {}
-        # The attempt is still the only trace of an execute_js (§12): full code +
-        # outcome='disabled' + reason 'kill_switch'.
-        rows = await db.read(
-            lambda c: c.execute(
-                "SELECT code, outcome, detail FROM js_audit"
-            ).fetchall()
-        )
-        assert len(rows) == 1
-        assert rows[0] == ("danger()", "disabled", "kill_switch")
-    finally:
-        await db.close()
-
-
-async def test_execute_js_sent_when_kill_switch_on_by_default(tmp_path):
-    # Default (no settings row) => the switch is ON => the frame IS sent.
+# --- start_js: the SAME arbitrary-code gate as execute_js (§12) --------------
+# start_js carries arbitrary caller code fire-and-forget, so it rides the identical
+# audit-before-send + db-None-fail-closed path. These pin that the branch was
+# widened to CMD_START_JS and NOT to the fixed verbs (poll_job below).
+async def test_start_js_audit_written_before_send_then_outcome_ok(tmp_path):
     db = await _make_db(tmp_path)
     try:
         reg, cs, ws = _registry_with()
         task = asyncio.create_task(
-            send_command(reg, db, "i1", protocol.CMD_EXECUTE_JS,
-                         {"code": "x", "world": "MAIN"}, cmd_timeout_ms=5000)
+            send_command(
+                reg, db, "i1", protocol.CMD_START_JS,
+                {"code": "await slowScrape()", "world": "MAIN", "tabId": 8,
+                 "jobId": "job-abc"},
+                cmd_timeout_ms=5000, initiator="mcp", auth_ctx="mcp:sess-j",
+            )
         )
-        # A frame reaches the socket precisely because the switch defaults ON.
+        # The row exists BEFORE we reply (outcome still NULL) — proof it was written before
+        # the send, exactly like execute_js: a rejected/timed-out start_js is still recorded.
         assert await _until(lambda: ws.sent)
-        assert ws.sent[-1]["command"] == "execute_js"
-        resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
-                              "result": {"results": [1]}})
-        assert await task == {"results": [1]}
+        assert ws.sent[-1]["command"] == "start_js"
         rows = await _read_audit(db)
-        assert rows[0][6] == "ok"
+        assert len(rows) == 1
+        assert rows[0] == ("i1", 8, "MAIN", "await slowScrape()", "mcp", "mcp:sess-j", None)
+
+        resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                              "result": {"jobId": "job-abc"}})
+        await task
+        rows = await _read_audit(db)
+        assert rows[0][6] == "ok"  # outcome updated after
+    finally:
+        await db.close()
+
+
+async def test_start_js_without_db_refuses_and_sends_no_frame():
+    # start_js MUST NOT be sent when there is no db to write the js_audit row (§12):
+    # fail-closed with `internal`, NOTHING reaches the socket. Fire-and-forget makes the
+    # trace matter MORE, not less — the code keeps running after the frame is answered.
+    reg, cs, ws = _registry_with()
+    with pytest.raises(CommandError) as ei:
+        await send_command(
+            reg, None, "i1", protocol.CMD_START_JS,
+            {"code": "danger()", "world": "MAIN", "jobId": "job-x"}, cmd_timeout_ms=5000,
+        )
+    assert ei.value.code == "internal"
+    assert ws.sent == []
+    assert cs.pending_commands == {}
+
+
+# --- poll_job / scroll_until: FIXED verbs, NEVER audited ---------------------
+async def test_poll_job_is_not_audited(tmp_path):
+    # poll_job reads a page global with a fixed function — no arbitrary code — so it must
+    # write NO js_audit row (unlike the arbitrary-code verbs execute_js / start_js).
+    db = await _make_db(tmp_path)
+    try:
+        reg, cs, ws = _registry_with()
+        task = asyncio.create_task(
+            send_command(reg, db, "i1", protocol.CMD_POLL_JOB,
+                         {"tabId": 5, "jobId": "job-z"}, cmd_timeout_ms=5000)
+        )
+        assert await _until(lambda: ws.sent)
+        assert ws.sent[-1]["command"] == "poll_job"
+        resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                              "result": {"state": "running"}})
+        assert await task == {"state": "running"}
+        rows = await _read_audit(db)
+        assert rows == []  # NO audit row for a fixed verb
+    finally:
+        await db.close()
+
+
+async def test_scroll_until_is_not_audited(tmp_path):
+    # scroll_until is a fixed-function verb too — selectors + a direction, no code — so it
+    # writes no js_audit row.
+    db = await _make_db(tmp_path)
+    try:
+        reg, cs, ws = _registry_with()
+        task = asyncio.create_task(
+            send_command(reg, db, "i1", protocol.CMD_SCROLL_UNTIL,
+                         {"tabId": 5, "countSelector": ".item", "direction": "down",
+                          "timeoutMs": 5000}, cmd_timeout_ms=9000)
+        )
+        assert await _until(lambda: ws.sent)
+        assert ws.sent[-1]["command"] == "scroll_until"
+        resolve_response(cs, {"type": "response", "id": ws.sent[-1]["id"], "ok": True,
+                              "result": {"count": 40, "rounds": 3, "stopped": "stable",
+                                         "elapsedMs": 1400}})
+        await task
+        rows = await _read_audit(db)
+        assert rows == []
     finally:
         await db.close()

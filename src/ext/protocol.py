@@ -64,6 +64,32 @@ CMD_MOVE_TAB = "move_tab"
 # own http/https edge guard on the target tab.
 CMD_GET_TEXT = "get_text"
 CMD_WAIT_FOR = "wait_for"
+# Scroll a tab until the element count for a selector stops growing (or a target / deadline
+# is hit). FIXED-function like ``get_text`` / ``wait_for``: its parameters are selectors and
+# a direction — DATA fed to ``querySelector`` / ``scrollTop``, never source spliced into a
+# page eval — so it is NOT behind the execute_js checkbox and writes NO ``js_audit`` row.
+# The scheduling loop lives in the extension's service worker (a fresh ``chrome.scripting``
+# inject per step), so its pacing survives a page throttling its own timers.
+CMD_SCROLL_UNTIL = "scroll_until"
+# The Job-API pair, formalising "fire arbitrary code into a page global, then poll it":
+#   * ``start_js`` carries ARBITRARY caller code, so it is behind the execute_js checkbox +
+#     a ``js_audit`` row, EXACTLY like ``execute_js`` (§12 —
+#     :func:`src.ext.commands.send_command` audits both before the send). It wraps the code
+#     in an async IIFE that stashes ``{state, value|message}`` under
+#     ``window.__curatorJobs[jobId]`` and returns ``{jobId}`` WITHOUT awaiting the promise.
+#   * ``poll_job`` is a FIXED read of that global (the injected body takes only the jobId as
+#     DATA), so — like ``get_text`` — no checkbox and no audit row. Job state lives IN THE
+#     PAGE and dies with the tab (reload/discard/close): ergonomics, not durability.
+CMD_START_JS = "start_js"
+CMD_POLL_JOB = "poll_job"
+# The first verb down the chrome.debugger (CDP) path (§12, wave 18). Toggles
+# ``Emulation.setFocusEmulationEnabled`` so a BACKGROUND tab behaves as focused (no timer
+# throttling) without taking the screen from the human. STATEFUL: the emulation holds only
+# while the debugger stays attached, so enable = attach + command + KEEP attached, and
+# disable = command(false) + detach. Gated by the SINGLE JS & Debugger checkbox at the
+# extension edge, but carries NO arbitrary code and writes NO ``js_audit`` row — it only
+# fakes focus, exfiltrating nothing; a later data-bearing CDP verb needs its own audit.
+CMD_SET_FOCUS_EMULATION = "set_focus_emulation"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side
@@ -79,6 +105,10 @@ ERR_BUSY_DRAGGING = "busy_dragging"
 # caller can tell the owner's "do not touch by hand" shield apart from every other
 # precondition without parsing a message.
 ERR_PINNED_CROSS_WINDOW = "pinned_cross_window"
+# ``set_focus_emulation`` could not attach the debugger to the target tab (§12): DevTools is
+# open on it, or another debugger client already holds it (a tab takes ONE debugger client).
+# Its own code so the agent can tell "unattachable tab" from every other precondition.
+ERR_DEBUGGER_ATTACH = "debugger_attach"
 ERR_INTERNAL = "internal"
 # Service-side only: no live socket for the instance, and the local send/wait
 # timed out before any `response` arrived.

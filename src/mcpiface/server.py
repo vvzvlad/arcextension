@@ -69,7 +69,7 @@ def build_mcp(app_ref) -> MCPServer:
     the lifespan has populated ``db`` / ``ext_registry`` / ``settings``). The handler
     bodies live in :mod:`src.mcpiface.tools` and are unit-tested directly.
     """
-    mcp = MCPServer("arc-curator")
+    mcp = MCPServer("tabscurator")
 
     def _host():
         return app_ref.app
@@ -336,7 +336,7 @@ def build_mcp(app_ref) -> MCPServer:
         max_bytes: int | None = None,
         expected_session: str | None = None,
     ) -> dict:
-        """Run JS in a tab (§12: audited before send, gated by the checkbox+kill-switch).
+        """Run JS in a tab (§12: audited before send, gated by the extension-edge checkbox).
 
         A promise is awaited on EITHER path, with or without the flag: ``fetch(u).then(r =>
         r.json())`` resolves to the parsed body, not to a promise.
@@ -408,6 +408,121 @@ def build_mcp(app_ref) -> MCPServer:
         return await _guarded(tools.wait_for(
             _host(), instance=instance, tab_id=tab_id, url_matches=url_matches,
             selector=selector, text_contains=text_contains, timeout_ms=timeout_ms,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def scroll_until(instance: str, tab_id: int, count_selector: str,
+                           container_selector: str | None = None, direction: str = "down",
+                           target_count: int | None = None, stable_rounds: int = 3,
+                           interval_ms: int = 700, timeout_ms: int | None = None,
+                           focus: bool = False,
+                           expected_session: str | None = None) -> dict:
+        """Scroll a tab until the ``count_selector`` match count stops growing.
+
+        For loading an infinite feed / chat backlog before reading it. A FIXED injected
+        function, so — unlike execute_js — NO execute_js checkbox and no js_audit row; the
+        http/https target guard still applies. The scroll loop runs in the extension worker
+        (a fresh inject every ``interval_ms``), so a background tab throttling its timers does
+        not stall it.
+
+        ``count_selector`` is the progress metric (how many items are loaded).
+        ``container_selector`` is what to scroll (omit for the whole document/window).
+        ``direction`` ``"down"`` (default, an ordinary feed growing off the bottom) or
+        ``"up"`` (a chat/history that pulls OLDER items in at the top).
+
+        Stops with ``stopped`` = ``"stable"`` (``stable_rounds`` steps with no growth, default
+        3), ``"target"`` (``count >= target_count``), or ``"deadline"``. Answers ``{ok, count,
+        rounds, stopped, elapsed_ms}``.
+
+        ``focus`` (default false) activates the tab and raises its window first. Reach for it
+        only when a background scroll stays flat: feeds built on IntersectionObserver do not
+        load in a tab that is not on screen, so their count never grows — but focusing TAKES
+        THE SCREEN from the human, which is why it is opt-in. ``timeout_ms`` defaults to
+        EXECUTE_JS_MAX_TIMEOUT_MS and is clamped to it."""
+        return await _guarded(tools.scroll_until(
+            _host(), instance=instance, tab_id=tab_id, count_selector=count_selector,
+            container_selector=container_selector, direction=direction,
+            target_count=target_count, stable_rounds=stable_rounds, interval_ms=interval_ms,
+            timeout_ms=timeout_ms, focus=focus, auth_ctx=current_mcp_session(),
+            expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def start_js(instance: str, tab_id: int, code: str,
+                       world: str | None = None,
+                       url_at_exec: str | None = None,
+                       expected_session: str | None = None) -> dict:
+        """Fire JS into a tab as a background JOB; answers ``{ok, job_id}`` at once.
+
+        For code that legitimately outlives a single command (a long scrape, a slow fetch
+        chain) without holding the socket open. ARBITRARY code, so gated EXACTLY like
+        execute_js: audited before send, gated by the extension-edge checkbox (§12).
+        Refused while paused.
+
+        The code is wrapped fire-and-forget: it runs on in the page after this returns, and
+        stashes its outcome under a page global keyed by ``job_id``. Read it with
+        ``poll_job(instance, tab_id, job_id)`` — ``state`` walks ``running`` -> ``done`` (with
+        ``value``) or ``error`` (with ``message``).
+
+        The gate stops NEW starts, not a RUNNING job: the checkbox and pause refuse the
+        next start_js/execute_js but cannot abort a job already firing in the page (§12) — a
+        wider surface than execute_js. The job always runs as an awaited async body, so its
+        audit row always carries ``awaitPromise:true`` (there is no non-await path here).
+
+        HONEST LIMIT: the job state lives IN THE PAGE and dies with the tab — a reload,
+        discard, or close loses it and ``poll_job`` then reports ``state:"unknown"``. This is
+        an ergonomic pattern, not a durable job queue. Records also GROW: each job lingers
+        under its id in ``window.__curatorJobs`` until that navigation/reload (poll_job does
+        not consume them), so re-open a long-lived tab running many jobs. ``world`` (MAIN
+        default) is the world the code and its job global live in; poll it in the same
+        world."""
+        return await _guarded(tools.start_js(
+            _host(), instance=instance, tab_id=tab_id, code=code, world=world,
+            url_at_exec=url_at_exec,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def poll_job(instance: str, tab_id: int, job_id: str,
+                       world: str | None = None, max_bytes: int | None = None,
+                       expected_session: str | None = None) -> dict:
+        """Read a ``start_js`` job's state — ``{ok, state, value?, message?}``.
+
+        A FIXED read, so — unlike execute_js — NO checkbox and no js_audit row; the
+        http/https guard still applies. ``state`` is ``running`` | ``done`` | ``error`` |
+        ``unknown``. ``unknown`` means the page-resident state is GONE (the tab
+        reloaded/discarded/closed, or the id is wrong) — a DIFFERENT fact from ``running``, so
+        do not read it as "still working". ``world`` (MAIN default) must match the world the
+        job lives in: a job started with ``world="ISOLATED"`` must be polled with the same
+        ``world``, or the MAIN-default read finds a different global and reports ``unknown``.
+        ``value`` (on ``done``) is capped at ``max_bytes`` (default 40000) with ``truncated``
+        + ``total_bytes``; ``message`` (on ``error``) is the error string."""
+        return await _guarded(tools.poll_job(
+            _host(), instance=instance, tab_id=tab_id, job_id=job_id, world=world,
+            max_bytes=max_bytes,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
+    async def set_focus_emulation(instance: str, tab_id: int, enabled: bool,
+                                  expected_session: str | None = None) -> dict:
+        """Toggle focus emulation on a tab via chrome.debugger; answers ``{ok, enabled}``.
+
+        Makes a BACKGROUND tab behave as focused — no timer throttling — WITHOUT taking the
+        screen from the human. The emulation HOLDS ONLY WHILE the debugger is attached, so
+        ``enabled=true`` attaches the debugger and keeps it attached, and ``enabled=false``
+        turns it off and detaches. While it is on, the browser shows its «идёт отладка» bar
+        (and the attached state is detectable by anti-bot systems — the cost of the debugger
+        path).
+
+        Gated by the SINGLE JS & Debugger checkbox (``allow_execute_js`` in list_instances),
+        exactly like execute_js — but it runs no arbitrary code and writes no js_audit row
+        (it only fakes focus). A tab with DevTools open, or already held by another debugger
+        client, cannot be attached and answers ``debugger_attach`` (one debugger client per
+        tab). Refused while paused."""
+        return await _guarded(tools.set_focus_emulation(
+            _host(), instance=instance, tab_id=tab_id, enabled=enabled,
             auth_ctx=current_mcp_session(), expected_session=expected_session,
         ))
 

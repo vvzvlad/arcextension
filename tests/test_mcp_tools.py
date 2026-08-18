@@ -2,7 +2,7 @@
 
 Covers each tool's handler plus the guards the reviewer mutation-checks:
 * confirm_impact on an MCP rule write,
-* execute_js audited (initiator='mcp' + the MCP session as auth_ctx) and kill-switch,
+* execute_js audited (initiator='mcp' + the MCP session as auth_ctx),
 * relocate_tab writing a live ``relocate`` row (initiator='mcp'),
 * a stopped system refusing a mutating verb (and no command leaving the socket).
 """
@@ -22,7 +22,7 @@ from src.curator import pause as pause_ops
 from src.db import state as state_read
 from src.db.access import Database
 from src.db.audit import insert_js_audit  # noqa: F401  (schema presence)
-from src.db.settings_store import get_setting, set_execute_js_enabled, set_setting
+from src.db.settings_store import get_setting, set_setting
 from src.ext import protocol
 from src.ext.commands import resolve_response
 from src.ext.registry import ConnState, Registry
@@ -172,11 +172,12 @@ async def test_list_instances_returns_freshness_envelope_and_stopped_at(tmp_path
     # leave `last_seen_at` / `reject_reason` / `reject_at` with no MCP surface at all.
     # The §11 capability report rides the same envelope: what this copy ALLOWS, as it
     # declared in its last hello. An instance that has never said hello reports the column
-    # defaults — both switches OFF, version unknown — which is the honest answer.
+    # defaults — the single JS & Debugger switch OFF, version unknown — which is the honest
+    # answer.
     assert main == {"snapshot_at": 1234, "fresh": False, "reason": "disconnected",
                     "session_id": None, "connected": False, "last_seen_at": None,
                     "reject_reason": None, "reject_at": None,
-                    "allow_execute_js": False, "allow_debugger": False,
+                    "allow_execute_js": False,
                     "ext_version": None}
 
     # A stopped curator surfaces stopped_at so an agent does not read the stop as a break.
@@ -201,7 +202,7 @@ async def test_list_tabs_returns_tabs_and_per_instance_freshness(tmp_path):
         "main": {"snapshot_at": now, "fresh": True, "reason": "fresh",
                  "session_id": "sess-1", "connected": True, "last_seen_at": None,
                  "reject_reason": None, "reject_at": None,
-                 "allow_execute_js": False, "allow_debugger": False, "ext_version": None}
+                 "allow_execute_js": False, "ext_version": None}
     }
 
 
@@ -222,13 +223,11 @@ async def test_list_tabs_freshens_and_flags_a_disconnected_sibling(tmp_path):
     assert inst["main"] == {"snapshot_at": now, "fresh": True, "reason": "fresh",
                             "session_id": "sess-1", "connected": True,
                             "last_seen_at": None, "reject_reason": None, "reject_at": None,
-                            "allow_execute_js": False, "allow_debugger": False,
-                            "ext_version": None}
+                            "allow_execute_js": False, "ext_version": None}
     assert inst["media"] == {"snapshot_at": None, "fresh": False, "reason": "disconnected",
                              "session_id": "sess-2", "connected": False,
                              "last_seen_at": None, "reject_reason": None, "reject_at": None,
-                             "allow_execute_js": False, "allow_debugger": False,
-                             "ext_version": None}
+                             "allow_execute_js": False, "ext_version": None}
     # The disconnected sibling did not drop the fresh instance's tab.
     assert [t["tab_id"] for t in out["tabs"]] == [1]
 
@@ -347,8 +346,7 @@ async def test_list_tabs_reader_error_maps_to_error_and_isolates_siblings(tmp_pa
     assert inst["bad"] == {"snapshot_at": 42, "fresh": False, "reason": "error",
                            "session_id": "sess-2", "connected": True,
                            "last_seen_at": None, "reject_reason": None, "reject_at": None,
-                           "allow_execute_js": False, "allow_debugger": False,
-                           "ext_version": None}
+                           "allow_execute_js": False, "ext_version": None}
     # The sibling with a working reader is returned normally.
     assert inst["main"]["reason"] == "fresh" and inst["main"]["fresh"] is True
 
@@ -530,6 +528,31 @@ async def test_close_and_focus_send_commands(tmp_path):
     assert f2["command"] == protocol.CMD_FOCUS_TAB and f2["params"] == {"tabId": 4}
 
 
+# --- set_focus_emulation (§12, wave 18 — the chrome.debugger foundation) ------
+async def test_set_focus_emulation_sends_enabled_and_returns_it(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+
+    # enable: the flag rides into the frame and the extension's {enabled} comes back.
+    out_on, f_on = await _run_with_response(
+        lambda: tools.set_focus_emulation(app, instance="main", tab_id=9, enabled=True),
+        cs, ws, {"enabled": True},
+    )
+    assert f_on["command"] == protocol.CMD_SET_FOCUS_EMULATION
+    assert f_on["params"] == {"tabId": 9, "enabled": True}
+    assert out_on == {"ok": True, "enabled": True}
+
+    # disable: the false flag rides through and the response is reflected.
+    out_off, f_off = await _run_with_response(
+        lambda: tools.set_focus_emulation(app, instance="main", tab_id=9, enabled=False),
+        cs, ws, {"enabled": False},
+    )
+    assert f_off["params"] == {"tabId": 9, "enabled": False}
+    assert out_off == {"ok": True, "enabled": False}
+
+
 # --- move_tab (§6/§9) --------------------------------------------------------
 async def test_move_tab_sends_the_command_and_omits_an_absent_index(tmp_path):
     # The verb that closes §11's gap: relocation BETWEEN instances is the §7 open+close
@@ -620,7 +643,7 @@ async def test_move_tab_is_refused_while_stopped_and_sends_nothing(tmp_path):
     assert ws.sent == []
 
 
-# --- execute_js: audited (§12) + kill-switch --------------------------------
+# --- execute_js: audited (§12) ----------------------------------------------
 async def test_execute_js_audited_with_mcp_session_as_auth_ctx(tmp_path):
     db = await _make_db(tmp_path)
     reg = Registry()
@@ -644,18 +667,173 @@ async def test_execute_js_audited_with_mcp_session_as_auth_ctx(tmp_path):
     assert code == "1+1" and outcome == "ok" and url == "https://a"
 
 
-async def test_execute_js_refused_by_kill_switch_still_audited_and_not_sent(tmp_path):
+# --- scroll_until: FIXED verb, wait-budget socket, snake_case shape ----------
+async def test_scroll_until_sends_command_and_renames_shape(tmp_path):
     db = await _make_db(tmp_path)
-    await db.write(lambda c: set_execute_js_enabled(c, False))
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.scroll_until(
+            app, instance="main", tab_id=3, count_selector=".msg",
+            container_selector="#feed", direction="up", target_count=200,
+            stable_rounds=4, interval_ms=500, focus=True, auth_ctx="s",
+        ),
+        cs, ws, {"count": 200, "rounds": 12, "stopped": "target", "elapsedMs": 6000},
+    )
+    assert frame["command"] == protocol.CMD_SCROLL_UNTIL
+    p = frame["params"]
+    assert p["countSelector"] == ".msg" and p["containerSelector"] == "#feed"
+    assert p["direction"] == "up" and p["targetCount"] == 200
+    assert p["stableRounds"] == 4 and p["intervalMs"] == 500 and p["focus"] is True
+    assert isinstance(p["timeoutMs"], int) and p["timeoutMs"] > 0
+    # elapsedMs -> elapsed_ms; the rest carried through.
+    assert out == {"ok": True, "count": 200, "rounds": 12, "stopped": "target",
+                   "elapsed_ms": 6000}
+    # A fixed verb writes NO audit row.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_scroll_until_omits_optional_keys_and_defaults_direction(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.scroll_until(app, instance="main", tab_id=3, count_selector=".msg"),
+        cs, ws, {"count": 10, "rounds": 3, "stopped": "stable", "elapsedMs": 2100},
+    )
+    p = frame["params"]
+    assert "containerSelector" not in p and "targetCount" not in p and "focus" not in p
+    assert p["direction"] == "down" and p["stableRounds"] == 3 and p["intervalMs"] == 700
+    assert out["stopped"] == "stable" and out["count"] == 10
+
+
+async def test_scroll_until_rejects_bad_direction_and_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
     reg = Registry()
     cs, ws = _put_conn(reg, "main")
     app = _app(db, reg)
     with pytest.raises(tools.ToolError) as ei:
-        await tools.execute_js(app, instance="main", tab_id=2, code="evil()", auth_ctx="s")
-    assert ei.value.code == protocol.ERR_JS_DISABLED
-    assert ws.sent == []  # refused before any frame reached the socket
-    outcome = await db.read(lambda c: c.execute("SELECT outcome, initiator FROM js_audit").fetchone())
-    assert outcome == ("disabled", "mcp")
+        await tools.scroll_until(app, instance="main", tab_id=3, count_selector=".m",
+                                 direction="sideways")
+    assert ei.value.code == "invalid_args"
+    assert ws.sent == []
+
+
+async def test_scroll_until_refused_while_paused_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.scroll_until(app, instance="main", tab_id=3, count_selector=".m")
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
+# --- Job-API: start_js (audited) + poll_job (fixed) --------------------------
+async def test_start_js_mints_job_id_audits_and_returns_it(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.start_js(app, instance="main", tab_id=2, code="await scrape()",
+                               world="MAIN", url_at_exec="https://a", auth_ctx="mcp-sess-j"),
+        cs, ws, {"jobId": None},  # the extension echoes back; None => server's minted id wins
+    )
+    assert frame["command"] == protocol.CMD_START_JS
+    minted = frame["params"]["jobId"]
+    assert minted.startswith("job-")
+    assert frame["params"]["code"] == "await scrape()" and frame["params"]["world"] == "MAIN"
+    # start_js ALWAYS runs the code as an awaited async body, so the frame (and the js_audit
+    # row it drives) unconditionally carries awaitPromise=true — there is no MCP-surface
+    # parameter to toggle it, and the audit cannot misstate how the code ran.
+    assert frame["params"]["awaitPromise"] is True
+    assert out == {"ok": True, "job_id": minted}
+    # Audited like execute_js: initiator='mcp', the MCP session as auth_ctx, outcome ok.
+    row = await db.read(lambda c: c.execute(
+        "SELECT initiator, auth_ctx, code, outcome, url_at_exec FROM js_audit").fetchone())
+    assert row == ("mcp", "mcp-sess-j", "await scrape()", "ok", "https://a")
+
+
+async def test_start_js_refused_while_paused_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.start_js(app, instance="main", tab_id=2, code="x", auth_ctx="s")
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+    # Refused BEFORE the audit-writing send, so no row either.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_poll_job_returns_state_and_caps_value(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    # done + a value under the cap: passed straight through.
+    out, frame = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-1"),
+        cs, ws, {"state": "done", "value": {"n": 3}},
+    )
+    assert frame["command"] == protocol.CMD_POLL_JOB
+    assert frame["params"] == {"tabId": 2, "jobId": "job-1"}
+    assert out == {"ok": True, "state": "done", "value": {"n": 3}}
+    # A fixed verb writes NO audit row.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+    # A value over max_bytes is cut and flagged with the true size.
+    big = "x" * 5000
+    out2, _ = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-1", max_bytes=100),
+        cs, ws, {"state": "done", "value": big},
+    )
+    assert out2["state"] == "done" and out2["truncated"] is True
+    assert out2["total_bytes"] == 5000 and len(out2["value"]) == 100
+
+
+async def test_poll_job_unknown_and_error_states(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    # unknown: the page-resident state is gone (reload/discard/close, or a wrong id).
+    out, _ = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="gone"),
+        cs, ws, {"state": "unknown"},
+    )
+    assert out == {"ok": True, "state": "unknown"}  # no value, no message
+    # error carries the message, not a value.
+    out2, _ = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-2"),
+        cs, ws, {"state": "error", "message": "boom"},
+    )
+    assert out2 == {"ok": True, "state": "error", "message": "boom"}
+
+
+async def test_poll_job_world_rides_the_frame(tmp_path):
+    # A job started in ISOLATED lives in that world's global, so poll_job must be able to say
+    # which world to read: `world` (when given) goes on the frame verbatim so the extension's
+    # readJobInWorld inject lands where start_js wrote the record. MAIN default matches
+    # start_js's default, so an unqualified pair puts no `world` on the wire.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    out, frame = await _run_with_response(
+        lambda: tools.poll_job(app, instance="main", tab_id=2, job_id="job-9", world="ISOLATED"),
+        cs, ws, {"state": "running"},
+    )
+    assert frame["command"] == protocol.CMD_POLL_JOB
+    assert frame["params"] == {"tabId": 2, "jobId": "job-9", "world": "ISOLATED"}
+    assert out == {"ok": True, "state": "running"}
 
 
 # --- relocate_tab (#48): synchronous open + close in one call ----------------
@@ -2112,7 +2290,7 @@ async def test_execute_js_timeout_is_clamped_to_the_ceiling(tmp_path, monkeypatc
 
 # --- get_text: the FIXED-function read (§12) ---------------------------------
 async def test_get_text_returns_the_text_and_writes_NO_js_audit_row(tmp_path):
-    """THE §12 line this wave draws. The execute_js gate (checkbox + kill-switch + an
+    """THE §12 line this wave draws. The execute_js gate (the extension-edge checkbox + an
     audit row before the send) exists because ARBITRARY code arrives there and truncated
     code cannot be reconstructed. get_text injects a function committed into the extension
     and known at build time — there is nothing to reconstruct, so it is NOT behind that
@@ -2612,10 +2790,12 @@ async def test_list_instances_reports_what_a_copy_declared_in_its_hello(tmp_path
     await _insert_instance(db, "main")
     await db.write(lambda c: queries.hello_upsert(
         c, "main", "sess-1", True, tools._now_ms(),
-        allow_debugger=True, ext_version="0.4.2",
+        ext_version="0.4.2",
     ))
     out = await tools.list_instances(_app(db))
     envelope = out["instances"]["main"]
+    # The single JS & Debugger gate (it covers execute_js AND the chrome.debugger path);
+    # the former separate `allow_debugger` is gone (migration v6).
     assert envelope["allow_execute_js"] is True
-    assert envelope["allow_debugger"] is True
+    assert "allow_debugger" not in envelope
     assert envelope["ext_version"] == "0.4.2"

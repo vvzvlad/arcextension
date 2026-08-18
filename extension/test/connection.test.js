@@ -249,30 +249,21 @@ describe("hello reports the STORED execute_js checkbox (§12)", () => {
 });
 
 // --- the capability report (§11/§12) ----------------------------------------
-// An agent must be able to see what a copy allows BEFORE it calls and fails mid-task.
-// These two ride the SAME hello path allowExecuteJs already rode.
+// An agent must be able to see what a copy is running BEFORE it calls and fails mid-task.
+// extVersion rides the SAME hello path allowExecuteJs already rode. The former separate
+// allowDebugger field is gone: one JS & Debugger checkbox now gates both surfaces.
 describe("hello carries the capability report", () => {
-  it("reports allowDebugger (default OFF) and the running extVersion", async () => {
+  it("reports the running extVersion", async () => {
     const conn = makeConnection();
     await conn.ensureSocket();
     conn.ws._open();
     await flush();
     expect(conn.ws.sent[0]).toMatchObject({
       type: "hello",
-      // Never ticked => OFF, exactly like the execute_js gate: a capability that
-      // defaulted ON would tell the agent this copy permits something it does not.
-      allowDebugger: false,
       extVersion: "9.9.9", // from the mock's chrome.runtime.getManifest()
     });
-  });
-
-  it("reports allowDebugger:true once the options checkbox is ticked", async () => {
-    await chrome.storage.local.set({ allowDebugger: true });
-    const conn = makeConnection();
-    await conn.ensureSocket();
-    conn.ws._open();
-    await flush();
-    expect(conn.ws.sent[0]).toMatchObject({ type: "hello", allowDebugger: true });
+    // The retired second checkbox no longer rides the frame.
+    expect(conn.ws.sent[0].allowDebugger).toBeUndefined();
   });
 
   it("a manifest read that throws costs the version, NEVER the hello", async () => {

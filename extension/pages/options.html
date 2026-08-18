@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>arcextension — Options</title>
+    <title>Tabs Curator — Options</title>
     <!--
       Styling lives in pages/ui.css, shared with the popup. An external stylesheet is
       fine under the extension_pages CSP (`script-src 'self'` governs scripts, not
@@ -36,7 +36,7 @@
       "<field>-error" line each input names in aria-describedby.
     -->
     <main class="ui-page">
-      <h1 class="ui-title">arcextension options</h1>
+      <h1 class="ui-title">Tabs Curator options</h1>
 
       <section class="ui-card">
         <h2 class="ui-card-title">Enrollment</h2>
@@ -99,31 +99,23 @@
       </section>
 
       <!--
-        execute_js (§12) is one checkbox in the page flow, deliberately without a card,
-        a warning stripe or a paragraph of its own: the danger is in what it ALLOWS, and
-        the switch that allows it is off by default and refuses every execute_js with
-        `js_disabled` while it stays off.
+        The SINGLE JS & Debugger opt-in (§12). One checkbox gates BOTH execute_js/start_js
+        AND the chrome.debugger (CDP) path — the former separate `allow-debugger` checkbox
+        is gone (it gated nothing). Deliberately without a card or a warning stripe: the
+        danger is in what it ALLOWS, and the switch is off by default and refuses every
+        gated verb with `js_disabled` while it stays off. The debugger half carries a cost
+        the owner PAYS EVEN WHEN NOTHING GOES WRONG, stated here rather than left to be
+        discovered: attaching the debugger (CDP) puts the browser's «идёт отладка» bar
+        across the top of the window while it stays attached, and the attached state is
+        trivially detectable by anti-bot systems — which is how a logged-in session gets
+        challenged or blocked.
       -->
       <label class="ui-checkbox" for="allow-execute-js">
         <input type="checkbox" id="allow-execute-js" />
-        <span>Allow <code>execute_js</code> on this copy</span>
-      </label>
-
-      <!--
-        The debugger opt-in (§12). Unlike execute_js — whose danger is entirely in what
-        the code does — this one has a cost the owner PAYS EVEN WHEN NOTHING GOES WRONG,
-        and that cost is stated here rather than left to be discovered: attaching the
-        debugger puts the browser's "идёт отладка" bar across the top of the window for as
-        long as it stays attached, and the attached state is trivially detectable by
-        anti-bot systems, which is how a logged-in session gets challenged or blocked.
-        Nothing reads this switch yet; it is reported in `hello` so an agent can see what
-        this copy allows before it asks.
-      -->
-      <label class="ui-checkbox" for="allow-debugger">
-        <input type="checkbox" id="allow-debugger" />
         <span>
-          Allow the <code>debugger</code> on this copy — shows the browser's
-          «идёт отладка» bar while attached, and is detectable by anti-bot systems
+          Allow JS &amp; Debugger on this copy — runs curator JS
+          (<code>execute_js</code>) and the <code>chrome.debugger</code> (CDP) path, which
+          shows the «идёт отладка» bar and is detectable by anti-bot systems
         </span>
       </label>
 

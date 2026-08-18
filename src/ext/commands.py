@@ -2,8 +2,7 @@
 
 This is the SERVICE half of §6 "Команды (сервис → расширение)". The extension
 executes the verbs (§6 dispatcher); here we own the send + correlate + timeout +
-error-code path, plus the ``execute_js`` audit-before-send rule and the runtime
-kill-switch that can refuse an ``execute_js`` before it is ever sent (§12).
+error-code path, plus the ``execute_js`` audit-before-send rule (§12).
 
 Correlation: :func:`send_command` builds a ``command {id, sessionId, command,
 params}`` frame, stores an :class:`asyncio.Future` under ``id`` on the live
@@ -27,7 +26,6 @@ from loguru import logger
 
 from src.db.audit import insert_js_audit, update_js_audit_outcome
 from src.db.queries import instance_status
-from src.db.settings_store import is_execute_js_enabled
 from src.ext import protocol
 
 
@@ -116,7 +114,7 @@ async def send_command(
     session, the stamped-old value no longer matches and the command is refused. This
     is race-free where a pre-send comparison would be TOCTOU: there are ``await`` points
     between reading the session and putting the frame on the socket (revoke check, the
-    execute_js audit/kill-switch), and a reconnect in that window would re-stamp the NEW
+    execute_js audit), and a reconnect in that window would re-stamp the NEW
     live session and defeat a comparison. ``None`` = today's behavior (stamp the live
     session); the param is deliberately OPTIONAL — a caller may go unprotected. (An
     instance whose envelope ``session_id`` is ``null`` — no clean hello yet — echoes
@@ -164,18 +162,32 @@ async def send_command(
         "params": params,
     }
 
-    # execute_js MUST NOT run without a durable audit sink (§12): with no db to
-    # write the js_audit row, refuse fail-closed rather than send arbitrary code
-    # un-audited. The "JS ran without an audit row" code path must not exist.
-    if command == protocol.CMD_EXECUTE_JS and db is None:
+    # GUARDRAIL — the ``(CMD_EXECUTE_JS, CMD_START_JS)`` tuple below (and its twin at the
+    # audit-before-send check) is the ALLOWLIST of verbs that carry arbitrary or
+    # data-exfiltrating code and therefore MUST write a ``js_audit`` row before the send.
+    # Fixed-function / benign verbs (set_focus_emulation, get_text, wait_for, …) are outside it
+    # ON PURPOSE — they reconstruct no code and move no page data. BUT any FUTURE data-bearing
+    # CDP verb built on this same ``send_command`` path — a screenshot verb, network/WebSocket
+    # capture, DOM/page dumps — MUST be added here (or given its own data-bearing flag): a verb
+    # that ships page data out while staying off this allowlist would silently bypass the
+    # js_audit trail.
+    #
+    # execute_js / start_js MUST NOT run without a durable audit sink (§12): both carry
+    # ARBITRARY caller code, so with no db to write the js_audit row, refuse fail-closed
+    # rather than send it un-audited. The "JS ran without an audit row" code path must not
+    # exist for EITHER verb (start_js is fire-and-forget, which makes the trace matter more,
+    # not less — the code keeps running in the page after the frame is answered).
+    if command in (protocol.CMD_EXECUTE_JS, protocol.CMD_START_JS) and db is None:
         raise CommandError(
-            protocol.ERR_INTERNAL, "execute_js requires an audit sink (db is None)"
+            protocol.ERR_INTERNAL, f"{command} requires an audit sink (db is None)"
         )
 
-    # execute_js: audit BEFORE sending, so a disabled/rejected/timed-out call is
-    # still the only durable trace of arbitrary code execution (§12).
+    # execute_js / start_js: audit BEFORE sending, so a disabled/rejected/timed-out call is
+    # still the only durable trace of arbitrary code execution (§12). ONLY these two arbitrary-
+    # code verbs are audited — the FIXED-function verbs (get_text, wait_for, scroll_until,
+    # poll_job) carry committed functions and no reconstructable code, so they write no row.
     audit_id: int | None = None
-    if command == protocol.CMD_EXECUTE_JS and db is not None:
+    if command in (protocol.CMD_EXECUTE_JS, protocol.CMD_START_JS) and db is not None:
         # url_at_exec is NOT a §6 command param — the caller (a later MCP/pass phase)
         # passes `urlAtExec` in params when it knows the tab's URL, else it stays
         # NULL. The audit still records who/what/where via the other fields.
@@ -197,19 +209,6 @@ async def send_command(
                 now=_now_ms(),
             )
         )
-
-        # Runtime kill-switch (§12 "запретить execute_js везде сейчас"): the
-        # audit row is written FIRST (a refused call is still the only trace of an
-        # execute_js attempt), THEN the switch is checked. When off we record
-        # outcome='disabled' and REFUSE — no frame is ever put on the socket.
-        if not await db.read(is_execute_js_enabled):
-            # best-effort like every other outcome-update: a failure here must not
-            # mask the intended CommandError (the audit row is already committed).
-            await _safe_update_outcome(db, audit_id, "disabled", "kill_switch")
-            raise CommandError(
-                protocol.ERR_JS_DISABLED,
-                "execute_js is disabled by the runtime kill-switch",
-            )
 
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()

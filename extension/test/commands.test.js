@@ -5,6 +5,11 @@ import {
   evalInWorld,
   readTextInWorld,
   matchInWorld,
+  scrollAndCountInWorld,
+  startJobInWorld,
+  readJobInWorld,
+  handleDebuggerDetach,
+  __resetDebuggerState,
 } from "../src/commands.js";
 import * as activityMap from "../src/activity-map.js";
 import {
@@ -19,6 +24,10 @@ import {
   CMD_MOVE_TAB,
   CMD_GET_TEXT,
   CMD_WAIT_FOR,
+  CMD_SCROLL_UNTIL,
+  CMD_START_JS,
+  CMD_POLL_JOB,
+  CMD_SET_FOCUS_EMULATION,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
 } from "../src/constants.js";
@@ -49,6 +58,9 @@ function frame(command, params = {}, sessionId = SID) {
 beforeEach(() => {
   globalThis.chrome = createChromeMock();
   activityMap.__resetQueue();
+  // The debugger attachment set is process-global; clear it so one test's attached tab
+  // does not leak into the next.
+  __resetDebuggerState();
 });
 
 // --- session check (§5): FIRST, before any verb executes --------------------
@@ -68,6 +80,10 @@ describe("stale_session rejects every verb without executing", () => {
     // one is reading a stranger's tab.
     [CMD_GET_TEXT, { tabId: 1 }],
     [CMD_WAIT_FOR, { tabId: 1, urlMatches: "x", timeoutMs: 1000 }],
+    [CMD_SCROLL_UNTIL, { tabId: 1, countSelector: ".x", timeoutMs: 1000 }],
+    // start_js carries arbitrary code but the session check runs FIRST, before its checkbox.
+    [CMD_START_JS, { tabId: 1, code: "1", jobId: "job-1" }],
+    [CMD_POLL_JOB, { tabId: 1, jobId: "job-1" }],
   ];
 
   it.each(verbs)("%s from a foreign session => stale_session, no side effects", async (cmd, params) => {
@@ -2624,5 +2640,606 @@ describe("navigate_tab waitUntil", () => {
     );
     expect(res.error.code).toBe("precondition_failed");
     expect(chrome.__state.tabs[0].url).toBe("https://old/");
+  });
+});
+
+// --- scroll_until: the FIXED-function scroll loop (§12) ----------------------
+// A document double for scrollAndCountInWorld. `containers` maps a selector to a scroller
+// element (with scrollHeight/scrollTop); `counts` maps a selector to the array
+// querySelectorAll returns; `bad` lists selectors that throw SyntaxError like a real engine.
+function scrollFakeDoc({ containers = {}, counts = {}, bad = [], scrollingElement } = {}) {
+  const guard = (sel) => {
+    if (bad.includes(sel)) {
+      const e = new Error(`'${sel}' is not a valid selector`);
+      e.name = "SyntaxError";
+      throw e;
+    }
+  };
+  return {
+    scrollingElement,
+    documentElement: scrollingElement,
+    querySelector: (sel) => {
+      guard(sel);
+      return sel in containers ? containers[sel] : null;
+    },
+    querySelectorAll: (sel) => {
+      guard(sel);
+      return counts[sel] || [];
+    },
+  };
+}
+
+describe("scrollAndCountInWorld — scroll_until's injected body", () => {
+  it("scrolls a CONTAINER to the far end for the direction and counts the selector", () => {
+    const scroller = { scrollHeight: 4000, scrollTop: 0 };
+    withDocument(
+      scrollFakeDoc({ containers: { "#feed": scroller }, counts: { ".m": [0, 0, 0] } }),
+      () => {
+        expect(scrollAndCountInWorld("#feed", "down", ".m")).toEqual({ count: 3 });
+        expect(scroller.scrollTop).toBe(4000); // down => scrollHeight
+      },
+    );
+  });
+
+  it("direction 'up' pulls the container to the top (chat/history backlog)", () => {
+    const scroller = { scrollHeight: 4000, scrollTop: 4000 };
+    withDocument(scrollFakeDoc({ containers: { "#feed": scroller }, counts: { ".m": [1] } }), () => {
+      expect(scrollAndCountInWorld("#feed", "up", ".m")).toEqual({ count: 1 });
+      expect(scroller.scrollTop).toBe(0);
+    });
+  });
+
+  it("with NO container it scrolls the document AND the window", () => {
+    const doc = { scrollHeight: 9000, scrollTop: 0 };
+    const scrollTo = vi.fn();
+    globalThis.window = { scrollTo };
+    try {
+      withDocument(scrollFakeDoc({ scrollingElement: doc, counts: { ".m": [1, 2] } }), () => {
+        expect(scrollAndCountInWorld(null, "down", ".m")).toEqual({ count: 2 });
+        expect(doc.scrollTop).toBe(9000);
+        expect(scrollTo).toHaveBeenCalledWith(0, 9000);
+      });
+    } finally {
+      delete globalThis.window;
+    }
+  });
+
+  it("a MALFORMED count selector is a badSelector VALUE, not a throw", () => {
+    // A throw is read by the loop as a torn-down frame and polled to the deadline — so a
+    // typo would cost the whole budget then answer wrong. It must travel as data.
+    const doc = { scrollHeight: 1, scrollTop: 0 };
+    withDocument(scrollFakeDoc({ scrollingElement: doc, bad: [":::"] }), () => {
+      const got = scrollAndCountInWorld(null, "down", ":::");
+      expect(got.badSelector).toBe(true);
+      expect(got.message).toMatch(/not a valid selector/);
+    });
+  });
+
+  it("a MALFORMED container selector is a badSelector VALUE too", () => {
+    withDocument(scrollFakeDoc({ bad: ["#a:has(>"] }), () => {
+      const got = scrollAndCountInWorld("#a:has(>", "down", ".m");
+      expect(got.badSelector).toBe(true);
+    });
+  });
+
+  it("a container selector that matched NOTHING is noContainer, distinct from bad", () => {
+    withDocument(scrollFakeDoc({ counts: { ".m": [1] } }), () => {
+      expect(scrollAndCountInWorld("#missing", "down", ".m")).toEqual({ noContainer: true });
+    });
+  });
+});
+
+describe("scroll_until dispatch", () => {
+  it("stops with 'stable' after stableRounds steps of no growth, reporting rounds/elapsed", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { count: 5 } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, {
+        tabId: 5, countSelector: ".m", direction: "down",
+        stableRounds: 3, intervalMs: 100, timeoutMs: 60000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+    // grew to 5 on round 1, then 3 flat rounds => 4 rounds total, stop 'stable'.
+    expect(res.result).toEqual({ count: 5, rounds: 4, stopped: "stable", elapsedMs: 300 });
+  });
+
+  it("stops with 'target' as soon as count reaches targetCount", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { count: 12 } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m", targetCount: 8, timeoutMs: 60000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.result).toEqual({ count: 12, rounds: 1, stopped: "target", elapsedMs: 0 });
+  });
+
+  it("runs with the execute_js checkbox OFF (fixed function, §12)", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { count: 3 } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m", targetCount: 1, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("passes selectors + direction as ARGS to the fixed function, never a code string", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { count: 1 } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const c = fakeClock();
+    await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, {
+        tabId: 5, countSelector: ".m", containerSelector: "#feed", direction: "up",
+        targetCount: 1, timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(exec.mock.calls[0][0].func).toBe(scrollAndCountInWorld);
+    expect(exec.mock.calls[0][0].args).toEqual(["#feed", "up", ".m"]);
+  });
+
+  it("a MALFORMED selector is precondition_failed, not internal or a full-budget wait", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { badSelector: true, message: "'.m:has(>' bad" } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m:has(>", timeoutMs: 60000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(c.sleeps).toBe(0); // refused on the first step, not polled to the deadline
+  });
+
+  it("a container that matched nothing is precondition_failed", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { noContainer: true } }];
+    const c = fakeClock();
+    const res = await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, {
+        tabId: 5, countSelector: ".m", containerSelector: "#gone", timeoutMs: 5000,
+      }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+  });
+
+  it("keeps the http/https guard and never injects into a non-http tab", async () => {
+    chromeWithOneTab("file:///etc/passwd");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m", timeoutMs: 5000 }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a tab that vanishes mid-scroll ends with no_such_tab", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { count: 1 } }];
+    const c = fakeClock();
+    c.onSleep((n) => {
+      if (n === 1) chrome.__state.tabs.length = 0; // the human closed it
+    });
+    const res = await dispatchCommand(
+      // no target/stable reached quickly => it will sleep and re-get the (gone) tab.
+      frame(CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m", targetCount: 999, timeoutMs: 60000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("with focus:true it activates the tab and raises the window before looping", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { count: 5 } }];
+    const update = vi.spyOn(chrome.tabs, "update");
+    const winUpdate = vi.spyOn(chrome.windows, "update");
+    const c = fakeClock();
+    await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, { tabId: 5, countSelector: ".m", targetCount: 1, focus: true, timeoutMs: 5000 }),
+      ctx({ now: c.now, sleep: c.sleep }),
+    );
+    expect(update).toHaveBeenCalledWith(5, { active: true });
+    expect(winUpdate).toHaveBeenCalledWith(1, { focused: true });
+  });
+
+  it("refuses a missing countSelector loudly, before touching the browser", async () => {
+    chromeWithOneTab();
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_SCROLL_UNTIL, { tabId: 5, timeoutMs: 5000 }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+// --- Job-API: start_js's + poll_job's injected bodies -----------------------
+describe("startJobInWorld — start_js's injected body", () => {
+  it("returns {jobId} at once and settles the job to done with the value", async () => {
+    const win = {};
+    globalThis.window = win;
+    try {
+      expect(startJobInWorld("job-1", "40 + 2")).toEqual({ jobId: "job-1" });
+      // The record is 'running' synchronously, BEFORE the promise settles.
+      expect(win.__curatorJobs["job-1"]).toEqual({ state: "running" });
+      await new Promise((r) => setTimeout(r, 0)); // let the async IIFE settle
+      expect(win.__curatorJobs["job-1"]).toEqual({ state: "done", value: 42 });
+    } finally {
+      delete globalThis.window;
+    }
+  });
+
+  it("compiles top-level await/return like execute_js's await path", async () => {
+    const win = {};
+    globalThis.window = win;
+    try {
+      startJobInWorld("job-a", "const v = await Promise.resolve(2); return v * 3;");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(win.__curatorJobs["job-a"]).toEqual({ state: "done", value: 6 });
+    } finally {
+      delete globalThis.window;
+    }
+  });
+
+  it("a throwing job settles to error with the message, not a crash", async () => {
+    const win = {};
+    globalThis.window = win;
+    try {
+      startJobInWorld("job-e", "throw new Error('boom')");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(win.__curatorJobs["job-e"]).toEqual({ state: "error", message: "boom" });
+    } finally {
+      delete globalThis.window;
+    }
+  });
+
+  it("an UNSERIALIZABLE result names itself instead of becoming a silent null", async () => {
+    const win = {};
+    globalThis.window = win;
+    try {
+      startJobInWorld("job-f", "() => 1");
+      await new Promise((r) => setTimeout(r, 0));
+      const rec = win.__curatorJobs["job-f"];
+      expect(rec.state).toBe("done");
+      expect(rec.value.__unserializable).toBe("Function");
+    } finally {
+      delete globalThis.window;
+    }
+  });
+
+  it("syntactically broken code settles to error, so poll_job never sees unknown", () => {
+    const win = {};
+    globalThis.window = win;
+    try {
+      // `const x = ;` fails to parse in ALL three compile forms. The old body let the last
+      // form throw OUT of the injected function, so NO job record was written and poll_job
+      // then answered `unknown` — indistinguishable from "state lost with the tab". Now the
+      // record is written `running` FIRST and downgraded to an HONEST `error` on compile
+      // failure; the function returns `{jobId}` normally, never throwing.
+      expect(startJobInWorld("job-bad", "const x = ;")).toEqual({ jobId: "job-bad" });
+      const rec = win.__curatorJobs["job-bad"];
+      expect(rec.state).toBe("error");
+      expect(typeof rec.message).toBe("string");
+      // readJobInWorld (poll_job's body) then reports `error` — the compile-failure signal —
+      // NOT `unknown`, which is reserved for a genuinely gone page-resident record.
+      expect(readJobInWorld("job-bad")).toEqual(rec);
+    } finally {
+      delete globalThis.window;
+    }
+  });
+});
+
+describe("readJobInWorld — poll_job's injected body", () => {
+  it("reads a stored record verbatim (state + value/message)", () => {
+    globalThis.window = {
+      __curatorJobs: {
+        "job-1": { state: "done", value: 42 },
+        "job-2": { state: "error", message: "boom" },
+      },
+    };
+    try {
+      expect(readJobInWorld("job-1")).toEqual({ state: "done", value: 42 });
+      expect(readJobInWorld("job-2")).toEqual({ state: "error", message: "boom" });
+    } finally {
+      delete globalThis.window;
+    }
+  });
+
+  it("a missing global or key is state:unknown — the honest 'state is gone' signal", () => {
+    // No global at all (a fresh/reloaded page).
+    expect(readJobInWorld("job-x")).toEqual({ state: "unknown" });
+    // Global present, key absent (wrong id).
+    globalThis.window = { __curatorJobs: { other: { state: "running" } } };
+    try {
+      expect(readJobInWorld("job-x")).toEqual({ state: "unknown" });
+    } finally {
+      delete globalThis.window;
+    }
+  });
+});
+
+describe("start_js dispatch (arbitrary code — checkbox gate §12)", () => {
+  it("checkbox OFF (default) => js_disabled and executeScript NOT called", async () => {
+    chromeWithOneTab();
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_START_JS, { tabId: 5, code: "1+1", jobId: "job-1" }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("js_disabled");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("checkbox ON => injects startJobInWorld in the world with [jobId, code] and echoes jobId", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.scriptResults = [{ result: { jobId: "job-1" } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_START_JS, { tabId: 5, code: "await scrape()", world: "ISOLATED", jobId: "job-1" }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { jobId: "job-1" } });
+    const injection = exec.mock.calls[0][0];
+    expect(injection.func).toBe(startJobInWorld);
+    expect(injection.world).toBe("ISOLATED");
+    expect(injection.args).toEqual(["job-1", "await scrape()"]);
+  });
+
+  it("keeps the http/https guard (§12) and does not inject into a file:// tab", async () => {
+    chromeWithOneTab("file:///etc/passwd");
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_START_JS, { tabId: 5, code: "1", jobId: "job-1" }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe("poll_job dispatch (fixed read — no checkbox §12)", () => {
+  it("runs with the execute_js checkbox OFF and returns the state", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { state: "running" } }];
+    const res = await dispatchCommand(
+      frame(CMD_POLL_JOB, { tabId: 5, jobId: "job-1" }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { state: "running" } });
+  });
+
+  it("carries value/message through and injects readJobInWorld with [jobId]", async () => {
+    chromeWithOneTab();
+    chrome.__state.scriptResults = [{ result: { state: "done", value: { n: 3 } } }];
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_POLL_JOB, { tabId: 5, jobId: "job-1" }),
+      ctx(),
+    );
+    expect(res.result).toEqual({ state: "done", value: { n: 3 } });
+    expect(exec.mock.calls[0][0].func).toBe(readJobInWorld);
+    expect(exec.mock.calls[0][0].args).toEqual(["job-1"]);
+  });
+
+  it("keeps the http/https guard like get_text", async () => {
+    chromeWithOneTab("file:///etc/passwd");
+    const exec = vi.spyOn(chrome.scripting, "executeScript");
+    const res = await dispatchCommand(
+      frame(CMD_POLL_JOB, { tabId: 5, jobId: "job-1" }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a vanished tab is no_such_tab, not internal", async () => {
+    chromeWithOneTab();
+    const res = await dispatchCommand(
+      frame(CMD_POLL_JOB, { tabId: 999, jobId: "job-1" }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
+// --- set_focus_emulation: the chrome.debugger foundation (§12, wave 18) -------
+describe("set_focus_emulation (chrome.debugger)", () => {
+  const FOCUS_METHOD = "Emulation.setFocusEmulationEnabled";
+
+  it("checkbox OFF (default) => js_disabled, and the debugger is NOT touched", async () => {
+    chromeWithOneTab();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: false, error: { code: "js_disabled", message: expect.any(String) } });
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("enable: attaches, turns emulation on, and KEEPS the tab attached", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, FOCUS_METHOD, { enabled: true });
+    expect(detach).not.toHaveBeenCalled(); // held attached — the emulation lapses on detach
+    expect(chrome.debugger._attached.has(5)).toBe(true);
+  });
+
+  it("disable: turns emulation off, detaches, and drops the tab from the set", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // First enable so there is something to tear down.
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, FOCUS_METHOD, { enabled: false });
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("disable on a tab we never attached is an idempotent no-op success", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: false } });
+    expect(detach).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("a repeat enable re-sends the command WITHOUT a second attach", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: true } });
+    expect(attach).not.toHaveBeenCalled(); // already ours — no second client
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, FOCUS_METHOD, { enabled: true });
+  });
+
+  it("a vanished tab is no_such_tab, and the debugger is not touched", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 999, enabled: true }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("no_such_tab");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("a non-http tab is precondition_failed (the debugger never attaches privileged pages)", async () => {
+    chromeWithOneTab("file:///etc/passwd");
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res.error.code).toBe("precondition_failed");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("attach that throws (DevTools open / another client) => debugger_attach, untracked", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.debuggerAttachError = "Another debugger is already attached";
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "debugger_attach", message: expect.any(String) },
+    });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("enable: attach ok but sendCommand throws on a FRESH attach => debugger_attach, and the fresh attach is rolled back", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // attach succeeds, but turning emulation on fails for a reason other than the tab closing.
+    chrome.__state.sendCommandError = "target crashed";
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "debugger_attach", message: expect.any(String) },
+    });
+    // The attach we just made is undone: detached on the browser side and dropped from our set,
+    // so no visible "debugging this tab" session is left hanging with emulation OFF.
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 });
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("a repeat enable whose sendCommand fails does NOT tear down the EARLIER attachment", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // First enable succeeds and attaches the tab.
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // A second enable re-issues the command and it fails transiently. Because THIS call did
+    // not attach the tab (attachedNow === false), the working session from the first enable
+    // must be left intact — tearing it down on one failed re-issue would be the bug the
+    // attachedNow guard exists to prevent.
+    chrome.__state.sendCommandError = "target crashed";
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({
+      ok: false,
+      error: { code: "debugger_attach", message: expect.any(String) },
+    });
+    expect(detach).not.toHaveBeenCalled(); // the prior session is untouched
+    expect(chrome.debugger._attached.has(5)).toBe(true); // still attached from the first enable
+  });
+
+  it("the fresh-attach rollback clears our INTERNAL set too (a later enable re-attaches)", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // A fresh attach whose emulation command fails is rolled back.
+    chrome.__state.sendCommandError = "target crashed";
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // With the failure cleared, a later enable must perform a FRESH attach — which only
+    // happens if the rollback dropped the tab from our module-level set, not just the browser
+    // side. A missing `delete` would leave has()===true and skip this attach.
+    chrome.__state.sendCommandError = null;
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    expect(res).toEqual({ ok: true, result: { enabled: true } });
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+
+  it("onDetach cleanup lets a later enable re-attach (the human closed the tab / opened DevTools)", async () => {
+    chromeWithOneTab();
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // The debugger detaches for a reason outside the verb; the listener drops it from our set.
+    handleDebuggerDetach({ tabId: 5 });
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    // A fresh attach happened because the set no longer claimed the tab was ours.
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
   });
 });

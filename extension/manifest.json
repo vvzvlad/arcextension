@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "arcextension",
-  "//version": "This literal is the BASE, not what ships. `instancegen bundle` (make bundle / make dev-bundle) stamps the BUILT copy's manifest with `version` = <major>.<minor>.<commit-count>.<HHMM> — only the first two components are taken from here, the third is `git rev-list --count HEAD` and the fourth is the build's wall-clock hour and minute as one integer (20:58 -> 2058, 09:30 -> 930), which is what distinguishes two builds of the SAME commit. That is the ONE field the build stamps: NO `version_name` is written, on purpose. brave://extensions renders `version_name` when present, in the slot beside the extension NAME, and a long human-readable stamp there wrapped to two lines and truncated the name («arcextens... 0.1.135 · edd7787 · 2026-08-07 20:58»); with no `version_name` the page falls back to `version`, exactly like every other extension's card. So the short sha, the `-dirty` flag and the full date stay OUT of the manifest — `make dev-bundle` prints them in the terminal, and that printed version is what you compare against the card to tell whether pressing «Обновить» actually picked up the build you just made. Do NOT bump this literal per build: the commit count already moves, and the repo's own extension/ is never written by the build. Bump it only to move the major/minor line. If git is unavailable the build degrades to copying this manifest verbatim, so an unstamped bundle shows exactly the version below.",
+  "name": "Tabs Curator",
+  "//version": "This literal is the BASE, not what ships. `instancegen bundle` (make bundle / make dev-bundle) stamps the BUILT copy's manifest with `version` = <major>.<minor>.<commit-count>.<HHMM> — only the first two components are taken from here, the third is `git rev-list --count HEAD` and the fourth is the build's wall-clock hour and minute as one integer (20:58 -> 2058, 09:30 -> 930), which is what distinguishes two builds of the SAME commit. That is the ONE field the build stamps: NO `version_name` is written, on purpose. brave://extensions renders `version_name` when present, in the slot beside the extension NAME, and a long human-readable stamp there wrapped to two lines and truncated the name («Tabs Cura... 0.1.135 · edd7787 · 2026-08-07 20:58»); with no `version_name` the page falls back to `version`, exactly like every other extension's card. So the short sha, the `-dirty` flag and the full date stay OUT of the manifest — `make dev-bundle` prints them in the terminal, and that printed version is what you compare against the card to tell whether pressing «Обновить» actually picked up the build you just made. Do NOT bump this literal per build: the commit count already moves, and the repo's own extension/ is never written by the build. Bump it only to move the major/minor line. If git is unavailable the build degrades to copying this manifest verbatim, so an unstamped bundle shows exactly the version below.",
   "version": "0.2.0",
   "description": "Curator client: reports tab activity snapshots and executes curator commands (§5, §6).",
 
@@ -13,7 +13,8 @@
     "storage",
     "idle",
     "bookmarks",
-    "history"
+    "history",
+    "debugger"
   ],
 
   "//host_permissions": "ONLY <all_urls> now. The two per-host patterns (https://<host>/* and wss://<host>/*) are REMOVED: with enrollment (§7, issue #35) the build is UNIVERSAL — there is no generator to stamp a concrete <host> at package time, and the service address is an operator setting entered per profile. <all_urls> IS requested — SECURITY-SENSITIVE, deliberate — and now carries TWO paths, not one: (1) execute_js runs curator-supplied JS in the arbitrary http/https tabs this instance manages (§6), and (2) the startpage's fetch to the service /api/* is a cross-origin request whose CORS host-permission is <all_urls> (slice C / §12). Both are gated (execute_js by the per-copy options checkbox default OFF + the server kill-switch + commands.js's http/https-only edge guard; /api by a Bearer carrying the RAW per-install instance secret — option A, the server hashes it on receipt — over a wss:// address the client refuses to downgrade, src/service-address.js). A future tightening of <all_urls> to a fixed host list must therefore account for BOTH the execute_js origins AND the /api fetch host, or the startpage goes offline fleet-wide.",
@@ -47,7 +48,7 @@
 
   "//action": "The toolbar popup is 'Rule from this tab' (§8, §10): one click to add a rule <origin>/* -> this instance with a server-side impact preview.",
   "action": {
-    "default_title": "arcextension",
+    "default_title": "Tabs Curator",
     "default_popup": "pages/popup.html",
     "default_icon": {
       "16": "icons/icon-16.png",

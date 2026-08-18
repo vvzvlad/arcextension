@@ -108,6 +108,10 @@ def test_mcp_tools_list_exposes_every_phase11_tool(tmp_path):
         # invisible to every agent.
         "get_text", "wait_for", "navigate_tab",
         "list_exemptions", "set_exemption", "clear_exemption",
+        # The long-running agent verbs (wave 19): the scroll scheduler and the Job-API pair.
+        "scroll_until", "start_js", "poll_job",
+        # The chrome.debugger foundation (wave 18): the first CDP verb.
+        "set_focus_emulation",
     }
     with TestClient(app) as client:
         r = client.post("/mcp", json=_init_body(), headers=_headers())
