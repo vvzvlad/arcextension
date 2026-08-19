@@ -44,6 +44,7 @@ import {
   CMD_READ_WS_FRAMES,
   CMD_STOP_WS_CAPTURE,
   CMD_WAKE_TAB,
+  CMD_SCREENSHOT,
   ERR_STALE_SESSION,
   ERR_PRECONDITION_FAILED,
   ERR_NO_SUCH_TAB,
@@ -375,6 +376,38 @@ export function matchInWorld(selector, textContains) {
   return { matched: text.includes(textContains) };
 }
 
+// The body injected by screenshot when a `selector` is given. FIXED like readTextInWorld (§12):
+// the selector is DATA handed to querySelector, nothing is spliced into an eval, so the verb
+// needs no execute_js checkbox and writes no js_audit row.
+//
+// Returns the element's bounding box in CSS pixels (`getBoundingClientRect`) plus the tab's
+// `devicePixelRatio`, so the caller can turn CSS-px coordinates into DEVICE-px ones when it crops
+// the captured frame (captureVisibleTab returns device pixels; the CDP clip takes CSS pixels). A
+// malformed selector comes back as a `{badSelector, message}` VALUE and a selector that matched
+// nothing as `{found:false}` — never a throw, same reason as readTextInWorld: a thrown injection
+// is indistinguishable from a torn-down frame.
+export function rectInWorld(selector) {
+  let el;
+  try {
+    el = document.querySelector(selector);
+  } catch (e) {
+    if (e && e.name === "SyntaxError") {
+      return { found: false, badSelector: true, message: String((e && e.message) || e) };
+    }
+    throw e;
+  }
+  if (!el) return { found: false };
+  const r = el.getBoundingClientRect();
+  return {
+    found: true,
+    x: r.x,
+    y: r.y,
+    width: r.width,
+    height: r.height,
+    devicePixelRatio: window.devicePixelRatio || 1,
+  };
+}
+
 // The body injected by scroll_until on EVERY step. FIXED like readTextInWorld/matchInWorld
 // (§12): `countSelector` / `containerSelector` are DATA handed to querySelector(All) and
 // `direction` is one of two literals — nothing is spliced into an eval — so this verb needs
@@ -614,6 +647,11 @@ export async function dispatchCommand(frame, ctx = {}) {
       // A FIXED action (like navigate_tab) — no execute_js checkbox, no js_audit row.
       case CMD_WAKE_TAB:
         return await wakeTab(params, nowFn, sleep);
+      // Capture a tab's pixels (§6). An ORDINARY read verb — the picture twin of get_text —
+      // so the ACTIVE-tab path writes no js_audit row; the BACKGROUND-tab path rides the same
+      // JS & Debugger checkbox as execute_js but still writes no row (a one-shot read).
+      case CMD_SCREENSHOT:
+        return await screenshot(params);
       default:
         return fail(ERR_INTERNAL, `unknown command: ${command}`);
     }
@@ -2265,21 +2303,31 @@ const debuggerAttachedTabs = new Set();
 // overflow (surfaced to the agent, never a silent loss); `bytes` is the running weight of the
 // buffered text payloads, kept incrementally so the byte cap does not rescan on every frame.
 //
-// OWNERSHIP INVARIANT (§12): `debuggerAttachedTabs` and `wsCaptureTabs` are each the ownership
-// marker of ONE feature — focus emulation and ws capture respectively — and a tab lives in AT
-// MOST ONE of them at a time (one debugger client per tab). The two are therefore MUTUALLY
-// EXCLUSIVE in BOTH directions: each start verb refuses with `debugger_attach` when the OTHER
-// set already holds the tab (`start_ws_capture` checks `debuggerAttachedTabs`,
-// `set_focus_emulation` checks `wsCaptureTabs`), and each feature only ever attaches/detaches a
-// tab of its OWN set — so neither can pull the debugger out from under the other. The cross-
-// feature cleanup in `handleDebuggerDetach` and `__resetDebuggerState` is the sole exception:
-// a real detach event / a test reset clear BOTH sets, because they cannot know which feature
-// owned the tab.
+// OWNERSHIP INVARIANT (§12): `debuggerAttachedTabs`, `wsCaptureTabs` and `screenshotTabs` are each
+// the ownership marker of ONE feature — focus emulation, ws capture and (transient) screenshot
+// respectively — and a tab lives in AT MOST ONE of the three at a time (one debugger client per
+// tab). They are therefore MUTUALLY EXCLUSIVE in EVERY direction: each start verb refuses with
+// `debugger_attach` when ANY OTHER set already holds the tab (each feature checks the two sets it
+// does NOT own), and each feature only ever attaches/detaches a tab of its OWN set — so none can
+// pull the debugger out from under another. `screenshotTabs` is TRANSIENT: screenshot attaches,
+// captures and detaches within one call (it never HOLDS the debugger the way focus emulation does),
+// but for that window the tab is its own, so a concurrent focus/ws verb must refuse rather than tear
+// the in-flight shot's session down. The cross-feature cleanup in `handleDebuggerDetach` and
+// `__resetDebuggerState` is the sole exception: a real detach event / a test reset clear ALL THREE
+// sets, because they cannot know which feature owned the tab.
 //
 // Deliberately in-memory and lost on MV3 SW death (the debugger detaches implicitly then, too):
 // a resurrected worker starts with no capture and a fresh `start_ws_capture` re-attaches
 // cleanly. The buffer is never persisted — page data does not outlive the worker on disk.
 const wsCaptureTabs = new Map();
+
+// Transient ownership marker for an in-flight screenshot on a BACKGROUND tab (§6). screenshot
+// attaches the debugger, captures ONE frame and detaches within a single call — it never holds the
+// session — but while that call is in flight the tab is exclusively its own, so a concurrent
+// `set_focus_emulation` / `start_ws_capture` sees it HERE and refuses `debugger_attach` instead of
+// attaching a second client onto it or (worse) detaching it mid-capture. Its OWN set, per the
+// invariant above; cleared alongside the other two on a real detach / test reset.
+const screenshotTabs = new Set();
 
 // Ring-buffer ceilings for a single tab's capture. On overflow the OLDEST frame is evicted and
 // `dropped` is incremented — no silent truncation. WS_MAX_BUFFER_BYTES caps the summed weight
@@ -2335,6 +2383,10 @@ export function handleDebuggerDetach(source) {
     // human closed the tab / opened DevTools — pinning page data in worker memory with no verb
     // left that could ever detach it (stop_ws_capture would try to detach a tab already gone).
     wsCaptureTabs.delete(source.tabId);
+    // And drop any in-flight screenshot marker (§6): the debugger is gone, so a transient shot on
+    // this tab can no longer detach it in its own finally — clear the marker so the invariant
+    // (a tab lives in AT MOST ONE set) holds and a later feature is not refused by a stale entry.
+    screenshotTabs.delete(source.tabId);
   }
 }
 
@@ -2378,6 +2430,7 @@ export function handleDebuggerEvent(source, method, params) {
 export function __resetDebuggerState() {
   debuggerAttachedTabs.clear();
   wsCaptureTabs.clear();
+  screenshotTabs.clear();
 }
 
 // set_focus_emulation {tabId, enabled} (§12, wave 18). Makes a BACKGROUND tab behave as
@@ -2422,15 +2475,15 @@ async function setFocusEmulation(params) {
     const discarded = discardedFail(tab, tabId);
     if (discarded) return discarded;
     // MUTUAL EXCLUSION (§12), symmetric to how `startWsCapture` refuses a tab held by focus
-    // emulation: if a ws capture already owns this tab, refuse UP FRONT with `debugger_attach`
-    // rather than attaching a second debugger client — which would throw — or, worse, letting a
-    // later `enabled=false` detach the capture out from under itself. A capture tab lives ONLY in
-    // `wsCaptureTabs`, never in `debuggerAttachedTabs`, so this check is the only thing that keeps
-    // focus emulation off it.
-    if (wsCaptureTabs.has(tabId)) {
+    // emulation: if a ws capture OR an in-flight screenshot already owns this tab, refuse UP FRONT
+    // with `debugger_attach` rather than attaching a second debugger client — which would throw —
+    // or, worse, letting a later `enabled=false` detach that session out from under itself. Those
+    // tabs live ONLY in `wsCaptureTabs` / `screenshotTabs`, never in `debuggerAttachedTabs`, so this
+    // check is the only thing that keeps focus emulation off them.
+    if (wsCaptureTabs.has(tabId) || screenshotTabs.has(tabId)) {
       return fail(
         ERR_DEBUGGER_ATTACH,
-        "tab is held by an active ws capture — stop it first",
+        "tab is held by an active ws capture or screenshot — let it finish or stop it first",
       );
     }
     // Track whether THIS call is the one that attached the tab, so the sendCommand catch
@@ -2547,14 +2600,14 @@ async function startWsCapture(params) {
   if (!isHttpUrl(tab.url)) {
     return fail(ERR_PRECONDITION_FAILED, "start_ws_capture target is not an http/https tab");
   }
-  // One debugger client per tab. If focus emulation already holds this tab, or a capture is
-  // already running on it, refuse up front rather than letting `chrome.debugger.attach` throw
-  // "Another debugger is already attached". Deliberately NOT ref-counted — a single client per
-  // tab is the acknowledged limit of this slice.
-  if (debuggerAttachedTabs.has(tabId) || wsCaptureTabs.has(tabId)) {
+  // One debugger client per tab. If focus emulation already holds this tab, a capture is already
+  // running on it, or a screenshot is mid-capture, refuse up front rather than letting
+  // `chrome.debugger.attach` throw "Another debugger is already attached". Deliberately NOT
+  // ref-counted — a single client per tab is the acknowledged limit of this slice.
+  if (debuggerAttachedTabs.has(tabId) || wsCaptureTabs.has(tabId) || screenshotTabs.has(tabId)) {
     return fail(
       ERR_DEBUGGER_ATTACH,
-      "debugger already attached to this tab (focus emulation or ws capture)",
+      "debugger already attached to this tab (focus emulation, ws capture or screenshot)",
     );
   }
   try {
@@ -2654,6 +2707,268 @@ async function stopWsCapture(params) {
   wsCaptureTabs.delete(tabId);
   debuggerAttachedTabs.delete(tabId);
   return ok({ ok: true });
+}
+
+// --- screenshot: capture a tab's pixels (§6) ---------------------------------
+//
+// An ORDINARY read verb, the picture twin of get_text: it reads the SAME page get_text reads,
+// only as pixels instead of text — no crop ceremony, no privacy audit (get_text already carries
+// the same data across the socket as text). HYBRID by the target's focus:
+//
+//   * ACTIVE tab  — the CHEAP path: `chrome.tabs.captureVisibleTab` snaps the visible frame with
+//                   NO debugger, NO js_audit row and WITHOUT taking OS focus. A `selector` crops
+//                   the frame in an OffscreenCanvas.
+//   * BACKGROUND  — the DEBUGGER path: `Page.captureScreenshot` over a TRANSIENT chrome.debugger
+//                   attach (attach — capture — detach, never held, rolled back on failure). It
+//                   rides the SAME single JS & Debugger checkbox as execute_js. A `selector`
+//                   becomes a native CDP `clip`, so the crop happens in the browser.
+//
+// Returns `{image, width, height, format}` where `image` is a `data:image/<fmt>;base64,…` URL. The
+// SERVICE side is where the pause gate and the byte-size cap live (see screenshot in tools.py); the
+// extension applies the usual no_such_tab / tab_discarded / http-https edge guards.
+
+// Only the three formats both capture paths can emit; anything else falls back to webp (the small
+// default that keeps the size cap reachable).
+function normalizeImageFormat(fmt) {
+  return fmt === "jpeg" || fmt === "png" || fmt === "webp" ? fmt : "webp";
+}
+
+// The MIME subtype an already-built data-URL declares (`data:image/png;base64,…` -> "png"), so the
+// cheap full-frame path reports the format captureVisibleTab ACTUALLY produced rather than assuming
+// the requested one.
+function formatFromDataUrl(dataUrl, fallback) {
+  const m = /^data:image\/([a-z0-9.+-]+)[;,]/i.exec(typeof dataUrl === "string" ? dataUrl : "");
+  return m ? m[1].toLowerCase() : fallback;
+}
+
+// data-URL -> Blob, without a network fetch (a data: fetch would work in a worker, but decoding the
+// base64 here keeps the path synchronous and independent of fetch). The bytes feed createImageBitmap.
+function dataUrlToBlob(dataUrl) {
+  const comma = dataUrl.indexOf(",");
+  const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes]);
+}
+
+// Blob -> base64 (no data-URL prefix). Used to serialise the cropped frame the OffscreenCanvas
+// produced back onto the wire.
+async function blobToBase64(blob) {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+// Decode a data-URL image just to read its intrinsic pixel size, so `width`/`height` describe
+// EXACTLY the bytes returned — honest on every path (a full frame, a canvas crop, a CDP clip) with
+// no assumption about scale factors.
+async function measureImageDataUrl(dataUrl) {
+  const bitmap = await createImageBitmap(dataUrlToBlob(dataUrl));
+  const size = { width: bitmap.width, height: bitmap.height };
+  if (typeof bitmap.close === "function") bitmap.close();
+  return size;
+}
+
+// Round `v` to an integer and clamp it into [lo, hi]; a NaN collapses to `lo`.
+function clampInt(v, lo, hi) {
+  const n = Math.round(v);
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+async function screenshot(params) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(params.tabId);
+  } catch {
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${params.tabId}`);
+  }
+  const discarded = discardedFail(tab, params.tabId);
+  if (discarded) return discarded;
+  if (!isHttpUrl(tab.url)) {
+    return fail(ERR_PRECONDITION_FAILED, "screenshot target is not an http/https tab");
+  }
+  const format = normalizeImageFormat(params.format);
+  const quality = typeof params.quality === "number" ? params.quality : undefined;
+  const selector =
+    typeof params.selector === "string" && params.selector !== "" ? params.selector : null;
+
+  // A selector crops to the element's bounding box. Resolve the rect with a FIXED injected body
+  // (rectInWorld), exactly the way get_text resolves its text — badSelector / matched-nothing are
+  // precondition_failed, never a crash.
+  let rect = null;
+  if (selector) {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: params.tabId },
+      func: rectInWorld,
+      args: [selector],
+    });
+    const got = ((results || [])[0] || {}).result || {};
+    if (got.badSelector) {
+      return fail(
+        ERR_PRECONDITION_FAILED,
+        `invalid CSS selector ${JSON.stringify(selector)}: ${got.message}`,
+      );
+    }
+    if (!got.found) {
+      return fail(
+        ERR_PRECONDITION_FAILED,
+        `selector ${selector} matched no element in tab ${params.tabId}`,
+      );
+    }
+    rect = got;
+  }
+
+  // The fork: an active tab is the visible surface captureVisibleTab can snap for free; a
+  // background tab is only reachable through the debugger.
+  if (tab.active === true) {
+    return await screenshotCheap(tab, format, quality, rect);
+  }
+  return await screenshotDebugger(params.tabId, format, quality, rect);
+}
+
+// CHEAP path (active tab): captureVisibleTab, then re-encode / crop in an OffscreenCanvas when the
+// requested output is not exactly what captureVisibleTab produced.
+//
+// ⚠️ captureVisibleTab can emit ONLY jpeg/png — a `format:"webp"` request is REJECTED by the Chrome
+// runtime ("Value must be one of jpeg, png"). So we NEVER hand it `webp`: it is asked for a codec it
+// supports (webp maps to png, the lossless intermediate that survives a re-encode without artefacts),
+// and the requested `webp` is produced from that frame through an OffscreenCanvas. Its bytes are only
+// returned verbatim when the caller asked for EXACTLY the captured codec AND wants no crop.
+async function screenshotCheap(tab, format, quality, rect) {
+  // The codec captureVisibleTab is actually asked for. Anything that will pass through the canvas
+  // below — a webp output (captureVisibleTab has no webp codec), OR any crop — is captured as PNG,
+  // the lossless intermediate that survives the re-encode without artefacts, so a jpeg crop is NOT
+  // double-compressed (captured jpeg then re-encoded jpeg). Only a VERBATIM full frame in a codec
+  // captureVisibleTab can emit (png/jpeg) asks for that codec directly. quality is a JPEG-only knob
+  // here, so it rides to captureVisibleTab only on the verbatim-jpeg path.
+  const needsCanvas = !!rect || format === "webp";
+  const captureFmt = needsCanvas ? "png" : format;
+  const opts = { format: captureFmt };
+  if (captureFmt === "jpeg" && typeof quality === "number") opts.quality = quality;
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, opts);
+
+  // TOCTOU guard (§6): `captureVisibleTab(windowId)` snaps the WINDOW's CURRENT active tab, which may
+  // have changed since `screenshot`'s `tabs.get` chose the cheap path for THIS tab. Re-read the tab
+  // and, if it is no longer active, refuse — the frame we just took belongs to whatever tab is active
+  // now, not the one asked for, and returning a stranger's pixels is worse than a retry.
+  let live;
+  try {
+    live = await chrome.tabs.get(tab.id);
+  } catch {
+    // The tab was closed between the capture and this re-read: honour the verb's declared guard with
+    // `no_such_tab` rather than letting the rejection surface as a generic `internal`.
+    return fail(ERR_NO_SUCH_TAB, `no such tab: ${tab.id}`);
+  }
+  if (!live.active) {
+    return fail(
+      ERR_PRECONDITION_FAILED,
+      `tab ${tab.id} stopped being the active tab before the screenshot was taken; retry`,
+    );
+  }
+
+  if (!rect && format === captureFmt) {
+    // Whole visible frame in exactly the captured codec — hand captureVisibleTab's own encoding back
+    // verbatim (no canvas). The format is read back from the data-URL for honesty.
+    const measured = await measureImageDataUrl(dataUrl);
+    return ok({
+      image: dataUrl,
+      width: measured.width,
+      height: measured.height,
+      format: formatFromDataUrl(dataUrl, format),
+    });
+  }
+
+  // Otherwise — a webp full frame (captured as png), OR any crop — decode the captured frame and
+  // re-encode to `format` through an OffscreenCanvas. With a rect, cut it in DEVICE px (device px =
+  // CSS px × devicePixelRatio, since captureVisibleTab returns device pixels); with no rect, take the
+  // whole bitmap 1:1. `width`/`height`/`format` are the canvas's own, so they describe the real bytes.
+  const bitmap = await createImageBitmap(dataUrlToBlob(dataUrl));
+  let sx = 0;
+  let sy = 0;
+  let sw = bitmap.width;
+  let sh = bitmap.height;
+  if (rect) {
+    const dpr = rect.devicePixelRatio || 1;
+    sx = clampInt(rect.x * dpr, 0, bitmap.width);
+    sy = clampInt(rect.y * dpr, 0, bitmap.height);
+    sw = clampInt(rect.width * dpr, 1, bitmap.width - sx);
+    sh = clampInt(rect.height * dpr, 1, bitmap.height - sy);
+  }
+  const canvas = new OffscreenCanvas(sw, sh);
+  const cctx = canvas.getContext("2d");
+  cctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
+  if (typeof bitmap.close === "function") bitmap.close();
+  const blobOpts = { type: `image/${format}` };
+  // quality is meaningless for PNG (lossless) — pass it only to a lossy target codec (jpeg/webp).
+  if (format !== "png" && typeof quality === "number") blobOpts.quality = quality;
+  const blob = await canvas.convertToBlob(blobOpts);
+  const base64 = await blobToBase64(blob);
+  return ok({ image: `data:image/${format};base64,${base64}`, width: sw, height: sh, format });
+}
+
+// DEBUGGER path (background tab): a TRANSIENT chrome.debugger attach around one
+// Page.captureScreenshot, then detach — the session is never held (unlike set_focus_emulation).
+async function screenshotDebugger(tabId, format, quality, rect) {
+  const stored = await chrome.storage.local.get(ALLOW_EXECUTE_JS_KEY);
+  const allowed = !!(stored && stored[ALLOW_EXECUTE_JS_KEY]);
+  if (!allowed) {
+    return fail(
+      ERR_JS_DISABLED,
+      "a background-tab screenshot needs the JS & Debugger checkbox enabled in this copy's options",
+    );
+  }
+  // One debugger client per tab: if focus emulation, a ws capture or ANOTHER in-flight screenshot
+  // already holds this tab, refuse up front rather than letting attach throw — the same mutual
+  // exclusion start_ws_capture uses, now checking ALL THREE ownership sets.
+  if (debuggerAttachedTabs.has(tabId) || wsCaptureTabs.has(tabId) || screenshotTabs.has(tabId)) {
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      "debugger already attached to this tab (focus emulation, ws capture or screenshot)",
+    );
+  }
+  try {
+    await chrome.debugger.attach({ tabId }, DEBUGGER_PROTOCOL_VERSION);
+  } catch {
+    return fail(
+      ERR_DEBUGGER_ATTACH,
+      "could not attach debugger — DevTools open on this tab, or another client attached",
+    );
+  }
+  // TRANSIENT ownership marker: hold the tab in `screenshotTabs` — screenshot's OWN set, NOT the
+  // focus-emulation set — only for the duration of the shot so a concurrent focus/ws verb refuses,
+  // then release it in the finally. Using its own set is what stops a concurrent `set_focus_emulation`
+  // from either skipping its attach (seeing the tab as already focus-emulation's) or detaching the
+  // debugger mid-capture. screenshot never KEEPS the debugger — it attaches, captures, detaches.
+  screenshotTabs.add(tabId);
+  try {
+    const args = { format, fromSurface: true };
+    if (typeof quality === "number") args.quality = quality;
+    if (rect) {
+      // The CDP clip takes CSS pixels (rectInWorld's own units); scale:1 leaves the surface's
+      // own device-pixel ratio to decide the output resolution.
+      args.clip = { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scale: 1 };
+    }
+    const shot = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", args);
+    const base64 = (shot && shot.data) || "";
+    const image = `data:image/${format};base64,${base64}`;
+    const measured = await measureImageDataUrl(image);
+    return ok({ image, width: measured.width, height: measured.height, format });
+  } catch (e) {
+    // The attach succeeded but the capture failed (tab crashed / navigated away). Report a page
+    // precondition, not `debugger_attach` — the attach was fine — and roll the attach back below.
+    return fail(ERR_PRECONDITION_FAILED, `could not capture screenshot: ${String((e && e.message) || e)}`);
+  } finally {
+    try {
+      await chrome.debugger.detach({ tabId });
+    } catch {
+      // Already gone (tab closed, DevTools took it): drop our marker regardless.
+    }
+    screenshotTabs.delete(tabId);
+  }
 }
 
 // --- wake_tab: wake a discarded tab (issue #68) ------------------------------

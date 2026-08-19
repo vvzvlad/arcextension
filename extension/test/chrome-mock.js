@@ -146,6 +146,14 @@ export function createChromeMock(opts = {}) {
     debuggerAttachError: opts.debuggerAttachError || null, // when set, debugger.attach throws
     sendCommandError: opts.sendCommandError || null, // when set, debugger.sendCommand throws
     detachError: opts.detachError || null, // when set, debugger.detach throws
+    // screenshot (§6). captureVisibleTab returns a canned data-URL for the CHEAP (active-tab) path,
+    // DISTINCT per requested format (so a test can see WHICH codec was asked for); set
+    // `captureVisibleTabResult` to a string to override it. captureScreenshotData is the base64
+    // `Page.captureScreenshot` answers with on the DEBUGGER path. captureVisibleTabError, when set,
+    // makes captureVisibleTab reject.
+    captureVisibleTabResult: opts.captureVisibleTabResult || null,
+    captureVisibleTabError: opts.captureVisibleTabError || null,
+    captureScreenshotData: opts.captureScreenshotData || "QkJCQg==",
     scriptResults: opts.scriptResults || [{ result: null }], // scripting.executeScript return
     // ⚠️ DEFERRED COMMIT, opt-in. Real `tabs.update({url})` does NOT change `tab.url`:
     // until the navigation commits, `tabs.get` answers the PREVIOUS url and the target
@@ -293,6 +301,24 @@ export function createChromeMock(opts = {}) {
           if (t) t.windowId = moveProps.windowId;
         }
       },
+      // screenshot's CHEAP path (§6). Returns a canned data-URL for the ACTIVE tab; rejects when
+      // `captureVisibleTabError` is set. Models the REAL runtime's codec limit: captureVisibleTab
+      // accepts ONLY jpeg/png and REJECTS anything else (a `format:"webp"` throws, exactly as Chrome
+      // does — "Value must be one of jpeg, png"). The returned data-URL declares the requested codec
+      // so a test can assert WHICH format was asked for, but its pixels are canned (a screenshot test
+      // asserts on the PATH, the codec and the crop clip, not real bytes).
+      captureVisibleTab: async (_windowId, captureOpts) => {
+        await tick();
+        if (state.captureVisibleTabError) throw new Error(state.captureVisibleTabError);
+        const fmt = (captureOpts && captureOpts.format) || "png";
+        if (fmt !== "jpeg" && fmt !== "png") {
+          throw new Error(`Value must be one of jpeg, png. (got ${fmt})`);
+        }
+        if (typeof state.captureVisibleTabResult === "string") return state.captureVisibleTabResult;
+        // Distinct canned payload per codec: "UE5H" -> "PNG", "SlBH" -> "JPG".
+        const canned = { png: "data:image/png;base64,UE5H", jpeg: "data:image/jpeg;base64,SlBH" };
+        return canned[fmt];
+      },
       onCreated: new FakeEvent(),
       onActivated: new FakeEvent(),
       onUpdated: new FakeEvent(),
@@ -393,9 +419,13 @@ export function createChromeMock(opts = {}) {
         if (state.debuggerAttachError) throw new Error(state.debuggerAttachError);
         chrome.debugger._attached.add(tabId);
       },
-      sendCommand: async ({ tabId }, _method, _params) => {
+      sendCommand: async ({ tabId }, method, _params) => {
         await tick();
         if (state.sendCommandError) throw new Error(state.sendCommandError);
+        // screenshot's DEBUGGER path (§6): Page.captureScreenshot answers `{data: <base64>}`.
+        if (method === "Page.captureScreenshot") {
+          return { data: state.captureScreenshotData };
+        }
         return {};
       },
       detach: async ({ tabId }) => {

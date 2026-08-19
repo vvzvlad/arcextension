@@ -224,6 +224,8 @@ def test_command_verbs_mirror_the_extension_exactly():
         "start_ws_capture", "read_ws_frames", "stop_ws_capture",
         # wake_tab (issue #68): reload a discarded tab and wait for it to load.
         "wake_tab",
+        # screenshot: the picture twin of get_text — hybrid captureVisibleTab / Page.captureScreenshot.
+        "screenshot",
     }
 
 

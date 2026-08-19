@@ -220,6 +220,15 @@ export const CMD_STOP_WS_CAPTURE = "stop_ws_capture";
 // whether it was a real wake or a plain reload of an already-live tab — wake_tab ALWAYS reloads,
 // so on a live tab it loses page state, it is not a no-op.
 export const CMD_WAKE_TAB = "wake_tab";
+// Capture a tab's pixels — an ORDINARY read verb, the picture twin of get_text (get_text reads
+// the same page as text, uncropped and unaudited). HYBRID by the target's focus: an ACTIVE tab is
+// snapped cheaply with `chrome.tabs.captureVisibleTab` (no debugger, no js_audit row, no OS focus
+// taken); a BACKGROUND tab needs the chrome.debugger `Page.captureScreenshot` path (a TRANSIENT
+// attach — capture — detach, never held), which rides the SAME single JS & Debugger checkbox as
+// execute_js. `selector` is OPTIONAL: absent, the whole visible frame; present, a crop to the
+// element's bounding box (cheap path via OffscreenCanvas, debugger path via a native CDP clip). It
+// is a one-shot READ like get_text, so it is NOT on the audit allowlist and writes NO js_audit row.
+export const CMD_SCREENSHOT = "screenshot";
 
 // How often `wait_for` (and navigate_tab's waitUntil) re-tests its condition. 250 ms is
 // the usual "fast enough to feel instant, cheap enough to run for 30 s" compromise: at

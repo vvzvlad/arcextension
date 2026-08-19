@@ -62,6 +62,45 @@ def _now_ms() -> int:
 # whatever the agent remembered to type.
 DEFAULT_MAX_BYTES = 40000
 
+# The screenshot verb's own default cap, far larger than DEFAULT_MAX_BYTES because a PNG/webp frame
+# is base64 image data, not text: a modest full-window webp lands in the hundreds of kB, so a 40 kB
+# cap would refuse nearly every real shot. ~1.5 MB is generous enough for a full frame yet still
+# bounds what a single tool call can pour into the agent's context; a caller wanting a bigger frame
+# raises max_bytes, or (cheaper) passes a selector to crop.
+SCREENSHOT_MAX_BYTES = 1_500_000
+
+# The image formats both capture paths can emit (captureVisibleTab / Page.captureScreenshot). webp
+# is the default: it is the smallest, which keeps the size cap reachable for a full frame.
+_SCREENSHOT_FORMATS = ("webp", "jpeg", "png")
+
+
+def _validate_screenshot_format(fmt: str) -> str:
+    """Refuse a format neither capture path can produce (before the round trip)."""
+    if fmt not in _SCREENSHOT_FORMATS:
+        raise ToolError("invalid_args", f"format must be one of {', '.join(_SCREENSHOT_FORMATS)}")
+    return fmt
+
+
+def _validate_screenshot_quality(quality: int | None) -> int | None:
+    """Resolve ``quality`` to an int in 0..100 (webp/jpeg only) or ``None`` (the codec default)."""
+    if quality is None:
+        return None
+    if isinstance(quality, bool) or not isinstance(quality, int) or not (0 <= quality <= 100):
+        raise ToolError("invalid_args", "quality must be an integer 0..100")
+    return quality
+
+
+def _validate_screenshot_max_bytes(max_bytes: int | None) -> int:
+    """Resolve ``max_bytes`` to a positive cap, defaulting to SCREENSHOT_MAX_BYTES.
+
+    Distinct from :func:`_validate_max_bytes` only in the default — a screenshot's budget is image
+    bytes, not text — so a caller who omits it does not inherit the 40 kB text cap.
+    """
+    limit = SCREENSHOT_MAX_BYTES if max_bytes is None else int(max_bytes)
+    if limit <= 0:
+        raise ToolError("invalid_args", "max_bytes must be a positive integer")
+    return limit
+
 
 def _cut_utf8(raw: bytes, limit: int) -> str:
     """Decode ``raw[:limit]``, dropping an incomplete trailing UTF-8 sequence.
@@ -982,6 +1021,71 @@ async def get_text(app, *, instance: str, tab_id: int, selector: str | None = No
     return {"ok": True, "text": text, **meta}
 
 
+async def screenshot(app, *, instance: str, tab_id: int, selector: str | None = None,
+                     format: str = "webp", quality: int | None = None,
+                     max_bytes: int | None = None, auth_ctx: str | None = None,
+                     expected_session: str | None = None) -> dict:
+    """Capture a tab's pixels — the picture twin of :func:`get_text` (same page, as an image).
+
+    An ORDINARY read verb, NOT audited and NOT wrapped in privacy ceremony: get_text already
+    ships the same page's data across the socket as text, and this ships it as pixels. HYBRID by
+    the target's focus, resolved on the extension side — an ACTIVE tab is snapped cheaply with
+    ``captureVisibleTab`` (no debugger, no checkbox); a BACKGROUND tab needs the chrome.debugger
+    ``Page.captureScreenshot`` path, which rides the SAME JS & Debugger checkbox as execute_js and
+    answers ``js_disabled`` when it is off. Either way the extension writes NO ``js_audit`` row.
+
+    ``selector`` is OPTIONAL: absent, the whole visible frame; present, a crop to the element's
+    bounding box (``precondition_failed`` if it does not parse or matches nothing).
+
+    ``format`` is one of ``webp`` (default), ``jpeg``, ``png``; ``quality`` (0..100, webp/jpeg
+    only) defaults to the codec's own — a ``quality`` passed with ``format=png`` is DROPPED, since
+    PNG is lossless and ignores it. The returned image is base64-capped at ``max_bytes``
+    (default ~1.5 MB): a frame past the cap is ``precondition_failed`` naming the real size, so
+    the caller crops with a selector or raises the cap — the image is never silently truncated.
+
+    Gated by the stop switch here (:func:`_ensure_not_paused`), like every verb that reaches the
+    browser. Answers ``{ok, image, width, height, format}`` — ``image`` is a
+    ``data:image/<fmt>;base64,…`` URL.
+    """
+    await _ensure_not_paused(app)
+    fmt = _validate_screenshot_format(format)
+    q = _validate_screenshot_quality(quality)
+    # quality is a LOSSY-codec knob (jpeg/webp only); PNG is lossless and ignores it. DROP a quality
+    # passed alongside format=png rather than shipping a no-op param the extension would ignore — the
+    # softer choice than rejecting the call for a harmless mismatch.
+    if fmt == "png":
+        q = None
+    cap = _validate_screenshot_max_bytes(max_bytes)
+    params: dict = {"tabId": tab_id, "format": fmt}
+    if selector is not None:
+        params["selector"] = selector
+    if q is not None:
+        params["quality"] = q
+    result = await _command(app, instance, protocol.CMD_SCREENSHOT, params, auth_ctx=auth_ctx,
+                            expected_session=expected_session)
+    image = result.get("image") or ""
+    # The cap is on the base64 PAYLOAD, not the whole data-URL: the `data:image/<fmt>;base64,`
+    # prefix is a couple dozen bytes and would only muddy the "N bytes" the message quotes.
+    comma = image.find(",")
+    payload = image[comma + 1:] if comma >= 0 else image
+    size = len(_measure_utf8(payload))
+    if size > cap:
+        # Never truncate an image (a cut base64 string is a corrupt file); refuse and name the
+        # real size so the caller can crop with a selector or raise max_bytes.
+        raise ToolError(
+            "precondition_failed",
+            f"screenshot is {size} bytes, exceeds cap {cap}; pass a selector to crop, "
+            f"or raise max_bytes",
+        )
+    return {
+        "ok": True,
+        "image": image,
+        "width": result.get("width"),
+        "height": result.get("height"),
+        "format": result.get("format") or fmt,
+    }
+
+
 async def set_input(app, *, instance: str, tab_id: int, selector: str, value: str,
                     auth_ctx: str | None = None, expected_session: str | None = None) -> dict:
     """Set a controlled (React/Vue) field's value in ONE call; answer ``{ok, kind}``.
@@ -1269,9 +1373,12 @@ async def set_focus_emulation(app, *, instance: str, tab_id: int, enabled: bool,
 
     Gated at the extension edge by the SINGLE JS & Debugger checkbox (``allow_execute_js``),
     exactly like execute_js. But UNLIKE execute_js it carries no arbitrary code and writes NO
-    js_audit row: focus emulation exfiltrates nothing, it only fakes focus. A future
-    DATA-BEARING CDP verb (screenshot, network capture) will need its own audit — the
-    absence of one here is a property of THIS verb, not of the debugger path.
+    js_audit row: focus emulation exfiltrates nothing, it only fakes focus. Each OTHER verb down
+    this CDP path decides its own audit: ``start_ws_capture`` opens a DURABLE data channel and DOES
+    write a js_audit row, whereas ``screenshot`` is DELIBERATELY unaudited — a one-shot read like
+    get_text, which already ships the same page's bytes across the socket as text, so it is treated
+    as an ordinary read and is NOT in ``_AUDITED_COMMANDS``. The absence of a row here is a property
+    of THIS verb, not of the debugger path.
 
     Refused while paused (it drives the browser). ``debugger_attach`` comes back when the
     debugger cannot attach — DevTools is open on the tab, or another client already holds it

@@ -184,12 +184,14 @@ async def send_command(
     # — what the row fixes is WHO opened the channel, WHEN and on WHICH tab.
     #
     # Fixed-function / benign verbs (set_focus_emulation, get_text, wait_for, read_ws_frames,
-    # stop_ws_capture, …) are outside it ON PURPOSE — they reconstruct no code and open no new
-    # data channel (read_ws_frames only drains a buffer start_ws_capture already authorised;
-    # stop tears it down). BUT any FUTURE data-bearing CDP verb built on this same
-    # ``send_command`` path — a screenshot verb, further network capture, DOM/page dumps — MUST
-    # be added here (or given its own data-bearing flag): a verb that ships page data out while
-    # staying off this allowlist would silently bypass the js_audit trail.
+    # stop_ws_capture, screenshot, …) are outside it ON PURPOSE — they reconstruct no code and open
+    # no new data channel (read_ws_frames only drains a buffer start_ws_capture already authorised;
+    # stop tears it down; screenshot is a ONE-SHOT read — it ships the SAME page's bytes get_text
+    # already ships as text, so it is treated as an ordinary read, DELIBERATELY unaudited). BUT any
+    # FUTURE verb that opens a DURABLE or NEW data channel on this same ``send_command`` path —
+    # further network capture, a streaming DOM/page feed — MUST be added here (or given its own
+    # data-bearing flag): a verb that opens such a channel while staying off this allowlist would
+    # silently bypass the js_audit trail.
     #
     # An audited verb MUST NOT run without a durable audit sink (§12): with no db to write the
     # js_audit row, refuse fail-closed rather than send it un-audited. The "ran without an audit
