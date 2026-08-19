@@ -125,6 +125,17 @@ CMD_STOP_WS_CAPTURE = "stop_ws_capture"
 # or a reload of an already-live tab — ``wake_tab`` ALWAYS reloads, so on a live tab it is a full
 # reload that loses page state, not a no-op.
 CMD_WAKE_TAB = "wake_tab"
+# Capture a tab's pixels — an ORDINARY read verb, the picture twin of ``get_text`` (get_text reads
+# the same page as text, uncropped and unaudited). HYBRID by the target's focus: an ACTIVE tab is
+# snapped cheaply with ``chrome.tabs.captureVisibleTab`` (no debugger, no ``js_audit`` row, no OS
+# focus taken); a BACKGROUND tab needs the chrome.debugger ``Page.captureScreenshot`` path (a
+# TRANSIENT attach — capture — detach, never held), which rides the SAME single JS & Debugger
+# checkbox as ``execute_js``. ``selector`` is OPTIONAL: absent, the whole visible frame; present, a
+# crop to the element's bounding box (cheap path via ``OffscreenCanvas``, debugger path via a native
+# CDP clip). A one-shot READ like ``get_text``, so it is NOT on the audit allowlist and writes NO
+# ``js_audit`` row. The SERVICE side gates it behind the pause switch (it reaches the browser) and
+# caps the returned image's size, refusing an oversized frame with ``precondition_failed``.
+CMD_SCREENSHOT = "screenshot"
 
 # --- Command error codes (§6) -----------------------------------------------
 # The `error.code` a failing `response` may carry. These are the extension-side

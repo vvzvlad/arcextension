@@ -413,6 +413,37 @@ def build_mcp(app_ref) -> MCPServer:
         ))
 
     @mcp.tool()
+    async def screenshot(instance: str, tab_id: int, selector: str | None = None,
+                         format: str = "webp", quality: int | None = None,
+                         max_bytes: int | None = None,
+                         expected_session: str | None = None) -> dict:
+        """Capture a tab's pixels — the picture twin of get_text (same page, as an image).
+
+        An ORDINARY read: no crop requirement, no privacy ceremony (get_text already ships the
+        same page's data as text). ``selector`` is OPTIONAL — absent, the whole visible frame;
+        present, a crop to the element's bounding box (``precondition_failed`` if it does not parse
+        or matches nothing). Answers ``{ok, image, width, height, format}`` where ``image`` is a
+        ``data:image/<fmt>;base64,…`` URL.
+
+        HYBRID by the target's focus. An ACTIVE tab is snapped cheaply with captureVisibleTab — no
+        debugger, no checkbox, no OS focus taken. A BACKGROUND tab goes through chrome.debugger
+        Page.captureScreenshot, which needs the SINGLE JS & Debugger checkbox (``allow_execute_js``
+        in list_instances) and answers ``js_disabled`` when it is off; the attach is TRANSIENT
+        (attach — capture — detach), but for that instant the «идёт отладка» bar shows and the
+        debugger is anti-bot detectable, so prefer shooting the tab while it is active. One debugger
+        client per tab: a tab held by focus emulation or a ws capture answers ``debugger_attach``.
+
+        ``format`` is ``webp`` (default, smallest), ``jpeg`` or ``png``; ``quality`` is 0..100
+        (webp/jpeg only). The base64 image is capped at ``max_bytes`` (default ~1.5 MB): a frame
+        past the cap is ``precondition_failed`` naming the real size — crop with a selector or raise
+        the cap; the image is never silently truncated. Refused while paused."""
+        return await _guarded(tools.screenshot(
+            _host(), instance=instance, tab_id=tab_id, selector=selector,
+            format=format, quality=quality, max_bytes=max_bytes,
+            auth_ctx=current_mcp_session(), expected_session=expected_session,
+        ))
+
+    @mcp.tool()
     async def set_input(instance: str, tab_id: int, selector: str, value: str,
                         expected_session: str | None = None) -> dict:
         """Set a controlled (React/Vue) field's value in ONE call; answers ``{ok, kind}``.

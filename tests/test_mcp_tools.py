@@ -2498,6 +2498,114 @@ async def test_get_text_is_refused_while_stopped_and_sends_nothing(tmp_path):
     assert ws.sent == []
 
 
+# --- screenshot: the picture twin of get_text (§6) ---------------------------
+async def test_screenshot_returns_the_image_shape_and_writes_NO_js_audit_row(tmp_path):
+    """An ORDINARY read like get_text: no js_audit row, and the tool passes the extension's
+    {image,width,height,format} straight through. Default format webp, no selector => whole frame."""
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, frame = await _run_with_response(
+        lambda: tools.screenshot(_app(db, reg), instance="main", tab_id=2),
+        cs, ws,
+        {"image": "data:image/webp;base64,QUFB", "width": 1200, "height": 800, "format": "webp"},
+    )
+    assert out == {"ok": True, "image": "data:image/webp;base64,QUFB",
+                   "width": 1200, "height": 800, "format": "webp"}
+    assert frame["command"] == protocol.CMD_SCREENSHOT
+    # Default format rides down; no selector / quality keys when the caller named neither.
+    assert frame["params"] == {"tabId": 2, "format": "webp"}
+    # A one-shot read, not arbitrary code — nothing to audit, exactly like get_text.
+    assert await db.read(lambda c: c.execute("SELECT COUNT(*) FROM js_audit").fetchone()) == (0,)
+
+
+async def test_screenshot_selector_and_quality_ride_to_the_extension(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    _out, frame = await _run_with_response(
+        lambda: tools.screenshot(_app(db, reg), instance="main", tab_id=2,
+                                 selector="#hero", format="jpeg", quality=70),
+        cs, ws,
+        {"image": "data:image/jpeg;base64,QUFB", "width": 100, "height": 50, "format": "jpeg"},
+    )
+    assert frame["params"] == {"tabId": 2, "format": "jpeg", "selector": "#hero", "quality": 70}
+
+
+async def test_screenshot_png_drops_quality_it_never_reaches_the_frame(tmp_path):
+    """quality is a lossy-codec knob (jpeg/webp); with format=png it is DROPPED, not shipped as a
+    no-op the extension would ignore. So a png+quality call sends NO quality key down the socket."""
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    _out, frame = await _run_with_response(
+        lambda: tools.screenshot(_app(db, reg), instance="main", tab_id=2,
+                                 format="png", quality=50),
+        cs, ws,
+        {"image": "data:image/png;base64,QUFB", "width": 100, "height": 50, "format": "png"},
+    )
+    assert frame["params"] == {"tabId": 2, "format": "png"}
+    assert "quality" not in frame["params"]
+
+
+async def test_screenshot_over_cap_is_precondition_failed_naming_the_size(tmp_path):
+    """A frame past max_bytes is refused, never truncated — a cut base64 string is a corrupt file.
+    The cap is on the base64 PAYLOAD, and the message names the real size so the caller can act."""
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    big = "A" * 100  # a 100-byte base64 payload behind the data-URL prefix
+    with pytest.raises(tools.ToolError) as ei:
+        await _run_with_response(
+            lambda: tools.screenshot(_app(db, reg), instance="main", tab_id=2, max_bytes=10),
+            cs, ws,
+            {"image": "data:image/webp;base64," + big, "width": 9, "height": 9, "format": "webp"},
+        )
+    assert ei.value.code == "precondition_failed"
+    assert "100 bytes" in ei.value.message
+    assert "cap 10" in ei.value.message
+
+
+async def test_screenshot_default_cap_admits_a_normal_frame(tmp_path):
+    # The ~1.5 MB default is far larger than get_text's 40 kB text cap: a modest image passes.
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    cs, ws = _put_conn(reg, "main")
+    out, _frame = await _run_with_response(
+        lambda: tools.screenshot(_app(db, reg), instance="main", tab_id=2),
+        cs, ws,
+        {"image": "data:image/webp;base64," + "A" * 200_000, "width": 800, "height": 600,
+         "format": "webp"},
+    )
+    assert out["ok"] is True and out["width"] == 800
+
+
+async def test_screenshot_refused_while_stopped_and_sends_nothing(tmp_path):
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    await tools.pause(app)
+    with pytest.raises(tools.ToolError) as ei:
+        await tools.screenshot(app, instance="main", tab_id=2)
+    assert ei.value.code == "stopped"
+    assert ws.sent == []
+
+
+async def test_screenshot_rejects_bad_args_before_the_round_trip(tmp_path):
+    # format / quality / max_bytes are validated BEFORE the command leaves the socket, so a bad
+    # argument never costs a round trip (nor makes the extension ship a frame under a bad cap).
+    db = await _make_db(tmp_path)
+    reg = Registry()
+    _cs, ws = _put_conn(reg, "main")
+    app = _app(db, reg)
+    for kwargs in ({"format": "gif"}, {"quality": 200}, {"quality": -1}, {"max_bytes": 0}):
+        with pytest.raises(tools.ToolError) as ei:
+            await tools.screenshot(app, instance="main", tab_id=2, **kwargs)
+        assert ei.value.code == "invalid_args"
+    assert ws.sent == []
+
+
 # --- set_input: the FIXED-but-MUTATING write (§12) ---------------------------
 async def test_set_input_sends_selector_and_value_and_returns_kind(tmp_path):
     """FIXED body like get_text (no js_audit row), but a WRITE. selector+value ride as DATA,

@@ -6,6 +6,7 @@ import {
   readTextInWorld,
   setInputInWorld,
   matchInWorld,
+  rectInWorld,
   scrollAndCountInWorld,
   startJobInWorld,
   readJobInWorld,
@@ -35,6 +36,7 @@ import {
   CMD_READ_WS_FRAMES,
   CMD_STOP_WS_CAPTURE,
   CMD_WAKE_TAB,
+  CMD_SCREENSHOT,
   WAIT_POLL_MS,
   WAIT_COMMIT_GRACE_POLLS,
 } from "../src/constants.js";
@@ -4169,5 +4171,491 @@ describe("wake_tab (#68)", () => {
     const res = await dispatchCommand(frame(CMD_WAKE_TAB, { tabId: 5 }), ctx());
     expect(res.error.code).toBe("precondition_failed");
     expect(reload).not.toHaveBeenCalled();
+  });
+});
+
+// --- screenshot (§6): the picture twin of get_text --------------------------
+
+// A document double for rectInWorld: the matched element carries a getBoundingClientRect, and
+// `window.devicePixelRatio` is installed so the body can read it. `badSelectors` throws a
+// SyntaxError like a real engine, exactly as fakeDoc does for the text bodies.
+function withRectDoc(rect, { devicePixelRatio = 1, badSelectors = [] } = {}, fn) {
+  const savedDoc = globalThis.document;
+  const savedWin = globalThis.window;
+  globalThis.document = {
+    querySelector: (sel) => {
+      if (badSelectors.includes(sel)) {
+        const e = new Error(`'${sel}' is not a valid selector`);
+        e.name = "SyntaxError";
+        throw e;
+      }
+      return rect ? { getBoundingClientRect: () => rect } : null;
+    },
+  };
+  globalThis.window = { devicePixelRatio };
+  try {
+    return fn();
+  } finally {
+    globalThis.document = savedDoc;
+    globalThis.window = savedWin;
+  }
+}
+
+describe("rectInWorld — screenshot's injected body", () => {
+  it("returns the element's bounding box plus devicePixelRatio", () => {
+    withRectDoc({ x: 10, y: 20, width: 100, height: 50 }, { devicePixelRatio: 2 }, () => {
+      expect(rectInWorld("#el")).toEqual({
+        found: true, x: 10, y: 20, width: 100, height: 50, devicePixelRatio: 2,
+      });
+    });
+  });
+
+  it("a selector that matches nothing is found:false", () => {
+    withRectDoc(null, {}, () => {
+      expect(rectInWorld("#nope")).toEqual({ found: false });
+    });
+  });
+
+  it("a MALFORMED selector comes back as a value, never a throw", () => {
+    withRectDoc(null, { badSelectors: ["#a:has(>"] }, () => {
+      const got = rectInWorld("#a:has(>");
+      expect(got.badSelector).toBe(true);
+      expect(got.found).toBe(false);
+      expect(got.message).toMatch(/not a valid selector/);
+    });
+  });
+});
+
+// Install the imaging globals a real service worker provides but the node runtime lacks:
+// createImageBitmap / OffscreenCanvas (+ its convertToBlob). The bitmap reports fixed dims and
+// convertToBlob yields deterministic bytes whose base64 is `convertBase64`, so a test asserts on
+// the PATH and the crop CLIP, not real pixels. Returns spies + a restore().
+function installImaging({ bitmapWidth = 1200, bitmapHeight = 800, convertBase64 = "Q1JPUA==" } = {}) {
+  const saved = {
+    createImageBitmap: globalThis.createImageBitmap,
+    OffscreenCanvas: globalThis.OffscreenCanvas,
+  };
+  const b64ToBytes = (b64) => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  };
+  const drawImage = vi.fn();
+  const convertToBlob = vi.fn(async (_opts) => ({
+    arrayBuffer: async () => b64ToBytes(convertBase64).buffer,
+  }));
+  const createImageBitmap = vi.fn(async (_blob) => ({
+    width: bitmapWidth,
+    height: bitmapHeight,
+    close: () => {},
+  }));
+  class FakeOffscreenCanvas {
+    constructor(w, h) {
+      this.width = w;
+      this.height = h;
+    }
+    getContext() {
+      return { drawImage };
+    }
+    convertToBlob(o) {
+      return convertToBlob(o);
+    }
+  }
+  globalThis.createImageBitmap = createImageBitmap;
+  globalThis.OffscreenCanvas = FakeOffscreenCanvas;
+  return {
+    drawImage,
+    convertToBlob,
+    createImageBitmap,
+    restore() {
+      globalThis.createImageBitmap = saved.createImageBitmap;
+      globalThis.OffscreenCanvas = saved.OffscreenCanvas;
+    },
+  };
+}
+
+describe("screenshot (§6) — cheap path (active tab)", () => {
+  it("no selector, default webp: captures PNG then RE-ENCODES to webp via OffscreenCanvas (never asks captureVisibleTab for webp)", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    const img = installImaging();
+    const cap = vi.spyOn(chrome.tabs, "captureVisibleTab");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.ok).toBe(true);
+    // THE load-bearing assertion (§6): webp is NOT a captureVisibleTab codec (the real runtime rejects
+    // it), so the cheap path asks for PNG — the lossless intermediate — NOT webp.
+    expect(cap).toHaveBeenCalledWith(1, { format: "png" });
+    // ...and the requested webp is produced from that PNG frame in the OffscreenCanvas.
+    expect(img.convertToBlob).toHaveBeenCalledWith({ type: "image/webp" });
+    // Whole bitmap, no crop: the full 1200×800 frame is drawn 1:1.
+    expect(img.drawImage).toHaveBeenCalledWith(
+      expect.anything(), 0, 0, 1200, 800, 0, 0, 1200, 800,
+    );
+    expect(res.result.image).toBe("data:image/webp;base64,Q1JPUA==");
+    expect(res.result.format).toBe("webp");
+    expect(res.result.width).toBe(1200);
+    expect(res.result.height).toBe(800);
+  });
+
+  it("no selector, explicit png: captureVisibleTab PNG handed back VERBATIM (no canvas)", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    const img = installImaging();
+    const cap = vi.spyOn(chrome.tabs, "captureVisibleTab");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5, format: "png" }), ctx());
+    img.restore();
+    expect(res.ok).toBe(true);
+    expect(cap).toHaveBeenCalledWith(1, { format: "png" });
+    // Exactly the captured codec and no crop => the frame is returned verbatim, no re-encode.
+    expect(res.result.image).toBe("data:image/png;base64,UE5H");
+    expect(res.result.format).toBe("png");
+    expect(img.convertToBlob).not.toHaveBeenCalled();
+  });
+
+  it("no selector, explicit jpeg: captureVisibleTab JPEG handed back VERBATIM, quality rides to it", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    const img = installImaging();
+    const cap = vi.spyOn(chrome.tabs, "captureVisibleTab");
+    const res = await dispatchCommand(
+      frame(CMD_SCREENSHOT, { tabId: 5, format: "jpeg", quality: 60 }),
+      ctx(),
+    );
+    img.restore();
+    expect(res.ok).toBe(true);
+    // jpeg IS a captureVisibleTab codec, and quality is a jpeg-only knob THERE, so it rides down.
+    expect(cap).toHaveBeenCalledWith(1, { format: "jpeg", quality: 60 });
+    expect(res.result.image).toBe("data:image/jpeg;base64,SlBH");
+    expect(res.result.format).toBe("jpeg");
+    expect(img.convertToBlob).not.toHaveBeenCalled();
+  });
+
+  it("TOCTOU: the tab stops being the active tab before the shot => precondition_failed", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    const img = installImaging();
+    // captureVisibleTab(windowId) snaps the WINDOW's active tab. Model the window's active tab
+    // changing the instant AFTER the frame is grabbed: the frame now belongs to a DIFFERENT tab, so
+    // the post-capture re-read must catch that tab 5 is no longer active and refuse.
+    const realCap = chrome.tabs.captureVisibleTab.bind(chrome.tabs);
+    vi.spyOn(chrome.tabs, "captureVisibleTab").mockImplementation(async (w, o) => {
+      const url = await realCap(w, o);
+      chrome.__state.tabs.find((t) => t.id === 5).active = false;
+      return url;
+    });
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("stopped being the active tab");
+  });
+
+  it("the tab is CLOSED between the capture and the re-read => no_such_tab, not internal", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    const img = installImaging();
+    // The user closes the tab the instant after the frame is grabbed: the post-capture re-read's
+    // chrome.tabs.get now rejects, and the verb must answer no_such_tab (its declared guard), not
+    // let the rejection escape as a generic `internal`.
+    const realCap = chrome.tabs.captureVisibleTab.bind(chrome.tabs);
+    vi.spyOn(chrome.tabs, "captureVisibleTab").mockImplementation(async (w, o) => {
+      const url = await realCap(w, o);
+      chrome.__state.tabs = chrome.__state.tabs.filter((t) => t.id !== 5);
+      return url;
+    });
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("no_such_tab");
+  });
+
+  it("with selector: crops the frame in an OffscreenCanvas to the rect in DEVICE px", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    // rect in CSS px; devicePixelRatio 2 => device px = ×2.
+    chrome.__state.scriptResults = [
+      { result: { found: true, x: 10, y: 20, width: 100, height: 50, devicePixelRatio: 2 } },
+    ];
+    const img = installImaging();
+    const res = await dispatchCommand(
+      frame(CMD_SCREENSHOT, { tabId: 5, selector: "#el", format: "png" }),
+      ctx(),
+    );
+    img.restore();
+    expect(res.ok).toBe(true);
+    // drawImage cuts the device-px rect (20,40,200,100) into the canvas origin.
+    expect(img.drawImage).toHaveBeenCalledWith(
+      expect.anything(), 20, 40, 200, 100, 0, 0, 200, 100,
+    );
+    expect(img.convertToBlob).toHaveBeenCalledWith({ type: "image/png" });
+    expect(res.result.image).toBe("data:image/png;base64,Q1JPUA==");
+    expect(res.result.width).toBe(200);
+    expect(res.result.height).toBe(100);
+    expect(res.result.format).toBe("png");
+  });
+
+  it("a jpeg crop captures PNG (lossless intermediate), re-encoding to jpeg ONCE with quality", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    chrome.__state.scriptResults = [
+      { result: { found: true, x: 0, y: 0, width: 10, height: 10, devicePixelRatio: 1 } },
+    ];
+    const img = installImaging();
+    const cap = vi.spyOn(chrome.tabs, "captureVisibleTab");
+    await dispatchCommand(
+      frame(CMD_SCREENSHOT, { tabId: 5, selector: "#el", format: "jpeg", quality: 70 }),
+      ctx(),
+    );
+    img.restore();
+    // A crop always goes through the canvas, so the source is captured as PNG (lossless) — NOT jpeg,
+    // which would double-compress. quality therefore rides to convertToBlob, not to captureVisibleTab.
+    expect(cap).toHaveBeenCalledWith(1, { format: "png" });
+    expect(img.convertToBlob).toHaveBeenCalledWith({ type: "image/jpeg", quality: 70 });
+  });
+
+  it("a MALFORMED selector is precondition_failed — capture never runs", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    chrome.__state.scriptResults = [
+      { result: { found: false, badSelector: true, message: "'#a:has(>' is not a valid selector" } },
+    ];
+    const img = installImaging();
+    const cap = vi.spyOn(chrome.tabs, "captureVisibleTab");
+    const res = await dispatchCommand(
+      frame(CMD_SCREENSHOT, { tabId: 5, selector: "#a:has(>" }),
+      ctx(),
+    );
+    img.restore();
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#a:has(>");
+    expect(cap).not.toHaveBeenCalled();
+  });
+
+  it("a selector that matched nothing => precondition_failed", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    chrome.__state.scriptResults = [{ result: { found: false } }];
+    const img = installImaging();
+    const res = await dispatchCommand(
+      frame(CMD_SCREENSHOT, { tabId: 5, selector: "#nope" }),
+      ctx(),
+    );
+    img.restore();
+    expect(res.error.code).toBe("precondition_failed");
+    expect(res.error.message).toContain("#nope");
+  });
+
+  it("a discarded tab is tab_discarded (wake it first) — capture never runs", async () => {
+    chromeWithOneTab("https://x/", { active: true, discarded: true });
+    const img = installImaging();
+    const cap = vi.spyOn(chrome.tabs, "captureVisibleTab");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("tab_discarded");
+    expect(cap).not.toHaveBeenCalled();
+  });
+
+  it("a non-http tab is precondition_failed — capture never runs", async () => {
+    chromeWithOneTab("file:///etc/passwd", { active: true });
+    const img = installImaging();
+    const cap = vi.spyOn(chrome.tabs, "captureVisibleTab");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("precondition_failed");
+    expect(cap).not.toHaveBeenCalled();
+  });
+
+  it("a vanished tab is no_such_tab", async () => {
+    chromeWithOneTab("https://x/", { active: true });
+    const img = installImaging();
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 999 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("no_such_tab");
+  });
+});
+
+describe("screenshot (§6) — debugger path (background tab)", () => {
+  it("checkbox OFF (default) => js_disabled, and the debugger is NOT touched", async () => {
+    chromeWithOneTab("https://x/", { active: false });
+    const img = installImaging();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("js_disabled");
+    expect(attach).not.toHaveBeenCalled();
+  });
+
+  it("no selector: TRANSIENT attach, Page.captureScreenshot, detach — never held", async () => {
+    chromeWithOneTab("https://x/", { active: false });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const img = installImaging();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5, format: "webp" }), ctx());
+    img.restore();
+    expect(res.ok).toBe(true);
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, "Page.captureScreenshot", {
+      format: "webp", fromSurface: true,
+    });
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 }); // detached — the session is not held
+    expect(chrome.debugger._attached.has(5)).toBe(false); // released
+    expect(res.result.image).toBe("data:image/webp;base64,QkJCQg==");
+    expect(res.result.format).toBe("webp");
+    expect(res.result.width).toBe(1200);
+  });
+
+  it("with selector: captures with a native CDP clip (CSS px, scale 1)", async () => {
+    chromeWithOneTab("https://x/", { active: false });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    // devicePixelRatio 2 must NOT scale the clip — the CDP clip is in CSS px.
+    chrome.__state.scriptResults = [
+      { result: { found: true, x: 5, y: 6, width: 30, height: 40, devicePixelRatio: 2 } },
+    ];
+    const img = installImaging();
+    const send = vi.spyOn(chrome.debugger, "sendCommand");
+    const res = await dispatchCommand(
+      frame(CMD_SCREENSHOT, { tabId: 5, selector: "#el", format: "jpeg", quality: 80 }),
+      ctx(),
+    );
+    img.restore();
+    expect(res.ok).toBe(true);
+    expect(send).toHaveBeenCalledWith({ tabId: 5 }, "Page.captureScreenshot", {
+      format: "jpeg",
+      fromSurface: true,
+      quality: 80,
+      clip: { x: 5, y: 6, width: 30, height: 40, scale: 1 },
+    });
+  });
+
+  it("mutual exclusion: a tab held by focus emulation refuses with debugger_attach", async () => {
+    chromeWithOneTab("https://x/", { active: false });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    await dispatchCommand(frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }), ctx());
+    const img = installImaging();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("debugger_attach");
+    expect(attach).not.toHaveBeenCalled(); // refused up front — one client per tab
+  });
+
+  it("attach that throws (DevTools open / another client) => debugger_attach, untracked", async () => {
+    chromeWithOneTab("https://x/", { active: false });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.debuggerAttachError = "Another debugger is already attached";
+    const img = installImaging();
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.error.code).toBe("debugger_attach");
+    expect(chrome.debugger._attached.has(5)).toBe(false);
+  });
+
+  it("capture failure after a FRESH attach rolls the attach back (detach + release)", async () => {
+    chromeWithOneTab("https://x/", { active: false });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    chrome.__state.sendCommandError = "target crashed";
+    const img = installImaging();
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.ok).toBe(false);
+    expect(res.error.code).toBe("precondition_failed");
+    expect(detach).toHaveBeenCalledWith({ tabId: 5 }); // rolled back
+    expect(chrome.debugger._attached.has(5)).toBe(false); // no residue
+  });
+
+  it("the transient attach is released even on SUCCESS, so a later shot re-attaches", async () => {
+    chromeWithOneTab("https://x/", { active: false });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const img = installImaging();
+    await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    // Released after the first shot: a second shot performs a FRESH attach, not a skip.
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const res = await dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    img.restore();
+    expect(res.ok).toBe(true);
+    expect(attach).toHaveBeenCalledWith({ tabId: 5 }, "1.3");
+  });
+
+  // --- ownership race (§6): screenshot uses its OWN transient set, not focus emulation's --------
+  //
+  // These reproduce the review bug: screenshot used to mark its tab in `debuggerAttachedTabs` (focus
+  // emulation's ownership set). A CONCURRENT set_focus_emulation on that tab would then either skip
+  // its own attach (seeing the tab as already attached) or, on enabled=false, DETACH the debugger
+  // out from under the in-flight capture. The fix gives screenshot `screenshotTabs`, so focus/ws
+  // verbs see it as SOMEONE ELSE'S and refuse rather than touch it.
+
+  // Poll on real macrotasks until a predicate holds (no fake timers in this suite).
+  async function waitUntil(pred, tries = 200) {
+    for (let i = 0; i < tries; i += 1) {
+      if (pred()) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error("waitUntil: condition never held");
+  }
+
+  // Start a background-tab screenshot and PARK it inside Page.captureScreenshot, so the tab is held
+  // in `screenshotTabs` (attach done, detach not yet) across a concurrent verb — the exact window the
+  // ownership set guards. `finish()` releases the capture, awaits the shot and restores the imaging.
+  async function beginHeldScreenshot() {
+    chromeWithOneTab("https://x/", { active: false });
+    await chrome.storage.local.set({ allowExecuteJs: true });
+    const img = installImaging();
+    let release;
+    let started = false;
+    const realSend = chrome.debugger.sendCommand.bind(chrome.debugger);
+    vi.spyOn(chrome.debugger, "sendCommand").mockImplementation(async (target, method, params) => {
+      if (method === "Page.captureScreenshot") {
+        started = true; // set BEFORE parking: by now screenshotTabs.add(tabId) has already run
+        await new Promise((r) => { release = r; });
+      }
+      return realSend(target, method, params);
+    });
+    const shotP = dispatchCommand(frame(CMD_SCREENSHOT, { tabId: 5 }), ctx());
+    await waitUntil(() => started);
+    return {
+      shotP,
+      async finish() {
+        release();
+        const shot = await shotP;
+        img.restore();
+        return shot;
+      },
+    };
+  }
+
+  it("a held screenshot makes a concurrent set_focus_emulation(enabled=true) refuse — the shot is NOT detached", async () => {
+    const held = await beginHeldScreenshot();
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const focus = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: true }),
+      ctx(),
+    );
+    // Refused up front: the tab is held by an in-flight screenshot (screenshotTabs), so focus
+    // emulation may not attach a second client — and it did NOT detach the running capture.
+    expect(focus.error.code).toBe("debugger_attach");
+    expect(detach).not.toHaveBeenCalled();
+    const shot = await held.finish();
+    expect(shot.ok).toBe(true); // the capture completed cleanly once released
+  });
+
+  it("a held screenshot makes a concurrent set_focus_emulation(enabled=false) a no-op — it does NOT detach the shot", async () => {
+    const held = await beginHeldScreenshot();
+    const detach = vi.spyOn(chrome.debugger, "detach");
+    const focus = await dispatchCommand(
+      frame(CMD_SET_FOCUS_EMULATION, { tabId: 5, enabled: false }),
+      ctx(),
+    );
+    // A screenshot tab lives ONLY in screenshotTabs, never in debuggerAttachedTabs, so disabling
+    // focus emulation is a natural no-op — it must NOT detach the debugger the capture is riding on.
+    // (Before the fix, screenshot added the tab to debuggerAttachedTabs, so disable saw it as its
+    // own and detached it — killing the in-flight shot.)
+    expect(focus).toEqual({ ok: true, result: { enabled: false } });
+    expect(detach).not.toHaveBeenCalled();
+    const shot = await held.finish();
+    expect(shot.ok).toBe(true);
+  });
+
+  it("a held screenshot makes a concurrent start_ws_capture refuse with debugger_attach", async () => {
+    const held = await beginHeldScreenshot();
+    const attach = vi.spyOn(chrome.debugger, "attach");
+    const ws = await dispatchCommand(frame(CMD_START_WS_CAPTURE, { tabId: 5 }), ctx());
+    expect(ws.error.code).toBe("debugger_attach");
+    expect(attach).not.toHaveBeenCalled(); // refused up front — one client per tab
+    const shot = await held.finish();
+    expect(shot.ok).toBe(true);
   });
 });
